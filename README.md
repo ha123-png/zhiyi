@@ -8,6 +8,10 @@
   <img src="apps/web/public/logo.png" alt="知意 Logo" width="128" />
 </p>
 
+## 界面预览
+
+![知意桌面端提取工作台](docs/assets/interface-preview.png)
+
 ## 主要能力
 
 - 本地优先：服务默认只监听本机，可连接 LM Studio、Ollama 或 OpenAI-compatible 云端接口。
