@@ -47,7 +47,7 @@
 git clone https://github.com/ha123-png/zhiyi.git
 cd zhiyi
 npm.cmd ci
-uv sync --project apps/api --dev
+uv sync --project apps/api --dev --python 3.12
 npm.cmd run dev:safe
 ```
 
