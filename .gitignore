@@ -42,7 +42,10 @@ output/
 *.gz
 *.gguf
 *.safetensors
-models/
+# Downloaded model-weight directories (do not ignore Python source packages
+# such as apps/api/src/document_pipeline_api/models/).
+/models/
+/.local/**/models/
 datasets/
 
 # Editors and operating systems
@@ -50,4 +53,3 @@ datasets/
 .vscode/
 .DS_Store
 Thumbs.db
-
