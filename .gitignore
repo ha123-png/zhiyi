@@ -1,0 +1,53 @@
+# Dependencies and build outputs
+node_modules/
+dist/
+.venv/
+.uv-cache/
+.npm-cache/
+*.tsbuildinfo
+apps/web/vite.config.js
+apps/web/vite.config.d.ts
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.pytest-tmp*/
+.test-*/
+.localpytest-*/
+
+# Runtime and user data
+.local/
+data/
+uploads/
+output/
+*.db
+*.db-shm
+*.db-wal
+*.dpbak
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Logs, archives, models and datasets
+*.log
+*.zip
+*.7z
+*.tar
+*.gz
+*.gguf
+*.safetensors
+models/
+datasets/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+

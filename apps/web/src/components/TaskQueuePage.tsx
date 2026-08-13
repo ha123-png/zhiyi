@@ -1,0 +1,692 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Activity,
+  AlertTriangle,
+  CheckCircle2,
+  ChevronDown,
+  HelpCircle,
+  Loader2,
+  Play,
+  Trash2,
+} from "lucide-react";
+import {
+  deleteTask,
+  deleteTasksBatch,
+  getTasks,
+  getTables,
+  getTemplates,
+  retryTask,
+  retryTasksBatch,
+  selectTaskTemplate,
+  subscribeTaskEvents,
+} from "../api";
+import type { DataTableRead, ExtractionTemplate, Task, TaskStatus } from "../types";
+import { parseServerTime } from "../time";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { Icon } from "./Icon";
+
+// 状态 → 中文文案（对齐原型队列语义：等待中/处理中/已暂停/已完成/失败）
+const STATUS_TEXT: Record<TaskStatus, string> = {
+  created: "等待中",
+  waiting_for_template: "待选模板/表",
+  queued: "等待中",
+  processing: "处理中",
+  validating: "校验中",
+  needs_review: "待确认",
+  completed: "已完成",
+  paused: "已暂停",
+  cancelled: "已取消",
+  failed: "失败",
+};
+
+// 状态 → 阶段描述
+const STAGE_TEXT: Record<TaskStatus, string> = {
+  created: "排队中，尚未开始",
+  waiting_for_template: "需要选择模板",
+  queued: "排队中，尚未开始",
+  processing: "识别中…",
+  validating: "校验中…",
+  needs_review: "等待确认",
+  completed: "已完成",
+  paused: "已暂停，可在队列中恢复全部",
+  cancelled: "已取消",
+  failed: "失败",
+};
+
+function formatTime(iso: string): string {
+  const now = Date.now();
+  const then = parseServerTime(iso);
+  const diff = Math.max(0, now - then);
+  if (diff < 60_000) return "刚刚";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+  return `${Math.floor(diff / 86_400_000)} 天前`;
+}
+
+function templateLabel(t: Task, templateNames: Record<string, string>): string {
+  if (t.template_mode === "smart") return "智能匹配";
+  if (t.template_id && templateNames[t.template_id]) return templateNames[t.template_id];
+  if (t.template_id) return "内置模板";
+  if (t.candidate_templates.length > 0) return t.candidate_templates[0].name;
+  return t.template_mode;
+}
+
+interface TaskQueuePageProps {
+  /** 全局处理日志（App 层由 SSE 事件生成，覆盖所有状态变化，页面切换不丢失）。 */
+  logs?: { time: string; message: string }[];
+  onOpenTask?: (task: Task) => void;
+  onOpenData?: (task: Task) => void;
+}
+
+export function TaskQueuePage({
+  logs = [],
+  onOpenTask,
+  onOpenData,
+}: TaskQueuePageProps) {
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [selectedTemplates, setSelectedTemplates] = useState<Record<string, string>>({});
+  // 模板 id → 中文名（隐藏 builtin-invoice 等英文 key）
+  const [templates, setTemplates] = useState<ExtractionTemplate[]>([]);
+  const [templateNames, setTemplateNames] = useState<Record<string, string>>({});
+  const [tables, setTables] = useState<DataTableRead[]>([]);
+  // 待选模板删除确认（单删）：无数据、不输入文件名
+  const [deleteMatchTarget, setDeleteMatchTarget] = useState<Task | null>(null);
+  // 待选模板批量删除确认：一次弹窗
+  const [batchDeleteMatchOpen, setBatchDeleteMatchOpen] = useState(false);
+  // 暂停任务批量删除确认：一次弹窗（防止误删整个队列）
+  const [batchDeletePausedOpen, setBatchDeletePausedOpen] = useState(false);
+  const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [retryingAll, setRetryingAll] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setError(null);
+      // 活动任务必须按状态查询，不能假设它们一定处于最近 N 条；否则大量新历史
+      // 会把旧的待选模板/暂停任务挤出列表。近期终态仅用于本页摘要。
+      const [active, recent] = await Promise.all([
+        getTasks({ limit: 1000, activeOnly: true }),
+        getTasks({ limit: 500 }),
+      ]);
+      const merged = new Map(recent.map((task) => [task.id, task]));
+      active.forEach((task) => merged.set(task.id, task));
+      const all = Array.from(merged.values());
+      setTasks(all);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载任务失败");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    // SSE 实时推送：状态变化立即刷新（暂停/恢复/完成马上反映）；轮询保留为断线兜底
+    const unsub =
+      typeof EventSource === "undefined" ? undefined : subscribeTaskEvents(load);
+    const timer = setInterval(load, 1500);
+    return () => {
+      clearInterval(timer);
+      unsub?.();
+    };
+  }, [load]);
+
+  useEffect(() => {
+    void getTemplates(true)
+      .then((list) => {
+        const active = list.filter((template) => template.is_active !== false);
+        setTemplates(active);
+        setTemplateNames(Object.fromEntries(list.map((t) => [t.id, t.name])));
+      })
+      .catch(() => {});
+    void getTables().then(setTables).catch(() => {});
+  }, []);
+
+  const toggleCard = (key: string) =>
+    setCollapsed((s) => ({ ...s, [key]: !s[key] }));
+  const isCardCollapsed = (key: string) => !!collapsed[key];
+
+  const handleRetry = async (taskId: string) => {
+    try {
+      await retryTask(taskId);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重试任务失败");
+    }
+  };
+
+  const handleSelectTemplate = async (taskId: string) => {
+    const templateId = selectedTemplates[taskId];
+    if (!templateId) return;
+    try {
+      await selectTaskTemplate(taskId, templateId);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "选择模板失败");
+    }
+  };
+
+  const handleSelectTable = async (taskId: string) => {
+    const tableId = selectedTemplates[taskId];
+    if (!tableId) return;
+    try {
+      await selectTaskTemplate(taskId, undefined, tableId);
+      await load();
+      setNotice("已使用保留的提取结果写入指定表，任务已完成。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "选择数据表失败");
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!deleteMatchTarget) return;
+    setBusyTaskId(deleteMatchTarget.id);
+    try {
+      const result = await deleteTask(deleteMatchTarget.id);
+      setDeleteMatchTarget(null);
+      await load();
+      setNotice(
+        result.kept_rows > 0
+          ? `任务已删除，数据表中保留 ${result.kept_rows} 行数据（与原文件追溯已断开）。`
+          : "任务已删除。",
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除任务失败");
+    } finally {
+      setBusyTaskId(null);
+    }
+  };
+
+  /** 失败任务 / 暂停任务：没有产生数据，删除无需确认，直接删 */
+  const handleDeleteImmediate = async (taskId: string) => {
+    setBusyTaskId(taskId);
+    try {
+      await deleteTask(taskId);
+      await load();
+      setNotice("任务已删除。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除任务失败");
+    } finally {
+      setBusyTaskId(null);
+    }
+  };
+
+  /** 待选模板批量删除：只弹一次确认，一次请求完成 */
+  const handleBatchDeleteMatch = async () => {
+    const ids = matchFailedTasks.map((t) => t.id);
+    if (ids.length === 0) return;
+    setBusyTaskId("batch");
+    try {
+      const result = await deleteTasksBatch(ids);
+      setBatchDeleteMatchOpen(false);
+      await load();
+      setNotice(
+        result.kept_rows > 0
+          ? `已删除 ${result.deleted} 个任务，数据表中保留 ${result.kept_rows} 行数据。`
+          : `已删除 ${result.deleted} 个任务。`,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "批量删除失败");
+    } finally {
+      setBusyTaskId(null);
+    }
+  };
+
+  /** 暂停任务批量删除：经确认弹窗后执行 */
+  const handleBatchDeletePaused = async () => {
+    const ids = activeTasks
+      .filter((t) => t.status === "paused")
+      .map((t) => t.id);
+    if (ids.length === 0) return;
+    setBusyTaskId("batch");
+    try {
+      await deleteTasksBatch(ids);
+      setBatchDeletePausedOpen(false);
+      await load();
+      setNotice(`已删除 ${ids.length} 个暂停任务。`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "批量删除失败");
+    } finally {
+      setBusyTaskId(null);
+    }
+  };
+
+  /** 失败任务批量删除：没有产生数据，直接删，不弹确认 */
+  const handleBatchDeleteFailed = async () => {
+    const ids = failedTasks
+      .filter((t) => t.status === "failed" || t.status === "cancelled")
+      .map((t) => t.id);
+    if (ids.length === 0) return;
+    setBusyTaskId("batch");
+    try {
+      await deleteTasksBatch(ids);
+      await load();
+      setNotice(`已删除 ${ids.length} 个失败任务。`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "批量删除失败");
+    } finally {
+      setBusyTaskId(null);
+    }
+  };
+
+  const handleBatchRetry = async () => {
+    const ids = failedTasks
+      .filter((t) => t.status === "failed")
+      .map((t) => t.id);
+    if (ids.length === 0) return;
+    setRetryingAll(true);
+    try {
+      const result = await retryTasksBatch(ids);
+      await load();
+      setNotice(
+        result.skipped > 0
+          ? `已重新提交 ${result.retried.length} 个任务，${result.skipped} 个因队列容量跳过。`
+          : `已重新提交 ${result.retried.length} 个任务。`,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "批量重试失败");
+    } finally {
+      setRetryingAll(false);
+    }
+  };
+
+  // 活动任务：processing / queued / created / paused / validating
+  const activeTasks = tasks.filter((t) =>
+    ["processing", "queued", "created", "paused", "validating"].includes(t.status),
+  );
+  // 待选模板
+  const matchFailedTasks = tasks.filter(
+    (t) => t.status === "waiting_for_template",
+  );
+  // 最近完成：今天的才叫“最近”（completed / needs_review）
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  const completedTasks = tasks.filter(
+    (t) =>
+      (t.status === "completed" || t.status === "needs_review")
+      && parseServerTime(t.updated_at) >= todayStart.getTime(),
+  );
+  // 失败
+  const failedTasks = tasks.filter(
+    (t) => t.status === "failed" || t.status === "cancelled",
+  );
+
+  return (
+    <div className="view">
+      <div className="page-header">
+        <div className="eyebrow">状态监控</div>
+        <h1>任务队列</h1>
+        <div className="support">实时查看文档处理状态、失败任务与最近完成记录。</div>
+      </div>
+
+      {error && (
+        <div className="callout danger" style={{ marginBottom: 16 }}>
+          {error}
+        </div>
+      )}
+      {notice && (
+        <div className="callout success" style={{ marginBottom: 16 }}>
+          {notice}
+        </div>
+      )}
+
+      <div className="task-queue-grid">
+        <div className="task-col">
+          {/* Active (活动任务：黑头 + 蓝脉冲点，放最顶) */}
+          <div className="task-queue-card is-active">
+            <div
+              className={`task-queue-header collapsible${isCardCollapsed("active") ? " is-collapsed" : ""}`}
+              onClick={() => toggleCard("active")}
+            >
+              <h3>
+                <Icon icon={Activity} size={15} /> 活动任务
+              </h3>
+              <div className="header-center">
+                <span className="badge live-blue">{activeTasks.length}</span>
+                {loading && <Icon icon={Loader2} size={14} className="spin" />}
+              </div>
+              <div className="header-actions">
+                <Icon className="card-caret" icon={ChevronDown} size={16} />
+                {activeTasks.some((t) => t.status === "paused") && (
+                  <button
+                    className="btn ghost sm"
+                    title="批量删除全部暂停任务（防止上传错文件，确认后删除）"
+                    disabled={busyTaskId !== null}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setBatchDeletePausedOpen(true);
+                    }}
+                  >
+                    <Icon icon={Trash2} size={12} /> 删除暂停任务
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className={"collapsible-region" + (isCardCollapsed("active") ? " is-collapsed" : "")}>
+              <div className="collapsible-inner">
+                <div className="task-list">
+                  {activeTasks.length === 0 && (
+                    <div className="task-empty">暂无活动任务</div>
+                  )}
+                  {activeTasks.map((t) => (
+                    <div className="task-item" key={t.id}>
+                      <div className="task-row-top">
+                        <span className="task-name">{t.filename}</span>
+                        <span
+                          className={`badge ${["processing", "validating"].includes(t.status) ? "live-blue" : "info"}`}
+                        >
+                          {STATUS_TEXT[t.status]}
+                        </span>
+                      </div>
+                      <div className="task-row-bottom">
+                        <div className="task-meta">
+                          <span>{templateLabel(t, templateNames)}</span>
+                          <span>·</span>
+                          <span>{STAGE_TEXT[t.status]}</span>
+                        </div>
+                        <div className="task-actions">
+                          {t.status === "paused" && (
+                            <button
+                              className="btn ghost sm danger-btn"
+                              title="删除此任务（防止上传错文件，直接删除不确认）"
+                              disabled={busyTaskId === t.id}
+                              onClick={() => void handleDeleteImmediate(t.id)}
+                            >
+                              <Icon icon={Trash2} size={12} />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Match failed (待选模板：黄) —— 始终显示卡片，无数据时展示空状态占位 */}
+          <div className="task-queue-card is-warning">
+            <div
+              className={`task-queue-header collapsible${isCardCollapsed("match") ? " is-collapsed" : ""}`}
+              onClick={() => toggleCard("match")}
+            >
+              <h3>
+                <Icon icon={HelpCircle} size={15} /> 待选模板/表
+              </h3>
+              <div className="header-center">
+                <span className="badge warn">{matchFailedTasks.length}</span>
+              </div>
+              <div className="header-actions">
+                <Icon className="card-caret" icon={ChevronDown} size={16} />
+                {matchFailedTasks.length > 0 && (
+                  <button
+                    className="btn ghost sm"
+                    title="批量删除全部待选模板任务（没有产生记录，确认后直接删除）"
+                    disabled={busyTaskId !== null}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setBatchDeleteMatchOpen(true);
+                    }}
+                  >
+                    <Icon icon={Trash2} size={12} /> 批量删除
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className={"collapsible-region" + (isCardCollapsed("match") ? " is-collapsed" : "")}>
+              <div className="collapsible-inner">
+                <div className="task-list">
+                  {matchFailedTasks.length === 0 && (
+                    <div className="task-empty">暂无待选模板/表任务</div>
+                  )}
+                  {matchFailedTasks.map((t) => {
+                    const choosingTable = t.candidate_templates.some((candidate) => candidate.description?.includes("指定表不符"));
+                    const options = choosingTable
+                      ? tables.filter((table) => {
+                          const candidate = t.candidate_templates[0];
+                          const template = templates.find((item) => item.id === candidate?.id);
+                          if (!candidate || !template) return false;
+                          const key = template.builtin_key ?? candidate.id;
+                          const version = template.builtin_key ? "builtin-v1" : String(candidate.version);
+                          return table.template_key === key && table.template_version === version;
+                        }).map((table) => ({ id: table.id, name: table.name }))
+                      : [
+                          ...t.candidate_templates.map((candidate) => ({ id: candidate.id, name: `${candidate.name}（推荐）` })),
+                          ...templates.filter((template) => !t.candidate_templates.some((candidate) => candidate.id === template.id)).map((template) => ({ id: template.id, name: template.name })),
+                        ];
+                    return (
+                      <div className="task-item" key={t.id}>
+                        <div className="task-row-top">
+                          <span className="task-name">{t.filename}</span>
+                          <span className="badge warn">待匹配</span>
+                        </div>
+                        <div className="match-failed-box">
+                          <p>{choosingTable ? "提取出字段与指定表不符，请重新选择指定表。" : "智能匹配未命中，请手动选择模板，或重试匹配。"}</p>
+                          <div className="row">
+                            <select
+                              aria-label={choosingTable ? "选择指定表" : "选择模板"}
+                              className="form-select"
+                              style={{ flex: 1 }}
+                              value={selectedTemplates[t.id] ?? ""}
+                              onChange={(e) =>
+                                setSelectedTemplates((s) => ({
+                                  ...s,
+                                  [t.id]: e.target.value,
+                                }))
+                              }
+                            >
+                              <option value="" disabled>{choosingTable ? "选择兼容的数据表…" : "选择模板…"}</option>
+                              {options.map((option) => (
+                                <option key={option.id} value={option.id}>{option.name}</option>
+                              ))}
+                            </select>
+                            <button
+                              className="btn primary sm"
+                              onClick={() => choosingTable ? handleSelectTable(t.id) : handleSelectTemplate(t.id)}
+                              disabled={!selectedTemplates[t.id]}
+                            >
+                              确认
+                            </button>
+                            {!choosingTable && <button className="btn sm" onClick={() => handleRetry(t.id)}>重试</button>}
+                            <button
+                              className="btn ghost sm danger-btn"
+                              title="删除此任务（没有产生记录，确认后删除）"
+                              onClick={() => setDeleteMatchTarget(t)}
+                            >
+                              <Icon icon={Trash2} size={12} />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )})}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        <div className="task-col">
+          {/* Completed (最近完成：绿) */}
+          <div className="task-queue-card is-success">
+            <div
+              className={`task-queue-header collapsible${isCardCollapsed("completed") ? " is-collapsed" : ""}`}
+              onClick={() => toggleCard("completed")}
+            >
+              <h3>
+                <Icon icon={CheckCircle2} size={15} /> 最近完成
+              </h3>
+              <div className="header-center">
+                <span className="badge success">{completedTasks.length}</span>
+              </div>
+              <div className="header-actions">
+                <Icon className="card-caret" icon={ChevronDown} size={16} />
+              </div>
+            </div>
+            <div className={"collapsible-region" + (isCardCollapsed("completed") ? " is-collapsed" : "")}>
+              <div className="collapsible-inner">
+                <div className="task-list">
+                  {completedTasks.length === 0 && (
+                    <div className="task-empty">暂无已完成任务</div>
+                  )}
+                  {completedTasks.map((t) => (
+                    <div className="task-item" key={t.id}>
+                      <div className="task-row-top">
+                        <span className="task-name">{t.filename}</span>
+                        <span className={`badge ${t.status === "needs_review" ? "warn" : "success"}`}>
+                          {STATUS_TEXT[t.status]}
+                        </span>
+                      </div>
+                      <div className="task-row-bottom">
+                        <div className="task-meta">
+                          <span>{templateLabel(t, templateNames)}</span>
+                          <span>·</span>
+                          <span>{formatTime(t.updated_at)}</span>
+                        </div>
+                        <div className="task-actions">
+                          <button className="btn ghost sm" onClick={() => onOpenTask?.(t)}>对照</button>
+                          <button className="btn ghost sm" onClick={() => onOpenData?.(t)}>数据</button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Failed (失败任务：红，第三) */}
+          <div className="task-queue-card is-danger">
+            <div
+              className={`task-queue-header collapsible${isCardCollapsed("failed") ? " is-collapsed" : ""}`}
+              onClick={() => toggleCard("failed")}
+            >
+              <h3>
+                <Icon icon={AlertTriangle} size={15} /> 失败任务
+              </h3>
+              <div className="header-center">
+                <span className="badge danger">{failedTasks.length}</span>
+              </div>
+              <div className="header-actions">
+                <Icon className="card-caret" icon={ChevronDown} size={16} />
+                {failedTasks.some((t) => t.status === "failed") && (
+                  <button
+                    className="btn ghost sm"
+                    title="全部重试"
+                    disabled={retryingAll}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void handleBatchRetry();
+                    }}
+                  >
+                    <Icon icon={retryingAll ? Loader2 : Play} size={12} className={retryingAll ? "spin" : undefined} />
+                    全部重试
+                  </button>
+                )}
+                {failedTasks.length > 0 && (
+                  <button
+                    className="btn ghost sm"
+                    title="批量删除全部失败任务（没有产生数据，直接删除不确认）"
+                    disabled={busyTaskId !== null}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void handleBatchDeleteFailed();
+                    }}
+                  >
+                    <Icon icon={Trash2} size={12} /> 批量删除
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className={"collapsible-region" + (isCardCollapsed("failed") ? " is-collapsed" : "")}>
+              <div className="collapsible-inner">
+                <div className="task-list">
+                  {failedTasks.length === 0 && (
+                    <div className="task-empty">暂无失败任务</div>
+                  )}
+                  {failedTasks.map((t) => (
+                    <div className="task-item" key={t.id}>
+                      <div className="task-row-top">
+                        <span className="task-name">{t.filename}</span>
+                        <span className="badge danger">{STATUS_TEXT[t.status]}</span>
+                      </div>
+                      <div className="task-row-bottom">
+                        <div className="task-meta">
+                          {t.status === "cancelled"
+                            ? "任务已取消，可清除该记录"
+                            : (t.failure_message ?? "处理失败，可重试")}
+                        </div>
+                        <div className="task-actions">
+                          {t.status === "failed" && (
+                            <button className="btn ghost sm" onClick={() => handleRetry(t.id)}>重试</button>
+                          )}
+                          <button
+                            className="btn ghost sm danger-btn"
+                            title="删除任务（失败任务没有产生数据，直接删除不确认）"
+                            disabled={busyTaskId === t.id}
+                            onClick={() => void handleDeleteImmediate(t.id)}
+                          >
+                            <Icon icon={Trash2} size={12} />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* 处理日志：上传/开始/完成/失败等状态变化实时记录；无记录时也保留面板占位 */}
+      <div className="queue-log-panel" aria-label="处理日志">
+        <div className="queue-log-title">处理日志</div>
+        <div className="queue-log-list">
+          {logs.length === 0 ? (
+            <div className="queue-log-empty">还没有处理记录，上传文件后这里会实时显示处理过程。</div>
+          ) : (
+            logs.map((log, index) => (
+              <div className="queue-log-entry" key={index}>
+                <span className="queue-log-time">{log.time}</span>
+                <span className="queue-log-msg">{log.message}</span>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      {/* 待选模板单删：没有产生记录，弹确认但无需输入文件名 */}
+      <ConfirmDialog
+        open={deleteMatchTarget !== null}
+        title="删除任务"
+        description="这个任务还没有产生任何数据记录。确认删除吗？"
+        buttonLabel="确认删除"
+        busy={busyTaskId === deleteMatchTarget?.id}
+        onConfirm={() => void handleDelete()}
+        onClose={() => setDeleteMatchTarget(null)}
+      />
+      {/* 待选模板批量删除：一次弹窗，删除全部 */}
+      <ConfirmDialog
+        open={batchDeleteMatchOpen}
+        title="批量删除任务"
+        description={`将删除 ${matchFailedTasks.length} 个待选模板任务（都没有产生任何数据记录）。确认删除吗？`}
+        buttonLabel="确认删除"
+        busy={busyTaskId === "batch"}
+        onConfirm={() => void handleBatchDeleteMatch()}
+        onClose={() => setBatchDeleteMatchOpen(false)}
+      />
+      {/* 暂停任务批量删除：一次弹窗，防止误删整个队列 */}
+      <ConfirmDialog
+        open={batchDeletePausedOpen}
+        title="批量删除暂停任务"
+        description={`将删除 ${activeTasks.filter((t) => t.status === "paused").length} 个暂停任务（都没有产生任何数据记录，删除后不可恢复）。确认删除吗？`}
+        buttonLabel="确认删除"
+        busy={busyTaskId === "batch"}
+        onConfirm={() => void handleBatchDeletePaused()}
+        onClose={() => setBatchDeletePausedOpen(false)}
+      />
+    </div>
+  );
+}
