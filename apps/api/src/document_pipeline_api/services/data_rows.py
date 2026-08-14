@@ -1,18 +1,14 @@
 import json
 
 from fastapi import HTTPException
-from pydantic import ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from document_pipeline_api.domain.template_rules import validate_template_rules
-from document_pipeline_api.domain.validation import validate_extraction
 from document_pipeline_api.models import (
     DataRowRecord,
     DataRowRevisionRecord,
     DataTableRecord,
     ExtractionRecord,
-    TaskRecord,
 )
 from document_pipeline_api.models.task import utc_now
 from document_pipeline_api.schemas.data_tables import (
@@ -20,14 +16,7 @@ from document_pipeline_api.schemas.data_tables import (
     DataRowRevisionRead,
     DataRowUpdate,
 )
-from document_pipeline_api.schemas.extraction import (
-    DocumentExtraction,
-    DocumentKind,
-    TemplateExtraction,
-)
-from document_pipeline_api.services.template_processing import (
-    build_template_extraction_model,
-)
+from document_pipeline_api.schemas.extraction import DocumentKind
 from document_pipeline_api.services.templates import get_template_version
 
 
@@ -101,37 +90,66 @@ def update_data_row(
     before = json.loads(row.row_json)
     _validate_row_changes(valid_keys, before, request.changes)
 
-    # 手动新增的行（无来源任务）：不参与任务级校验与跨行传播，只更新本行
+    table_column_defs = table_columns(session, table)
+
+    # 合并表没有 task_id，但用 __row_group 表示同一份原文件。表头在界面上是
+    # 跨明细合并单元格，因此编辑时也必须同步到同组所有行并分别留下修订；
+    # 否则选择同组第二条明细查看历史时，会误以为表头从未修改。
     if row.task_id is None:
-        after = dict(before)
-        after.update(request.changes)
-        after_json = _canonical_json(after)
-        if after_json == row.row_json:
-            return data_row_read(row)
-        # SQLAlchemy 的 bulk UPDATE 会同步当前 Session 中的 row 对象；必须在
-        # execute 前冻结旧 JSON，否则修订记录的 before/after 会被写成相同值。
-        before_json = row.row_json
+        header_keys = {
+            column.key for column in table_column_defs if column.section == "header"
+        }
+        row_group = before.get("__row_group")
+        propagated = header_keys & request.changes.keys()
+        related_rows = [row]
+        if row_group and propagated:
+            candidates = session.scalars(
+                select(DataRowRecord).where(DataRowRecord.table_id == table_id)
+            ).all()
+            related_rows = [
+                candidate
+                for candidate in candidates
+                if json.loads(candidate.row_json).get("__row_group") == row_group
+            ]
         changed_at = utc_now()
-        next_version = request.expected_version + 1
-        result = session.execute(
-            update(DataRowRecord)
-            .where(
-                DataRowRecord.id == row.id,
-                DataRowRecord.table_id == row.table_id,
-                DataRowRecord.row_version == request.expected_version,
+        for current in related_rows:
+            before_json = current.row_json
+            current_before = json.loads(before_json)
+            changes = (
+                request.changes
+                if current.id == row.id
+                else {key: request.changes[key] for key in propagated}
             )
-            .values(row_json=after_json, row_version=next_version, updated_at=changed_at)
-        )
-        if result.rowcount != 1:
-            session.rollback()
-            raise HTTPException(
-                status_code=409,
-                detail="相关数据已经更新，请刷新后再修改。",
+            current_after = {**current_before, **changes}
+            after_json = _canonical_json(current_after)
+            if after_json == current.row_json:
+                continue
+            expected_version = (
+                request.expected_version if current.id == row.id else current.row_version
             )
-        session.add(
-            DataRowRevisionRecord(
-                row_id=row.id,
-                table_id=row.table_id,
+            next_version = expected_version + 1
+            result = session.execute(
+                update(DataRowRecord)
+                .where(
+                    DataRowRecord.id == current.id,
+                    DataRowRecord.table_id == current.table_id,
+                    DataRowRecord.row_version == expected_version,
+                )
+                .values(
+                    row_json=after_json,
+                    row_version=next_version,
+                    updated_at=changed_at,
+                )
+            )
+            if result.rowcount != 1:
+                session.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail="相关数据已经更新，请刷新后再修改。",
+                )
+            session.add(DataRowRevisionRecord(
+                row_id=current.id,
+                table_id=current.table_id,
                 task_id=None,
                 version=next_version,
                 operation="table_edit",
@@ -139,8 +157,7 @@ def update_data_row(
                 after_json=after_json,
                 editor=request.editor,
                 created_at=changed_at,
-            )
-        )
+            ))
         session.commit()
         updated_row = session.get(DataRowRecord, row.id)
         if updated_row is None:
@@ -152,13 +169,11 @@ def update_data_row(
         .where(DataRowRecord.task_id == row.task_id)
         .order_by(DataRowRecord.item_index)
     ).all()
-    table_column_defs = table_columns(session, table)
     custom_header_keys = {
         column.key
         for column in table_column_defs
         if column.user_defined and column.section == "header"
     }
-    custom_keys = {column.key for column in table_column_defs if column.user_defined}
     header_keys = _header_keys_for_task(session, row.task_id) | custom_header_keys
     propagated = header_keys & request.changes.keys()
     prospective: dict[int, dict[str, object | None]] = {
@@ -172,30 +187,8 @@ def update_data_row(
             {key: request.changes[key] for key in propagated}
         )
 
-    task = session.get(TaskRecord, row.task_id)
-    if task is None:
-        raise HTTPException(status_code=409, detail="这行数据缺少来源任务，不能修改。")
-    # 附加列只属于数据仓库，不属于提取结果；校验模板时必须剥离，避免污染
-    # 模型/模板契约，也避免用户填写备注后被误判为提取字段错误。
-    validation_rows = {
-        row_id: {
-            key: value
-            for key, value in values.items()
-            if key not in custom_header_keys
-            and key not in custom_keys
-        }
-        for row_id, values in prospective.items()
-    }
-    issues = (
-        []
-        if set(request.changes).issubset(custom_keys)
-        else _validate_task_rows(session, task, task_rows, validation_rows)
-    )
-    if task.status == "completed" and issues:
-        raise HTTPException(
-            status_code=422,
-            detail=f"修改后未通过检查：{issues[0].message}",
-        )
+    # 数据仓库是确认结果的下游副本。这里的编辑只改变数据表，不回写提取结果、
+    # 文件历史或任务校验；否则用户整理已入库数据会被旧模板规则反向阻断。
 
     changed_at = utc_now()
     for current in task_rows:
@@ -258,90 +251,6 @@ def _header_keys_for_task(session: Session, task_id: str) -> set[str]:
         extraction.template_version,
     )
     return {field.key for field in template.fields if field.section == "header"}
-
-
-def _validate_task_rows(
-    session: Session,
-    task: TaskRecord,
-    rows: list[DataRowRecord],
-    values_by_id: dict[int, dict[str, object | None]],
-):
-    extraction = session.get(ExtractionRecord, task.id)
-    if extraction is None:
-        raise HTTPException(status_code=409, detail="这行数据缺少提取结果，不能修改。")
-    values = [values_by_id[row.id] for row in rows]
-    if extraction.document_kind != DocumentKind.CUSTOM.value:
-        try:
-            result = _builtin_result_from_rows(values)
-        except ValidationError as error:
-            raise _type_error(error) from error
-        return validate_extraction(result, DocumentKind(extraction.document_kind))
-    if extraction.template_id is None or extraction.template_version is None:
-        raise HTTPException(status_code=409, detail="这行数据缺少模板版本，不能修改。")
-    template = get_template_version(
-        session,
-        extraction.template_id,
-        extraction.template_version,
-    )
-    header_keys = {field.key for field in template.fields if field.section == "header"}
-    item_keys = {field.key for field in template.fields if field.section == "item"}
-    first = values[0]
-    raw_result = {
-        "header": {key: first.get(key) for key in header_keys},
-        "items": [
-            {key: value.get(key) for key in item_keys}
-            for value in values
-            if value.get("item_index") is not None
-        ],
-    }
-    try:
-        dynamic_result = build_template_extraction_model(template).model_validate(
-            raw_result,
-            strict=True,
-        )
-    except ValidationError as error:
-        raise _type_error(error) from error
-    result = TemplateExtraction.model_validate(dynamic_result.model_dump())
-    return validate_template_rules(
-        result,
-        template.deterministic_rules,
-        template.fields,
-    )
-
-
-def _builtin_result_from_rows(
-    rows: list[dict[str, object | None]],
-) -> DocumentExtraction:
-    first = rows[0]
-    return DocumentExtraction.model_validate(
-        {
-            **{key: first.get(key) for key in BUILTIN_HEADER_KEYS},
-            "items": [
-                {
-                    "name": row.get("name"),
-                    "specification": row.get("specification"),
-                    "unit": row.get("unit"),
-                    "quantity": row.get("quantity"),
-                    "unit_price": row.get("unit_price"),
-                    "amount": row.get("item_amount"),
-                    "tax_rate": row.get("tax_rate"),
-                    "tax_amount": row.get("item_tax_amount"),
-                }
-                for row in rows
-                if row.get("item_index") is not None
-            ],
-        },
-        strict=True,
-    )
-
-
-def _type_error(error: ValidationError) -> HTTPException:
-    first = error.errors(include_url=False)[0]
-    path = ".".join(str(part) for part in first["loc"])
-    return HTTPException(
-        status_code=422,
-        detail=f"字段 {path} 的值类型不正确。",
-    )
 
 
 def list_row_revisions(
@@ -411,20 +320,6 @@ def _validate_row_changes(
             raise HTTPException(
                 status_code=422,
                 detail=f"字段 {key} 只能保存文字、数字、真假值或空值。",
-            )
-        previous = before.get(key)
-        if value is None or previous is None:
-            continue
-        if isinstance(previous, bool):
-            valid_type = isinstance(value, bool)
-        elif isinstance(previous, (int, float)):
-            valid_type = isinstance(value, (int, float)) and not isinstance(value, bool)
-        else:
-            valid_type = isinstance(value, type(previous))
-        if not valid_type:
-            raise HTTPException(
-                status_code=422,
-                detail=f"字段 {key} 的值类型不正确。",
             )
 
 

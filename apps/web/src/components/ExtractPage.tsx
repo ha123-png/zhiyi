@@ -34,6 +34,7 @@ import {
 } from "../api";
 import type {
   DataTableRead,
+  DemoScenario,
   Extraction,
   ExtractionResult,
   ExtractionTemplate,
@@ -449,7 +450,7 @@ function writeLastUploadMode(mode: "auto" | "manual", templateId: string) {
 
 interface ExtractPageProps {
   initialTask?: Task | null;
-  demo?: boolean;
+  demo?: DemoScenario | null;
   onNavigateHistory?: () => void;
   onTasksChange?: () => void;
   /** 上传请求发出前立即调用：前端先显示文件并开始计时，不等后端响应 */
@@ -464,7 +465,7 @@ interface ExtractPageProps {
 
 export function ExtractPage({
   initialTask = null,
-  demo = false,
+  demo = null,
   onNavigateHistory,
   onTasksChange,
   onUploadStarted,
@@ -509,14 +510,63 @@ export function ExtractPage({
   useEffect(() => {
     if (!demo) return;
     const now = new Date().toISOString();
+    const scenarios: Record<DemoScenario, { filename: string; source: string; name: string; result: TemplateResult; fields: ExtractionTemplate["fields"]; issues: Extraction["validation_issues"] }> = {
+      sentiment: {
+        filename: "新闻报道.txt", name: "新闻情感分析",
+        source: "某市发布公共交通优化方案，将新增夜间线路并降低换乘成本。多位市民表示期待，但也担心高峰期运力是否充足。",
+        result: { header: { 情感倾向: "审慎乐观", 核心依据: "便利性提升获得期待，同时存在运力担忧" }, items: [] },
+        fields: [{ key: "情感倾向", label: "情感倾向", section: "header", example: "积极", instructions: "", value_type: "text" }, { key: "核心依据", label: "核心依据", section: "header", example: "", instructions: "", value_type: "text" }], issues: [],
+      },
+      article: {
+        filename: "行业观察.md", name: "文章关键信息",
+        source: "# 本地大模型进入实用阶段\n作者：林知远\n文章讨论小型多模态模型如何在普通电脑上承担文档理解任务，并分析隐私、成本与准确率之间的取舍。",
+        result: { header: { 标题: "本地大模型进入实用阶段", 作者: "林知远", 摘要: "小型多模态模型正在普通电脑上承担文档理解任务。", 关键词: "本地模型、多模态、文档理解" }, items: [] },
+        fields: ["标题", "作者", "摘要", "关键词"].map((label) => ({ key: label, label, section: "header" as const, example: "", instructions: "", value_type: "text" as const })), issues: [],
+      },
+      grading: {
+        filename: "数学作业.txt", name: "作业批改",
+        source: "数学作业（八题）\n1. 12+8=20  2. 36÷6=5  3. 7×9=63  4. 45-17=28\n5. 3/4+1/4=1  6. 2.5×4=10  7. 18÷3=6  8. 6²=36\n\n模板额外提示词中的标准答案：1.20；2.6；3.63；4.28；5.1；6.10；7.6；8.36。",
+        result: { header: { 批改结果: "7/8", 说明: "标准答案等固定评分口径可以写在字段模板的额外提示词中" }, items: [
+          { 题号: 1, 学生答案: "20", 正确答案: "20", 是否正确: true }, { 题号: 2, 学生答案: "5", 正确答案: "6", 是否正确: false },
+          { 题号: 3, 学生答案: "63", 正确答案: "63", 是否正确: true }, { 题号: 4, 学生答案: "28", 正确答案: "28", 是否正确: true },
+          { 题号: 5, 学生答案: "1", 正确答案: "1", 是否正确: true }, { 题号: 6, 学生答案: "10", 正确答案: "10", 是否正确: true },
+          { 题号: 7, 学生答案: "6", 正确答案: "6", 是否正确: true }, { 题号: 8, 学生答案: "36", 正确答案: "36", 是否正确: true },
+        ] },
+        fields: [
+          { key: "批改结果", label: "批改结果", section: "header", example: "7/8", instructions: "", value_type: "text" },
+          { key: "说明", label: "标准答案来源", section: "header", example: "模板额外提示词", instructions: "", value_type: "text" },
+          ...["题号", "学生答案", "正确答案", "是否正确"].map((label) => ({ key: label, label, section: "item" as const, example: "", instructions: "", value_type: (label === "题号" ? "number" : label === "是否正确" ? "boolean" : "text") as "number" | "boolean" | "text" })),
+        ], issues: [],
+      },
+      mistakes: {
+        filename: "错题记录.txt", name: "错题分析",
+        source: "原题：一辆汽车 3 小时行驶 180 千米，平均每小时行驶多少千米？\n学生答案：180×3=540（千米）",
+        result: { header: {}, items: [{ 原题目: "汽车3小时行驶180千米，求平均速度", 正确解析: "平均速度=总路程÷总时间=180÷3=60千米/小时", 易错点: "把求平均量误写成乘法", 举一反三: "240千米用4小时，平均每小时多少千米？", 举一反三答案: "240÷4=60千米/小时" }] },
+        fields: ["原题目", "正确解析", "易错点", "举一反三", "举一反三答案"].map((label) => ({ key: label, label, section: "item" as const, example: "", instructions: "", value_type: "text" as const })), issues: [],
+      },
+      business: {
+        filename: "示例送货单.txt", name: "发票／送货单解析",
+        source: "送货单 R-20260815\n供货方：知意科技有限公司\n收货方：示例客户\n打印纸 A4 10箱 单价128元 金额1280元",
+        result: { header: { 单据编号: "R-20260815", 供货方: "知意科技有限公司", 收货方: "示例客户", 合计金额: 1280 }, items: [{ 商品: "打印纸 A4", 数量: 10, 单位: "箱", 单价: 128, 金额: 1280 }] },
+        fields: [{ key: "单据编号", label: "单据编号", section: "header", example: "", instructions: "", value_type: "text" }, { key: "供货方", label: "供货方", section: "header", example: "", instructions: "", value_type: "text" }, { key: "收货方", label: "收货方", section: "header", example: "", instructions: "", value_type: "text" }, { key: "合计金额", label: "合计金额", section: "header", example: "", instructions: "", value_type: "number" }, ...["商品", "数量", "单位", "单价", "金额"].map((label) => ({ key: label, label, section: "item" as const, example: "", instructions: "", value_type: (["数量", "单价", "金额"].includes(label) ? "number" : "text") as "number" | "text" }))], issues: [],
+      },
+      rule: {
+        filename: "金额异常发票.txt", name: "规则兜底",
+        source: "服务费 1000.00元\n税额 60.00元\n价税合计 1160.00元",
+        result: { header: { 不含税金额: 1000, 税额: 60, 价税合计: 1160 }, items: [] },
+        fields: ["不含税金额", "税额", "价税合计"].map((label) => ({ key: label, label, section: "header" as const, example: "", instructions: "", value_type: "number" as const })),
+        issues: [{ code: "amount_mismatch", field: "价税合计", message: "规则校验：不含税金额 + 税额应为 1060.00，与价税合计 1160.00 不一致。", severity: "error" }],
+      },
+    };
+    const scenario = scenarios[demo];
     const demoTask: Task = {
       id: "onboarding-demo",
-      filename: "示例发票.png",
-      content_type: "image/png",
+      filename: scenario.filename,
+      content_type: "text/plain",
       size_bytes: 0,
       page_count: 1,
       sha256: "",
-      template_mode: "invoice",
+      template_mode: "manual",
       template_id: null,
       template_version: null,
       candidate_templates: [],
@@ -526,36 +576,27 @@ export function ExtractPage({
       completed_at: now,
       updated_at: now,
     };
-    const demoResult: ExtractionResult = {
-      document_type: "增值税电子普通发票",
-      seller_name: "知意科技有限公司",
-      buyer_name: "示例客户有限公司",
-      document_number: "24312000000000000001",
-      document_date: "2026-08-12",
-      amount_before_tax: 1207.55,
-      tax_amount: 72.45,
-      total_amount: 1280,
-      items: [{ name: "信息技术服务", specification: null, unit: "项", quantity: 1, unit_price: 1207.55, amount: 1207.55, tax_rate: "6%", tax_amount: 72.45 }],
-    };
+    const demoResult: ExtractionResult = scenario.result;
+    const demoTemplate: ExtractionTemplate = { id: `demo-${demo}`, version: 1, is_system: true, builtin_key: null, source_template_id: null, name: scenario.name, description: "内置只读演示", extra_instructions: "", fields: scenario.fields, validation_rules: [], deterministic_rules: [], output_mapping: {}, created_at: now, updated_at: now };
     const demoExtraction: Extraction = {
       task_id: demoTask.id,
-      document_kind: "invoice",
-      template_id: null,
-      template_version: null,
-      template: null,
+      document_kind: "custom",
+      template_id: demoTemplate.id,
+      template_version: 1,
+      template: demoTemplate,
       model_name: "内置示例",
       prompt_version: "demo",
       elapsed_seconds: 0,
       review_version: 0,
       original_result: demoResult,
       result: demoResult,
-      validation_issues: [],
+      validation_issues: scenario.issues,
       evidence: [],
     };
     setTask(demoTask);
     setExtraction(demoExtraction);
     setDraftResult(structuredClone(demoResult));
-    setExtractValidationIssues([]);
+    setExtractValidationIssues(scenario.issues.map((issue, index) => ({ id: `${issue.code}-${index}`, index, row: 0, field: issue.field, msg: issue.message, ignored: false })));
   }, [demo]);
 
   useEffect(() => {
@@ -1500,14 +1541,20 @@ export function ExtractPage({
                 <p>上传文件后，此处显示原文件预览</p>
               </div>
             )}
-            {hasExtractData && (task.size_bytes ?? 0) <= 0 && (
-              <div className="preview-empty">
-                <Icon icon={EyeOff} size={40} />
-                <p>演示数据，无原始图片</p>
-                <p className="small muted">以上提取结果来自内置示例，未使用你的真实文件</p>
-              </div>
+            {hasExtractData && demo && (
+              <article className="document-text-preview demo-source-preview">
+                <div className="small muted">内置原文件预览 · {task.filename}</div>
+                <pre>{({
+                  sentiment: "某市发布公共交通优化方案，将新增夜间线路并降低换乘成本。多位市民表示期待，但也担心高峰期运力是否充足。",
+                  article: "# 本地大模型进入实用阶段\n作者：林知远\n\n文章讨论小型多模态模型如何在普通电脑上承担文档理解任务，并分析隐私、成本与准确率之间的取舍。",
+                  grading: "数学作业（八题）\n1. 12+8=20  2. 36÷6=5  3. 7×9=63  4. 45-17=28\n5. 3/4+1/4=1  6. 2.5×4=10  7. 18÷3=6  8. 6²=36\n\n模板额外提示词中的标准答案：1.20；2.6；3.63；4.28；5.1；6.10；7.6；8.36。",
+                  mistakes: "原题：一辆汽车 3 小时行驶 180 千米，平均每小时行驶多少千米？\n学生答案：180×3=540（千米）",
+                  business: "送货单 R-20260815\n供货方：知意科技有限公司\n收货方：示例客户\n\n打印纸 A4  10箱  单价128元  金额1280元",
+                  rule: "金额异常发票\n服务费：1000.00 元\n税额：60.00 元\n价税合计：1160.00 元",
+                } as const)[demo]}</pre>
+              </article>
             )}
-            {hasExtractData && (task.size_bytes ?? 0) > 0 && (
+            {hasExtractData && !demo && (task.size_bytes ?? 0) > 0 && (
               <div className="document-preview-shell">
                 <div
                   className={`evidence-status ${selectedEvidence?.status ?? "unselected"}`}

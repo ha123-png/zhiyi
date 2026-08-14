@@ -38,7 +38,7 @@ class TemplateUpdate(TemplateBody):
 
 
 class TemplateFieldRead(TemplateField):
-    key: str
+    key: str = ""
 
 
 class TemplateRead(TemplateBody):
@@ -65,10 +65,21 @@ class TemplateMatchDecision(BaseModel):
 class TemplateDraftField(BaseModel):
     """AI 生成的草稿字段：不含内部 key，保存时由后端生成。"""
 
+    key: str
     label: str
     section: Literal["header", "item"]
     example: str = ""
     value_type: Literal["text", "number", "date", "boolean"] = "text"
+
+
+class TemplateDraftRuleSuggestion(BaseModel):
+    """AI 规则建议：合法规则可直接保存，非法建议保留拒绝原因供用户查看。"""
+
+    status: Literal["accepted", "rejected"]
+    summary: str
+    explanation: str
+    reason: str = ""
+    rule: ValidationRule | None = None
 
 
 class TemplateDraft(BaseModel):
@@ -77,3 +88,4 @@ class TemplateDraft(BaseModel):
     name: str = ""
     description: str = ""
     fields: list[TemplateDraftField]
+    rule_suggestions: list[TemplateDraftRuleSuggestion] = Field(default_factory=list)

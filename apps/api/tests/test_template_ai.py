@@ -8,6 +8,7 @@ from document_pipeline_api.main import create_app
 from document_pipeline_api.model_providers.base import ModelUnavailableError
 from document_pipeline_api.services.template_ai import (
     AiGeneratedField,
+    AiGeneratedRule,
     AiGeneratedTemplate,
     generate_template_draft,
 )
@@ -54,13 +55,21 @@ def client(tmp_path: Path) -> TestClient:
         yield test_client
 
 
-def _run_generate(client: TestClient, *, fake, requirement: str, images: int = 1):
+def _run_generate(
+    client: TestClient,
+    *,
+    fake,
+    requirement: str,
+    images: int = 1,
+    with_rules: bool = False,
+):
     with client.app.state.session_factory() as session:
         return generate_template_draft(
             client.app.state.settings,
             session,
             image_paths=[Path(f"sample-{i}.png") for i in range(images)],
             requirement=requirement,
+            with_rules=with_rules,
             model_client=fake,
         )
 
@@ -84,6 +93,100 @@ def test_generate_returns_cleaned_fields(client: TestClient) -> None:
     assert draft.fields[1].value_type == "number"
     assert all(field.section in {"header", "item"} for field in draft.fields)
     assert fake.closed is False  # 外部注入的 client 由调用方负责关闭
+
+
+def test_generate_accepts_safe_rules_and_rejects_invalid_references(
+    client: TestClient,
+) -> None:
+    fake = _FakeProvider(
+        AiGeneratedTemplate(
+            fields=[
+                AiGeneratedField(label="合计金额", section="header", value_type="number"),
+                AiGeneratedField(label="数量", section="item", value_type="number"),
+                AiGeneratedField(label="单价", section="item", value_type="number"),
+                AiGeneratedField(label="金额", section="item", value_type="number"),
+            ],
+            rules=[
+                AiGeneratedRule(kind="required", field="合计金额", section="header"),
+                AiGeneratedRule(
+                    kind="equation",
+                    operation="multiply",
+                    inputs=["数量", "单价"],
+                    input_section="item",
+                    result_field="金额",
+                    result_section="item",
+                ),
+                AiGeneratedRule(kind="range", field="不存在", section="header", minimum=0),
+                AiGeneratedRule(kind="python", field="合计金额"),
+            ],
+        )
+    )
+
+    draft = _run_generate(
+        client,
+        fake=fake,
+        requirement="送货单",
+        with_rules=True,
+    )
+
+    assert [item.status for item in draft.rule_suggestions] == [
+        "accepted",
+        "accepted",
+        "rejected",
+        "rejected",
+    ]
+    assert draft.rule_suggestions[0].rule.field == "header.field_1"
+    assert draft.rule_suggestions[1].rule.field == "items[].field_4"
+    assert draft.rule_suggestions[0].summary == "表头的合计金额不能为空"
+    assert "关键字段" in draft.rule_suggestions[0].explanation
+    assert draft.rule_suggestions[1].summary == "每条明细：数量 × 单价 = 金额"
+    assert "计算关系" in draft.rule_suggestions[1].explanation
+    assert "不存在" in draft.rule_suggestions[2].reason
+    assert "不会" not in draft.rule_suggestions[2].explanation
+    assert "不受支持" in draft.rule_suggestions[3].reason
+
+
+def test_generate_rejects_cross_section_row_equation_with_readable_reason(
+    client: TestClient,
+) -> None:
+    fake = _FakeProvider(
+        AiGeneratedTemplate(
+            fields=[
+                AiGeneratedField(label="平时成绩", section="item", value_type="number"),
+                AiGeneratedField(label="期末成绩", section="item", value_type="number"),
+                AiGeneratedField(label="总成绩", section="header", value_type="number"),
+            ],
+            rules=[
+                AiGeneratedRule(
+                    kind="equation",
+                    operation="add",
+                    inputs=["平时成绩", "期末成绩"],
+                    input_section="item",
+                    result_field="总成绩",
+                    result_section="header",
+                ),
+            ],
+        )
+    )
+
+    draft = _run_generate(client, fake=fake, requirement="学生成绩", with_rules=True)
+
+    suggestion = draft.rule_suggestions[0]
+    assert suggestion.status == "rejected"
+    assert suggestion.summary == "每条明细：平时成绩 + 期末成绩 = 总成绩"
+    assert suggestion.reason == "逐行计算的输入字段和结果字段必须都属于每条明细。"
+    assert "阻止" in suggestion.explanation
+
+
+def test_generate_does_not_return_rules_unless_user_asks(client: TestClient) -> None:
+    fake = _FakeProvider(
+        AiGeneratedTemplate(
+            fields=[AiGeneratedField(label="金额", section="header", value_type="number")],
+            rules=[AiGeneratedRule(kind="required", field="金额", section="header")],
+        )
+    )
+    draft = _run_generate(client, fake=fake, requirement="金额", with_rules=False)
+    assert draft.rule_suggestions == []
 
 
 def test_generate_sends_fixed_system_prompt(client: TestClient) -> None:

@@ -1,4 +1,5 @@
 from io import BytesIO
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -582,7 +583,7 @@ def test_row_edit_uses_optimistic_concurrency(tmp_path: Path) -> None:
         assert current["values"]["name"] == "第一次修改"
 
 
-def test_completed_row_edit_rejects_broken_builtin_rule(tmp_path: Path) -> None:
+def test_completed_row_edit_is_independent_from_builtin_rule(tmp_path: Path) -> None:
     settings = Settings(
         database_url=f"sqlite:///{tmp_path / 'row-rule.db'}",
         storage_dir=tmp_path / "uploads",
@@ -603,13 +604,15 @@ def test_completed_row_edit_rejects_broken_builtin_rule(tmp_path: Path) -> None:
             },
         )
 
-        assert response.status_code == 422
-        assert "第 1 行：数量 1.0 × 单价 100.0 不等于金额 999.0" in response.json()[
-            "detail"
-        ]
+        assert response.status_code == 200
+        assert response.json()["values"]["item_amount"] == 999
+        with client.app.state.session_factory() as session:
+            extraction = session.get(ExtractionRecord, "row-rule")
+            assert extraction is not None
+            assert json.loads(extraction.result_json)["items"][0]["amount"] != 999
         current = client.get(f"/api/v1/tables/{table_id}").json()["rows"][0]
-        assert current["values"]["item_amount"] == 100
-        assert current["version"] == row["version"]
+        assert current["values"]["item_amount"] == 999
+        assert current["version"] == row["version"] + 1
 
 
 def test_header_edit_propagates_to_all_rows_of_same_document(tmp_path: Path) -> None:
@@ -640,9 +643,16 @@ def test_header_edit_propagates_to_all_rows_of_same_document(tmp_path: Path) -> 
             "统一后的销售方",
         ]
         assert [row["version"] for row in current] == [2, 2]
+        for row in current:
+            revisions = client.get(
+                f"/api/v1/tables/{table_id}/rows/{row['id']}/revisions"
+            ).json()
+            assert revisions[-1]["operation"] == "table_edit"
+            assert revisions[-1]["before"]["seller_name"] != "统一后的销售方"
+            assert revisions[-1]["after"]["seller_name"] == "统一后的销售方"
 
 
-def test_custom_template_rule_also_guards_fact_table_edits(tmp_path: Path) -> None:
+def test_custom_template_rule_does_not_block_downstream_table_edits(tmp_path: Path) -> None:
     settings = Settings(
         database_url=f"sqlite:///{tmp_path / 'custom-row-rule.db'}",
         storage_dir=tmp_path / "uploads",
@@ -722,17 +732,17 @@ def test_custom_template_rule_also_guards_fact_table_edits(tmp_path: Path) -> No
             },
         )
 
-        assert response.status_code == 422
-        assert "不能大于 100" in response.json()["detail"]
-        wrong_type = client.patch(
-            f"/api/v1/tables/{table_id}/rows/{row['id']}",
-            json={
-                "expected_version": row["version"],
-                "changes": {"score": "不是数字"},
-            },
-        )
-        assert wrong_type.status_code == 422
-        assert "值类型不正确" in wrong_type.json()["detail"]
+        assert response.status_code == 200
+        assert response.json()["values"]["score"] == 120
+        with client.app.state.session_factory() as session:
+            extraction = session.get(ExtractionRecord, "custom-row-rule")
+            assert extraction is not None
+            assert json.loads(extraction.result_json)["items"][0]["score"] is None
+        revisions = client.get(
+            f"/api/v1/tables/{table_id}/rows/{row['id']}/revisions"
+        ).json()
+        assert revisions[-1]["before"]["score"] is None
+        assert revisions[-1]["after"]["score"] == 120
 
 
 def test_split_view_reuses_source_rows_and_edits_same_fact(tmp_path: Path) -> None:
@@ -785,6 +795,14 @@ def test_split_view_reuses_source_rows_and_edits_same_fact(tmp_path: Path) -> No
         ).json()
         assert refreshed_view["rows"][0]["id"] == view_row["id"]
         assert refreshed_view["rows"][0]["values"]["name"] == "分 Sheet 修改"
+
+        exported = client.get(
+            f"/api/v1/tables/{first['table_id']}/export-views.xlsx"
+        )
+        assert exported.status_code == 200
+        workbook = load_workbook(BytesIO(exported.content))
+        assert set(workbook.sheetnames) == {"company-a.png", "company-b.png"}
+        assert workbook["company-a.png"].max_row == 2
 
 
 def test_review_sync_does_not_overwrite_a_user_edited_table_row(

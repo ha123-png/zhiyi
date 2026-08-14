@@ -15,7 +15,7 @@ import {
   X,
 } from "lucide-react";
 import { setOnboardingState } from "../api";
-import type { ModelStatus, NavigationKey } from "../types";
+import type { DemoScenario, ModelStatus, NavigationKey } from "../types";
 import { Icon } from "./Icon";
 
 export const ONBOARDING_VERSION = 4;
@@ -42,7 +42,7 @@ interface OnboardingProps {
   open: boolean;
   modelStatus: ModelStatus | null;
   onNavigate: (page: NavigationKey) => void;
-  onShowDemo: () => void;
+  onShowDemo: (scenario: DemoScenario) => void;
   onClose: () => void;
 }
 
@@ -149,23 +149,24 @@ export function Onboarding({ open, modelStatus, onNavigate, onShowDemo, onClose 
           {step === 3 && (
             <>
               <div className="onboarding-icon"><Icon icon={UploadCloud} size={30} /></div>
-              <h2>先看一个真实示例</h2>
-              <p className="support">不调用模型、也不改动你的配置，直接看一张发票被"看懂"后长什么样。</p>
-              <div className="onboarding-demo">
-                <div className="onboarding-demo-file">
-                  <Icon icon={FileUp} size={26} />
-                  <span>示例发票.png</span>
-                </div>
-                <div className="onboarding-demo-arrow">→</div>
-                <div className="onboarding-demo-result">
-                  <span>开票方 · 金额 · 税号</span>
-                  <span className="small muted">校验通过后进入数据表</span>
-                </div>
+              <h2>选择一个例子，看知意怎样解析含义</h2>
+              <p className="support">六个示例都会跳到提取页面，同时展示原内容、解析结果和规则校验；不调用模型、不写入历史。</p>
+              <div className="onboarding-choice onboarding-demo-choices">
+                {([
+                  ["sentiment", "新闻情感分析", "从新闻中判断倾向并给出依据"],
+                  ["article", "文章关键信息", "提取标题、作者、摘要和关键词"],
+                  ["grading", "作业批改", "按模板提示中的标准答案逐题判断对错"],
+                  ["mistakes", "错题分析", "整理原题、解析、易错点和举一反三"],
+                  ["business", "发票／送货单", "把抬头与明细解析成结构化数据"],
+                  ["rule", "规则发现错误", "AI 结果金额不一致，规则激活人工兜底"],
+                ] as const).map(([id, title, desc]) => (
+                  <button className="onboarding-choice-card" key={id} type="button" onClick={() => { markOnboardingDone(); onShowDemo(id); onClose(); }}>
+                    <span className="onboarding-choice-title">{title}</span>
+                    <span className="onboarding-choice-desc">{desc}</span>
+                    <span className="small">在提取页面查看 →</span>
+                  </button>
+                ))}
               </div>
-              <button className="btn primary" onClick={() => { markOnboardingDone(); onShowDemo(); onClose(); }}>
-                <Icon icon={Sparkles} size={14} />
-                在提取页面查看示例
-              </button>
             </>
           )}
           </div>

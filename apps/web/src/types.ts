@@ -10,6 +10,14 @@ export type NavigationKey =
   | "guide"
   | "settings";
 
+export type DemoScenario =
+  | "sentiment"
+  | "article"
+  | "grading"
+  | "mistakes"
+  | "business"
+  | "rule";
+
 export type TaskStatus =
   | "created"
   | "waiting_for_template"
@@ -286,10 +294,19 @@ export interface TemplateField {
 
 /** AI 生成模板草稿字段（无内部 key，保存时后端生成） */
 export interface AiDraftField {
+  key: string;
   label: string;
   section: "header" | "item";
   example: string;
   value_type: "text" | "number" | "date" | "boolean";
+}
+
+export interface AiRuleSuggestion {
+  status: "accepted" | "rejected";
+  summary: string;
+  explanation: string;
+  reason: string;
+  rule: DeterministicRule | null;
 }
 
 /** AI 生成模板草稿：只返回结构，不落库，人工确认后保存 */
@@ -297,6 +314,7 @@ export interface AiTemplateDraft {
   name: string;
   description: string;
   fields: AiDraftField[];
+  rule_suggestions: AiRuleSuggestion[];
 }
 
 export type RuleExpression =

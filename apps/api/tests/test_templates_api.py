@@ -194,6 +194,41 @@ def test_deterministic_rules_are_versioned_and_cannot_reference_unknown_fields(
     assert "不存在的字段" in rejected.json()["detail"]
 
 
+def test_updating_rules_keeps_the_old_template_version_immutable(client: TestClient) -> None:
+    body = {
+        "name": "历史规则",
+        "description": "",
+        "extra_instructions": "",
+        "fields": [{"key": "amount", "label": "金额", "value_type": "number"}],
+        "validation_rules": [],
+        "deterministic_rules": [{"kind": "required", "field": "header.amount"}],
+        "output_mapping": {},
+    }
+    created = client.post("/api/v1/templates", json=body).json()
+    updated = client.put(
+        f"/api/v1/templates/{created['id']}",
+        json={
+            **body,
+            "expected_version": created["version"],
+            "deterministic_rules": [
+                {"kind": "range", "field": "header.amount", "minimum": 100}
+            ],
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["version"] == created["version"] + 1
+    with client.app.state.session_factory() as session:
+        old = session.scalar(
+            select(TemplateVersionRecord).where(
+                TemplateVersionRecord.template_id == created["id"],
+                TemplateVersionRecord.version == created["version"],
+            )
+        )
+        assert old is not None
+        assert '"required"' in old.deterministic_rules_json
+        assert '"range"' not in old.deterministic_rules_json
+
+
 def test_user_template_archive_is_recoverable_and_preserves_versions(
     client: TestClient,
 ) -> None:

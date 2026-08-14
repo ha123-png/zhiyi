@@ -35,6 +35,7 @@ from document_pipeline_api.services.data_tables import (
     delete_rows,
     delete_table,
     export_data_table,
+    export_data_table_views,
     export_data_table_csv,
     export_data_table_json,
     get_data_table,
@@ -261,6 +262,11 @@ def view(
 @router.get("/{table_id}/export.xlsx", response_class=StreamingResponse)
 def export(table_id: str, session: SessionDependency) -> StreamingResponse:
     return export_data_table(session, table_id)
+
+
+@router.get("/{table_id}/export-views.xlsx", response_class=StreamingResponse)
+def export_views(table_id: str, session: SessionDependency) -> StreamingResponse:
+    return export_data_table_views(session, table_id)
 
 
 @router.get("/{table_id}/export.csv", response_class=StreamingResponse)

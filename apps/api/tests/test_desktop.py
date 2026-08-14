@@ -38,9 +38,13 @@ def test_desktop_export_defaults_to_output_and_avoids_overwrite(
     second = Path(api.export_table(
         "http://127.0.0.1:8765/api/v1/tables/t1/export.xlsx", "台账.xlsx"
     ))
+    views = Path(api.export_table(
+        "http://127.0.0.1:8765/api/v1/tables/t1/export-views.xlsx", "台账-分Sheet.xlsx"
+    ))
 
     assert first == tmp_path / "output" / "台账.xlsx"
     assert second == tmp_path / "output" / "台账 (2).xlsx"
+    assert views == tmp_path / "output" / "台账-分Sheet.xlsx"
 
 
 def test_desktop_bridge_does_not_expose_native_window(tmp_path: Path) -> None:

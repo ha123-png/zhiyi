@@ -7,6 +7,7 @@ import {
   ChevronsLeft,
   ChevronsRight,
   EyeOff,
+  Download,
   FileText,
   List,
   Loader2,
@@ -1074,7 +1075,17 @@ export function HistoryPage({ onOpenTask, onOpenData }: HistoryPageProps = {}) {
 
                   {/* 原文件 */}
                   <div className="history-original-panel">
-                    <div className="history-panel-title">原文件</div>
+                    <div className="history-panel-title">
+                      <span>原文件</span>
+                      <a
+                        className="btn ghost sm"
+                        download={selectedTask.filename}
+                        href={getOriginalFileUrl(selectedTask.id)}
+                        title="下载上传时保存的原文件"
+                      >
+                        <Icon icon={Download} size={14} /> 下载原文件
+                      </a>
+                    </div>
                     <div className="history-panel-body history-preview">
                       <DocumentPreview
                         contentType={selectedTask.content_type}

@@ -64,7 +64,8 @@ class _DesktopApi:
         parsed = urlparse(url)
         if parsed.hostname not in {"127.0.0.1", "localhost"}:
             raise ValueError("桌面版只允许从知意本地服务导出。")
-        if not parsed.path.startswith("/api/v1/tables/") or "/export." not in parsed.path:
+        is_table_export = "/export." in parsed.path or "/export-views." in parsed.path
+        if not parsed.path.startswith("/api/v1/tables/") or not is_table_export:
             raise ValueError("导出地址无效。")
         safe_name = Path(filename).name
         if not safe_name or safe_name != filename:

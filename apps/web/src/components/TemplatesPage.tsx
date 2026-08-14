@@ -91,6 +91,8 @@ export function TemplatesPage() {
   const [aiDraftDescription, setAiDraftDescription] = useState("");
   const [aiDraftFields, setAiDraftFields] = useState<AiDraftField[]>([]);
   const [aiWithExamples, setAiWithExamples] = useState(true);
+  const [aiWithRules, setAiWithRules] = useState(false);
+  const [aiSelectedRules, setAiSelectedRules] = useState<number[]>([]);
   const aiFileInput = useRef<HTMLInputElement>(null);
   const [aiProfiles, setAiProfiles] = useState<ModelProfile[]>([]);
   const [aiProfileId, setAiProfileId] = useState("");
@@ -264,6 +266,8 @@ export function TemplatesPage() {
     setAiDraftDescription("");
     setAiDraftFields([]);
     setAiWithExamples(true);
+    setAiWithRules(false);
+    setAiSelectedRules([]);
   }
 
   function handleAiClose() {
@@ -300,12 +304,18 @@ export function TemplatesPage() {
         aiRequirement.trim(),
         aiProfileId || undefined,
         aiWithExamples,
+        aiWithRules,
       );
       setAiDraft(draft);
       setAiDraftName(draft.name || "");
       setAiDraftDescription(draft.description || "");
       setAiDraftFields(
         draft.fields.map((field) => ({ ...field, example: field.example ?? "" })),
+      );
+      setAiSelectedRules(
+        draft.rule_suggestions
+          .map((suggestion, index) => suggestion.status === "accepted" ? index : -1)
+          .filter((index) => index >= 0),
       );
     } catch (error) {
       setAiError(error instanceof Error ? error.message : "AI 生成失败，请重试。");
@@ -356,13 +366,16 @@ export function TemplatesPage() {
         extra_instructions: "",
         fields: aiDraftFields.map((field) => ({
           label: field.label,
+          key: field.key,
           section: field.section,
           example: field.example ?? "",
           instructions: "",
           value_type: field.value_type,
         })),
         validation_rules: [],
-        deterministic_rules: [],
+        deterministic_rules: (aiDraft?.rule_suggestions ?? [])
+          .filter((suggestion, index) => aiSelectedRules.includes(index) && suggestion.rule)
+          .map((suggestion) => suggestion.rule!),
         output_mapping: {},
       });
       await refreshTemplates(saved.id);
@@ -1046,13 +1059,46 @@ export function TemplatesPage() {
                     onClick={() =>
                       setAiDraftFields((current) => [
                         ...current,
-                        { label: "", section: "header", example: "", value_type: "text" },
+                        { key: `field_${current.length + 1}`, label: "", section: "header", example: "", value_type: "text" },
                       ])
                     }
                     type="button"
                   >
                     <Icon icon={Plus} size={13} /> 添加字段
                   </button>
+                  {aiDraft.rule_suggestions.length > 0 ? (
+                    <div className="form-field" style={{ marginTop: 16 }}>
+                      <div className="ai-draft-label">AI 建议的校验规则</div>
+                      <div className="small muted" style={{ marginBottom: 8 }}>
+                        合法规则默认勾选，保存前可取消；不安全或引用错误的建议不会进入模板。
+                      </div>
+                      <div className="ai-rule-suggestions">
+                        {aiDraft.rule_suggestions.map((suggestion, index) => (
+                          <label className={`ai-examples-toggle${suggestion.status === "rejected" ? " rejected" : ""}`} key={`${suggestion.summary}-${index}`}>
+                            <input
+                              type="checkbox"
+                              disabled={suggestion.status === "rejected"}
+                              checked={aiSelectedRules.includes(index)}
+                              onChange={(event) => setAiSelectedRules((current) => event.target.checked ? [...current, index] : current.filter((item) => item !== index))}
+                            />
+                            <span>
+                              <strong>{suggestion.summary}</strong>
+                              <span className="small muted" style={{ display: "block", marginTop: 2 }}>
+                                {suggestion.explanation}
+                              </span>
+                              <span className="small muted" style={{ display: "block", marginTop: 4 }}>
+                                {suggestion.status === "rejected"
+                                  ? `已拒绝：${suggestion.reason} 该规则不会进入模板。`
+                                  : aiSelectedRules.includes(index)
+                                    ? "已勾选：保存后会进入模板，并用于之后处理的文件。"
+                                    : "未勾选：这条规则不会进入模板。"}
+                              </span>
+                            </span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
               ) : (
                 /* 阶段 1：上传 + 需求描述 */
@@ -1145,7 +1191,7 @@ export function TemplatesPage() {
                       placeholder="说明这类文件需要提取什么。例如：这是一张增值税发票，需要提取发票号码、购销双方名称、价税合计、税率，以及明细行的商品名称、数量、单价"
                     />
                     <div className="small muted" style={{ marginTop: 6 }}>
-                      <Icon icon={Info} size={12} /> 描述越具体，生成的字段越贴合；AI 只生成字段结构，校验规则需保存后手动添加。
+                      <Icon icon={Info} size={12} /> 描述越具体，生成结果越贴合；规则建议只使用受控类型，引用错误或不安全的内容会被拒绝。
                     </div>
                   </div>
                   <label className="ai-examples-toggle" style={{ marginTop: 14 }}>
@@ -1158,6 +1204,19 @@ export function TemplatesPage() {
                       <strong>生成示例值</strong>
                       <span className="small muted" style={{ display: "block", marginTop: 2 }}>
                         勾选后为每个字段生成典型示例；示例会进入提取提示词（基于样例文件，非中性），不勾选则全部留空
+                      </span>
+                    </span>
+                  </label>
+                  <label className="ai-examples-toggle" style={{ marginTop: 10 }}>
+                    <input
+                      type="checkbox"
+                      checked={aiWithRules}
+                      onChange={(event) => setAiWithRules(event.target.checked)}
+                    />
+                    <span>
+                      <strong>同时建议校验规则</strong>
+                      <span className="small muted" style={{ display: "block", marginTop: 2 }}>
+                        可选。AI 只负责建议，系统会逐条检查；保存前由你确认。
                       </span>
                     </span>
                   </label>

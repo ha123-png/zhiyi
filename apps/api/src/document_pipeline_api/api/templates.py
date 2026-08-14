@@ -69,6 +69,7 @@ def generate_draft(
     files: Annotated[list[UploadFile] | None, File()] = None,
     profile_id: Annotated[str | None, Form()] = None,
     with_examples: Annotated[bool | None, Form()] = None,
+    with_rules: Annotated[bool | None, Form()] = None,
 ) -> TemplateDraft:
     """AI 生成模板草稿：样例文件（可选）+ 需求描述 → 字段结构（不落库，人工确认后保存）。
     profile_id 可选：指定全局模型方案；缺省用任务激活方案。
@@ -151,6 +152,7 @@ def generate_draft(
             image_paths=image_paths,
             requirement=requirement,
             with_examples=with_examples if with_examples is not None else True,
+            with_rules=with_rules if with_rules is not None else False,
             model_profile_id=profile_id,
         )
 

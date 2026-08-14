@@ -25,7 +25,7 @@ import {
   subscribeTaskEvents,
 } from "./api";
 import type { TaskEvent } from "./api";
-import type { ModelStatus, NavigationKey, SystemStatus, Task, TaskStatus } from "./types";
+import type { DemoScenario, ModelStatus, NavigationKey, SystemStatus, Task, TaskStatus } from "./types";
 
 function applyTheme(theme: "auto" | "light" | "dark") {
   const root = document.documentElement;
@@ -55,7 +55,7 @@ export function App() {
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [onboardingOpen, setOnboardingOpen] = useState(false);
-  const [showExtractionDemo, setShowExtractionDemo] = useState(false);
+  const [extractionDemo, setExtractionDemo] = useState<DemoScenario | null>(null);
   const { toast, notify, clear } = useToast();
   // 失败/待选模板 toast 去重：同一任务同一状态只通知一次，避免 SSE 重复推送刷屏。
   const notifiedTasksRef = useRef<Set<string>>(new Set());
@@ -276,7 +276,7 @@ export function App() {
   }, [activePage]);
 
   const handleNavigate = useCallback((page: NavigationKey) => {
-    setShowExtractionDemo(false);
+    setExtractionDemo(null);
     if (page === "extract") setSelectedTask(null);
     if (page === "tables") {
       setSelectedTableTemplateId(null);
@@ -367,7 +367,7 @@ export function App() {
             ) : activePage === "extract" ? (
               <ExtractPage
                 initialTask={selectedTask}
-                demo={showExtractionDemo}
+                demo={extractionDemo}
                 onNavigateHistory={() => navigateTo("history")}
                 onTasksChange={loadTasks}
                 onUploadStarted={handleUploadStarted}
@@ -405,9 +405,9 @@ export function App() {
         open={onboardingOpen}
         modelStatus={modelStatus}
         onNavigate={handleNavigate}
-        onShowDemo={() => {
+        onShowDemo={(scenario) => {
           setSelectedTask(null);
-          setShowExtractionDemo(true);
+          setExtractionDemo(scenario);
           navigateTo("extract");
         }}
         onClose={() => setOnboardingOpen(false)}

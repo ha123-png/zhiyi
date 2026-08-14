@@ -579,6 +579,101 @@ def export_data_table(session: Session, table_id: str) -> StreamingResponse:
     )
 
 
+def export_data_table_views(session: Session, table_id: str) -> StreamingResponse:
+    """把当前表的全部分 Sheet 视图导出为一个多工作表 XLSX。"""
+    table = session.get(DataTableRecord, table_id)
+    if table is None:
+        raise HTTPException(status_code=404, detail="没有找到这个数据表。")
+    views = session.scalars(
+        select(DataViewRecord)
+        .where(DataViewRecord.table_id == table_id)
+        .order_by(DataViewRecord.created_at, DataViewRecord.name)
+    ).all()
+    if not views:
+        raise HTTPException(status_code=422, detail="当前数据表还没有分 Sheet 视图。")
+    all_rows = session.scalars(
+        select(DataRowRecord)
+        .where(DataRowRecord.table_id == table_id)
+        .order_by(*_row_order())
+    ).all()
+    keys, labels = _export_columns(session, table)
+    column_defs = {column.key: column for column in table_columns(session, table)}
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    used_names: set[str] = set()
+    matched_ids: set[int] = set()
+    for view in views:
+        expected = json.loads(view.field_value_json)
+        rows = [
+            row for row in all_rows
+            if json.loads(row.row_json).get(view.field_key) == expected
+        ]
+        matched_ids.update(row.id for row in rows)
+        sheet = workbook.create_sheet(_unique_sheet_name(view.name, used_names))
+        _populate_export_sheet(sheet, rows, keys, labels, column_defs)
+    unmatched = [row for row in all_rows if row.id not in matched_ids]
+    if unmatched:
+        sheet = workbook.create_sheet(_unique_sheet_name("未分组", used_names))
+        _populate_export_sheet(sheet, unmatched, keys, labels, column_defs)
+    output = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    workbook.save(output)
+    output.seek(0)
+    filename = f"{table.name}-分Sheet.xlsx"
+    disposition = f"attachment; filename=table-{table.id}-views.xlsx; filename*=UTF-8''{quote(filename)}"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": disposition},
+        background=BackgroundTask(output.close),
+    )
+
+
+def _unique_sheet_name(raw: str, used: set[str]) -> str:
+    base = re.sub(r"[\\/*?:\[\]]", "_", raw).strip()[:31] or "Sheet"
+    name = base
+    index = 2
+    while name.casefold() in used:
+        suffix = f"-{index}"
+        name = f"{base[:31-len(suffix)]}{suffix}"
+        index += 1
+    used.add(name.casefold())
+    return name
+
+
+def _populate_export_sheet(sheet, rows, keys, labels, column_defs) -> None:
+    header_fill = PatternFill("solid", fgColor="F0FDF4")
+    for index, key in enumerate(keys, start=1):
+        cell = sheet.cell(row=1, column=index, value=labels[key])
+        cell.font = Font(bold=True, color="065F46")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+    max_widths = [_display_width(labels[key]) for key in keys]
+    task_spans: dict[str, list[int]] = {}
+    row_number = 1
+    for record in rows:
+        values_map = json.loads(record.row_json)
+        values = [_excel_safe(values_map.get(key)) for key in keys]
+        sheet.append(values)
+        row_number += 1
+        for index, value in enumerate(values):
+            max_widths[index] = max(max_widths[index], _display_width(value))
+        group_key = record.task_id or values_map.get("__row_group")
+        if group_key:
+            task_spans.setdefault(str(group_key), []).append(row_number)
+    sheet.freeze_panes = "A2"
+    if keys and row_number > 1:
+        sheet.auto_filter.ref = f"A1:{get_column_letter(len(keys))}{row_number}"
+    header_keys = {key for key in keys if key in column_defs and column_defs[key].section == "header"}
+    for key in header_keys:
+        column_index = keys.index(key) + 1
+        for span in task_spans.values():
+            if len(span) > 1:
+                sheet.merge_cells(start_row=span[0], start_column=column_index, end_row=span[-1], end_column=column_index)
+                sheet.cell(span[0], column_index).alignment = Alignment(vertical="center", wrap_text=True)
+    for index in range(1, len(keys) + 1):
+        sheet.column_dimensions[get_column_letter(index)].width = min(max(max_widths[index - 1] + 2, 10), 48)
+
+
 def _display_width(value: object) -> int:
     text_value = "" if value is None else str(value)
     return max(

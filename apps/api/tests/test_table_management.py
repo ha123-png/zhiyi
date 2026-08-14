@@ -70,6 +70,49 @@ def test_manual_empty_row_edit_allows_missing_field(tmp_path) -> None:
         assert latest["after"]["total_amount"] == 372
 
 
+def test_merged_group_header_edit_is_visible_from_every_detail_revision(tmp_path) -> None:
+    with _client(tmp_path) as client:
+        table = _create_manual_table(client, "合并表")
+        with client.app.state.session_factory() as session:
+            rows = [
+                DataRowRecord(
+                    table_id=table["id"],
+                    task_id=None,
+                    item_index=index,
+                    row_json=(
+                        '{"__row_group":"source:1","seller_name":"甲公司",'
+                        f'"name":"货品{index}"}}'
+                    ),
+                    row_version=1,
+                )
+                for index in (1, 2)
+            ]
+            session.add_all(rows)
+            session.commit()
+            row_ids = [row.id for row in rows]
+
+        response = client.patch(
+            f"/api/v1/tables/{table['id']}/rows/{row_ids[0]}",
+            json={
+                "expected_version": 1,
+                "changes": {"seller_name": "乙公司"},
+            },
+        )
+        assert response.status_code == 200, response.text
+
+        detail = client.get(f"/api/v1/tables/{table['id']}").json()
+        assert [row["values"]["seller_name"] for row in detail["rows"]] == [
+            "乙公司",
+            "乙公司",
+        ]
+        for row_id in row_ids:
+            revisions = client.get(
+                f"/api/v1/tables/{table['id']}/rows/{row_id}/revisions"
+            ).json()
+            assert revisions[-1]["before"]["seller_name"] == "甲公司"
+            assert revisions[-1]["after"]["seller_name"] == "乙公司"
+
+
 def test_manual_table_create_columns_and_row_crud(tmp_path) -> None:
     with _client(tmp_path) as client:
         table = _create_manual_table(client)

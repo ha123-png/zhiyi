@@ -50,7 +50,15 @@ if ($isDirty -and -not $AllowDirty) {
 # NOTE: keep comments ASCII-only; PowerShell 5.1 reads .ps1 as ANSI unless a
 # BOM is present, and UTF-8 Chinese comments corrupt parsing of the next line.
 $alembicIni = (Join-Path $projectRoot "apps\api\alembic.ini").Replace('\', '/')
-$migrationHead = (& uv --cache-dir (Join-Path $projectRoot ".uv-cache") run --project (Join-Path $projectRoot "apps/api") python -c "from alembic.config import Config; from alembic.script import ScriptDirectory; print(ScriptDirectory.from_config(Config('$alembicIni')).get_current_head())" 2>$null)
+$savedErrorActionPreference = $ErrorActionPreference
+try {
+    # PowerShell 5.1 wraps any native stderr output in NativeCommandError when
+    # ErrorActionPreference is Stop. uv writes harmless build progress there.
+    $ErrorActionPreference = "Continue"
+    $migrationHead = (& uv --cache-dir (Join-Path $projectRoot ".uv-cache") run --project (Join-Path $projectRoot "apps/api") python -c "from alembic.config import Config; from alembic.script import ScriptDirectory; print(ScriptDirectory.from_config(Config('$alembicIni')).get_current_head())" 2>$null)
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
 if ($LASTEXITCODE -ne 0 -or -not $migrationHead) {
     throw "Cannot resolve the current alembic migration head."
 }

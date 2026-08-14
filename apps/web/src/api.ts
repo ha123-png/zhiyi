@@ -563,6 +563,7 @@ export async function generateTemplateDraft(
   requirement: string,
   profileId?: string,
   withExamples = true,
+  withRules = false,
 ): Promise<AiTemplateDraft> {
   const form = new FormData();
   for (const file of files) {
@@ -570,6 +571,7 @@ export async function generateTemplateDraft(
   }
   form.append("requirement", requirement);
   form.append("with_examples", String(withExamples));
+  form.append("with_rules", String(withRules));
   if (profileId) {
     form.append("profile_id", profileId);
   }
@@ -733,6 +735,10 @@ export async function mergeTables(
 
 export function getTableExportUrl(tableId: string, format: "xlsx" | "csv" | "json" = "xlsx"): string {
   return `${API_BASE_URL}/tables/${tableId}/export.${format}`;
+}
+
+export function getTableViewsExportUrl(tableId: string): string {
+  return `${API_BASE_URL}/tables/${tableId}/export-views.xlsx`;
 }
 
 export async function updateDataRow(

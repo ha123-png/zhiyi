@@ -44,6 +44,7 @@ import {
   deleteCustomColumn,
   getTable,
   getTableExportUrl,
+  getTableViewsExportUrl,
   getTables,
   getTableView,
   getTableViews,
@@ -74,6 +75,7 @@ interface ColumnDef {
   key: string;
   label: string;
   numeric: boolean;
+  valueType: string;
   section?: string | null;
   width: number;
   userDefined: boolean;
@@ -293,6 +295,7 @@ export function DataTablePage({
       key: c.key,
       label: c.label,
       numeric: c.value_type === "number",
+      valueType: c.value_type,
       section: c.section,
       width: columnWidths[c.key] ?? (c.value_type === "number" ? 112 : 132),
       userDefined: Boolean(c.user_defined),
@@ -472,10 +475,10 @@ export function DataTablePage({
     }
   }
 
-  async function handleExport(format: "xlsx" | "csv" | "json") {
+  async function handleExport(format: "xlsx" | "csv" | "json" | "views") {
     if (!currentTableId) return;
     setExportMenuOpen(false);
-    const url = getTableExportUrl(currentTableId, format);
+    const url = format === "views" ? getTableViewsExportUrl(currentTableId) : getTableExportUrl(currentTableId, format);
     const bridge = desktopApi();
     if (!bridge) {
       window.open(url, "_blank");
@@ -483,7 +486,7 @@ export function DataTablePage({
     }
     try {
       const absoluteUrl = new URL(url, window.location.origin).toString();
-      const filename = `${currentSheetName || "数据表"}.${format}`;
+      const filename = `${currentSheetName || "数据表"}${format === "views" ? "-分Sheet.xlsx" : `.${format}`}`;
       const path = await bridge.export_table(absoluteUrl, filename);
       setTableError(null);
       setTableNotice(`已导出到 ${path}`);
@@ -543,9 +546,22 @@ export function DataTablePage({
     const oldValue = getCellValue(row, colKey);
     if (newValue === oldValue) return;
     try {
-      // 空串 = 清空该单元格（提交 null）；否则按输入值提交
+      const column = columns.find((item) => item.key === colKey);
+      let value: unknown = newValue === "" ? null : newValue;
+      if (value !== null && column?.valueType === "number") {
+        const normalized = Number(newValue.replace(/,/g, "").trim());
+        if (!Number.isFinite(normalized)) {
+          throw new Error(`「${column.label}」需要填写有效数字。`);
+        }
+        value = normalized;
+      } else if (value !== null && column?.valueType === "boolean") {
+        const normalized = newValue.trim().toLowerCase();
+        if (["true", "是", "1"].includes(normalized)) value = true;
+        else if (["false", "否", "0"].includes(normalized)) value = false;
+        else throw new Error(`「${column.label}」需要填写是/否。`);
+      }
       await updateDataRow(currentTableId, row.id, row.version, {
-        [colKey]: newValue === "" ? null : newValue,
+        [colKey]: value,
       });
       setReloadTrigger((n) => n + 1);
     } catch (err) {
@@ -789,6 +805,9 @@ export function DataTablePage({
                 <div className="toolbar-menu">
                   <button className="toolbar-menu-item" onClick={() => handleExport("xlsx")}>
                     <Icon icon={FileSpreadsheet} size={15} /> 导出 Excel (.xlsx)<span className="menu-hint">XLSX</span>
+                  </button>
+                  <button className="toolbar-menu-item" onClick={() => handleExport("views")}>
+                    <Icon icon={FileSpreadsheet} size={15} /> 导出全部分 Sheet<span className="menu-hint">多工作表</span>
                   </button>
                   <button className="toolbar-menu-item" onClick={() => handleExport("csv")}>
                     <Icon icon={FileText} size={15} /> 导出 CSV (.csv)<span className="menu-hint">CSV</span>
