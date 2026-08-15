@@ -23,6 +23,7 @@ from document_pipeline_api.business_backup import (
     restore_business_backup,
 )
 from document_pipeline_api.config import Settings
+from document_pipeline_api.public_errors import public_error_message
 
 
 router = APIRouter(prefix="/backups", tags=["backups"])
@@ -174,7 +175,7 @@ def create_backup(request: Request) -> BackupRead:
     except BusinessBackupError as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"备份创建失败：{error}",
+            detail=public_error_message(error, "备份创建失败，请检查磁盘空间后重试。"),
         ) from error
     backups = _list_backup_files(settings)
     for old in backups[: max(0, len(backups) - BACKUP_RETENTION)]:
@@ -215,7 +216,7 @@ def restore_backup(request: Request, name: str) -> RestoreResult:
     except BusinessBackupError as error:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"恢复未完成：{error}",
+            detail=public_error_message(error, "恢复未完成，当前数据没有改变。请检查备份文件后重试。"),
         ) from error
 
     # 正式桌面由监督器持有 instance.lock。API 只安排维护，监督器会在响应送达后
@@ -269,7 +270,7 @@ def restore_backup(request: Request, name: str) -> RestoreResult:
     except BusinessBackupError as error:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"恢复未完成：{error}",
+            detail=public_error_message(error, "恢复未完成，当前数据没有改变。请重启知意后重试。"),
         ) from error
     return RestoreResult(
         rollback_dir=str(rollback_dir),

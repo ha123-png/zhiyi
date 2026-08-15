@@ -118,7 +118,7 @@ def test_restore_returns_previous_data_and_keeps_current_after_failure(
     corrupt.write_bytes(b"not a zip archive")
     failed = client.post("/api/v1/backups/20260810T000000000000Z.dpbak/restore")
     assert failed.status_code == 409
-    assert "未完成" in failed.json()["detail"]
+    assert "备份格式损坏" in failed.json()["detail"]
     task_ids = [t["id"] for t in client.get("/api/v1/tasks").json()]
     assert task_id in task_ids
 

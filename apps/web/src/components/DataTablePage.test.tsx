@@ -128,6 +128,17 @@ describe("DataTablePage", () => {
     expect(await screen.findByText("视图 · 来源 发票")).toBeInTheDocument();
   });
 
+  it("disables multi-sheet export until split-sheet views exist", async () => {
+    render(<DataTablePage />);
+
+    const exportButton = await screen.findByRole("button", { name: "导出" });
+    fireEvent.click(exportButton);
+    const viewsExport = screen.getByRole("button", { name: /导出全部分 Sheet/ });
+
+    expect(viewsExport).toBeDisabled();
+    expect(viewsExport).toHaveAttribute("title", "当前数据表还没有分 Sheet，请先创建分 Sheet");
+  });
+
   it("does not let a stale table request overwrite a successful merge", async () => {
     const second = { ...table, id: "receipt-v1", name: "收据", template_key: "receipt" };
     const merged = { ...table, id: "merged-v1", name: "合并结果", template_key: "merged" };

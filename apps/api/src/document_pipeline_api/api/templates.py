@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from document_pipeline_api.config import Settings
 from document_pipeline_api.db import get_session
+from document_pipeline_api.public_errors import public_error_message
 from document_pipeline_api.schemas.templates import (
     TemplateCreate,
     TemplateDraft,
@@ -128,7 +129,7 @@ def generate_draft(
                 except Exception as error:
                     raise HTTPException(
                         status_code=422,
-                        detail=f"PDF 解析失败：{error}",
+                        detail=public_error_message(error, "PDF 无法读取，请确认文件未损坏或未加密。"),
                     ) from error
             else:
                 try:
@@ -143,7 +144,10 @@ def generate_draft(
                         )
                     )
                 except UnsupportedImageError as error:
-                    raise HTTPException(status_code=422, detail=str(error)) from error
+                    raise HTTPException(
+                        status_code=422,
+                        detail=public_error_message(error, "图片无法读取，请换一张清晰、未损坏的图片。"),
+                    ) from error
         if saved and not image_paths:
             raise HTTPException(status_code=422, detail="没有可分析的样例图像。")
         return generate_template_draft(

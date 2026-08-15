@@ -13,6 +13,7 @@ from document_pipeline_api.model_providers import (
 from document_pipeline_api.model_providers.local_model_manager import (
     build_local_model_manager,
 )
+from document_pipeline_api.public_errors import public_error_message
 from document_pipeline_api.model_secrets import (
     ModelSecretStore,
     SecretStoreError,
@@ -95,7 +96,10 @@ def _secret_store(request: Request, *, required: bool) -> ModelSecretStore | Non
     try:
         store = create_model_secret_store()
     except SecretStoreError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+        raise HTTPException(
+            status_code=503,
+            detail=public_error_message(error, "系统密钥库暂时不可用，请重启知意后重试。"),
+        ) from error
     request.app.state.model_secret_store = store
     return store
 
@@ -139,7 +143,10 @@ def _local_manager_for_active_profile(
     try:
         metadata = settings_for_active_profile_metadata(session, settings)
     except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+        raise HTTPException(
+            status_code=409,
+            detail=public_error_message(error, "当前模型方案不可用，请检查模型配置。"),
+        ) from error
     # The local manager is a utility panel, not the active extraction route.
     # Keep LM Studio manageable even while a cloud or one-click profile is active.
     if metadata.model_provider not in {"lm_studio", "ollama"}:

@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 from pathlib import Path
 
@@ -74,6 +75,43 @@ class _DesktopApi:
             index += 1
         return target
 
+    @staticmethod
+    def _friendly_download_error(error: Exception) -> ValueError:
+        if isinstance(error, HTTPError):
+            try:
+                payload = json.loads(error.read(64 * 1024).decode("utf-8", errors="replace"))
+                detail = payload.get("detail") if isinstance(payload, dict) else None
+                if isinstance(detail, str) and detail.strip():
+                    return ValueError(detail.strip())
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+            fallback = {
+                404: "没有找到要下载的文件或数据表。",
+                409: "当前数据状态已经变化，请刷新后重试。",
+                413: "要下载的文件过大。",
+                422: "当前内容还不能执行这项导出。",
+                500: "知意暂时无法完成导出，请稍后重试。",
+            }
+            return ValueError(fallback.get(error.code, "下载失败，请稍后重试。"))
+        if isinstance(error, URLError):
+            return ValueError("无法连接知意本地服务，请重新打开知意后再试。")
+        return ValueError("下载失败，请稍后重试。")
+
+    def _download_to_target(self, url: str, target: Path) -> str:
+        temporary = target.with_name(f".{target.name}.partial")
+        try:
+            with urlopen(url, timeout=60) as response, temporary.open("wb") as output:
+                while chunk := response.read(1024 * 1024):
+                    output.write(chunk)
+            temporary.replace(target)
+            return str(target)
+        except (HTTPError, URLError) as error:
+            temporary.unlink(missing_ok=True)
+            raise self._friendly_download_error(error) from None
+        except OSError:
+            temporary.unlink(missing_ok=True)
+            raise ValueError("无法保存文件，请检查导出文件夹是否可写或磁盘空间是否充足。") from None
+
     def export_template(self, filename: str, content: str) -> str:
         """把字段模板 JSON 写入桌面版默认导出目录。"""
         if not filename.lower().endswith(".json"):
@@ -93,10 +131,7 @@ class _DesktopApi:
         if len(parts) != 6 or parts[:4] != ["", "api", "v1", "tasks"] or parts[-1] != "file":
             raise ValueError("原文件下载地址无效。")
         target = self._export_target(filename)
-        with urlopen(url, timeout=60) as response, target.open("wb") as output:
-            while chunk := response.read(1024 * 1024):
-                output.write(chunk)
-        return str(target)
+        return self._download_to_target(url, target)
 
     def export_table(self, url: str, filename: str) -> str:
         parsed = urlparse(url)
@@ -106,10 +141,7 @@ class _DesktopApi:
         if not parsed.path.startswith("/api/v1/tables/") or not is_table_export:
             raise ValueError("导出地址无效。")
         target = self._export_target(filename)
-        with urlopen(url, timeout=60) as response, target.open("wb") as output:
-            while chunk := response.read(1024 * 1024):
-                output.write(chunk)
-        return str(target)
+        return self._download_to_target(url, target)
 
 
 class _DesktopInstance:

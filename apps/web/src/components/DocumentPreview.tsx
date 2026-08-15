@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { PDFDocumentLoadingTask, PDFDocumentProxy } from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { responseErrorMessage } from "../api";
 
 interface EvidenceRegion {
   x: number;
@@ -116,7 +117,7 @@ function TextDocument({ filename, scale, url }: Pick<DocumentPreviewProps, "file
     setError("");
     fetch(url.replace(/\/file$/, "/preview"), { signal: controller.signal })
       .then(async (response) => {
-        if (!response.ok) throw new Error(`原文件预览请求失败（${response.status}）`);
+        if (!response.ok) throw new Error(await responseErrorMessage(response, "原文件预览"));
         return response.json() as Promise<TextPreviewResponse>;
       })
       .then(setPreview)
@@ -170,7 +171,7 @@ function WordDocument({ filename, url }: { filename: string; url: string }) {
     setError("");
     fetch(url.replace(/\/file$/, "/preview/docx"), { signal: controller.signal })
       .then(async (response) => {
-        if (!response.ok) throw new Error(`原文件预览请求失败（${response.status}）`);
+        if (!response.ok) throw new Error(await responseErrorMessage(response, "原文件预览"));
         return response.json() as Promise<DocxPreviewResponse>;
       })
       .then(setPreview)
@@ -263,7 +264,7 @@ function XlsxDocument({ filename, url }: { filename: string; url: string }) {
     setActiveSheet(0);
     fetch(url.replace(/\/file$/, "/preview/xlsx"), { signal: controller.signal })
       .then(async (response) => {
-        if (!response.ok) throw new Error(`原文件预览请求失败（${response.status}）`);
+        if (!response.ok) throw new Error(await responseErrorMessage(response, "原文件预览"));
         return response.json() as Promise<XlsxPreviewResponse>;
       })
       .then(setPreview)

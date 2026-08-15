@@ -1,6 +1,8 @@
 import json
 import threading
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -88,6 +90,34 @@ def test_desktop_downloads_original_file_through_local_api(
         api.download_task_file(
             "http://127.0.0.1:8765/api/v1/tables/t1/export.xlsx", "越权.xlsx"
         )
+
+
+def test_desktop_export_translates_http_and_connection_errors(
+    monkeypatch, tmp_path: Path
+) -> None:
+    api = _DesktopApi(tmp_path)
+    url = "http://127.0.0.1:8765/api/v1/tables/t1/export-views.xlsx"
+
+    def reject_with_detail(*_args, **_kwargs):
+        raise HTTPError(
+            url,
+            422,
+            "Unprocessable Entity",
+            {},
+            BytesIO(json.dumps({"detail": "当前数据表还没有分 Sheet 视图。"}).encode()),
+        )
+
+    monkeypatch.setattr("document_pipeline_api.desktop.urlopen", reject_with_detail)
+    with pytest.raises(ValueError, match="当前数据表还没有分 Sheet 视图"):
+        api.export_table(url, "台账-分Sheet.xlsx")
+    assert not list((tmp_path / "output").glob("*.partial"))
+
+    monkeypatch.setattr(
+        "document_pipeline_api.desktop.urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(URLError("refused")),
+    )
+    with pytest.raises(ValueError, match="无法连接知意本地服务"):
+        api.export_table(url, "台账-分Sheet.xlsx")
 
 
 def test_desktop_bridge_does_not_expose_native_window(tmp_path: Path) -> None:

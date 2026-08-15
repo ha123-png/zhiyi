@@ -15,6 +15,7 @@ from document_pipeline_api.model_providers import (
     ModelServiceError,
     build_model_provider,
 )
+from document_pipeline_api.public_errors import public_error_message
 from document_pipeline_api.schemas.rules import (
     BinaryExpression,
     EquationRule,
@@ -194,7 +195,10 @@ def generate_template_draft(
     except ModelServiceError as error:
         raise HTTPException(
             status_code=502,
-            detail=f"AI 生成失败，请检查模型服务后重试。{error}",
+            detail=(
+                "AI 生成失败："
+                + public_error_message(error, "请检查模型服务是否已连接后重试。")
+            ),
         ) from error
     finally:
         if owns_client:

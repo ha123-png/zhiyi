@@ -478,6 +478,11 @@ export function DataTablePage({
   async function handleExport(format: "xlsx" | "csv" | "json" | "views") {
     if (!currentTableId) return;
     setExportMenuOpen(false);
+    if (format === "views" && views.length === 0) {
+      setTableError(null);
+      setTableNotice("当前数据表还没有分 Sheet，请先创建分 Sheet 后再导出。");
+      return;
+    }
     const url = format === "views" ? getTableViewsExportUrl(currentTableId) : getTableExportUrl(currentTableId, format);
     const bridge = desktopApi();
     if (!bridge) {
@@ -806,7 +811,12 @@ export function DataTablePage({
                   <button className="toolbar-menu-item" onClick={() => handleExport("xlsx")}>
                     <Icon icon={FileSpreadsheet} size={15} /> 导出 Excel (.xlsx)<span className="menu-hint">XLSX</span>
                   </button>
-                  <button className="toolbar-menu-item" onClick={() => handleExport("views")}>
+                  <button
+                    className="toolbar-menu-item"
+                    disabled={views.length === 0}
+                    onClick={() => handleExport("views")}
+                    title={views.length === 0 ? "当前数据表还没有分 Sheet，请先创建分 Sheet" : undefined}
+                  >
                     <Icon icon={FileSpreadsheet} size={15} /> 导出全部分 Sheet<span className="menu-hint">多工作表</span>
                   </button>
                   <button className="toolbar-menu-item" onClick={() => handleExport("csv")}>

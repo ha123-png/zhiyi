@@ -20,6 +20,7 @@ from document_pipeline_api.models import (
     ReviewRevisionRecord,
 )
 from document_pipeline_api.models.task import TaskRecord, utc_now
+from document_pipeline_api.public_errors import public_error_message
 from document_pipeline_api.services.file_formats import (
     CONVERTIBLE_IMAGE_TYPES,
     RASTER_IMAGE_TYPES,
@@ -125,7 +126,10 @@ async def create_task_from_upload(
                     max_pages=settings.max_pdf_pages,
                 )
             except UnsupportedPdfError as error:
-                raise HTTPException(status_code=422, detail=str(error)) from error
+                raise HTTPException(
+                    status_code=422,
+                    detail=public_error_message(error, "PDF 无法读取，请确认文件未损坏或未加密。"),
+                ) from error
             except Exception as error:
                 raise HTTPException(
                     status_code=422,
@@ -146,7 +150,10 @@ async def create_task_from_upload(
                 )
                 page_count = len(text_pages)
             except UnsupportedTextFileError as error:
-                raise HTTPException(status_code=422, detail=str(error)) from error
+                raise HTTPException(
+                    status_code=422,
+                    detail=public_error_message(error, "图片无法读取，请换一张清晰、未损坏的图片。"),
+                ) from error
         elif upload.content_type in RASTER_IMAGE_TYPES:
             try:
                 page_count = inspect_image_frame_count(
@@ -156,7 +163,10 @@ async def create_task_from_upload(
                     max_total_pixels=settings.max_image_total_pixels,
                 )
             except UnsupportedImageError as error:
-                raise HTTPException(status_code=422, detail=str(error)) from error
+                raise HTTPException(
+                    status_code=422,
+                    detail=public_error_message(error, "文档无法读取，请确认文件未损坏或未加密。"),
+                ) from error
 
         sha256 = digest.hexdigest()
         duplicate_id = session.scalar(

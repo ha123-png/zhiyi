@@ -23,6 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.config import Settings
+from document_pipeline_api.public_errors import public_error_message
 from document_pipeline_api.db import get_session
 from document_pipeline_api.domain.tasks import TaskStatus
 from document_pipeline_api.models import ExtractionRecord
@@ -458,7 +459,10 @@ def text_preview(
         )
         image_count = len(_docx_preview_image_names(path, request)) if task.content_type == _DOCX_TYPE else 0
     except (UnsupportedTextFileError, zipfile.BadZipFile, OSError) as error:
-        raise HTTPException(status_code=422, detail=f"原文件预览失败：{error}") from error
+        raise HTTPException(
+            status_code=422,
+            detail=public_error_message(error, "原文件预览失败，请确认文件未损坏。"),
+        ) from error
     truncated = len(text) > _MAX_PREVIEW_CHARS
     return TextPreviewRead(
         kind="markdown" if task.content_type == "text/markdown" else "text",
@@ -486,7 +490,10 @@ def xlsx_preview(
             max_columns=request.app.state.settings.max_import_columns,
         )
     except UnsupportedTextFileError as error:
-        raise HTTPException(status_code=422, detail=f"原文件预览失败：{error}") from error
+        raise HTTPException(
+            status_code=422,
+            detail=public_error_message(error, "原文件预览失败，请确认文件未损坏。"),
+        ) from error
     return XlsxPreviewRead(sheets=sheets)
 
 
@@ -509,7 +516,10 @@ def docx_preview(
             max_columns=request.app.state.settings.max_import_columns,
         )
     except UnsupportedTextFileError as error:
-        raise HTTPException(status_code=422, detail=f"原文件预览失败：{error}") from error
+        raise HTTPException(
+            status_code=422,
+            detail=public_error_message(error, "原文件预览失败，请确认文件未损坏。"),
+        ) from error
     return DocxPreviewRead(blocks=blocks)
 
 

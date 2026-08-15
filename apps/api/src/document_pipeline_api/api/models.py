@@ -12,6 +12,7 @@ from document_pipeline_api.model_secrets import (
     create_model_secret_store,
 )
 from document_pipeline_api.model_providers import ModelServiceError, build_model_provider
+from document_pipeline_api.public_errors import public_error_message
 from document_pipeline_api.schemas.model_profiles import (
     ModelProfileActivate,
     ModelProfileBody,
@@ -171,6 +172,9 @@ def _secret_store(request: Request, *, required: bool) -> ModelSecretStore | Non
     try:
         store = create_model_secret_store()
     except SecretStoreError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+        raise HTTPException(
+            status_code=503,
+            detail=public_error_message(error, "系统密钥库暂时不可用，请重启知意后重试。"),
+        ) from error
     request.app.state.model_secret_store = store
     return store

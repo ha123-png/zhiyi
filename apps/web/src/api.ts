@@ -43,20 +43,34 @@ export function getIntegrationBaseUrl(): string {
 }
 
 
+function statusFallback(status: number, action: string): string {
+  if (status === 400 || status === 422) return `${action}失败：提交的内容不完整或格式不正确，请检查后重试。`;
+  if (status === 401 || status === 403) return `${action}失败：当前没有执行这项操作的权限。`;
+  if (status === 404) return `${action}失败：相关内容不存在，可能已被删除。`;
+  if (status === 409) return `${action}失败：数据已经发生变化，请刷新后重试。`;
+  if (status === 413) return `${action}失败：文件超过当前允许的大小。`;
+  if (status >= 500) return `${action}失败：知意服务暂时不可用，请稍后重试。`;
+  return `${action}失败，请稍后重试。`;
+}
+
+export async function responseErrorMessage(response: Response, action = "请求"): Promise<string> {
+  const body = (await response.json().catch(() => null)) as { detail?: unknown } | null;
+  if (typeof body?.detail === "string" && body.detail.trim()) return body.detail.trim();
+  return statusFallback(response.status, action);
+}
+
 async function readResponse<T>(response: Response): Promise<T> {
   if (response.ok) {
     return response.json() as Promise<T>;
   }
 
-  const body = (await response.json().catch(() => null)) as { detail?: string } | null;
-  throw new Error(body?.detail ?? `请求失败（${response.status}）`);
+  throw new Error(await responseErrorMessage(response));
 }
 
 /** 校验无响应体接口（如 204 删除）是否成功；失败时把后端 detail 抛成友好错误。 */
 async function expectOk(response: Response): Promise<void> {
   if (response.ok) return;
-  const body = (await response.json().catch(() => null)) as { detail?: string } | null;
-  throw new Error(body?.detail ?? `请求失败（${response.status}）`);
+  throw new Error(await responseErrorMessage(response));
 }
 
 /** fetch wrapper that turns network errors into a friendly Chinese message. */
@@ -830,7 +844,7 @@ export async function getIntegrationStatus(): Promise<{
     }
     return {
       enabled: false,
-      message: `集成接口状态异常（${response.status}）。`,
+      message: "暂时无法确认集成接口状态，请稍后刷新。",
     };
   } catch {
     return { enabled: false, message: "无法连接集成接口。" };

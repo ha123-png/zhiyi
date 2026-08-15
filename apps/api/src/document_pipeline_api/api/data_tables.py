@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from document_pipeline_api.db import get_session
 from document_pipeline_api.config import Settings
 from document_pipeline_api.models import DataTableRecord
+from document_pipeline_api.public_errors import public_error_message
 from document_pipeline_api.schemas.data_tables import (
     DataRowRead,
     DataRowRevisionRead,
@@ -98,7 +99,10 @@ def import_new_table(
     try:
         rows = parse_import_rows(content, filename, max_rows=settings.max_import_rows, max_columns=settings.max_import_columns, max_uncompressed_bytes=settings.max_import_uncompressed_bytes)
     except ImportFileError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
+        raise HTTPException(
+            status_code=422,
+            detail=public_error_message(error, "无法读取导入文件，请确认文件未损坏且表头结构正确。"),
+        ) from error
     if not rows:
         raise HTTPException(status_code=422, detail="导入文件没有可用数据行。")
     table = create_table_from_import(session, Path(filename).stem[:128], rows)
@@ -199,7 +203,10 @@ def import_table(
             max_uncompressed_bytes=settings.max_import_uncompressed_bytes,
         )
     except ImportFileError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
+        raise HTTPException(
+            status_code=422,
+            detail=public_error_message(error, "无法读取导入文件，请确认文件未损坏且表头结构正确。"),
+        ) from error
     import_table_rows(session, table_id, rows)
     table = session.get(DataTableRecord, table_id)
     if table is None:

@@ -26,6 +26,7 @@ from document_pipeline_api.models import (
     ModelRuntimeStateRecord,
 )
 from document_pipeline_api.models.task import utc_now
+from document_pipeline_api.public_errors import public_error_message
 from document_pipeline_api.schemas.model_profiles import (
     ModelProfileBody,
     ModelProfileCreate,
@@ -297,7 +298,10 @@ def _store_new_secret(api_key, secret_store: ModelSecretStore | None) -> str | N
     try:
         return secret_store.put(api_key.get_secret_value())
     except SecretStoreError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+        raise HTTPException(
+            status_code=503,
+            detail=public_error_message(error, "系统密钥库暂时不可用，请重启知意后重试。"),
+        ) from error
 
 
 def _discard_new_secret(
