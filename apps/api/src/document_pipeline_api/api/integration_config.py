@@ -1,4 +1,4 @@
-"""集成配置管理接口：界面读写密钥与 MCP 权限开关。
+"""集成配置管理接口：HTTP API 读写密钥与独立的 MCP 权限开关。
 
 密钥/开关落盘到 <data_dir>/config/integration.json（本机数据目录）；API 动态读取，
 MCP 在每次客户端连接时由 launcher 加载。接口本身只在本机 Web 界面使用，不走集成 Bearer 认证；
@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from document_pipeline_api.services.integration_config import (
@@ -94,17 +94,7 @@ def create_key(request: Request, body: KeyRequest) -> dict[str, str]:
 def revoke_key(request: Request, body: KeyRequest) -> dict[str, bool]:
     """撤销（清空）指定密钥：API 鉴权立即读取文件并生效。"""
     field = "read_token" if body.kind == "read" else "write_token"
-    updates: dict[str, object] = {field: None}
-    if body.kind == "write":
-        updates.update(
-            {
-                "mcp_task_control": False,
-                "mcp_write_enabled": False,
-                "mcp_file_access": False,
-                "mcp_file_roots": None,
-            }
-        )
-    write_integration_config(_data_dir(request), updates)
+    write_integration_config(_data_dir(request), {field: None})
     return {"revoked": True}
 
 
@@ -112,17 +102,6 @@ def revoke_key(request: Request, body: KeyRequest) -> dict[str, bool]:
 def save_permissions(request: Request, body: PermissionRequest) -> dict[str, bool]:
     """保存 MCP 权限开关与文件允许目录；下次 MCP 连接立即采用。"""
     data_dir = _data_dir(request)
-    if body.write_enabled or body.task_control or body.file_access:
-        # 写能力依赖集成写密钥（MCP 进程使用同一把写密钥）；没有写密钥则拒绝开启
-        from document_pipeline_api.services.integration_config import (
-            read_integration_config,
-        )
-
-        if not read_integration_config(data_dir).get("write_token"):
-            raise HTTPException(
-                status_code=409,
-                detail="开启任务控制、写事实或文件访问前，请先生成写密钥。",
-            )
     updates: dict[str, object] = {
         "mcp_task_read": body.task_read,
         "mcp_template_read": body.template_read,

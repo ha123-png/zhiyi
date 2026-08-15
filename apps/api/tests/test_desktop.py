@@ -47,6 +47,49 @@ def test_desktop_export_defaults_to_output_and_avoids_overwrite(
     assert views == tmp_path / "output" / "台账-分Sheet.xlsx"
 
 
+def test_desktop_exports_template_json_to_output(tmp_path: Path) -> None:
+    api = _DesktopApi(tmp_path)
+
+    first = Path(api.export_template("成绩表.template.json", '{"name":"成绩表"}'))
+    second = Path(api.export_template("成绩表.template.json", '{"name":"成绩表"}'))
+
+    assert first == tmp_path / "output" / "成绩表.template.json"
+    assert second == tmp_path / "output" / "成绩表.template (2).json"
+    assert first.read_text(encoding="utf-8") == '{"name":"成绩表"}'
+
+
+def test_desktop_downloads_original_file_through_local_api(
+    monkeypatch, tmp_path: Path
+) -> None:
+    api = _DesktopApi(tmp_path)
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _size: int) -> bytes:
+            if hasattr(self, "done"):
+                return b""
+            self.done = True
+            return b"original"
+
+    monkeypatch.setattr("document_pipeline_api.desktop.urlopen", lambda *_a, **_k: Response())
+    target = Path(api.download_task_file(
+        "http://127.0.0.1:8765/api/v1/tasks/task-1/file", "原文件.pdf"
+    ))
+
+    assert target == tmp_path / "output" / "原文件.pdf"
+    assert target.read_bytes() == b"original"
+
+    with pytest.raises(ValueError, match="下载地址无效"):
+        api.download_task_file(
+            "http://127.0.0.1:8765/api/v1/tables/t1/export.xlsx", "越权.xlsx"
+        )
+
+
 def test_desktop_bridge_does_not_expose_native_window(tmp_path: Path) -> None:
     api = _DesktopApi(tmp_path)
     api._window = object()

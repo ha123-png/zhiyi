@@ -1,13 +1,11 @@
 import os
 import mimetypes
 from pathlib import Path
-from secrets import compare_digest
 
 from mcp.server.fastmcp import FastMCP
 from sqlalchemy.orm import sessionmaker
 from starlette.datastructures import Headers, UploadFile
 
-from document_pipeline_api.api.integration_auth import validate_integration_tokens
 from document_pipeline_api.config import Settings
 from document_pipeline_api.db import build_engine
 from document_pipeline_api.migrations import upgrade_database
@@ -40,7 +38,6 @@ def create_mcp_server(
     settings: Settings,
     *,
     write_enabled: bool = False,
-    write_token: str = "",
     task_control_enabled: bool = False,
     file_access_enabled: bool = False,
     allowed_file_roots: tuple[Path, ...] = (),
@@ -49,14 +46,6 @@ def create_mcp_server(
     result_read_enabled: bool = False,
     data_read_enabled: bool = False,
 ) -> FastMCP:
-    if write_enabled or task_control_enabled or file_access_enabled:
-        validate_integration_tokens(settings)
-        if (
-            not settings.integration_write_token
-            or not write_token
-            or not compare_digest(write_token, settings.integration_write_token)
-        ):
-            raise RuntimeError("MCP 写入已请求，但写入密钥无效。")
     resolved_roots = tuple(root.resolve() for root in allowed_file_roots)
     if file_access_enabled and not resolved_roots:
         raise RuntimeError("MCP 文件访问已启用，但没有配置允许目录。")
@@ -353,7 +342,6 @@ def main() -> None:
     server = create_mcp_server(
         settings,
         write_enabled=write_enabled,
-        write_token=os.getenv("DOCUMENT_PIPELINE_MCP_WRITE_TOKEN", ""),
         task_control_enabled=task_control_enabled,
         file_access_enabled=file_access_enabled,
         allowed_file_roots=allowed_file_roots,

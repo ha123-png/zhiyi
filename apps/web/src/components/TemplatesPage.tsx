@@ -36,6 +36,7 @@ import type {
   TemplateDraft,
   TemplateField,
 } from "../types";
+import { desktopApi } from "../desktop";
 import { DeterministicRulesEditor } from "./DeterministicRulesEditor";
 import { Icon } from "./Icon";
 import { Toast, useToast } from "./Toast";
@@ -414,7 +415,7 @@ export function TemplatesPage() {
     }
   }
 
-  function handleExport() {
+  async function handleExport() {
     if (!draft.name.trim()) {
       notify("当前模板还没有名称，不能导出。", "error");
       return;
@@ -428,12 +429,23 @@ export function TemplatesPage() {
       null,
       2,
     );
+    const filename = `${draft.name}.template.json`;
+    const bridge = desktopApi();
+    if (bridge) {
+      try {
+        const path = await bridge.export_template(filename, payload);
+        notify(`模板已导出到 ${path}`, "success");
+      } catch (error) {
+        notify(error instanceof Error ? error.message : "模板导出失败。", "error");
+      }
+      return;
+    }
     const url = URL.createObjectURL(
       new Blob([payload], { type: "application/json;charset=utf-8" }),
     );
     const link = document.createElement("a");
     link.href = url;
-    link.download = `${draft.name}.template.json`;
+    link.download = filename;
     link.click();
     URL.revokeObjectURL(url);
     notify("模板已导出为 JSON 文件。", "success");

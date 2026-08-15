@@ -38,6 +38,7 @@ import type {
   TemplateValue,
 } from "../types";
 import { serverDate } from "../time";
+import { desktopApi } from "../desktop";
 import { DocumentPreview } from "./DocumentPreview";
 import { EditableText } from "./EditableText";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -130,6 +131,19 @@ export function HistoryPage({ onOpenTask, onOpenData }: HistoryPageProps = {}) {
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
   // 删除确认：文件历史删除=删除任务记录，不删除数据表中的数据；需输入文件名确认
   const [deleteTarget, setDeleteTarget] = useState<Task | null>(null);
+
+  async function downloadOriginalFile(task: Task) {
+    const bridge = desktopApi();
+    if (!bridge) return;
+    setError(null);
+    try {
+      const absoluteUrl = new URL(getOriginalFileUrl(task.id), window.location.origin).toString();
+      const path = await bridge.download_task_file(absoluteUrl, task.filename);
+      setNotice(`原文件已下载到 ${path}`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "原文件下载失败");
+    }
+  }
 
   useEffect(() => {
     getTemplates(true)
@@ -1079,8 +1093,13 @@ export function HistoryPage({ onOpenTask, onOpenData }: HistoryPageProps = {}) {
                       <span>原文件</span>
                       <a
                         className="btn ghost sm"
-                        download={selectedTask.filename}
+                        download={desktopApi() ? undefined : selectedTask.filename}
                         href={getOriginalFileUrl(selectedTask.id)}
+                        onClick={(event) => {
+                          if (!desktopApi()) return;
+                          event.preventDefault();
+                          void downloadOriginalFile(selectedTask);
+                        }}
                         title="下载上传时保存的原文件"
                       >
                         <Icon icon={Download} size={14} /> 下载原文件

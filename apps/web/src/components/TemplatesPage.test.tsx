@@ -93,6 +93,32 @@ describe("TemplatesPage", () => {
     );
   });
 
+  it("uses the native bridge when exporting a template in the desktop app", async () => {
+    const exportTemplate = vi.fn().mockResolvedValue("D:\\知意导出\\发票.template.json");
+    window.pywebview = {
+      api: {
+        get_export_directory: vi.fn(),
+        choose_export_directory: vi.fn(),
+        export_table: vi.fn(),
+        export_template: exportTemplate,
+        download_task_file: vi.fn(),
+      },
+    };
+
+    render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: "发票" });
+    fireEvent.click(screen.getByRole("button", { name: "导出" }));
+
+    await waitFor(() => expect(exportTemplate).toHaveBeenCalledTimes(1));
+    expect(exportTemplate.mock.calls[0][0]).toBe("发票.template.json");
+    expect(JSON.parse(exportTemplate.mock.calls[0][1])).toMatchObject({
+      format: "document-pipeline-template",
+      template: { name: "发票" },
+    });
+    expect(await screen.findByText(/模板已导出到 D:/)).toBeInTheDocument();
+    delete window.pywebview;
+  });
+
   it("stays honest when the template service is unavailable", async () => {
     vi.stubGlobal(
       "fetch",

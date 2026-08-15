@@ -37,9 +37,6 @@ def _mcp_params(data_dir: Path, *, write_enabled: bool = False) -> StdioServerPa
         env["DOCUMENT_PIPELINE_MCP_TASK_CONTROL_ENABLED"] = "1"
         env["DOCUMENT_PIPELINE_MCP_FILE_ACCESS_ENABLED"] = "1"
         env["DOCUMENT_PIPELINE_MCP_FILE_ROOTS"] = str(data_dir)
-        env["DOCUMENT_PIPELINE_MCP_WRITE_TOKEN"] = "w" * 40
-        env["DOCUMENT_PIPELINE_INTEGRATION_READ_TOKEN"] = "r" * 40
-        env["DOCUMENT_PIPELINE_INTEGRATION_WRITE_TOKEN"] = "w" * 40
     return StdioServerParameters(
         command=sys.executable,
         args=["-m", "document_pipeline_api.mcp_server"],
@@ -198,7 +195,7 @@ async def _read_via_stdio(data_dir: Path) -> None:
             assert _parse_result(aggregate)["count"] == 1
 
 
-def test_mcp_external_client_write_requires_token(tmp_path: Path) -> None:
+def test_mcp_external_client_write_uses_permission_without_http_token(tmp_path: Path) -> None:
     """显式开启写入的 MCP server 暴露 update_data_row，且外部客户端可改行。"""
     row_id: list[int] = []
     _seed_db(tmp_path, "mcp-write.db", "mcp-write-task", "mcp-write-table", row_id)

@@ -60,13 +60,7 @@ class _DesktopApi:
         temporary.replace(self._settings_path)
         return str(selected)
 
-    def export_table(self, url: str, filename: str) -> str:
-        parsed = urlparse(url)
-        if parsed.hostname not in {"127.0.0.1", "localhost"}:
-            raise ValueError("桌面版只允许从知意本地服务导出。")
-        is_table_export = "/export." in parsed.path or "/export-views." in parsed.path
-        if not parsed.path.startswith("/api/v1/tables/") or not is_table_export:
-            raise ValueError("导出地址无效。")
+    def _export_target(self, filename: str) -> Path:
         safe_name = Path(filename).name
         if not safe_name or safe_name != filename:
             raise ValueError("导出文件名无效。")
@@ -78,6 +72,40 @@ class _DesktopApi:
         while target.exists():
             target = directory / f"{stem} ({index}){suffix}"
             index += 1
+        return target
+
+    def export_template(self, filename: str, content: str) -> str:
+        """把字段模板 JSON 写入桌面版默认导出目录。"""
+        if not filename.lower().endswith(".json"):
+            raise ValueError("字段模板只能导出为 JSON 文件。")
+        if not isinstance(content, str) or len(content.encode("utf-8")) > 4 * 1024 * 1024:
+            raise ValueError("字段模板内容无效或过大。")
+        target = self._export_target(filename)
+        target.write_text(content, encoding="utf-8")
+        return str(target)
+
+    def download_task_file(self, url: str, filename: str) -> str:
+        """通过本地 API 下载任务原文件，避免依赖 WebView 浏览器下载。"""
+        parsed = urlparse(url)
+        if parsed.hostname not in {"127.0.0.1", "localhost"}:
+            raise ValueError("桌面版只允许从知意本地服务下载。")
+        parts = parsed.path.rstrip("/").split("/")
+        if len(parts) != 6 or parts[:4] != ["", "api", "v1", "tasks"] or parts[-1] != "file":
+            raise ValueError("原文件下载地址无效。")
+        target = self._export_target(filename)
+        with urlopen(url, timeout=60) as response, target.open("wb") as output:
+            while chunk := response.read(1024 * 1024):
+                output.write(chunk)
+        return str(target)
+
+    def export_table(self, url: str, filename: str) -> str:
+        parsed = urlparse(url)
+        if parsed.hostname not in {"127.0.0.1", "localhost"}:
+            raise ValueError("桌面版只允许从知意本地服务导出。")
+        is_table_export = "/export." in parsed.path or "/export-views." in parsed.path
+        if not parsed.path.startswith("/api/v1/tables/") or not is_table_export:
+            raise ValueError("导出地址无效。")
+        target = self._export_target(filename)
         with urlopen(url, timeout=60) as response, target.open("wb") as output:
             while chunk := response.read(1024 * 1024):
                 output.write(chunk)

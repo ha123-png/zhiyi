@@ -80,8 +80,7 @@ def test_apply_integration_config_sets_env(tmp_path: Path, monkeypatch) -> None:
         assert os.environ["DOCUMENT_PIPELINE_INTEGRATION_READ_TOKEN"] == "read-secret"
         assert os.environ["DOCUMENT_PIPELINE_INTEGRATION_WRITE_TOKEN"] == "write-secret"
         assert os.environ["DOCUMENT_PIPELINE_MCP_TASK_CONTROL_ENABLED"] == "1"
-        # 写开关开启时，MCP 写密钥同步为集成写密钥
-        assert os.environ["DOCUMENT_PIPELINE_MCP_WRITE_TOKEN"] == "write-secret"
+        assert "DOCUMENT_PIPELINE_MCP_WRITE_TOKEN" not in os.environ
     finally:
         # apply_integration_config 直接写 os.environ，必须显式清理，
         # 否则短密钥会泄漏进后续 MCP 测试的子进程环境（monkeypatch.setenv
@@ -155,18 +154,9 @@ def test_revoke_key_endpoint_clears(tmp_path: Path) -> None:
         assert client.get("/api/v1/integration/settings").json()["write_token_set"] is False
 
 
-def test_permissions_save_and_write_requires_key(tmp_path: Path) -> None:
+def test_permissions_save_is_independent_from_http_write_key(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     with TestClient(create_app(settings)) as client:
-        # 没有写密钥时开启写能力被拒绝
-        denied = client.post(
-            "/api/v1/integration/settings/permissions",
-            json={"task_control": True, "write_enabled": True, "file_access": False},
-        )
-        assert denied.status_code == 409
-
-        # 生成写密钥后可开启写能力
-        client.post("/api/v1/integration/settings/keys", json={"kind": "write"})
         saved = client.post(
             "/api/v1/integration/settings/permissions",
             json={
@@ -182,6 +172,7 @@ def test_permissions_save_and_write_requires_key(tmp_path: Path) -> None:
         )
         assert saved.status_code == 200
         config = read_integration_config(tmp_path)
+        assert "write_token" not in config
         assert config["mcp_task_control"] == "1"
         assert config["mcp_task_read"] == "1"
         assert config["mcp_template_read"] == "1"
@@ -199,6 +190,21 @@ def test_permissions_save_and_write_requires_key(tmp_path: Path) -> None:
         assert status["write_enabled"] is True
         assert status["file_access"] is True
         assert status["file_roots"] == ["D:/inbox", "D:/outbox"]
+
+
+def test_revoking_http_write_key_does_not_disable_mcp_permissions(tmp_path: Path) -> None:
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        client.post("/api/v1/integration/settings/keys", json={"kind": "write"})
+        client.post(
+            "/api/v1/integration/settings/permissions",
+            json={"task_control": True, "write_enabled": True},
+        )
+        client.post("/api/v1/integration/settings/keys/revoke", json={"kind": "write"})
+
+        status = client.get("/api/v1/integration/settings").json()
+        assert status["write_token_set"] is False
+        assert status["task_control"] is True
+        assert status["write_enabled"] is True
 
 
 def test_mcp_config_endpoint_uses_current_runtime_paths(tmp_path: Path) -> None:

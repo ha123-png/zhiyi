@@ -1,9 +1,9 @@
-"""集成配置落盘：读写密钥与 MCP 权限开关保存在 <data_dir>/config/integration.json。
+"""集成配置落盘：HTTP API 密钥与独立的 MCP 权限保存在 <data_dir>/config/integration.json。
 
 - 文件只存明文密钥与权限开关，由本机数据目录持有（与数据库同级信任边界），
   前端不保存密钥原文，接口也只在生成瞬间返回一次明文。
-- 启动时由 launcher.configure_runtime_data 把文件内容加载为环境变量，
-  因此修改后需重启 API/Worker/MCP 进程才生效。
+- 启动时由 launcher.configure_runtime_data 把文件内容加载为环境变量；
+  新建 MCP 连接时重新读取，API 密钥则由接口动态读取文件。
 - 文件为权威来源：加载时覆盖同名环境变量，保证「界面撤销/修改后重启一定生效」。
 """
 
@@ -95,14 +95,15 @@ def apply_integration_config(data_dir: Path) -> None:
     """把配置文件加载为环境变量（文件为权威来源，覆盖已存在的同名环境变量）。
 
     供 launcher.configure_runtime_data 在启动子进程前调用；
-    MCP 写开关开启时，把写密钥同步为 MCP_WRITE_TOKEN。
+    未配置的字段会清除同名环境变量，防止 MCP 客户端注入环境变量绕过权限文件。
     """
     config = read_integration_config(data_dir)
     for field, env in FIELD_TO_ENV.items():
         if field in config:
             os.environ[env] = config[field]
-    if config.get("mcp_write_enabled") == "1" and config.get("write_token"):
-        os.environ["DOCUMENT_PIPELINE_MCP_WRITE_TOKEN"] = config["write_token"]
+        else:
+            os.environ.pop(env, None)
+    os.environ.pop("DOCUMENT_PIPELINE_MCP_WRITE_TOKEN", None)
 
 
 def generate_token() -> str:

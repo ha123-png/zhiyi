@@ -73,8 +73,7 @@ const mcpFeatures = [
 const cloudPlannerExample = `# 云端规划者：能看任务/模板并控制任务，不能读提取正文或业务数据
 DOCUMENT_PIPELINE_MCP_RESULT_READ_ENABLED=0
 DOCUMENT_PIPELINE_MCP_DATA_READ_ENABLED=0
-DOCUMENT_PIPELINE_MCP_TASK_CONTROL_ENABLED=1
-DOCUMENT_PIPELINE_MCP_WRITE_TOKEN=<与集成写密钥相同>`;
+DOCUMENT_PIPELINE_MCP_TASK_CONTROL_ENABLED=1`;
 
 function buildCurlExample(baseUrl: string) {
   return `# 查询任务列表（读密钥）
@@ -150,6 +149,8 @@ export function ConnectionsPage() {
   const [mcpCopied, setMcpCopied] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
+  const [mcpError, setMcpError] = useState<string | null>(null);
+  const [mcpNotice, setMcpNotice] = useState<string | null>(null);
   const [busyKey, setBusyKey] = useState<"read" | "write" | null>(null);
   // 生成后的密钥明文：只在弹窗里出现一次，关闭后不可再查看
   const [revealedToken, setRevealedToken] = useState<{
@@ -225,7 +226,7 @@ export function ConnectionsPage() {
       await revokeIntegrationKey(revokeTarget);
       setRevokeTarget(null);
       setSettingsNotice(
-        `${revokeTarget === "read" ? "读" : "写"}密钥已撤销，API 立即生效；MCP 客户端请重新连接。`,
+        `${revokeTarget === "read" ? "读" : "写"}密钥已撤销，HTTP API 立即生效。`,
       );
       await refreshSettings();
     } catch (err) {
@@ -247,8 +248,8 @@ export function ConnectionsPage() {
 
   const handleSavePermissions = async () => {
     setSavingPerms(true);
-    setSettingsError(null);
-    setSettingsNotice(null);
+    setMcpError(null);
+    setMcpNotice(null);
     try {
       const fileRoots = permDraft.fileRoots
         .split(/[;,，]/)
@@ -264,10 +265,10 @@ export function ConnectionsPage() {
         file_access: permDraft.fileAccess,
         file_roots: fileRoots,
       });
-      setSettingsNotice("权限已保存；无需重启知意，请在 MCP 客户端重新连接以刷新工具列表。");
+      setMcpNotice("MCP 权限已保存；无需重启知意，请在 MCP 客户端重新连接以刷新工具列表。");
       await refreshSettings();
     } catch (err) {
-      setSettingsError(err instanceof Error ? err.message : "保存权限失败");
+      setMcpError(err instanceof Error ? err.message : "保存权限失败");
     } finally {
       setSavingPerms(false);
     }
@@ -375,7 +376,7 @@ export function ConnectionsPage() {
               <div className="setting-row">
                 <div>
                   <div className="settings-name">写密钥</div>
-                  <div className="small muted">上传文件、修改事实行（MCP 写能力也用这把密钥）</div>
+                  <div className="small muted">仅用于 HTTP API：上传文件、修改事实行</div>
                 </div>
                 <span className={`badge ${settings?.write_token_set ? "live" : "warn"}`}>
                   {settings?.write_token_set ? "已设置" : "未设置"}
@@ -385,7 +386,7 @@ export function ConnectionsPage() {
                 <div style={{ minWidth: 0 }}>
                   <div className="settings-name">密钥操作</div>
                   <div className="small muted" style={{ marginBottom: 8 }}>
-                    生成后请立即复制保存；关闭弹窗后明文不可再查看。API 立即生效，MCP 客户端重新连接后生效。
+                    生成后请立即复制保存；关闭弹窗后明文不可再查看。密钥只用于 HTTP API，并立即生效。
                   </div>
                   <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
                     <button
@@ -465,6 +466,16 @@ export function ConnectionsPage() {
             title="MCP 权限"
           >
             <div className="settings-toggles">
+              {mcpError && (
+                <div className="callout danger" style={{ marginBottom: 12 }}>
+                  {mcpError}
+                </div>
+              )}
+              {mcpNotice && (
+                <div className="callout success" style={{ marginBottom: 12 }}>
+                  {mcpNotice}
+                </div>
+              )}
               {([
                 ["taskRead", "读取任务", "允许 AI 查看任务列表、状态和文件名"],
                 ["templateRead", "读取模板", "允许 AI 查看模板、字段和校验规则"],
@@ -505,7 +516,7 @@ export function ConnectionsPage() {
               <div className="setting-row">
                 <div>
                   <div className="settings-name">写事实</div>
-                  <div className="small muted">允许 AI 修改数据行（需先生成写密钥；带版本保护）</div>
+                  <div className="small muted">允许 AI 修改数据行；与 HTTP 写密钥无关，仍有版本保护</div>
                 </div>
                 <button
                   aria-label="写事实"

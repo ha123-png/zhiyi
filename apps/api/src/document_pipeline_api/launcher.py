@@ -21,8 +21,8 @@ def configure_runtime_data(data_dir: Path) -> None:
     os.environ["DOCUMENT_PIPELINE_WORKER_HEARTBEAT"] = str(
         runtime_dir / "worker-heartbeat.json"
     )
-    # 集成配置（读写密钥 + MCP 权限开关）由界面写入 config/integration.json，
-    # 启动时加载为环境变量，API/Worker/MCP 子进程一并生效
+    # HTTP API 密钥与 MCP 权限开关由界面写入 config/integration.json。
+    # MCP 每次连接都会重新加载权限；两套授权彼此独立。
     from document_pipeline_api.services.integration_config import apply_integration_config
 
     apply_integration_config(resolved)

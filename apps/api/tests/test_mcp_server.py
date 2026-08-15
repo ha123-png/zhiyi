@@ -7,14 +7,10 @@ from document_pipeline_api.config import Settings
 from document_pipeline_api.mcp_server import create_mcp_server
 
 
-WRITE_TOKEN = "write-" + ("c" * 40)
-
-
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
         database_url=f"sqlite:///{tmp_path / 'mcp.db'}",
         storage_dir=tmp_path / "uploads",
-        integration_write_token=WRITE_TOKEN,
     )
 
 
@@ -51,22 +47,13 @@ def test_mcp_read_capabilities_are_independently_registered(tmp_path: Path) -> N
     }
 
 
-def test_mcp_write_tool_requires_explicit_matching_write_token(
+def test_mcp_write_tool_only_requires_explicit_permission(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
-
-    with pytest.raises(RuntimeError, match="写入密钥无效"):
-        create_mcp_server(
-            settings,
-            write_enabled=True,
-            write_token="wrong-" + ("x" * 40),
-        )
-
     server = create_mcp_server(
         settings,
         write_enabled=True,
-        write_token=WRITE_TOKEN,
     )
     assert "update_data_row" in _tool_names(server)
 
@@ -82,7 +69,6 @@ def test_mcp_privileged_capabilities_are_independently_registered(
         create_mcp_server(
             settings,
             file_access_enabled=True,
-            write_token=WRITE_TOKEN,
         )
 
     server = create_mcp_server(
@@ -90,7 +76,6 @@ def test_mcp_privileged_capabilities_are_independently_registered(
         task_control_enabled=True,
         file_access_enabled=True,
         allowed_file_roots=(allowed,),
-        write_token=WRITE_TOKEN,
     )
     names = _tool_names(server)
     assert {"control_task", "select_task_template"} <= names
@@ -104,7 +89,6 @@ def test_cloud_planner_can_control_tasks_without_reading_results_or_rows(
     server = create_mcp_server(
         _settings(tmp_path),
         task_control_enabled=True,
-        write_token=WRITE_TOKEN,
         result_read_enabled=False,
         data_read_enabled=False,
     )
