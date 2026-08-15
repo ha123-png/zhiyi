@@ -129,19 +129,29 @@ export function HistoryPage({ onOpenTask, onOpenData }: HistoryPageProps = {}) {
   const [ignoredIssueIndices, setIgnoredIssueIndices] = useState<number[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
+  const [originalDownload, setOriginalDownload] = useState<{
+    taskId: string;
+    status: "downloading" | "success" | "error";
+    message: string;
+  } | null>(null);
   // 删除确认：文件历史删除=删除任务记录，不删除数据表中的数据；需输入文件名确认
   const [deleteTarget, setDeleteTarget] = useState<Task | null>(null);
 
   async function downloadOriginalFile(task: Task) {
     const bridge = desktopApi();
     if (!bridge) return;
-    setError(null);
+    if (originalDownload?.taskId === task.id && originalDownload.status === "downloading") return;
+    setOriginalDownload({ taskId: task.id, status: "downloading", message: "正在下载原文件…" });
     try {
       const absoluteUrl = new URL(getOriginalFileUrl(task.id), window.location.origin).toString();
       const path = await bridge.download_task_file(absoluteUrl, task.filename);
-      setNotice(`原文件已下载到 ${path}`);
+      setOriginalDownload({ taskId: task.id, status: "success", message: `下载完成：${path}` });
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "原文件下载失败");
+      setOriginalDownload({
+        taskId: task.id,
+        status: "error",
+        message: reason instanceof Error ? reason.message : "原文件下载失败",
+      });
     }
   }
 
@@ -1098,13 +1108,40 @@ export function HistoryPage({ onOpenTask, onOpenData }: HistoryPageProps = {}) {
                         onClick={(event) => {
                           if (!desktopApi()) return;
                           event.preventDefault();
+                          if (
+                            originalDownload?.taskId === selectedTask.id &&
+                            originalDownload.status === "downloading"
+                          ) return;
                           void downloadOriginalFile(selectedTask);
                         }}
+                        aria-disabled={
+                          originalDownload?.taskId === selectedTask.id &&
+                          originalDownload.status === "downloading"
+                        }
                         title="下载上传时保存的原文件"
                       >
-                        <Icon icon={Download} size={14} /> 下载原文件
+                        <Icon icon={Download} size={14} />
+                        {originalDownload?.taskId === selectedTask.id &&
+                        originalDownload.status === "downloading"
+                          ? "下载中…"
+                          : "下载原文件"}
                       </a>
                     </div>
+                    {originalDownload?.taskId === selectedTask.id && (
+                      <div
+                        className={`callout ${
+                          originalDownload.status === "error"
+                            ? "danger"
+                            : originalDownload.status === "success"
+                              ? "success"
+                              : "info"
+                        }`}
+                        role="status"
+                        style={{ margin: "0 12px 12px", overflowWrap: "anywhere" }}
+                      >
+                        {originalDownload.message}
+                      </div>
+                    )}
                     <div className="history-panel-body history-preview">
                       <DocumentPreview
                         contentType={selectedTask.content_type}
