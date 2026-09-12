@@ -1,11 +1,11 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { Loader2, ShieldAlert } from "lucide-react";
 import { Icon } from "./Icon";
 
 interface ConfirmDialogProps {
   open: boolean;
   title: string;
-  description: string;
+  description: ReactNode;
   /** 必须逐字输入的确认文字（参考 GitHub 删除仓库）。为空表示无需输入、可直接确认 */
   confirmText?: string;
   buttonLabel: string;

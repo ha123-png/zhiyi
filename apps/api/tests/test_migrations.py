@@ -54,7 +54,7 @@ def test_upgrade_database_creates_schema_from_empty_database(tmp_path) -> None:
     with engine.connect() as connection:
         assert connection.execute(
             select(_version_table(engine))
-        ).scalar_one() == "0023_model_profile_multimodal"
+        ).scalar_one() == "0033_row_review_pending"
     assert "rule_engine_version" in {
         column["name"] for column in inspect(engine).get_columns("extractions")
     }
@@ -137,7 +137,7 @@ def test_unversioned_0005_database_is_not_mistaken_for_0006(tmp_path) -> None:
     with engine.connect() as connection:
         assert connection.execute(
             select(_version_table(engine))
-        ).scalar_one() == "0023_model_profile_multimodal"
+        ).scalar_one() == "0033_row_review_pending"
 
 
 def test_unversioned_0006_database_is_upgraded_to_row_versions(tmp_path) -> None:
@@ -160,7 +160,7 @@ def test_unversioned_0006_database_is_upgraded_to_row_versions(tmp_path) -> None
     with engine.connect() as connection:
         assert connection.execute(
             select(_version_table(engine))
-        ).scalar_one() == "0023_model_profile_multimodal"
+        ).scalar_one() == "0033_row_review_pending"
 
 
 def test_unversioned_current_database_is_adopted_without_replaying_migrations(tmp_path) -> None:
@@ -178,7 +178,7 @@ def test_unversioned_current_database_is_adopted_without_replaying_migrations(tm
 
     with engine.connect() as connection:
         assert connection.execute(select(_version_table(engine))).scalar_one() == (
-            "0023_model_profile_multimodal"
+            "0033_row_review_pending"
         )
         assert connection.exec_driver_sql(
             "SELECT value FROM system_settings WHERE key = 'image_convert'"
@@ -249,7 +249,7 @@ def test_0010_recovers_when_column_was_added_before_revision_was_recorded(
 
     with engine.connect() as connection:
         assert connection.execute(select(_version_table(engine))).scalar_one() == (
-            "0023_model_profile_multimodal"
+            "0033_row_review_pending"
         )
     assert [
         column["name"]
@@ -367,7 +367,7 @@ def test_0014_upgrade_keeps_tasks_referenced_by_child_rows(tmp_path) -> None:
 
     with engine.connect() as connection:
         assert connection.execute(select(_version_table(engine))).scalar_one() == (
-            "0023_model_profile_multimodal"
+            "0033_row_review_pending"
         )
         assert connection.exec_driver_sql(
             "SELECT count(*) FROM tasks"
@@ -443,3 +443,20 @@ def _create_legacy_initial_schema(engine) -> None:
         Column("created_at", DateTime(timezone=True), nullable=False),
     )
     metadata.create_all(engine)
+
+
+def test_0031_preserves_existing_template_versions(tmp_path):
+    engine = build_engine(f"sqlite:///{tmp_path / 'previous.db'}")
+    config = _alembic_config()
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0030_row_input_scope")
+    from document_pipeline_api.services.templates import ensure_builtin_templates
+    with Session(engine) as session:
+        ensure_builtin_templates(session)
+    with engine.connect() as connection:
+        before = connection.exec_driver_sql("SELECT * FROM template_versions ORDER BY id").fetchall()
+    upgrade_database(engine)
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql("SELECT * FROM template_versions ORDER BY id").fetchall() == before
+        assert connection.exec_driver_sql("SELECT count(*) FROM template_restorations").scalar_one() == 0

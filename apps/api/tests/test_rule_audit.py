@@ -87,7 +87,7 @@ def test_rule_audit_uses_exact_template_and_never_writes(
         assert report.entries[0].template_id == template.id
         assert report.entries[0].template_version == template.version
         assert report.entries[0].stored_engine_version == "legacy-unversioned"
-        assert report.entries[0].current_engine_version == "template-v1"
+        assert report.entries[0].current_engine_version == "template-v2"
         assert report.entries[0].current_issues[0].field == "header.amount"
         assert not session.dirty
         assert not session.new

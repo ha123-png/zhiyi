@@ -30,6 +30,9 @@ def test_settings_default_to_enabled(tmp_path: Path) -> None:
         "image_convert": True,
         "office_convert": True,
         "word_include_images": False,
+        "allow_limited_input": False,
+        "upload_limit_mb": 50, "input_text_limit": 20000, "input_page_limit": 10,
+        "input_row_limit": 500, "input_docx_image_limit": 10,
     }
 
 
@@ -41,6 +44,9 @@ def test_settings_update_is_persisted(tmp_path: Path) -> None:
                 "image_convert": False,
                 "office_convert": True,
                 "word_include_images": False,
+        "allow_limited_input": False,
+        "upload_limit_mb": 50, "input_text_limit": 20000, "input_page_limit": 10,
+        "input_row_limit": 500, "input_docx_image_limit": 10,
             },
         )
         fetched = client.get("/api/v1/system/settings")
@@ -50,11 +56,17 @@ def test_settings_update_is_persisted(tmp_path: Path) -> None:
         "image_convert": False,
         "office_convert": True,
         "word_include_images": False,
+        "allow_limited_input": False,
+        "upload_limit_mb": 50, "input_text_limit": 20000, "input_page_limit": 10,
+        "input_row_limit": 500, "input_docx_image_limit": 10,
     }
     assert fetched.json() == {
         "image_convert": False,
         "office_convert": True,
         "word_include_images": False,
+        "allow_limited_input": False,
+        "upload_limit_mb": 50, "input_text_limit": 20000, "input_page_limit": 10,
+        "input_row_limit": 500, "input_docx_image_limit": 10,
     }
 
 

@@ -20,6 +20,14 @@ class TaskRecord(Base):
     content_type: Mapped[str] = mapped_column(String(128))
     size_bytes: Mapped[int] = mapped_column(Integer)
     page_count: Mapped[int] = mapped_column(Integer, default=1)
+    processing_units: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    input_policy_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    input_plan_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    match_scope_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pending_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    export_state_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    file_name_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    internal_storage_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     sha256: Mapped[str] = mapped_column(String(64), index=True)
     storage_path: Mapped[str] = mapped_column(String(1024))
     template_mode: Mapped[str] = mapped_column(String(32), default="smart")
@@ -55,6 +63,7 @@ class TaskRecord(Base):
         index=True,
     )
     failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    failure_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     failure_message: Mapped[str | None] = mapped_column(String(512), nullable=True)
     duplicate_of_task_id: Mapped[str | None] = mapped_column(
         ForeignKey("tasks.id"),
@@ -85,3 +94,27 @@ class TaskRecord(Base):
     @property
     def candidate_templates(self) -> list[dict[str, str | int]]:
         return json.loads(self.candidate_templates_json)
+
+    @property
+    def planned_scope(self):
+        from document_pipeline_api.schemas.input_scope import InputScope
+        return InputScope.model_validate_json(self.input_plan_json) if self.input_plan_json else None
+
+    @property
+    def match_scope(self):
+        from document_pipeline_api.schemas.input_scope import InputScope
+        return InputScope.model_validate_json(self.match_scope_json) if self.match_scope_json else None
+
+    @property
+    def file_export(self):
+        from document_pipeline_api.schemas.file_export import TaskExportState
+        return TaskExportState.model_validate_json(self.export_state_json) if self.export_state_json else None
+
+    @property
+    def file_name(self):
+        from document_pipeline_api.schemas.file_name import FileNameRead
+        return FileNameRead.model_validate_json(self.file_name_json) if self.file_name_json else None
+
+    @property
+    def internal_storage(self):
+        return json.loads(self.internal_storage_json) if self.internal_storage_json else None

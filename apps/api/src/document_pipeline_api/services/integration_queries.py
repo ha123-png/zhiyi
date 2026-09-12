@@ -8,7 +8,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.models import DataRowRecord, DataTableRecord
-from document_pipeline_api.services.data_tables import get_data_table, table_columns
+from document_pipeline_api.services.data_tables import get_data_table, table_columns, _csv_safe
+from document_pipeline_api.services.export_scope import SCOPE_LABEL, csv_scope_value, export_row_values, table_has_input_scopes
 
 
 def aggregate_data_table(
@@ -97,12 +98,15 @@ def export_data_table_file(
     """流式导出事实表到新文件；调用者负责路径授权并保证不覆盖。"""
     detail = get_data_table(session, table_id, page=1, page_size=1)
     columns = [column.key for column in detail.columns]
+    scoped = table_has_input_scopes(session, table_id)
+    if scoped and SCOPE_LABEL in [column.label for column in detail.columns]:
+        raise ValueError("业务列名与知意范围说明列冲突，请重命名后导出。")
     if output_format == "csv":
         with path.open("w", encoding="utf-8-sig", newline="") as stream:
             writer = csv.writer(stream)
-            writer.writerow([column.label for column in detail.columns])
+            writer.writerow([column.label for column in detail.columns] + ([SCOPE_LABEL] if scoped else []))
             for values in _iter_table_values(session, table_id):
-                writer.writerow([values.get(column) for column in columns])
+                writer.writerow([_csv_safe(values.get(column)) for column in columns] + ([csv_scope_value(values)] if scoped else []))
     else:
         with path.open("w", encoding="utf-8") as stream:
             stream.write("[")
@@ -118,10 +122,10 @@ def export_data_table_file(
 
 def _iter_table_values(session: Session, table_id: str):
     row_jsons = session.scalars(
-        select(DataRowRecord.row_json)
+        select(DataRowRecord)
         .where(DataRowRecord.table_id == table_id)
         .order_by(DataRowRecord.id)
         .execution_options(yield_per=1000)
     )
     for row_json in row_jsons:
-        yield json.loads(row_json)
+        yield export_row_values(row_json)

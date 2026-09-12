@@ -15,12 +15,21 @@ from document_pipeline_api.runtime_paths import api_resource_dir
 
 
 EXPECTED_SCHEMA = {
+    "template_restorations": {"id", "template_id", "from_version", "to_version", "created_at"},
     "tasks": {
         "id",
         "filename",
         "content_type",
         "size_bytes",
         "page_count",
+        "processing_units",
+        "input_policy_json",
+        "input_plan_json",
+        "match_scope_json",
+        "pending_reason",
+        "export_state_json",
+        "file_name_json",
+        "internal_storage_json",
         "sha256",
         "storage_path",
         "template_mode",
@@ -44,6 +53,7 @@ EXPECTED_SCHEMA = {
         "lease_expires_at",
         "failure_code",
         "failure_message",
+        "failure_detail",
         "duplicate_of_task_id",
         "target_table_id",
         "started_at",
@@ -64,6 +74,7 @@ EXPECTED_SCHEMA = {
         "validation_json",
         "rule_engine_version",
         "evidence_json",
+        "input_scope_json",
         "created_at",
     },
     "review_revisions": {
@@ -84,6 +95,7 @@ EXPECTED_SCHEMA = {
         "template_version",
         "document_kind",
         "columns_json",
+        "presentation_json",
         "created_at",
     },
     "confirmed_documents": {
@@ -99,6 +111,7 @@ EXPECTED_SCHEMA = {
         "task_id",
         "item_index",
         "row_json",
+        "input_scope_json",
         "row_version",
         "created_at",
         "updated_at",
@@ -146,6 +159,7 @@ EXPECTED_SCHEMA = {
         "validation_rules_json",
         "deterministic_rules_json",
         "output_mapping_json",
+        "behavior_json",
         "created_at",
     },
     "system_settings": {
@@ -185,6 +199,9 @@ EXPECTED_SCHEMA = {
         "updated_at",
     },
 }
+EXPECTED_SCHEMA["template_local_bindings"] = {"template_id", "revision", "enabled", "parent_path", "internal_folder"}
+EXPECTED_SCHEMA["data_rows"].add("review_pending")
+
 SCHEMA_REVISIONS = {
     "0001_initial": {"tasks", "extractions"},
     "0002_review_revisions": {
@@ -380,9 +397,42 @@ SCHEMA_REVISIONS.update(
         | {"system_settings"},
         "0023_model_profile_multimodal": SCHEMA_REVISIONS["0016_model_profile_context"]
         | {"system_settings"},
+        "0024_template_behavior": SCHEMA_REVISIONS["0016_model_profile_context"]
+        | {"system_settings"},
+        "0025_table_presentation": SCHEMA_REVISIONS["0016_model_profile_context"]
+        | {"system_settings"},
+        "0026_input_scopes": SCHEMA_REVISIONS["0016_model_profile_context"]
+        | {"system_settings"},
+        "0027_local_exports": SCHEMA_REVISIONS["0016_model_profile_context"]
+        | {"system_settings", "template_local_bindings"},
+        "0028_file_names": SCHEMA_REVISIONS["0016_model_profile_context"]
+        | {"system_settings", "template_local_bindings"},
+        "0029_internal_storage": SCHEMA_REVISIONS["0016_model_profile_context"]
+        | {"system_settings", "template_local_bindings"},
+        "0030_row_input_scope": SCHEMA_REVISIONS["0016_model_profile_context"]
+        | {"system_settings", "template_local_bindings"},
     }
 )
+SCHEMA_REVISIONS["0031_template_restorations"] = SCHEMA_REVISIONS["0030_row_input_scope"] | {"template_restorations"}
+SCHEMA_REVISIONS["0032_task_diagnostics"] = SCHEMA_REVISIONS["0031_template_restorations"]
+SCHEMA_REVISIONS["0033_row_review_pending"] = SCHEMA_REVISIONS["0032_task_diagnostics"]
 COLUMNS_INTRODUCED_BY_REVISION = {
+    "0033_row_review_pending": {"data_rows": {"review_pending"}},
+    "0032_task_diagnostics": {"tasks": {"failure_detail"}},
+    "0030_row_input_scope": {"data_rows": {"input_scope_json"}},
+    "0029_internal_storage": {"tasks": {"internal_storage_json"}, "template_local_bindings": {"internal_folder"}},
+    "0028_file_names": {"tasks": {"file_name_json"}},
+    "0027_local_exports": {"tasks": {"export_state_json"}},
+    "0026_input_scopes": {
+        "tasks": {"processing_units", "input_policy_json", "input_plan_json", "match_scope_json", "pending_reason"},
+        "extractions": {"input_scope_json"},
+    },
+    "0025_table_presentation": {
+        "data_tables": {"presentation_json"},
+    },
+    "0024_template_behavior": {
+        "template_versions": {"behavior_json"},
+    },
     "0023_model_profile_multimodal": {
         "model_profile_versions": {"multimodal"},
     },

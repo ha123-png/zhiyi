@@ -1,5 +1,6 @@
-import re
 from decimal import Decimal, InvalidOperation
+
+from document_pipeline_api.domain.pattern_matching import matches_pattern
 
 from document_pipeline_api.schemas.extraction import TemplateExtraction, ValidationIssue
 from document_pipeline_api.schemas.rules import (
@@ -18,7 +19,7 @@ from document_pipeline_api.schemas.rules import (
 from document_pipeline_api.schemas.templates import TemplateFieldRead
 
 
-TEMPLATE_RULE_ENGINE_VERSION = "template-v1"
+TEMPLATE_RULE_ENGINE_VERSION = "template-v2"
 
 
 def validate_template_rules(
@@ -31,7 +32,12 @@ def validate_template_rules(
     for rule_index, rule in enumerate(rules):
         bindings = range(len(result.items)) if _rule_uses_items(rule) else (None,)
         for item_index in bindings:
-            issue = _validate_rule(result, rule, labels, rule_index, item_index)
+            try:
+                issue = _validate_rule(result, rule, labels, rule_index, item_index)
+            except TimeoutError:
+                issues.append(_issue(rule_index, _concrete_path(rule.field, item_index),
+                    "格式表达式计算过久，已停止该规则的检查；请简化表达式后重新核对。", "error"))
+                break
             if issue is not None:
                 issues.append(issue)
     return issues
@@ -84,7 +90,7 @@ def _validate_rule(
         return None
     if isinstance(rule, PatternRule):
         text = str(value)
-        if len(text) > 512 or re.fullmatch(rule.pattern, text) is None:
+        if not matches_pattern(rule.pattern, text):
             return _issue(
                 rule_index,
                 field_path,

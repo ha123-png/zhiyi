@@ -20,6 +20,7 @@ import {
   getModelStatus,
   getSystemStatus,
   getTasks,
+  getTaskSummary,
   pauseQueue,
   resumeQueue,
   subscribeTaskEvents,
@@ -38,6 +39,7 @@ function applyTheme(theme: "auto" | "light" | "dark") {
 }
 
 export function App() {
+  const [attentionCounts, setAttentionCounts] = useState<{ pending?: number; review?: number }>({});
   const [activePage, setActivePage] = useState<NavigationKey>("workspace");
   const pageWrapRef = useRef<HTMLDivElement>(null);
   const pageScrollPositionsRef = useRef<Partial<Record<NavigationKey, number>>>({});
@@ -86,8 +88,13 @@ export function App() {
   // 不能让旧失败轮番占据一个无法真正清空的全局横幅。
   const loadTasks = useCallback(async () => {
     try {
-      const data = await getTasks({ limit: 1000, activeOnly: true });
-      setTasks(data);
+      const [active, exports, summary] = await Promise.all([
+        getTasks({ limit: 1000, activeOnly: true }),
+        getTasks({ limit: 1000, exportPending: true }),
+        getTaskSummary().catch(() => null),
+      ]);
+      setTasks(Array.from(new Map([...active, ...exports].map((task) => [task.id, task])).values()));
+      setAttentionCounts({ pending: summary?.waiting_for_action == null || summary?.pending_exports == null ? undefined : summary.waiting_for_action + summary.pending_exports, review: summary?.needs_review });
     } catch {
       // 顶部任务栏静默失败，错误由各页面自行处理
     }
@@ -95,12 +102,12 @@ export function App() {
 
   // 全局处理日志：由后端 SSE 任务事件生成，覆盖入队/开始/校验/完成/失败/暂停/
   // 取消/待选模板等所有状态变化；日志放在 App 层，页面切换不丢失，状态监控页展示。
-  const [taskLogs, setTaskLogs] = useState<{ time: string; message: string }[]>([]);
-  const appendTaskLogs = useCallback((messages: string[]) => {
+  const [taskLogs, setTaskLogs] = useState<{ time: string; message: string; taskId?: string }[]>([]);
+  const appendTaskLogs = useCallback((messages: { message: string; taskId?: string }[]) => {
     if (messages.length === 0) return;
     const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
     setTaskLogs((prev) => {
-      const next = [...prev, ...messages.map((message) => ({ time, message }))];
+      const next = [...prev, ...messages.map((message) => ({ time, ...message }))];
       return next.length > 100 ? next.slice(next.length - 100) : next;
     });
   }, []);
@@ -115,7 +122,21 @@ export function App() {
       case "validating":
         return `「${event.filename}」进入规则校验`;
       case "completed":
-        return `「${event.filename}」处理完成`;
+        switch (event.export_status) {
+          case "completed":
+            return `「${event.filename}」提取已完成；副本已导出`;
+          case "failed":
+          case "needs_rebind":
+            return `「${event.filename}」提取已完成；副本导出需要处理，请查看待处理事项`;
+          case "pending":
+          case "awaiting_confirmation":
+          case "exporting":
+            return `「${event.filename}」提取已完成；副本等待导出`;
+          case "skipped":
+            return `「${event.filename}」提取已完成；已跳过副本导出`;
+          default:
+            return `「${event.filename}」提取已完成`;
+        }
       case "failed":
         return event.failure_message
           ? `「${event.filename}」处理失败：${event.failure_message}`
@@ -127,7 +148,7 @@ export function App() {
       case "needs_review":
         return `「${event.filename}」等待确认`;
       case "waiting_for_template":
-        return `「${event.filename}」需要选择模板`;
+        return `「${event.filename}」需要你确认，请查看待处理事项`;
       default:
         return null;
     }
@@ -136,10 +157,10 @@ export function App() {
   // SSE 事件 → 全局日志 + 失败/待选模板 toast：事件驱动，实时且不受页面切换影响
   const handleTaskEvents = useCallback(
     (events: TaskEvent[]) => {
-      const messages: string[] = [];
+      const messages: { message: string; taskId?: string }[] = [];
       for (const event of events) {
         const message = statusToLogMessage(event);
-        if (message) messages.push(message);
+        if (message) messages.push({ message, taskId: event.status === "failed" ? event.id : undefined });
         const key = `${event.id}:${event.status}`;
         if (notifiedTasksRef.current.has(key)) continue;
         notifiedTasksRef.current.add(key);
@@ -147,9 +168,9 @@ export function App() {
           const reason = event.failure_message
             ? `：${event.failure_message.slice(0, 90)}${event.failure_message.length > 90 ? "…" : ""}`
             : "";
-          notifyRef.current(`「${event.filename}」处理失败${reason}`, "error", 6000);
+          notifyRef.current(`「${event.filename}」处理失败${reason}。诊断详情见状态监控。`, "error", 6000);
         } else if (event.status === "waiting_for_template") {
-          notifyRef.current(`「${event.filename}」需要选择模板`, "info");
+          notifyRef.current(`「${event.filename}」需要你确认，请查看待处理事项`, "info");
         }
       }
       appendTaskLogs(messages);
@@ -347,6 +368,9 @@ export function App() {
               onPause={handlePauseTask}
               onResume={handleResumeTask}
               onDelete={handleDeleteTask}
+              onOpenPending={() => handleNavigate("workspace")}
+              pendingCount={attentionCounts.pending}
+              reviewCount={attentionCounts.review}
             />
             <div className="system-status-summary" role="status">
               {systemStatus

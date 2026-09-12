@@ -3,6 +3,9 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 from document_pipeline_api.domain.tasks import TaskStatus
+from document_pipeline_api.schemas.input_scope import InputScope
+from document_pipeline_api.schemas.file_export import TaskExportState
+from document_pipeline_api.schemas.file_name import FileNameRead
 
 
 class TaskTemplateCandidate(BaseModel):
@@ -24,6 +27,9 @@ class TasksSummary(BaseModel):
     completed: int = 0
     needs_review: int = 0
     failed: int = 0
+    active: int = 0
+    waiting_for_action: int = 0
+    pending_exports: int = 0
 
 
 class TaskRead(BaseModel):
@@ -34,6 +40,12 @@ class TaskRead(BaseModel):
     content_type: str
     size_bytes: int
     page_count: int
+    planned_scope: InputScope | None = None
+    match_scope: InputScope | None = None
+    pending_reason: str | None = None
+    file_export: TaskExportState | None = None
+    file_name: FileNameRead | None = None
+    internal_storage: dict | None = None
     sha256: str
     template_mode: str
     template_id: str | None

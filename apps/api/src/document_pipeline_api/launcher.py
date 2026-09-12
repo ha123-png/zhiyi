@@ -96,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "start",
             "stop",
+            "stop-installation",
             "api",
             "worker",
             "mcp",
@@ -107,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="内部运行模式；正式版由监督器调用。",
     )
     parser.add_argument("--data-dir", type=Path)
+    parser.add_argument("--installation-dir", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument(
         "--port",
@@ -122,6 +124,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     arguments = build_parser().parse_args()
+    if arguments.mode == "stop-installation":
+        from document_pipeline_api.installation_processes import stop_installation
+
+        if arguments.installation_dir is None:
+            raise SystemExit("An installation directory is required.")
+        stop_installation(arguments.installation_dir)
+        return
     data_dir = arguments.data_dir or default_data_dir()
     if arguments.mode == "start":
         if (

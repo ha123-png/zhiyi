@@ -19,7 +19,7 @@ from sqlalchemy.engine import make_url
 from document_pipeline_api.config import Settings
 from document_pipeline_api.db import build_engine
 from document_pipeline_api.migrations import upgrade_database
-from document_pipeline_api.storage_paths import task_storage_name
+from document_pipeline_api.storage_paths import task_storage_name, resolve_original_reference
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,12 @@ class BusinessBackupError(RuntimeError):
 
 
 def create_business_backup(settings: Settings, output_path: Path) -> Path:
+    from document_pipeline_api.services.file_operation_lock import file_operation_lock
+    with file_operation_lock(settings.storage_dir):
+        return _create_business_backup(settings, output_path)
+
+
+def _create_business_backup(settings: Settings, output_path: Path) -> Path:
     database_path = _database_path(settings)
     if not database_path.is_file():
         raise BusinessBackupError("业务数据库不存在，无法创建备份。")
@@ -128,6 +134,18 @@ def inspect_business_backup(archive_path: Path) -> dict[str, Any]:
 
 
 def restore_business_backup(
+    settings: Settings,
+    archive_path: Path,
+    data_dir: Path,
+    *,
+    before_install: Callable[[], None] | None = None,
+) -> Path:
+    from document_pipeline_api.services.file_operation_lock import file_operation_lock
+    with file_operation_lock(settings.storage_dir):
+        return _restore_business_backup(settings, archive_path, data_dir, before_install=before_install)
+
+
+def _restore_business_backup(
     settings: Settings,
     archive_path: Path,
     data_dir: Path,
@@ -279,9 +297,22 @@ def _prepare_staged_database(
             ):
                 raise BusinessBackupError("恢复文件与数据库记录不一致。")
             connection.execute(
-                "UPDATE tasks SET storage_path = ? WHERE id = ?",
+                "UPDATE tasks SET storage_path = ?, internal_storage_json = NULL WHERE id = ?",
                 (name, task_id),
             )
+        # A portable restore must never resume writes into another machine's
+        # directories. Keep historical destinations, but require explicit rebind.
+        connection.execute("UPDATE template_local_bindings SET enabled = 0, revision = revision + 1")
+        from document_pipeline_api.schemas.file_export import TaskExportState
+        for task_id, state_json in connection.execute(
+            "SELECT id, export_state_json FROM tasks WHERE export_state_json IS NOT NULL"
+        ).fetchall():
+            state = TaskExportState.model_validate_json(state_json)
+            if state.status not in {"disabled", "completed", "skipped"}:
+                state.status = "needs_rebind"
+                state.error_code = "backup_restored"
+                state.error_message = "已恢复备份；请重新选择并确认外部副本目标，不会自动写入旧路径。"
+                connection.execute("UPDATE tasks SET export_state_json = ? WHERE id = ?", (state.model_dump_json(), task_id))
         connection.commit()
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         journal_mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
@@ -395,8 +426,10 @@ def _build_manifest(
     connection = sqlite3.connect(snapshot_path)
     connection.row_factory = sqlite3.Row
     try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+        internal_column = "internal_storage_json" if "internal_storage_json" in columns else "NULL AS internal_storage_json"
         tasks = connection.execute(
-            "SELECT id, content_type, size_bytes, sha256, storage_path "
+            f"SELECT id, content_type, size_bytes, sha256, storage_path, {internal_column} "
             "FROM tasks ORDER BY id"
         ).fetchall()
         for task in tasks:
@@ -408,6 +441,7 @@ def _build_manifest(
                 settings.storage_dir,
                 task["storage_path"],
                 name,
+                (json.loads(task["internal_storage_json"]) if task["internal_storage_json"] else {}).get("previous_path"),
             )
             if not source.is_file():
                 raise BusinessBackupError("存在无法找到的任务原文件，备份已停止。")
@@ -532,16 +566,11 @@ def _hash_file(path: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
-def _resolve_backup_source(storage_dir: Path, stored_value: str, expected_name: str) -> Path:
-    canonical = storage_dir.resolve() / expected_name
-    stored = Path(stored_value)
-    if not stored.is_absolute():
-        if stored.name != expected_name or len(stored.parts) != 1:
-            raise BusinessBackupError("任务原文件引用无效，备份已停止。")
-        return canonical
-    if stored.name != expected_name:
-        raise BusinessBackupError("旧任务原文件路径与任务标识不一致。")
-    return canonical if canonical.is_file() else stored
+def _resolve_backup_source(storage_dir: Path, stored_value: str, expected_name: str, previous: str | None = None) -> Path:
+    try:
+        return resolve_original_reference(storage_dir, stored_value, expected_name, previous)
+    except ValueError as error:
+        raise BusinessBackupError("任务原文件引用无效，备份已停止。") from error
 
 
 def _validate_task_id(task_id: str) -> None:

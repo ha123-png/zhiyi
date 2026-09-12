@@ -7,7 +7,7 @@ SetCompressor /SOLID zlib
 !include "FileFunc.nsh"
 
 !ifndef APP_VERSION
-  !define APP_VERSION "0.2.0"
+  !define APP_VERSION "0.3.0"
 !endif
 !ifndef BUILD_ROOT
   !error "BUILD_ROOT must point to the PyInstaller dist directory"
@@ -78,9 +78,16 @@ Section "主程序" SEC_MAIN
     ExecWait '"$INSTDIR\${APP_CLI_EXE}" stop'
 !endif
   ; The native window host can outlive its already-stopped supervisor. End
-  ; only our product executable so upgrade can replace locked files cleanly.
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM "${APP_EXE}"'
-
+  ; Stage the new runtime so upgrades from older versions can use the scoped
+  ; stop helper. NSIS deduplicates these files against the installed payload.
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR\payload"
+  File /r "${BUILD_ROOT}\Zhiyi\*"
+  nsExec::ExecToLog '"$PLUGINSDIR\payload\${APP_CLI_EXE}" stop-installation --installation-dir "$INSTDIR"'
+  Pop $0
+  ${If} $0 != 0
+    Abort "无法关闭当前安装目录中的知意，请退出该程序后重试。"
+  ${EndIf}
   SetOutPath "$INSTDIR"
   File /r "${BUILD_ROOT}\Zhiyi\*"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
@@ -140,7 +147,11 @@ Function un.onInit
 !else
     nsExec::ExecToLog '"$INSTDIR\${APP_CLI_EXE}" stop'
 !endif
-  nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM "${APP_EXE}"'
+  nsExec::ExecToLog '"$INSTDIR\${APP_CLI_EXE}" stop-installation --installation-dir "$INSTDIR"'
+  Pop $0
+  ${If} $0 != 0
+    Abort "无法关闭当前安装目录中的知意，请退出该程序后重试。"
+  ${EndIf}
 FunctionEnd
 
 Section "Uninstall"

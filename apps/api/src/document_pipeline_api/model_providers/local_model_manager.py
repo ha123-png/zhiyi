@@ -12,6 +12,11 @@
   在 Windows 上通常是前台进程，自动启动仅作尽力而为。
 """
 
+from collections import deque
+import threading
+
+from document_pipeline_api.model_diagnostics import safe_diagnostic
+
 import json
 import os
 from pathlib import Path
@@ -75,7 +80,7 @@ class LmStudioManager(LocalModelManager):
                 "running": False,
                 "installed": False,
                 "install_url": LM_STUDIO_INSTALL_URL,
-                "message": "尚未安装 LM Studio 后台运行组件。",
+                "message": "没有找到 LM Studio 的服务启动组件。请安装并打开一次 LM Studio；已安装时请检查其命令行工具是否可用。",
             }
         try:
             with httpx.Client(timeout=2, trust_env=False) as client:
@@ -122,7 +127,7 @@ class LmStudioManager(LocalModelManager):
 
     def start_server(self) -> dict:
         if self._lms is None:
-            return {"ok": False, "message": "没有找到 lms CLI，无法启动 LM Studio 服务。请先安装 LM Studio。"}
+            return {"ok": False, "message": "没有找到 LM Studio 的服务启动组件。请先安装并打开一次 LM Studio，再回来刷新。"}
         # 服务已在运行 → 幂等成功
         if self.server_status().get("running"):
             return {"ok": True, "message": "LM Studio 服务已运行。", "detail": "可直接使用。"}
@@ -366,35 +371,74 @@ class LmStudioManager(LocalModelManager):
 class OllamaManager(LocalModelManager):
     def __init__(self, base_url: str) -> None:
         self.provider = "ollama"
-        self.base_url = base_url.rstrip("/").removesuffix("/v1")
-        self._ollama = _find_executable("ollama", None)
+        self.base_url = base_url.rstrip("/").removesuffix("/api/chat").removesuffix("/api/tags").removesuffix("/v1")
+        self._ollama = _find_executable("ollama", _resolve_user_home() / "AppData/Local/Programs/Ollama/ollama.exe")
 
     def _status(self) -> dict:
+        installed = self._ollama is not None
+        base = {"installed": installed, "install_url": "https://ollama.com/download/windows"}
         try:
             with httpx.Client(timeout=2, trust_env=False) as client:
                 response = client.get(f"{self.base_url}/api/ps")
                 response.raise_for_status()
-                loaded = [item["name"] for item in response.json().get("models", [])]
-            return {"running": True, "message": f"Ollama 服务已运行，已加载 {len(loaded)} 个模型。", "loaded": loaded}
+                payload = response.json()
+                if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+                    raise ValueError("invalid models response")
+                loaded = [item["name"] for item in payload["models"]]
+            return {**base, "installed": True, "running": True, "message": f"Ollama 服务已运行，已加载 {len(loaded)} 个模型。", "loaded": loaded}
+        except httpx.HTTPStatusError as error:
+            return {**base, "running": False, "blocked": True,
+                    "message": f"配置端口有响应，但 Ollama 接口不可用（HTTP {error.response.status_code}）。请检查地址和端口占用。"}
+        except (KeyError, TypeError, ValueError):
+            return {**base, "running": False, "blocked": True, "message": "配置端口返回的不是 Ollama 模型状态，请检查是否被其他服务占用。"}
         except httpx.RequestError:
-            return {"running": False, "message": "Ollama 服务未运行，可以尝试启动。"}
+            return {**base, "running": False, "message": "Ollama 服务未运行，可以启动服务。" if installed else
+                    "没有找到 Ollama 的启动程序。请安装并打开一次 Ollama，再回来刷新；已安装时也可先手动打开服务。"}
 
     def server_status(self) -> dict:
         return self._status()
 
     def start_server(self) -> dict:
+        status = self._status()
+        if status.get("running"):
+            return {"ok": True, "message": "Ollama 服务已运行，无需重复启动。"}
+        if status.get("blocked"):
+            return {"ok": False, "message": status["message"]}
         if self._ollama is None:
-            return {"ok": False, "message": "没有找到 ollama 命令，请先安装 Ollama 或将其加入 PATH。"}
+            return {"ok": False, "message": "没有找到 Ollama 启动程序。", "detail": "请安装并打开一次 Ollama，再回来刷新；已安装时可先从开始菜单打开它。"}
+        address = urlparse(self.base_url)
+        if address.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            return {"ok": False, "message": "此处只能启动本机 Ollama。", "detail": "请在模型服务所在电脑上启动它。"}
+        lines = deque(maxlen=32)
         try:
-            subprocess.Popen(
-                [self._ollama, "serve"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            environment = os.environ.copy()
+            environment["OLLAMA_HOST"] = address.netloc
+            process = subprocess.Popen(
+                [self._ollama, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                env=environment, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
-            return {"ok": True, "message": "已尝试启动 ollama serve，稍后刷新状态确认。"}
+            def collect():
+                if process.stderr is not None:
+                    try:
+                        for line in iter(lambda: process.stderr.readline(512), b""):
+                            lines.append(line.decode("utf-8", errors="replace"))
+                    finally:
+                        process.stderr.close()
+            reader = threading.Thread(target=collect, daemon=True)
+            reader.start()
+            for _ in range(12):
+                status = self._status()
+                if status.get("running"):
+                    return {"ok": True, "message": "Ollama 服务已启动并通过就绪检查。"}
+                if process.poll() is not None:
+                    reader.join(timeout=0.2)
+                    detail = safe_diagnostic("".join(lines))
+                    return {"ok": False, "message": f"Ollama 启动进程已退出（代码 {process.returncode}）。",
+                            "detail": _safe_cli_detail(detail, "请检查服务地址、端口占用或重新打开 Ollama。") + (f"\n{detail}" if detail else "")}
+                time.sleep(0.25)
+            return {"ok": False, "message": "Ollama 启动后尚未就绪。", "detail": "进程可能仍在初始化，请稍后刷新；若持续未运行，请检查服务端口。"}
         except OSError as error:
-            return {"ok": False, "message": f"无法启动 ollama serve：{error}"}
+            return {"ok": False, "message": "无法启动 Ollama。", "detail": safe_diagnostic(str(error))}
 
     def stop_server(self) -> dict:
         return {
@@ -408,7 +452,7 @@ class OllamaManager(LocalModelManager):
                 response = client.get(f"{self.base_url}/api/tags")
                 response.raise_for_status()
                 return [item["name"] for item in response.json().get("models", [])]
-        except httpx.RequestError:
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
             return []
 
     def loaded_models(self) -> list[str]:

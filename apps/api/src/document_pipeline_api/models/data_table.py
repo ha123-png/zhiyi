@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -32,6 +33,7 @@ class DataTableRecord(Base):
     # 手动新建/合并表的列定义（[{"key","label","value_type"}]）；内置与模板表留空，
     # 列契约从内置映射或模板字段推导。仅用于无模板驱动的表。
     columns_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    presentation_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -71,6 +73,8 @@ class DataRowRecord(Base):
     )
     item_index: Mapped[int] = mapped_column(Integer)
     row_json: Mapped[str] = mapped_column(Text)
+    input_scope_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    review_pending: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     row_version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

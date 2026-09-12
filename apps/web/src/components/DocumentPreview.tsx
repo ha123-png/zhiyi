@@ -22,6 +22,7 @@ interface DocumentPreviewProps {
   onPageCount?: (count: number) => void;
   /** 多页文件按页上下排列（用于原文件预览）；默认单页模式 */
   flowPages?: boolean;
+  showDownload?: boolean;
 }
 
 interface TextPreviewResponse {
@@ -62,7 +63,11 @@ interface DocxPreviewResponse {
   blocks: DocxBlock[];
 }
 
-export function DocumentPreview({
+export function DocumentPreview(props: DocumentPreviewProps) {
+  return <><DocumentContent {...props} />{props.showDownload !== false && <a className="original-download" href={props.url} download={props.filename}>下载完整原件</a>}</>;
+}
+
+function DocumentContent({
   contentType,
   filename,
   pageNumber,
@@ -129,7 +134,7 @@ function TextDocument({ filename, scale, url }: Pick<DocumentPreviewProps, "file
     return () => controller.abort();
   }, [url]);
 
-  if (error) return <div className="document-preview-error">{error}</div>;
+  if (error) return <div className="document-preview-error"><div>{error}</div><p className="small muted">预览失败不影响已保存的原件，可下载后查看。</p></div>;
   if (!preview) return <div className="document-preview-loading">正在生成原文件预览…</div>;
 
   const previewBaseUrl = url.replace(/\/file$/, "/preview");
@@ -140,7 +145,7 @@ function TextDocument({ filename, scale, url }: Pick<DocumentPreviewProps, "file
       style={{ fontSize: `${scale}rem` }}
     >
       {preview.kind === "markdown" ? <MarkdownDocument text={preview.text} /> : <pre>{preview.text}</pre>}
-      {preview.truncated ? <div className="document-preview-note">内容较长，此处显示前 20 万字。</div> : null}
+      {preview.truncated ? <div className="document-preview-note">预览仅显示开头 {preview.text.length.toLocaleString("zh-CN")} 个字符，后续内容未在此展示。可下载完整原件；这不是模型的读取范围。</div> : null}
       {Array.from({ length: preview.image_count }, (_, index) => (
         <figure className="document-embedded-image" key={index}>
           <figcaption>图片 {index + 1}</figcaption>
@@ -183,7 +188,7 @@ function WordDocument({ filename, url }: { filename: string; url: string }) {
     return () => controller.abort();
   }, [url]);
 
-  if (error) return <div className="document-preview-error">{error}</div>;
+  if (error) return <div className="document-preview-error"><div>{error}</div><p className="small muted">预览失败不影响已保存的原件，可下载后查看。</p></div>;
   if (!preview) return <div className="document-preview-loading">正在生成原文件预览…</div>;
 
   const imageBaseUrl = url.replace(/\/file$/, "/preview");
@@ -276,7 +281,7 @@ function XlsxDocument({ filename, url }: { filename: string; url: string }) {
     return () => controller.abort();
   }, [url]);
 
-  if (error) return <div className="document-preview-error">{error}</div>;
+  if (error) return <div className="document-preview-error"><div>{error}</div><p className="small muted">预览失败不影响已保存的原件，可下载后查看。</p></div>;
   if (!preview) return <div className="document-preview-loading">正在生成原文件预览…</div>;
 
   const sheet = preview.sheets[activeSheet] ?? preview.sheets[0];
@@ -424,7 +429,7 @@ function PdfPage({
     <div className="document-preview-stage pdf-preview-stage">
       <canvas aria-label={`${filename} 第 ${pageNumber} 页`} ref={canvasRef} />
       {rendering ? <div className="document-preview-loading">正在渲染第 {pageNumber} 页…</div> : null}
-      {error ? <div className="document-preview-error">{error}</div> : null}
+      {error ? <div className="document-preview-error"><div>{error}</div><p className="small muted">预览失败不影响已保存的原件，可下载后查看。</p></div> : null}
       {region ? <EvidenceHighlight region={region} /> : null}
     </div>
   );
@@ -466,7 +471,7 @@ function PdfFlow({
     };
   }, [onPageCount, url]);
 
-  if (error) return <div className="document-preview-error">{error}</div>;
+  if (error) return <div className="document-preview-error"><div>{error}</div><p className="small muted">预览失败不影响已保存的原件，可下载后查看。</p></div>;
   if (!document) return <div className="document-preview-loading">正在读取 PDF…</div>;
 
   return (
@@ -543,7 +548,7 @@ function PdfFlowPage({
       <div className="pdf-preview-stage">
         <canvas aria-label={`${filename} 第 ${pageNumber} 页`} ref={canvasRef} />
         {rendering ? <div className="document-preview-loading">正在渲染第 {pageNumber} 页…</div> : null}
-        {error ? <div className="document-preview-error">{error}</div> : null}
+        {error ? <div className="document-preview-error"><div>{error}</div><p className="small muted">预览失败不影响已保存的原件，可下载后查看。</p></div> : null}
       </div>
     </div>
   );

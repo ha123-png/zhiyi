@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from document_pipeline_api.domain.tasks import TaskState, TaskStatus
 from document_pipeline_api.models import (
+    TemplateRecord,
     ConfirmedDocumentRecord,
     DataRowRecord,
     DataRowRevisionRecord,
@@ -29,6 +30,8 @@ from document_pipeline_api.models import (
     ReviewRevisionRecord,
     TaskRecord,
 )
+from document_pipeline_api.services.export_scope import SCOPE_KEY, SCOPE_LABEL, csv_scope_value, export_row_values, table_has_input_scopes
+from document_pipeline_api.services.export_scope import REVIEW_KEY, REVIEW_LABEL, imported_pending_review, table_has_pending_reviews
 from document_pipeline_api.models.task import utc_now
 from document_pipeline_api.schemas.data_tables import (
     ColumnDef,
@@ -128,6 +131,7 @@ def confirm_task(
     *,
     expected_lease_token: str | None = None,
     target_table_id: str | None = None,
+    filename: str | None = None,
 ) -> ConfirmationRead:
     existing = session.get(ConfirmedDocumentRecord, task_id)
     if existing is not None and expected_lease_token is not None:
@@ -247,6 +251,7 @@ def confirm_task(
             raise TaskLeaseLostError("任务租约已被替换，拒绝迟到的自动确认。")
 
     table, rows = _materialize_rows(session, task, extraction, result)
+    session.execute(update(DataRowRecord).where(DataRowRecord.task_id == task.id).values(review_pending=False))
     if existing is None:
         confirmation = ConfirmedDocumentRecord(
             task_id=task_id,
@@ -276,6 +281,8 @@ def confirm_task(
         task.failure_code = None
         task.failure_message = None
         task.updated_at = confirmed_at
+    from document_pipeline_api.services.file_names import confirm_file_name
+    confirm_file_name(task, filename)
     try:
         session.commit()
     except IntegrityError as error:
@@ -370,6 +377,7 @@ def get_data_table(
     ).all()
     row_count = session.scalar(count_query)
     return DataTableDetail(
+        presentation=table_presentation(session, table),
         id=table.id,
         name=table.name,
         template_key=table.template_key,
@@ -384,6 +392,23 @@ def get_data_table(
     )
 
 
+def table_presentation(session: Session, table: DataTableRecord):
+    from document_pipeline_api.schemas.templates import TemplatePresentation
+
+    if table.presentation_json:
+        return TemplatePresentation.model_validate_json(table.presentation_json)
+    if table.document_kind != DocumentKind.CUSTOM.value:
+        return TemplatePresentation()
+    # Hand-made and merged tables have no versioned source template.
+    try:
+        version = int(table.template_version)
+    except (ValueError, TypeError):
+        return TemplatePresentation()
+    if session.get(TemplateRecord, table.template_key) is None:
+        return TemplatePresentation()
+    return get_template_version(session, table.template_key, version).behavior.presentation
+
+
 def table_columns(session: Session, table: DataTableRecord) -> list[ColumnDef]:
     """表的列契约（中文列名 + 分区）。手动/合并表读 columns_json；内置表用固定映射；
     模板表用模板字段。身份字段（来源文件/明细序号）不进入列契约，
@@ -391,7 +416,7 @@ def table_columns(session: Session, table: DataTableRecord) -> list[ColumnDef]:
     columns_json 是表的结构契约，不得根据当前行是否有值裁剪。模板创建的字段即使
     暂时全空也必须保留，否则用户只填写字段 1 后字段 2 会从界面消失。"""
     if table.columns_json:
-        return [ColumnDef(**column) for column in json.loads(table.columns_json)]
+        return _current_field_order(session, table, [ColumnDef(**column) for column in json.loads(table.columns_json)])
     if table.document_kind != DocumentKind.CUSTOM.value:
         builtin_columns = _builtin_template_columns(session, table.document_kind)
         if builtin_columns is not None:
@@ -410,7 +435,7 @@ def table_columns(session: Session, table: DataTableRecord) -> list[ColumnDef]:
         table.template_key,
         int(table.template_version),
     )
-    return [
+    return _current_field_order(session, table, [
         ColumnDef(
             key=field.key,
             label=template.output_mapping.get(field.key, field.label),
@@ -418,7 +443,22 @@ def table_columns(session: Session, table: DataTableRecord) -> list[ColumnDef]:
             section=field.section,
         )
         for field in template.fields
-    ]
+    ])
+
+
+def _current_field_order(session: Session, table: DataTableRecord, columns: list[ColumnDef]) -> list[ColumnDef]:
+    """Project current reading order without rewriting the table's historical schema.
+
+    Only matching key/section/type identities participate. Old or manually added
+    columns retain their relative order after those fields. Values, labels and
+    template/task snapshots remain unchanged.
+    """
+    record = session.get(TemplateRecord, table.template_key)
+    if record is None or record.is_system:
+        return columns
+    latest = get_template(session, record.id)
+    ranks = {(field.key, field.section, field.value_type): index for index, field in enumerate(latest.fields)}
+    return sorted(columns, key=lambda column: ranks.get((column.key, column.section, column.value_type), len(ranks)))
 
 
 def _persisted_columns(session: Session, table: DataTableRecord) -> list[ColumnDef]:
@@ -512,6 +552,9 @@ def export_data_table(session: Session, table_id: str) -> StreamingResponse:
     sheet = workbook.active
     sheet.title = table.name[:31]
     keys, labels = _export_columns(session, table)
+    from document_pipeline_api.services.export_scope import WorkbookInputScopes
+    scopes = WorkbookInputScopes()
+    source_header_keys = {column.key for column in table_columns(session, table) if column.section == "header"}
     # 与数据仓库淡绿表头保持一致：#f0fdf4 / #065f46 / #a7f3d0。
     header_fill = PatternFill("solid", fgColor="F0FDF4")
     for index, key in enumerate(keys, start=1):
@@ -533,6 +576,7 @@ def export_data_table(session: Session, table_id: str) -> StreamingResponse:
         values = [_excel_safe(row.get(key)) for key in keys]
         sheet.append(values)
         row_count += 1
+        scopes.record(sheet, row_count, record, keys, source_header_keys)
         for index, value in enumerate(values):
             max_widths[index] = max(max_widths[index], _display_width(value))
         group_key = record.task_id or row.get("__row_group")
@@ -567,6 +611,7 @@ def export_data_table(session: Session, table_id: str) -> StreamingResponse:
         )
 
     output = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    scopes.finish(workbook)
     workbook.save(output)
     output.seek(0)
     filename = f"{table.name}-{table.template_version}.xlsx"
@@ -600,22 +645,25 @@ def export_data_table_views(session: Session, table_id: str) -> StreamingRespons
     column_defs = {column.key: column for column in table_columns(session, table)}
     workbook = Workbook()
     workbook.remove(workbook.active)
+    from document_pipeline_api.services.export_scope import WorkbookInputScopes
+    scopes = WorkbookInputScopes()
     used_names: set[str] = set()
     matched_ids: set[int] = set()
     for view in views:
         expected = json.loads(view.field_value_json)
         rows = [
             row for row in all_rows
-            if json.loads(row.row_json).get(view.field_key) == expected
+            if (row.task_id if view.field_key == "" else json.loads(row.row_json).get(view.field_key)) == expected
         ]
         matched_ids.update(row.id for row in rows)
         sheet = workbook.create_sheet(_unique_sheet_name(view.name, used_names))
-        _populate_export_sheet(sheet, rows, keys, labels, column_defs)
+        _populate_export_sheet(sheet, rows, keys, labels, column_defs, scopes)
     unmatched = [row for row in all_rows if row.id not in matched_ids]
     if unmatched:
         sheet = workbook.create_sheet(_unique_sheet_name("未分组", used_names))
-        _populate_export_sheet(sheet, unmatched, keys, labels, column_defs)
+        _populate_export_sheet(sheet, unmatched, keys, labels, column_defs, scopes)
     output = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    scopes.finish(workbook)
     workbook.save(output)
     output.seek(0)
     filename = f"{table.name}-分Sheet.xlsx"
@@ -640,7 +688,7 @@ def _unique_sheet_name(raw: str, used: set[str]) -> str:
     return name
 
 
-def _populate_export_sheet(sheet, rows, keys, labels, column_defs) -> None:
+def _populate_export_sheet(sheet, rows, keys, labels, column_defs, scopes) -> None:
     header_fill = PatternFill("solid", fgColor="F0FDF4")
     for index, key in enumerate(keys, start=1):
         cell = sheet.cell(row=1, column=index, value=labels[key])
@@ -655,6 +703,7 @@ def _populate_export_sheet(sheet, rows, keys, labels, column_defs) -> None:
         values = [_excel_safe(values_map.get(key)) for key in keys]
         sheet.append(values)
         row_number += 1
+        scopes.record(sheet, row_number, record, keys, {key for key, column in column_defs.items() if column.section == "header"})
         for index, value in enumerate(values):
             max_widths[index] = max(max_widths[index], _display_width(value))
         group_key = record.task_id or values_map.get("__row_group")
@@ -768,6 +817,8 @@ def _materialize_rows(
                 task_id=task.id,
                 item_index=index,
                 row_json=after_json,
+                input_scope_json=extraction.input_scope_json,
+                review_pending=task.status != TaskStatus.COMPLETED.value,
                 row_version=1,
                 created_at=changed_at,
                 updated_at=changed_at,
@@ -788,6 +839,7 @@ def _materialize_rows(
                 )
             )
             continue
+        current.review_pending = task.status != TaskStatus.COMPLETED.value
         if current.id in user_edited_row_ids:
             # 用户改过的事实值优先，重新物化不得覆盖；但“保存到另一张表”是明确的
             # 路由操作，仍必须移动该行，否则确认记录指向新表、用户行却滞留旧表。
@@ -810,6 +862,7 @@ def _materialize_rows(
                     )
                 )
             continue
+        current.input_scope_json = extraction.input_scope_json
         if current.row_json == after_json and current.table_id == table.id:
             continue
         before_json = current.row_json
@@ -1035,6 +1088,7 @@ def create_table(session: Session, name: str, template_key: str) -> DataTableRea
         template_version="1",
         document_kind=DocumentKind.CUSTOM.value,
         columns_json=json.dumps(columns, ensure_ascii=False),
+        presentation_json=template.behavior.presentation.model_dump_json(),
     )
     session.add(table)
     session.commit()
@@ -1199,6 +1253,8 @@ def merge_tables(
                 task_id=None,
                 item_index=index,
                 row_json=json.dumps(merged_row, ensure_ascii=False),
+                input_scope_json=row.input_scope_json,
+                review_pending=row.review_pending,
                 row_version=1,
             )
             merged_values = json.loads(created.row_json)
@@ -1228,6 +1284,12 @@ def export_data_table_csv(session: Session, table_id: str) -> StreamingResponse:
     if table is None:
         raise HTTPException(status_code=404, detail="没有找到这个数据表。")
     keys, labels = _export_columns(session, table)
+    scoped = table_has_input_scopes(session, table_id)
+    pending = table_has_pending_reviews(session, table_id)
+    if pending and REVIEW_LABEL in labels.values():
+        raise HTTPException(422, "业务列名与知意来源状态说明列冲突，请重命名该业务列后导出。")
+    if scoped and SCOPE_LABEL in labels.values():
+        raise HTTPException(422, "业务列名与知意范围说明列冲突，请重命名该业务列后导出。")
     output = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
     line = StringIO()
     writer = csv.writer(line)
@@ -1239,16 +1301,16 @@ def export_data_table_csv(session: Session, table_id: str) -> StreamingResponse:
         output.write(line.getvalue().encode("utf-8"))
 
     output.write(b"\xef\xbb\xbf")
-    write_csv_row([labels[key] for key in keys])
+    write_csv_row([labels[key] for key in keys] + ([SCOPE_LABEL] if scoped else []) + ([REVIEW_LABEL] if pending else []))
     row_jsons = session.scalars(
-        select(DataRowRecord.row_json)
+        select(DataRowRecord)
         .where(DataRowRecord.table_id == table_id)
         .order_by(*_row_order())
         .execution_options(yield_per=1000)
     )
     for row_json in row_jsons:
-        row = json.loads(row_json)
-        write_csv_row([_csv_safe(row.get(key)) for key in keys])
+        row = export_row_values(row_json)
+        write_csv_row([_csv_safe(row.get(key)) for key in keys] + ([csv_scope_value(row)] if scoped else []) + (["待核对" if row.get(REVIEW_KEY) else ""] if pending else []))
     output.seek(0)
     filename = f"{table.name}.csv"
     disposition = f"attachment; filename=table-{table.id}.csv; filename*=UTF-8''{quote(filename)}"
@@ -1268,7 +1330,7 @@ def export_data_table_json(session: Session, table_id: str) -> StreamingResponse
     output.write(b"[")
     first = True
     row_jsons = session.scalars(
-        select(DataRowRecord.row_json)
+        select(DataRowRecord)
         .where(DataRowRecord.table_id == table_id)
         .order_by(*_row_order())
         .execution_options(yield_per=1000)
@@ -1276,7 +1338,7 @@ def export_data_table_json(session: Session, table_id: str) -> StreamingResponse
     for row_json in row_jsons:
         if not first:
             output.write(b",")
-        output.write(json.dumps(json.loads(row_json), ensure_ascii=False).encode("utf-8"))
+        output.write(json.dumps(export_row_values(row_json), ensure_ascii=False).encode("utf-8"))
         first = False
     output.write(b"]")
     output.seek(0)
@@ -1328,6 +1390,11 @@ def parse_import_rows(
         workbook = load_workbook(BytesIO(content), read_only=False, data_only=True)
         try:
             sheet = workbook.active
+            from document_pipeline_api.services.export_scope import read_workbook_scopes
+            try:
+                row_scopes = read_workbook_scopes(workbook, sheet)
+            except ValueError as error:
+                raise ImportFileError(f"无法恢复 Excel 来源范围：{error}") from error
             if any(merged.min_row == 1 for merged in sheet.merged_cells.ranges):
                 raise ImportFileError(
                     "Excel 第一行包含合并表头，无法确定唯一字段名；请整理为单行表头后再导入。"
@@ -1348,13 +1415,16 @@ def parse_import_rows(
             rows_iter = (
                 tuple(merged_values.get((cell.row, cell.column), cell.value) for cell in row)
                 + (row_groups.get(row[0].row),)
+                + ((row_scopes.get(row[0].row),) if row_scopes else ())
                 for row in sheet.iter_rows()
             )
             header_row = next(rows_iter, None)
             if header_row is None:
                 return []
-            headers = _validate_import_headers(header_row[:-1], max_columns=max_columns)
+            headers = _validate_import_headers(header_row[:-(2 if row_scopes else 1)], max_columns=max_columns)
             headers.append("__row_group")
+            if row_scopes:
+                headers.append(SCOPE_KEY)
             if merged_header_columns:
                 header_labels = [headers[index - 1] for index in sorted(merged_header_columns)]
                 rows_iter = (tuple(row) + (header_labels,) for row in rows_iter)
@@ -1379,6 +1449,7 @@ def _validate_import_headers(
     max_columns: int,
 ) -> list[str]:
     headers = [str(header).strip() if header is not None else "" for header in header_row]
+    headers = [SCOPE_KEY if header == SCOPE_LABEL else REVIEW_KEY if header == REVIEW_LABEL else header for header in headers]
     if len(headers) > max_columns:
         raise ImportFileError(f"导入文件不能超过 {max_columns} 列。")
     if not headers or any(not header for header in headers):
@@ -1477,15 +1548,35 @@ def import_table_rows(
         table.columns_json = json.dumps(
             [column.model_dump() for column in columns], ensure_ascii=False
         )
-    normalized: list[dict[str, object | None]] = []
+    normalized: list[tuple[dict[str, object | None], str | None, bool | None]] = []
     for raw in rows:
+        from document_pipeline_api.schemas.input_scope import InputScope
+        imported_scope = None
+        try:
+            review_pending = imported_pending_review(raw.get(REVIEW_KEY))
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        if raw.get(SCOPE_KEY):
+            try:
+                scope = (InputScope.model_validate(raw[SCOPE_KEY]) if isinstance(raw[SCOPE_KEY], dict)
+                         else InputScope.model_validate_json(str(raw[SCOPE_KEY])))
+                note = "此读取范围随数据文件导入，未重新读取或核验原件；不恢复原文件关联。"
+                if note not in scope.notes:
+                    scope.notes.append(note)
+                imported_scope = scope.model_dump_json()
+            except ValueError as error:
+                raise HTTPException(422, "导入文件中的知意输入范围说明损坏，未导入。请保留原导出说明或明确移除该说明列后再试。") from error
         values: dict[str, object | None] = {}
         for header, value in raw.items():
             header = str(header).strip()
+            if header in {SCOPE_KEY, REVIEW_KEY}:
+                continue
             if header in {"__row_group", "__header_labels"}:
                 if value:
                     values[header] = value
                 continue
+            if header not in header_to_key:
+                raise HTTPException(422, "导入文件包含无法识别的内部字段，请检查表头。")
             key = header_to_key[header]
             if isinstance(value, str) and value.strip() == "":
                 value = None
@@ -1493,7 +1584,7 @@ def import_table_rows(
                 continue
             values[key] = value
         if values:
-            normalized.append(values)
+            normalized.append((values, imported_scope, review_pending))
     max_index = (
         session.scalar(
             select(func.max(DataRowRecord.item_index)).where(DataRowRecord.table_id == table_id)
@@ -1501,13 +1592,15 @@ def import_table_rows(
         or 0
     )
     now = utc_now()
-    for values in normalized:
+    for values, imported_scope, review_pending in normalized:
         max_index += 1
         row = DataRowRecord(
             table_id=table_id,
             task_id=None,
             item_index=max_index,
             row_json=json.dumps(values, ensure_ascii=False),
+            input_scope_json=imported_scope,
+            review_pending=review_pending,
             row_version=1,
             created_at=now,
             updated_at=now,
@@ -1571,6 +1664,8 @@ def create_table_from_import(
         {
             **{f"import_{index}": raw.get(header) for index, header in enumerate(headers, start=1)},
             **({"__row_group": raw.get("__row_group")} if raw.get("__row_group") else {}),
+            **({SCOPE_KEY: raw[SCOPE_KEY]} if raw.get(SCOPE_KEY) else {}),
+            **({REVIEW_KEY: raw[REVIEW_KEY]} if raw.get(REVIEW_KEY) else {}),
         }
         for raw in rows
     ]

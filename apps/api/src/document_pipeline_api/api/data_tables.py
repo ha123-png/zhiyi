@@ -241,7 +241,7 @@ def split_table(
     request: SplitViewsRequest,
     session: SessionDependency,
 ) -> list[DataViewRead]:
-    return create_split_views(session, table_id, request.field_key)
+    return create_split_views(session, table_id, request.field_key, by_file=request.group_by == "file")
 
 
 @router.get("/{table_id}/views", response_model=list[DataViewRead])
@@ -256,6 +256,7 @@ def view(
     session: SessionDependency,
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=500)] = 100,
+    search: str | None = None,
 ) -> DataViewDetail:
     return get_data_view(
         session,
@@ -263,6 +264,7 @@ def view(
         view_id,
         page=page,
         page_size=page_size,
+        search=search,
     )
 
 

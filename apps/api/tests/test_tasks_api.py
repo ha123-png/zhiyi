@@ -417,7 +417,7 @@ def test_text_file_is_rejected_when_office_conversion_disabled(
     assert "Office" in response.json()["detail"]
 
 
-def test_text_page_limit_is_enforced_before_queueing(tmp_path: Path) -> None:
+def test_legacy_page_limit_does_not_reject_text(tmp_path: Path) -> None:
     settings = Settings(
         database_url=f"sqlite:///{tmp_path / 'text-limit.db'}",
         storage_dir=tmp_path / "uploads",
@@ -434,9 +434,10 @@ def test_text_page_limit_is_enforced_before_queueing(tmp_path: Path) -> None:
         )
 
     assert accepted.status_code == 201
-    assert accepted.json()["page_count"] == 2
-    assert rejected.status_code == 422
-    assert "页" in rejected.json()["detail"]
+    assert accepted.json()["page_count"] == 1
+    assert accepted.json()["planned_scope"]["selected"] == [{"kind": "line", "start": 1, "end": 60, "container": None, "columns": None, "character_start": None, "character_end": None}]
+    assert rejected.status_code == 201
+    assert rejected.json()["planned_scope"]["coverage"] == "complete"
 
 
 def test_rejects_oversized_file_without_leaving_artifact(
@@ -495,9 +496,9 @@ def test_pdf_page_count_is_validated_before_queueing(tmp_path: Path) -> None:
 
     assert accepted.status_code == 201
     assert accepted.json()["page_count"] == 2
-    assert rejected.status_code == 422
-    assert "3 页" in rejected.json()["detail"]
-    assert len(list((tmp_path / "uploads").glob("*.pdf"))) == 1
+    assert rejected.status_code == 201
+    assert rejected.json()["planned_scope"]["coverage"] == "complete"
+    assert len(list((tmp_path / "uploads").glob("*.pdf"))) == 2
 
 
 def _multi_frame_image_bytes(*, frames: int, image_format: str = "TIFF") -> bytes:
@@ -598,9 +599,9 @@ def test_multi_frame_image_page_count_and_limit_are_enforced_before_queueing(tmp
 
     assert accepted.status_code == 201
     assert accepted.json()["page_count"] == 2
-    assert rejected.status_code == 422
-    assert "3 页" in rejected.json()["detail"]
-    assert len(list((tmp_path / "uploads").glob("*"))) == 1
+    assert rejected.status_code == 201
+    assert rejected.json()["planned_scope"]["coverage"] == "complete"
+    assert len(list((tmp_path / "uploads").glob("*"))) == 2
 
 
 def test_active_queue_capacity_rejects_upload_without_leaking_file(
@@ -1321,8 +1322,32 @@ def test_tasks_summary_counts_by_status(client: TestClient) -> None:
         session.commit()
 
     summary = client.get("/api/v1/tasks/summary").json()
-    assert summary == {"total": 5, "completed": 2, "needs_review": 1, "failed": 1}
+    assert summary == {"total": 5, "completed": 2, "needs_review": 1, "failed": 1, "active": 2, "waiting_for_action": 0, "pending_exports": 0}
 
     # 带文件名筛选：只统计命中子集（c1/c2 文件名含 "c"）
     filtered = client.get("/api/v1/tasks/summary", params={"search": "c"}).json()
-    assert filtered == {"total": 2, "completed": 2, "needs_review": 0, "failed": 0}
+    assert filtered == {"total": 2, "completed": 2, "needs_review": 0, "failed": 0, "active": 0, "waiting_for_action": 0, "pending_exports": 0}
+
+
+def test_summary_counts_copy_actions_beyond_list_limit_and_excludes_model_failures(client: TestClient) -> None:
+    with client.app.state.session_factory() as session:
+        for index in range(1005):
+            task_id = f"export-{index:04d}"
+            _add_task(session, task_id, status="completed", created_at=datetime(2026, 1, 11, tzinfo=timezone.utc))
+            session.flush()
+            session.get(TaskRecord, task_id).export_state_json = json.dumps({"status": "failed"})
+        _add_task(session, "waiting", status="waiting_for_template", created_at=datetime(2026, 1, 11, tzinfo=timezone.utc))
+        _add_task(session, "model-failure", status="failed", created_at=datetime(2026, 1, 11, tzinfo=timezone.utc))
+        session.commit()
+    summary = client.get("/api/v1/tasks/summary").json()
+    assert summary["pending_exports"] == 1005
+    assert summary["waiting_for_action"] == 1
+    assert summary["failed"] == 1
+    assert summary["completed"] == 1005
+    filtered = client.get("/api/v1/tasks/summary", params={"search": "export-0000"}).json()
+    assert filtered["pending_exports"] == 1
+    assert filtered["waiting_for_action"] == 0
+    first = client.get("/api/v1/tasks", params={"export_pending": True, "limit": 1000}).json()
+    last = client.get("/api/v1/tasks", params={"export_pending": True, "limit": 1000, "offset": 1000}).json()
+    assert len(first) == 1000 and len(last) == 5
+    assert len({task["id"] for task in first + last}) == 1005

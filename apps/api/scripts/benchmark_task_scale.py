@@ -6,7 +6,7 @@
 行为：
 - 在临时 SQLite 库中生成 10000 个任务、少量提取快照，以及真实 data_rows 10 万行。
 - 测量任务/数据表首页、非空末页、搜索、统计，以及 CSV/JSON 导出与 1 万行导入。
-- 结果打印并写入 docs/项目管理/性能报告-ISSUE-067.json。
+- 结果打印并写入本地 `.local/test-runs/performance-report-issue-067.json`。
 
 验收标准（ISSUE-067）：目标 Windows 硬件上首屏与常用翻页在 2 秒内有反馈；
 前后端内存有上限，不一次加载全部历史（前端每页只拉 10 条，本脚本验证服务端响应）。
@@ -253,7 +253,13 @@ def main() -> None:
         ) else "不通过",
     }
 
-    report_path = Path(__file__).resolve().parents[3] / "docs" / "项目管理" / "性能报告-ISSUE-067.json"
+    report_path = (
+        Path(__file__).resolve().parents[3]
+        / ".local"
+        / "test-runs"
+        / "performance-report-issue-067.json"
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     with report_path.open("w", encoding="utf-8", newline="\n") as report_file:
         report_file.write(json.dumps(report, ensure_ascii=False, indent=2))
         report_file.write("\n")

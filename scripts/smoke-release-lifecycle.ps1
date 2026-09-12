@@ -36,6 +36,8 @@ $dataRoot = Join-Path $testRoot "data"
 $installer = Join-Path $installerOutput "Zhiyi-$Version-win-x64-smoke-setup.exe"
 $marker = Join-Path $dataRoot "preserve-me.txt"
 $supervisor = $null
+$otherSupervisor = $null
+$otherDataRoot = Join-Path $testRoot "other-data"
 
 if (-not $testRoot.StartsWith((Join-Path $projectRoot ".local\release-lifecycle"))) {
     throw "Refusing to use a lifecycle directory outside the workspace."
@@ -84,6 +86,19 @@ function Start-IsolatedApplication {
 }
 
 try {
+    # Run the build output as a separate installation. Upgrade/uninstall must
+    # not kill it merely because it shares the Zhiyi.exe filename.
+    $otherExecutable = Join-Path $distRoot "Zhiyi\Zhiyi.exe"
+    $otherPort = $Port + 1
+    $otherSupervisor = Start-Process -FilePath $otherExecutable -ArgumentList "--data-dir", $otherDataRoot, "--port", "$otherPort", "--no-browser" -WindowStyle Hidden -PassThru
+    $otherDeadline = (Get-Date).AddSeconds(20)
+    $otherReady = $false
+    do {
+        Start-Sleep -Milliseconds 250
+        try { $otherReady = (Invoke-RestMethod -Uri "http://127.0.0.1:$otherPort/api/v1/health" -TimeoutSec 1).status -eq "ok" } catch {}
+    } while (-not $otherReady -and (Get-Date) -lt $otherDeadline)
+    if (-not $otherReady) { throw "Separate installation did not become healthy." }
+
     Install-SmokePackage
     Start-IsolatedApplication
     Set-Content -LiteralPath $marker -Encoding ascii -Value "business-data-must-survive"
@@ -144,7 +159,10 @@ try {
         throw "Business data changed during uninstall."
     }
 
-    Write-Output "Lifecycle smoke passed: install, start, upgrade, supervised backup restore, uninstall, data preserved."
+    if ($otherSupervisor.HasExited -or (Invoke-RestMethod -Uri "http://127.0.0.1:$otherPort/api/v1/health" -TimeoutSec 2).status -ne "ok") {
+        throw "Upgrade or uninstall stopped a separate installation."
+    }
+    Write-Output "Lifecycle smoke passed: install, start, upgrade, supervised backup restore, uninstall, data preserved, separate installation unaffected."
 } finally {
     if ($supervisor -and -not $supervisor.HasExited) {
         $executable = Join-Path $installRoot "Zhiyi.exe"
@@ -152,5 +170,9 @@ try {
             & $executable stop --data-dir $dataRoot | Out-Null
         }
         $supervisor.WaitForExit(5 * 1000) | Out-Null
+    }
+    if ($otherSupervisor -and -not $otherSupervisor.HasExited) {
+        & (Join-Path $distRoot "Zhiyi\ZhiyiCLI.exe") stop --data-dir $otherDataRoot | Out-Null
+        $otherSupervisor.WaitForExit(10 * 1000) | Out-Null
     }
 }

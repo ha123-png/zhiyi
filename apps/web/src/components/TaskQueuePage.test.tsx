@@ -176,7 +176,7 @@ describe("TaskQueuePage", () => {
     render(<TaskQueuePage />);
 
     expect(await screen.findByText("m.png")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "批量删除" }));
+    fireEvent.click(screen.getByRole("button", { name: "删除本页待选任务" }));
 
     // 只弹一次确认，无需输入文件名，确认即可删除
     const confirmButton = await screen.findByRole("button", { name: "确认删除" });
@@ -190,6 +190,24 @@ describe("TaskQueuePage", () => {
       ).toBe(true);
     });
     expect(await screen.findByText(/已删除 1 个任务/)).toBeInTheDocument();
+  });
+
+  it("pages pending actions using backend totals instead of the loaded row count", async () => {
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/tasks/summary")) return Promise.resolve({ ok: true, json: async () => ({ waiting_for_action: 51, pending_exports: 0 }) });
+      if (url.includes("status=waiting_for_template")) return Promise.resolve({ ok: true, json: async () => [{ ...BASE_TASK, id: url.includes("offset=50") ? "last" : "first", filename: url.includes("offset=50") ? "最后一页.png" : "第一页.png", status: "waiting_for_template", candidate_templates: [] }] });
+      return Promise.resolve({ ok: true, json: async () => [] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<TaskQueuePage />);
+    await screen.findByText("第一页.png");
+    expect(screen.getByText(/共 51 份/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "下一页待选" }));
+    await screen.findByText("最后一页.png");
+    expect(screen.queryByText("第一页.png")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "下一页待选" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "上一页待选" })).toBeEnabled();
   });
 
   it("keeps old waiting tasks and offers every active template", async () => {
@@ -227,7 +245,7 @@ describe("TaskQueuePage", () => {
           ],
         });
       }
-      if (url.includes("active_only=true")) {
+      if (url.includes("active_only=true") || url.includes("status=waiting_for_template")) {
         return Promise.resolve({ ok: true, json: async () => [waitingTask] });
       }
       return Promise.resolve({ ok: true, json: async () => [] });

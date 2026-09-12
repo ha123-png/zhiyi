@@ -22,6 +22,8 @@ from document_pipeline_api.models import DataRowRecord, DataTableRecord, TaskRec
 from document_pipeline_api.schemas.extraction import DocumentExtraction, DocumentKind
 from document_pipeline_api.services.data_tables import confirm_task
 from image_test_data import PNG_BYTES
+from fastapi.testclient import TestClient
+from document_pipeline_api.services.extraction import process_task
 
 
 def _mcp_params(data_dir: Path, *, write_enabled: bool = False) -> StdioServerParameters:
@@ -158,7 +160,7 @@ def _parse_result(call_result) -> object:
     """从 CallToolResult 提取结构化数据（structuredContent 的 result 键或文本 JSON）。"""
     if call_result.structuredContent is not None:
         value = call_result.structuredContent.get("result")
-        if value is not None:
+        if value is not None and set(call_result.structuredContent) == {"result"}:
             return value
         return call_result.structuredContent
     text = call_result.content[0].text if call_result.content else "[]"
@@ -267,3 +269,60 @@ async def _write_via_stdio(data_dir: Path, row_id: int) -> None:
                 {"file_path": str(data_dir.parent / "outside.png")},
             )
             assert escaped.isError is True
+
+
+def test_mcp_full_file_progress_review_table_export_chain(tmp_path: Path):
+    """Real stdio transport; deterministic model keeps CI offline and reproducible."""
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'document-pipeline.db'}", storage_dir=tmp_path / "uploads")
+    class Model:
+        model_name = "offline-mcp-fixture"
+        def complete_text(self, prompt, result_type):
+            assert "合成读书会" in prompt
+            return result_type.model_validate({"header": {"title": "合成读书会"}, "items": []})
+    with TestClient(create_app(settings)) as api:
+        template = api.post("/api/v1/templates", json={"name": "会议记录", "fields": [{"key": "title", "label": "名称"}],
+            "deterministic_rules": [{"kind": "required", "field": "header.title"}]}).json()
+        source = tmp_path / "meeting.txt"
+        raw = "合成读书会，测试材料，无用户信息。".encode()
+        source.write_bytes(raw)
+        async def journey():
+            async with stdio_client(_mcp_params(tmp_path, write_enabled=True)) as (read, write):
+                async with ClientSession(read, write) as mcp:
+                    await mcp.initialize()
+                    capabilities = _parse_result(await mcp.call_tool("get_capabilities", {}))
+                    assert capabilities["table_export"] is True
+                    imported = await mcp.call_tool("create_task_from_file", {"file_path": str(source), "template_id": template["id"]})
+                    assert not imported.isError
+                    task = _parse_result(imported)
+                    paused = _parse_result(await mcp.call_tool("control_task", {"task_id": task["id"], "action": "pause"}))
+                    assert paused["status"] == "paused"
+                    await mcp.call_tool("control_task", {"task_id": task["id"], "action": "resume"})
+                    with api.app.state.session_factory() as session:
+                        result = process_task(session, settings, task["id"], client=Model())
+                        assert result is not None
+                    status = _parse_result(await mcp.call_tool("get_task", {"task_id": task["id"]}))
+                    assert status["status"] in {"needs_review", "completed"}
+                    extracted = _parse_result(await mcp.call_tool("get_task_result", {"task_id": task["id"]}))
+                    assert extracted["result"]["header"]["title"] == "合成读书会"
+                    # Confirmation remains the existing explicit product action.
+                    confirmed = api.post(f"/api/v1/tasks/{task['id']}/confirm", json={"expected_review_version": result.review_version})
+                    assert confirmed.status_code == 200
+                    table_id = confirmed.json()["table_id"]
+                    table = _parse_result(await mcp.call_tool("get_data_table", {"table_id": table_id}))
+                    row = table["rows"][0]
+                    update = {"table_id": table_id, "row_id": row["id"], "expected_version": row["version"], "changes": {"title": "合成读书会（核对后）"}}
+                    changed = await mcp.call_tool("update_data_row", update)
+                    assert not changed.isError
+                    stale = await mcp.call_tool("update_data_row", update)
+                    assert stale.isError
+                    output = tmp_path / "export.json"
+                    args = {"table_id": table_id, "output_path": str(output), "format": "json"}
+                    exported = await mcp.call_tool("export_data_table", args)
+                    assert not exported.isError
+                    original_export = output.read_bytes()
+                    assert "合成读书会（核对后）" in original_export.decode("utf-8-sig")
+                    assert (await mcp.call_tool("export_data_table", args)).isError
+                    assert output.read_bytes() == original_export
+                    assert (await mcp.call_tool("export_data_table", {**args, "output_path": str(tmp_path.parent / "outside.json")})).isError
+                    assert source.read_bytes() == raw
+        asyncio.run(journey())

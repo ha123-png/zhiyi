@@ -127,11 +127,6 @@ export function Sidebar({ active, onNavigate }: SidebarProps) {
       </div>
 
       <div className="sidebar-footer">
-        <div className="nav-section-title">队列</div>
-        <div className="queue-pill">
-          <span className="queue-dot processing" />
-          <span>处理中</span>
-        </div>
         <button
           aria-label={collapsed ? "展开侧边栏" : "收起侧边栏"}
           className="icon-button sidebar-toggle"

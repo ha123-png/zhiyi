@@ -3,6 +3,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import BaseModel
 
 from document_pipeline_api.model_providers import (
     OllamaProvider,
@@ -15,6 +16,35 @@ from document_pipeline_api.model_providers.base import (
     ModelUnavailableError,
 )
 from document_pipeline_api.schemas.extraction import DocumentExtraction
+
+
+@pytest.mark.parametrize("visual", [False, True])
+def test_custom_system_prompt_keeps_json_instruction(tmp_path: Path, visual: bool) -> None:
+    class Result(BaseModel):
+        answer: str
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        system = payload["messages"][0]["content"]
+        assert "遵循原件" in system
+        assert "JSON" in system
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": '{"answer":"OK"}'}}],
+        })
+
+    provider = OpenAICompatibleProvider(
+        "http://local.test/v1", "test-model",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    if visual:
+        source = tmp_path / "source.png"
+        source.write_bytes(b"image")
+        result = provider.extract_images(
+            [source], "读取", Result, system_prompt="遵循原件",
+        )
+    else:
+        result = provider.complete_text("读取", Result, system_prompt="遵循原件")
+    assert result.answer == "OK"
 
 
 def test_lists_available_models() -> None:
@@ -304,7 +334,7 @@ def test_openai_compatible_connect_refused_gives_plain_actionable_message(
     with pytest.raises(ModelUnavailableError) as caught:
         provider.extract_image(image, "提取", DocumentExtraction)
     message = str(caught.value)
-    assert "无法连接本地模型服务" in message
+    assert "无法连接模型服务" in message
     assert "127.0.0.1:1234" in message
     assert "LM Studio" in message
     assert "结构化输出" not in message
@@ -336,3 +366,29 @@ def test_openai_compatible_http_error_includes_server_reply(
     assert "model 'qwen3.5-4b' not found" in message
     assert "模型名称" in message
     assert "结构化输出" not in message
+
+
+def test_complete_endpoint_is_normalized_and_length_stop_is_not_success():
+    class Result(BaseModel):
+        value: str
+    def reply(request):
+        assert str(request.url) == "https://provider.test/v1/chat/completions"
+        assert "max_tokens" not in json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"finish_reason": "length", "message": {"content": '{"value":"partial"}'}}]})
+    provider = OpenAICompatibleProvider("https://provider.test/v1/chat/completions/", "example",
+        client=httpx.Client(transport=httpx.MockTransport(reply)))
+    with pytest.raises(ModelResponseError, match="输出未完成"):
+        provider.complete_text("读取", Result)
+
+
+def test_ollama_gateway_key_and_native_context_are_sent():
+    class Result(BaseModel):
+        value: str
+    def reply(request):
+        assert str(request.url) == "https://gateway.test/api/chat"
+        assert request.headers["authorization"] == "Bearer synthetic-test-key"
+        assert json.loads(request.content)["options"]["num_ctx"] == 16384
+        return httpx.Response(200, json={"message": {"content": '{"value":"ok"}'}})
+    provider = OllamaProvider("https://gateway.test/api/chat", "local", api_key="synthetic-test-key", context_length=16384,
+        client=httpx.Client(transport=httpx.MockTransport(reply)))
+    assert provider.complete_text("读取", Result).value == "ok"

@@ -304,7 +304,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
             ) : (
               <span className="badge muted">未验证</span>
             )}
-            <span className="small muted">由真实图片请求判定。连接或接口异常只会显示“未验证”，不会误判为仅文本；仅文本方案不能用于文档提取。</span>
+            <span className="small muted">由真实图片请求判定。连接或接口异常只会显示“未验证”，不会误判为仅文本；仅文本方案可处理纯文本和 Office 正文；包含图片的输入需要多模态模型。</span>
           </div>
         </div>
         <div className="form-field" style={{ alignSelf: "flex-end" }}>

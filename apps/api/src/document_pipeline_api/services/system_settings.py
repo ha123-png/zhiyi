@@ -27,3 +27,8 @@ def get_bool_setting(session: Session, key: str, default: bool = True) -> bool:
 
 def set_bool_setting(session: Session, key: str, value: bool) -> None:
     set_setting(session, key, "true" if value else "false")
+
+
+def upload_limit_bytes(session: Session, fallback: int) -> int:
+    value = get_setting(session, "upload_limit_mb", "")
+    return int(value) * 1024 * 1024 if value else fallback

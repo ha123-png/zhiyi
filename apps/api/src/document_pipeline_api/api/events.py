@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.models.task import TaskRecord
@@ -47,6 +47,7 @@ def poll_task_changes(
             TaskRecord.filename,
             TaskRecord.failure_message,
             TaskRecord.updated_at,
+            func.json_extract(TaskRecord.export_state_json, "$.status").label("export_status"),
         )
         .where(TaskRecord.updated_at > last_poll)
         .order_by(TaskRecord.updated_at)
@@ -60,6 +61,7 @@ def poll_task_changes(
             "status": row.status,
             "filename": row.filename,
             "failure_message": row.failure_message,
+            "export_status": row.export_status,
         }
         for row in rows
     ]

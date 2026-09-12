@@ -22,18 +22,21 @@ class _FakeProvider:
         self.closed = False
         self.last_system_prompt: str | None = None
         self.used_text_only = False
+        self.last_prompt = ""
 
     @property
     def model_name(self) -> str:
         return "fake"
 
     def extract_images(self, image_paths, prompt, result_type, *, system_prompt=None):
+        self.last_prompt = prompt
         self.last_system_prompt = system_prompt
         if self._error is not None:
             raise self._error
         return self._result
 
     def complete_text(self, prompt, result_type, *, system_prompt=None):
+        self.last_prompt = prompt
         self.last_system_prompt = system_prompt
         self.used_text_only = True
         if self._error is not None:
@@ -93,6 +96,20 @@ def test_generate_returns_cleaned_fields(client: TestClient) -> None:
     assert draft.fields[1].value_type == "number"
     assert all(field.section in {"header", "item"} for field in draft.fields)
     assert fake.closed is False  # 外部注入的 client 由调用方负责关闭
+
+
+def test_ai_ignores_obsolete_presentation_choices(client):
+    fake = _FakeProvider(AiGeneratedTemplate(
+        name="错题", presentation_mode="card", title_field_label="题目",
+        collapsed_field_labels=["答案", "不存在"],
+        fields=[AiGeneratedField(label="题目", section="item"), AiGeneratedField(label="答案", section="item")],
+    ))
+    draft = _run_generate(client, fake=fake, requirement="错题卡片")
+    assert draft.behavior.presentation.mode == "card"
+    assert draft.behavior.presentation.title_field is None
+    assert draft.behavior.presentation.collapsed_fields == []
+    assert draft.behavior.requires_complete_input is True
+    assert draft.behavior.suggest_filename is False
 
 
 def test_generate_accepts_safe_rules_and_rejects_invalid_references(
@@ -233,7 +250,7 @@ def test_generate_drops_blank_labels_and_caps_at_20(client: TestClient) -> None:
 
 def test_generate_requires_requirement(client: TestClient) -> None:
     with pytest.raises(Exception) as error:
-        _run_generate(client, fake=_FakeProvider(AiGeneratedTemplate()), requirement="   ")
+        _run_generate(client, fake=_FakeProvider(AiGeneratedTemplate.model_construct(fields=[])), requirement="   ")
     assert error.value.status_code == 422
 
 
@@ -469,3 +486,21 @@ def test_extract_json_text_strips_chitchat_and_fences() -> None:
     # 围栏 + 前缀废话同时存在
     both = '```json\n好的：\n{"name": "送货单", "fields": []}\n```'
     assert _extract_json_text(both) == '{"name": "送货单", "fields": []}'
+
+
+def test_generation_contract_names_explicit_choices_and_reports_fallbacks(client):
+    from document_pipeline_api.services.template_ai import OUTPUT_FORMAT_HINT, SYSTEM_PROMPT
+    fake = _FakeProvider(AiGeneratedTemplate(name="需求验证", presentation_mode="card", fields=[
+        AiGeneratedField(label="日期", section="header", value_type="text"),
+        AiGeneratedField(label="金额", section="header", value_type="text"),
+    ]))
+    draft = _run_generate(client, fake=fake, requirement="两个字段日期和金额，全部文本，默认卡片", images=0)
+    assert draft.behavior.presentation.mode == "card"
+    assert [f.value_type for f in draft.fields] == ["text", "text"]
+    assert draft.warnings == []
+    assert '"presentation_mode"' in OUTPUT_FORMAT_HINT
+    assert "全部文本" in SYSTEM_PROMPT
+    assert "两个字段日期和金额，全部文本，默认卡片" in fake.last_prompt
+    fallback = _run_generate(client, fake=_FakeProvider(AiGeneratedTemplate(fields=[AiGeneratedField(label="内容")])), requirement="内容", images=0)
+    assert fallback.behavior.presentation.mode == "table"
+    assert len(fallback.warnings) == 2

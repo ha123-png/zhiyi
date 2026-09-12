@@ -40,7 +40,7 @@ describe("App", () => {
       screen.getByRole("heading", { name: "任务队列" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "活动任务" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "待选模板/表" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "待处理事项" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "最近完成" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "失败任务" })).toBeInTheDocument();
     expect(await screen.findByText(/任务消费者在线/)).toHaveTextContent(

@@ -46,8 +46,11 @@ import type {
 } from "../types";
 import { Icon } from "./Icon";
 import { DocumentPreview } from "./DocumentPreview";
+import { InputScopeDetails, PartialInputAction } from "./InputScopeDetails";
+import { FileNameConfirmation } from "./FileNameConfirmation";
 import { EditableText } from "./EditableText";
 import { parseServerTime, serverDate } from "../time";
+import { evidenceDescription } from "../evidence";
 
 function formatDateTime(iso: string): string {
   const d = serverDate(iso);
@@ -74,8 +77,6 @@ interface ValidationIssue {
   index: number;
   ignored: boolean;
 }
-
-type FieldEvidence = NonNullable<Extraction["evidence"]>[number];
 
 const documentHeaderLabels: Record<string, string> = {
   document_type: "票据类型",
@@ -200,13 +201,14 @@ const BATCH_ACTIVE_STATUSES = new Set<Task["status"]>([
   // 暂停后仍保持 SSE/轮询监听；否则恢复队列时这个 effect 已卸载，
   // 后续完成事件无法刷新提取预览。
   "paused",
+  "waiting_for_template",
 ]);
 const BATCH_STATUS_LABEL: Record<string, string> = {
   created: "等待中",
   queued: "等待中",
   processing: "处理中",
   validating: "校验中",
-  waiting_for_template: "待选模板/表",
+  waiting_for_template: "待处理事项",
   completed: "已完成",
   needs_review: "待确认",
   paused: "已暂停",
@@ -399,18 +401,6 @@ function editedValue(raw: string, previous: TemplateValue | undefined): Template
   return value;
 }
 
-function evidenceDescription(evidence: FieldEvidence | undefined): string {
-  if (!evidence) return "该字段没有可用的来源定位";
-  if (evidence.status === "located") {
-    return evidence.quote
-      ? `已定位：${evidence.quote}`
-      : "已定位到原文件区域";
-  }
-  if (evidence.status === "page_only") return `仅确认来自第 ${evidence.page_number ?? 1} 页，暂无可靠区域`;
-  if (evidence.status === "user_edited") return "该值经过人工修改，原定位已失效";
-  return "当前模型没有提供可靠页码或区域";
-}
-
 // 记住用户上次的模板选择（智能匹配 / 手动 + 模板）：默认沿用上次用过的模式，
 // 而不是每次回到页面都重置成智能匹配
 const LAST_UPLOAD_MODE_KEY = "last-upload-mode-v1";
@@ -497,6 +487,7 @@ export function ExtractPage({
   const [targetTableId, setTargetTableId] = useState<string>("");
   const [task, setTask] = useState<Task | null>(null);
   const [extraction, setExtraction] = useState<Extraction | null>(null);
+  const [nameChoices, setNameChoices] = useState<Record<string, string>>({});
   const [draftResult, setDraftResult] = useState<ExtractionResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -506,6 +497,7 @@ export function ExtractPage({
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const resultSectionRef = useRef<HTMLDivElement | null>(null);
+  const scrolledHistoryTaskRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!demo) return;
@@ -692,6 +684,11 @@ export function ExtractPage({
     setPreviewPage(1);
     setPreviewPageCount(initialTask.page_count ?? 1);
     setSelectedEvidencePath(null);
+    if (initialTask.status === "waiting_for_template") {
+      setExtraction(null); setDraftResult(null); setLoading(false);
+      setBatch((current) => current.some((item) => item.task.id === initialTask.id) ? current : [...current, { task: initialTask }]);
+      return;
+    }
     getExtraction(initialTask.id)
       .then((result) => {
         if (cancelled) return;
@@ -711,6 +708,12 @@ export function ExtractPage({
       cancelled = true;
     };
   }, [initialTask]);
+
+  useEffect(() => {
+    if (!initialTask || extraction?.task_id !== initialTask.id || scrolledHistoryTaskRef.current === initialTask.id) return;
+    scrolledHistoryTaskRef.current = initialTask.id;
+    resultSectionRef.current?.scrollIntoView({ block: "start", behavior: "auto" });
+  }, [initialTask, extraction]);
 
   const hasExtractData = extraction !== null && task !== null;
   const extractedSourceName = task?.filename ?? "";
@@ -738,11 +741,12 @@ export function ExtractPage({
   );
 
   const templateDisplayName = (() => {
-    const prefix = matchMode === "auto" ? "智能匹配" : "手动";
+    // Upload controls describe the next file, never how a historical result was produced.
+    const prefix = task ? (task.template_mode === "smart" ? "智能匹配" : "手动") : null;
     if (extraction?.template) {
-      return `${prefix} · ${extraction.template.name}`;
+      return `${prefix ? `${prefix} · ` : ""}${extraction.template.name}`;
     }
-    return `${prefix} · 待识别模板`;
+    return "待识别模板";
   })();
 
   function zoomPreview(delta: number) {
@@ -873,6 +877,7 @@ export function ExtractPage({
           });
           if (!changed) return;
           setBatch(refreshedBatch);
+          setTask((current) => current ? byId.get(current.id) ?? current : current);
           onTasksChange?.();
           const latestResult = refreshedBatch
             .map((item) => item.task)
@@ -913,6 +918,7 @@ export function ExtractPage({
         extraction.review_version,
         draftResult,
         ignoredIndices,
+        nameChoices[task.id],
       );
       setExtraction(updated);
       setDraftResult(structuredClone(updated.result));
@@ -1214,7 +1220,11 @@ export function ExtractPage({
             )}
           </div>
 
-          {!showExtractData && (
+          {task?.pending_reason === "input_scope" && <PartialInputAction task={task} onUpdated={onTasksChange} />}
+          {extraction?.input_scope?.coverage === "partial" && <p className="small muted">仅处理部分内容</p>}
+          {task && extraction?.file_name && <FileNameConfirmation original={task.filename} state={extraction.file_name}
+            value={nameChoices[task.id]} disabled={saving} onChange={(name) => setNameChoices((current) => ({ ...current, [task.id]: name }))} />}
+          {!showExtractData && task?.pending_reason !== "input_scope" && (
             <div className="extract-empty">
               {loading || batchActive ? (
                 // 计时信息与长句提示由顶部全局任务条承担，这里只保留转圈
@@ -1588,6 +1598,8 @@ export function ExtractPage({
           </div>
         </div>
       </div>
+
+      {extraction?.input_scope && <InputScopeDetails scope={extraction.input_scope} label="来源与处理详情" />}
 
       {/* 原文件放大模态 */}
       {previewFullscreen && (

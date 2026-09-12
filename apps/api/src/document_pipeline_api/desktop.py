@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import sqlite3
+from contextlib import closing
 import ctypes
 import traceback
 import sys
 import threading
 import time
+import tempfile
 from urllib.parse import urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 from pathlib import Path
 
 from document_pipeline_api.runtime_paths import default_data_dir
+from document_pipeline_api.services.file_copies import publish_original_copy, validate_copy_name
 
 _ERROR_ALREADY_EXISTS = 183
 _WINDOW_WIDTH = 1440
@@ -22,7 +28,7 @@ _WINDOW_HEIGHT = 920
 
 class _DesktopApi:
     def __init__(self, data_dir: Path) -> None:
-        self.data_dir = data_dir
+        self._data_dir = data_dir
         # pywebview exposes public bridge members to JavaScript recursively.
         # A public Window reference creates a cycle (api -> window -> api) and
         # can block the UI thread while the bridge is being registered.
@@ -38,12 +44,26 @@ class _DesktopApi:
                 return Path(value).expanduser().resolve()
         except (OSError, TypeError, json.JSONDecodeError):
             pass
-        return (self.data_dir / "output").resolve()
+        return (self._data_dir / "output").resolve()
 
     def get_export_directory(self) -> str:
         return str(self._configured_export_directory())
 
     def choose_export_directory(self) -> str | None:
+        selected = self.choose_folder()
+        if selected is None:
+            return None
+        self._settings_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._settings_path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps({"export_directory": selected}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temporary.replace(self._settings_path)
+        return selected
+
+    def choose_folder(self) -> str | None:
+        """Pick a folder without changing the global manual-export preference."""
         if self._window is None:
             return None
         import webview
@@ -52,16 +72,34 @@ class _DesktopApi:
         if not result:
             return None
         selected = Path(result[0] if isinstance(result, (list, tuple)) else result).resolve()
-        self._settings_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._settings_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps({"export_directory": str(selected)}, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        temporary.replace(self._settings_path)
         return str(selected)
 
+    def open_export_folder(self, task_id: str) -> str:
+        """Open a recorded copy's parent, without granting file-management rights."""
+        if not isinstance(task_id, str) or not task_id or len(task_id) > 128:
+            raise ValueError("任务标识无效。")
+        database = (self._data_dir / "document-pipeline.db").resolve()
+        try:
+            with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
+                row = connection.execute("SELECT export_state_json FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            state = json.loads(row[0]) if row and row[0] else {}
+        except (sqlite3.Error, ValueError, TypeError):
+            raise ValueError("无法读取副本位置，请刷新知意后重试。") from None
+        if not isinstance(state, dict) or state.get("status") != "completed" or not isinstance(state.get("actual_path"), str) or not state["actual_path"]:
+            raise ValueError("这份文件没有已完成的副本导出记录。")
+        path = Path(state["actual_path"])
+        if not path.is_absolute():
+            raise ValueError("记录的副本位置无效。")
+        try:
+            if not path.is_file():
+                raise ValueError("原副本位置已不可用，文件可能已移动、改名或删除。知意内部原件预览不受影响；不会自动重建副本。")
+            os.startfile(str(path.parent), "explore")
+        except OSError:
+            raise ValueError("无法打开副本文件夹，请检查磁盘连接、目录权限或资源管理器。内部原件预览不受影响。") from None
+        return str(path.parent)
+
     def _export_target(self, filename: str) -> Path:
+        validate_copy_name(filename)
         safe_name = Path(filename).name
         if not safe_name or safe_name != filename:
             raise ValueError("导出文件名无效。")
@@ -98,18 +136,22 @@ class _DesktopApi:
         return ValueError("下载失败，请稍后重试。")
 
     def _download_to_target(self, url: str, target: Path) -> str:
-        temporary = target.with_name(f".{target.name}.partial")
         try:
-            with urlopen(url, timeout=60) as response, temporary.open("wb") as output:
-                while chunk := response.read(1024 * 1024):
-                    output.write(chunk)
-            temporary.replace(target)
-            return str(target)
+            with tempfile.TemporaryDirectory(prefix="zhiyi-export-") as staging:
+                source = Path(staging) / "download"
+                digest = hashlib.sha256()
+                size = 0
+                with urlopen(url, timeout=60) as response, source.open("wb") as output:
+                    while chunk := response.read(1024 * 1024):
+                        digest.update(chunk)
+                        size += len(chunk)
+                        output.write(chunk)
+                published = publish_original_copy(source, target.parent, target.name,
+                    expected_sha256=digest.hexdigest(), expected_size=size)
+                return str(published.path)
         except (HTTPError, URLError) as error:
-            temporary.unlink(missing_ok=True)
             raise self._friendly_download_error(error) from None
         except OSError:
-            temporary.unlink(missing_ok=True)
             raise ValueError("无法保存文件，请检查导出文件夹是否可写或磁盘空间是否充足。") from None
 
     def export_template(self, filename: str, content: str) -> str:
@@ -119,8 +161,13 @@ class _DesktopApi:
         if not isinstance(content, str) or len(content.encode("utf-8")) > 4 * 1024 * 1024:
             raise ValueError("字段模板内容无效或过大。")
         target = self._export_target(filename)
-        target.write_text(content, encoding="utf-8")
-        return str(target)
+        data = content.encode("utf-8")
+        with tempfile.TemporaryDirectory(prefix="zhiyi-template-export-") as staging:
+            source = Path(staging) / "template.json"
+            source.write_bytes(data)
+            published = publish_original_copy(source, target.parent, target.name,
+                expected_sha256=hashlib.sha256(data).hexdigest(), expected_size=len(data))
+            return str(published.path)
 
     def download_task_file(self, url: str, filename: str) -> str:
         """通过本地 API 下载任务原文件，避免依赖 WebView 浏览器下载。"""
@@ -147,15 +194,18 @@ class _DesktopApi:
 class _DesktopInstance:
     """Process-wide Windows mutex acquired before starting the supervisor."""
 
-    def __init__(self) -> None:
+    def __init__(self, title: str = "知意") -> None:
         self.handle: int | None = None
         self.already_running = False
+        self._mutex_name = "Local\\ZhiyiDesktopWindow"
+        if title != "知意":
+            self._mutex_name += "-" + hashlib.sha256(title.encode("utf-8")).hexdigest()[:24]
 
     def __enter__(self) -> "_DesktopInstance":
         if sys.platform == "win32":
             kernel32 = ctypes.windll.kernel32
             kernel32.SetLastError(0)
-            self.handle = kernel32.CreateMutexW(None, False, "Local\\ZhiyiDesktopWindow")
+            self.handle = kernel32.CreateMutexW(None, False, self._mutex_name)
             if not self.handle:
                 raise ctypes.WinError()
             self.already_running = kernel32.GetLastError() == _ERROR_ALREADY_EXISTS
@@ -193,7 +243,7 @@ def _show_desktop_error(message: str) -> None:
         ctypes.windll.user32.MessageBoxW(None, message, "知意启动失败", 0x10)
 
 
-def _center_window(window: object, webview: object) -> None:
+def _center_window(window: object, webview: object, title: str = "知意") -> None:
     """Center the native window before its first visible paint."""
     if sys.platform == "win32":
         class Rect(ctypes.Structure):
@@ -209,7 +259,7 @@ def _center_window(window: object, webview: object) -> None:
             ]
 
         user32 = ctypes.windll.user32
-        handle = user32.FindWindowW(None, "知意")
+        handle = user32.FindWindowW(None, title)
         bounds = Rect()
         info = MonitorInfo()
         info.size = ctypes.sizeof(MonitorInfo)
@@ -290,21 +340,21 @@ def _existing_desktop_url(data_dir: Path) -> str | None:
         return None
 
 
-def run_desktop(data_dir: Path | None = None, explicit_port: int | None = None) -> None:
+def run_desktop(data_dir: Path | None = None, explicit_port: int | None = None, *, window_title: str = "知意") -> None:
     """Start API/worker services and host the UI in a native WebView2 window."""
     active_data_dir = (data_dir or default_data_dir()).resolve()
-    with _DesktopInstance() as instance:
+    with _DesktopInstance(window_title) as instance:
         if instance.already_running:
             # The primary process may still be creating its window. Never keep
             # a second GUI process alive while waiting: an immediate click can
             # focus an existing window, and an early click simply returns while
             # the primary window finishes appearing.
-            _focus_existing_window()
+            _focus_existing_window(window_title)
             return
-        _run_primary_desktop(active_data_dir, explicit_port)
+        _run_primary_desktop(active_data_dir, explicit_port, window_title)
 
 
-def _run_primary_desktop(active_data_dir: Path, explicit_port: int | None) -> None:
+def _run_primary_desktop(active_data_dir: Path, explicit_port: int | None, window_title: str = "知意") -> None:
     from document_pipeline_api.supervisor import run_supervisor
 
     shutdown = threading.Event()
@@ -331,7 +381,7 @@ def _run_primary_desktop(active_data_dir: Path, explicit_port: int | None) -> No
         url = _wait_for_desktop_url(active_data_dir, supervisor, errors)
     except RuntimeError:
         existing_url = _existing_desktop_url(active_data_dir)
-        if existing_url and _focus_existing_window():
+        if existing_url and _focus_existing_window(window_title):
             supervisor.join(timeout=2)
             return
         raise
@@ -345,7 +395,7 @@ def _run_primary_desktop(active_data_dir: Path, explicit_port: int | None) -> No
         )
         desktop_api = _DesktopApi(active_data_dir)
         window = webview.create_window(
-            "知意",
+            window_title,
             url=url,
             width=_WINDOW_WIDTH,
             height=_WINDOW_HEIGHT,
@@ -360,7 +410,7 @@ def _run_primary_desktop(active_data_dir: Path, explicit_port: int | None) -> No
             raise RuntimeError("无法创建知意桌面窗口。")
         desktop_api._window = window
         window.events.closed += shutdown.set
-        window.events.before_show += lambda: _center_window(window, webview)
+        window.events.before_show += lambda: _center_window(window, webview, window_title)
         icon = _application_icon()
         webview.start(
             gui="edgechromium",

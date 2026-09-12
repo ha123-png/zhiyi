@@ -32,12 +32,60 @@ export type TaskStatus =
 
 export type TemplateMode = "smart" | "manual" | "invoice" | "delivery";
 
+export interface SourceRange {
+  character_start?: number | null;
+  character_end?: number | null;
+  kind: "page" | "frame" | "line" | "paragraph" | "table_row" | "sheet_row" | "image" | "document_part";
+  start: number;
+  end: number;
+  container: string | null;
+  columns: number | null;
+}
+
+export interface InputScope {
+  version: number;
+  rule: "all" | "head_tail_v1" | "prefix_v1";
+  coverage: "complete" | "partial";
+  selected: SourceRange[];
+  omitted: { location: SourceRange; reason: "input_budget" | "images_disabled" | "unsupported_image" | "unsupported_structure" }[];
+  selected_units: number;
+  total_units: number;
+  text_characters: number;
+  text_budget: number;
+  image_budget: number;
+  notes: string[];
+}
+
+export interface FileExportState {
+  status: "disabled" | "awaiting_confirmation" | "pending" | "exporting" | "completed" | "failed" | "skipped" | "needs_rebind";
+  parent_path: string | null;
+  destination: string | null;
+  actual_path: string | null;
+  confirmed_name: string | null;
+  error_code: string | null;
+  error_message: string | null;
+}
+
+export interface FileNameState {
+  status: "pending" | "confirmed";
+  suggested_filename: string;
+  confirmed_filename: string | null;
+  source_fields: string[];
+  explanation: string;
+}
+
 export interface Task {
   id: string;
   filename: string;
   content_type: string;
   size_bytes: number;
   page_count?: number;
+  planned_scope?: InputScope | null;
+  match_scope?: InputScope | null;
+  pending_reason?: string | null;
+  file_export?: FileExportState | null;
+  file_name?: FileNameState | null;
+  internal_storage?: { status: "moving" | "classified" | "failed"; folder?: string; absolute_path?: string; relative_path?: string; error?: string } | null;
   sha256: string;
   template_mode: TemplateMode;
   template_id: string | null;
@@ -63,6 +111,9 @@ export interface Task {
 
 /** 历史页统计：各状态任务计数（SQL 聚合，不加载任务全表）。 */
 export interface TaskSummary {
+  active?: number;
+  waiting_for_action?: number;
+  pending_exports?: number;
   total: number;
   completed: number;
   needs_review: number;
@@ -240,6 +291,8 @@ export interface TemplateResult {
 export type ExtractionResult = DocumentResult | TemplateResult;
 
 export interface Extraction {
+  file_name?: FileNameState | null;
+  input_scope?: InputScope | null;
   task_id: string;
   document_kind: "invoice" | "delivery" | "custom";
   template_id: string | null;
@@ -271,6 +324,7 @@ export interface Extraction {
     status: "page_only" | "located" | "unavailable" | "user_edited";
     source: "system" | "model_reported" | "user";
     location_verified: boolean;
+    location?: SourceRange | null;
   }>;
 }
 
@@ -311,10 +365,12 @@ export interface AiRuleSuggestion {
 
 /** AI 生成模板草稿：只返回结构，不落库，人工确认后保存 */
 export interface AiTemplateDraft {
+  warnings?: string[];
   name: string;
   description: string;
   fields: AiDraftField[];
   rule_suggestions: AiRuleSuggestion[];
+  behavior?: TemplateBehavior;
 }
 
 export type RuleExpression =
@@ -352,6 +408,17 @@ export type DeterministicRule =
       severity?: "warning" | "error";
     };
 
+export interface TemplateBehavior {
+  presentation: {
+    mode: "table" | "card";
+    title_field: string | null;
+    primary_fields: string[];
+    collapsed_fields: string[];
+  };
+  requires_complete_input: boolean;
+  suggest_filename: boolean;
+}
+
 export interface ExtractionTemplate {
   id: string;
   version: number;
@@ -367,6 +434,7 @@ export interface ExtractionTemplate {
   validation_rules: string[];
   deterministic_rules: DeterministicRule[];
   output_mapping: Record<string, string>;
+  behavior?: TemplateBehavior;
   created_at: string;
   updated_at: string;
 }
@@ -380,6 +448,7 @@ export type TemplateDraft = Pick<
   | "validation_rules"
   | "deterministic_rules"
   | "output_mapping"
+  | "behavior"
 >;
 
 /* ---- Data tables / rows / views（对应后端 schemas/data_tables.py） ---- */
@@ -406,6 +475,8 @@ export interface DataTableRead {
 }
 
 export interface DataRowRead {
+  review_pending?: boolean | null;
+  input_scope?: InputScope | null;
   id: number;
   task_id: string | null;
   item_index: number;
@@ -424,6 +495,7 @@ export interface TableColumnDef {
 }
 
 export interface DataTableDetail extends DataTableRead {
+  presentation?: TemplateBehavior["presentation"];
   columns: TableColumnDef[];
   page: number;
   page_size: number;
@@ -448,6 +520,7 @@ export interface DataViewRead {
 }
 
 export interface DataViewDetail extends DataViewRead {
+  presentation?: TemplateBehavior["presentation"];
   source_table_name: string;
   columns: TableColumnDef[];
   page: number;
@@ -456,6 +529,12 @@ export interface DataViewDetail extends DataViewRead {
 }
 
 export interface SystemSettings {
+  upload_limit_mb?: number;
+  input_text_limit?: number;
+  input_page_limit?: number;
+  input_row_limit?: number;
+  input_docx_image_limit?: number;
+  allow_limited_input?: boolean;
   image_convert: boolean;
   office_convert: boolean;
   /** Word 是否连同内嵌图片一起识别：true=文字+图片，false=只提取文本 */

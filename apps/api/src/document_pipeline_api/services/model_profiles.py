@@ -287,7 +287,12 @@ def get_model_profile_version(
 def _validated_endpoint(body: ModelProfileBody) -> tuple[str, bool]:
     # 保存方案时不要求确认远端传输；确认推迟到“激活（使用）此方案”时弹出，
     # 与原型行为一致——创建/编辑云端方案是配置，激活才代表真正开始使用。
-    return classify_model_endpoint(body.base_url)
+    value = body.base_url.strip().rstrip("/")
+    if body.provider == "ollama":
+        value = value.removesuffix("/api/chat").removesuffix("/api/tags").removesuffix("/v1")
+    else:
+        value = value.removesuffix("/chat/completions")
+    return classify_model_endpoint(value)
 
 
 def _store_new_secret(api_key, secret_store: ModelSecretStore | None) -> str | None:

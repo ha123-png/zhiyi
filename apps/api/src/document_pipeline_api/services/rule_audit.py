@@ -15,6 +15,7 @@ from document_pipeline_api.schemas.extraction import (
     ValidationIssue,
 )
 from document_pipeline_api.services.rule_evaluation import evaluate_rules
+from document_pipeline_api.services.processing_input import input_scope_issues
 
 
 class RuleAuditEntry(BaseModel):
@@ -86,7 +87,7 @@ def audit_rule_engine(session: Session) -> RuleAuditReport:
                 template_id=extraction.template_id,
                 template_version=extraction.template_version,
             )
-            current_issues = [_summarize(issue) for issue in evaluation.issues]
+            current_issues = [_summarize(issue) for issue in evaluation.issues + input_scope_issues(extraction.input_scope_json)]
             changed = stored_issues != current_issues
             entries.append(
                 RuleAuditEntry(

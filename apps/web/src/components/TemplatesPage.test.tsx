@@ -30,6 +30,33 @@ const invoice: ExtractionTemplate = {
 };
 
 describe("TemplatesPage", () => {
+  it("saves a folder binding through Save without creating a template version", async () => {
+    const template = { ...invoice, id: "local-template", is_system: false, builtin_key: null };
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/templates?include_inactive=true")) return response([template]);
+      if (url.endsWith("/local-export")) return response(init?.method === "PUT"
+        ? { revision: 1, enabled: true, parent_path: "D:\\副本", destination: "D:\\副本\\发票" }
+        : { revision: 0, enabled: false, parent_path: null, destination: null });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: "发票" });
+    fireEvent.click(screen.getByText("高级设置"));
+    const toggle = screen.getByRole("checkbox", { name: "自动导出原件副本" });
+    await waitFor(() => expect(toggle).toBeEnabled());
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole("button", { name: "设置服务端目录" }));
+    fireEvent.change(screen.getByLabelText("知意服务所在电脑的绝对路径"), { target: { value: "D:\\副本" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await screen.findByText("设置已保存。");
+    const writes = fetchMock.mock.calls.filter(([, init]) => init?.method === "PUT");
+    expect(writes).toHaveLength(1);
+    expect(String(writes[0][0])).toMatch(/\/local-export$/);
+    expect(JSON.parse(writes[0][1]!.body as string)).toEqual({ expected_revision: 0, enabled: true, parent_path: "D:\\副本" });
+  });
+
   beforeEach(() => {
     const copy = {
       ...invoice,
@@ -45,6 +72,7 @@ describe("TemplatesPage", () => {
       "fetch",
       vi.fn().mockImplementation(async (input: string | URL, init?: RequestInit) => {
         const url = String(input);
+        if (url.endsWith("/local-export")) return { ok: true, json: async () => ({ revision: 0, enabled: false, parent_path: null, destination: null }) };
         if (url.endsWith("/templates?include_inactive=true") && !init?.method) {
           listCount += 1;
           const templates =
@@ -62,6 +90,35 @@ describe("TemplatesPage", () => {
     );
   });
 
+  it("keeps the selected template and local binding stable while a save is pending", async () => {
+    const custom = { ...invoice, id: "custom", name: "物资", is_system: false, builtin_key: null };
+    let finishWrite!: (value: ReturnType<typeof response>) => void;
+    const pendingWrite = new Promise<ReturnType<typeof response>>(resolve => { finishWrite = resolve; });
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/templates?include_inactive=true")) return response([custom, invoice]);
+      if (url.endsWith("/local-export")) return response({ revision: 0, enabled: false, parent_path: null, destination: null });
+      if (url.endsWith("/templates/custom") && init?.method === "PUT") return pendingWrite;
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { container } = render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: "物资" });
+    fireEvent.change(screen.getByLabelText("用途说明"), { target: { value: "更新用途" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "新建空白模板" })).toBeDisabled());
+    const target = [...container.querySelectorAll(".template-list-item")].find(e => e.textContent?.includes("发票"))!;
+    expect(target).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(target);
+    fireEvent.keyDown(target, { key: "Enter" });
+    expect(screen.getByRole("heading", { name: "物资" })).toBeInTheDocument();
+    finishWrite(response({ ...custom, version: 2 }));
+    await screen.findByText("模板已保存（第 2 版）。");
+    fireEvent.click(target);
+    await screen.findByRole("heading", { name: "发票" });
+    expect(screen.getByLabelText("模板名称")).toBeDisabled();
+  });
+
   it("copies a system template before editing and saves a new version", async () => {
     const { container } = render(<TemplatesPage />);
 
@@ -70,7 +127,7 @@ describe("TemplatesPage", () => {
     expect(screen.getByRole("button", { name: "导入" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "导出" })).toBeEnabled();
     expect(
-      screen.getByText("给 AI 的理解要求（不会自动报错，每行一条）"),
+      screen.getByLabelText("额外提示词"),
     ).toBeInTheDocument();
     expect(container.querySelector('input[type="file"]')).toHaveClass("visually-hidden");
     expect(container.querySelector(".template-list-item")).toContainElement(
@@ -86,7 +143,7 @@ describe("TemplatesPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
 
     expect(
-      await screen.findByText("已保存为第 2 版，旧任务和旧数据不受影响。"),
+      await screen.findByText("模板已保存（第 2 版）。"),
     ).toBeInTheDocument();
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: "门店发票" })).toBeInTheDocument(),
@@ -144,7 +201,7 @@ describe("TemplatesPage", () => {
     render(<TemplatesPage />);
 
     expect(await screen.findByRole("heading", { name: "发票" })).toBeInTheDocument();
-    expect(screen.getByText("暂无自定义校验规则。上面的“AI 理解要求”只会提示 AI，不会自动报错。"))
+    expect(screen.getByText("暂无校验规则。"))
       .toBeInTheDocument();
   });
 
@@ -233,7 +290,7 @@ describe("TemplatesPage", () => {
     await screen.findByRole("heading", { name: "门店模板" });
 
     fireEvent.click(screen.getByTitle("停用模板"));
-    expect(await screen.findByText("第 1 版模板 · 已停用 · 1 个字段 · 整理发票内容"))
+    expect(await screen.findByText("自定义模板 · 已停用 · 1 个字段 · 整理发票内容"))
       .toBeInTheDocument();
     expect(screen.getByLabelText("模板名称")).toBeDisabled();
 

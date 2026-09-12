@@ -1,3 +1,5 @@
+import { FileLocation } from "./FileLocation";
+import { Disclosure } from "./Disclosure";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
@@ -40,6 +42,8 @@ import type {
 import { serverDate } from "../time";
 import { desktopApi } from "../desktop";
 import { DocumentPreview } from "./DocumentPreview";
+import { InputScopeDetails } from "./InputScopeDetails";
+import { TaskExportDetails } from "./TaskExportDetails";
 import { EditableText } from "./EditableText";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { Icon } from "./Icon";
@@ -922,7 +926,7 @@ export function HistoryPage({ onOpenTask, onOpenData }: HistoryPageProps = {}) {
                       </span>
                     </div>
                     <div className="hist-meta-item">
-                      <span className="hist-meta-label">处理时间</span>
+                      <span className="hist-meta-label">最近更新</span>
                       <span className="hist-meta-value">{formatDateTime(selectedTask.updated_at)}</span>
                     </div>
                     <div className="hist-meta-item">
@@ -937,6 +941,7 @@ export function HistoryPage({ onOpenTask, onOpenData }: HistoryPageProps = {}) {
 
                   {extraction ? (
                     <div className="history-original-body">
+                      {extraction.input_scope?.coverage === "partial" && <p className="small muted">仅处理部分内容</p>}
                       {/* 提取数据（复用提取页样式） */}
                       <div className="extract-data-block">
                         <div className="extract-header-card">
@@ -1145,6 +1150,7 @@ export function HistoryPage({ onOpenTask, onOpenData }: HistoryPageProps = {}) {
                     <div className="history-panel-body history-preview">
                       <DocumentPreview
                         contentType={selectedTask.content_type}
+                        showDownload={false}
                         filename={selectedTask.filename}
                         flowPages
                         pageNumber={1}
@@ -1152,6 +1158,19 @@ export function HistoryPage({ onOpenTask, onOpenData }: HistoryPageProps = {}) {
                         url={getOriginalFileUrl(selectedTask.id)}
                       />
                     </div>
+                    {extraction && <Disclosure className="processing-details" title="来源与处理详情">
+                      <InputScopeDetails scope={extraction.input_scope} />
+                      {selectedTask.internal_storage && <Disclosure className="source-section" title={<>知意内部原件 · {selectedTask.internal_storage.status === "classified" ? "已按模板保存" : "归类尚未完成"}</>}>
+                        <FileLocation path={selectedTask.internal_storage.absolute_path ?? selectedTask.internal_storage.relative_path ?? selectedTask.internal_storage.error ?? "原件位置正在调整，仍可按任务追溯。"} />
+                        <p className="support">这是知意管理的完整原件，供预览、下载和备份。内部目录首次按模板名确定，后续模板改名不会搬动旧文件；明确删除原件或清除全部本地数据会删除它。外部副本独立保留。</p>
+                      </Disclosure>}
+                      {extraction.file_name && <Disclosure className="source-section" title="文件名称">
+                        <p className="source-value" style={{ overflowWrap: "anywhere" }}>上传原名：{selectedTask.filename}</p>
+                        <p className="source-value" style={{ overflowWrap: "anywhere" }}>确认后的名称：{extraction.file_name.confirmed_filename ?? "尚未确认，仍保留原名"}</p>
+                        <p className="support">{extraction.file_name.explanation}</p>
+                      </Disclosure>}
+                      <TaskExportDetails key={selectedTask.id} task={selectedTask} />
+                    </Disclosure>}
                   </div>
                 </div>
               )}

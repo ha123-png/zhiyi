@@ -31,12 +31,14 @@ class OllamaProvider:
         temperature: float | None = None,
         timeout_seconds: float = 180,
         client: httpx.Client | None = None,
+        api_key: str = "",
     ) -> None:
-        normalized_url = base_url.rstrip("/")
+        normalized_url = base_url.strip().rstrip("/").removesuffix("/api/chat").removesuffix("/api/tags")
         self.base_url = normalized_url.removesuffix("/v1")
         self.model_name = model
         self.context_length = context_length
         self.temperature = temperature
+        self.api_key = api_key
         # 连接阶段用短超时：Ollama 没打开时立即失败，而不是等满 read 超时
         self._client = client or httpx.Client(
             timeout=httpx.Timeout(
@@ -78,11 +80,14 @@ class OllamaProvider:
             ],
         }
         try:
-            response = self._client.post(f"{self.base_url}/api/chat", json=payload)
+            response = self._client.post(f"{self.base_url}/api/chat", json=payload, headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})
             response.raise_for_status()
-            content = response.json()["message"]["content"]
+            body = response.json()
+            if body.get("done_reason") == "length":
+                raise ModelResponseError("模型输出达到长度上限，结果未完成。原件仍保留，请调整模型设置后重试。")
+            content = body["message"]["content"]
             payload = json.loads(_extract_json_text(content))
-            return result_type.model_validate(_unwrap_scalar_wrappers(payload))
+            return result_type.model_validate({key: _unwrap_scalar_wrappers(value) for key, value in payload.items()} if isinstance(payload, dict) else payload)
         except httpx.TimeoutException as error:
             raise ModelTimeoutError(
                 "处理超时：模型可能未加载、正在加载或响应缓慢，"
@@ -118,7 +123,7 @@ class OllamaProvider:
 
     def available_models(self) -> list[str]:
         try:
-            response = self._client.get(f"{self.base_url}/api/tags")
+            response = self._client.get(f"{self.base_url}/api/tags", headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})
             response.raise_for_status()
             return [item["model"] for item in response.json().get("models", [])]
         except httpx.TimeoutException as error:
@@ -203,19 +208,22 @@ class OllamaProvider:
                 {
                     "role": "user",
                     "content": (
-                        f"{prompt}\n以下 {len(image_paths)} 张图片按文件页码顺序排列，"
-                        "请合并理解为同一份文件，不要遗漏后续页。"
+                        f"{prompt}\n以下 {len(image_paths)} 张图片按所列输入范围顺序排列，"
+                        "这些范围可能不连续；仅依据提供内容理解，不推测或拼接缺失部分。"
                     ),
                     "images": image_data,
                 },
             ],
         }
         try:
-            response = self._client.post(f"{self.base_url}/api/chat", json=payload)
+            response = self._client.post(f"{self.base_url}/api/chat", json=payload, headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})
             response.raise_for_status()
-            content = response.json()["message"]["content"]
+            body = response.json()
+            if body.get("done_reason") == "length":
+                raise ModelResponseError("模型输出达到长度上限，结果未完成。原件仍保留，请调整模型设置后重试。")
+            content = body["message"]["content"]
             payload = json.loads(_extract_json_text(content))
-            return result_type.model_validate(_unwrap_scalar_wrappers(payload))
+            return result_type.model_validate({key: _unwrap_scalar_wrappers(value) for key, value in payload.items()} if isinstance(payload, dict) else payload)
         except httpx.TimeoutException as error:
             raise ModelTimeoutError(
                 "Ollama 理解文件超时：模型可能未加载、正在加载或响应缓慢，"

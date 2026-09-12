@@ -1,3 +1,4 @@
+from document_pipeline_api.model_diagnostics import safe_diagnostic
 import base64
 import json
 import re
@@ -47,8 +48,8 @@ def _unwrap_scalar_wrappers(value: object) -> object:
 
 
 _DEFAULT_SYSTEM_PROMPT = (
-    "你是文件结构化助手。只依据图片内容和当前要求回答；"
-    "未知值使用 null，不猜测，不补写图片中不存在的内容。"
+    "你是文件结构化助手。只依据提供的文字、图片和当前要求回答；"
+    "未知值使用 null，不猜测，不补写未提供的内容。"
 )
 
 
@@ -70,7 +71,12 @@ def _response_error_detail(response: httpx.Response) -> str:
     if not isinstance(message, str) or not message.strip():
         text = response.text or ""
         message = text.strip()
-    message = message.strip().replace("\n", " ")[:200]
+    try:
+        authorization = response.request.headers.get("Authorization", "")
+    except RuntimeError:
+        authorization = ""
+    secret = authorization.removeprefix("Bearer ")
+    message = safe_diagnostic(message, secrets=(secret,))
     return f"（服务端返回：{message}）" if message else ""
 
 
@@ -86,7 +92,7 @@ class OpenAICompatibleProvider:
         timeout_seconds: float = 180,
         client: httpx.Client | None = None,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
+        self.base_url = base_url.strip().rstrip("/").removesuffix("/chat/completions")
         self.model_name = model
         self.api_key = api_key
         self.reasoning_effort = reasoning_effort
@@ -134,13 +140,13 @@ class OpenAICompatibleProvider:
             ) from error
         except httpx.ConnectError as error:
             raise ModelUnavailableError(
-                "无法连接本地模型服务"
+                "无法连接模型服务"
                 f"（{self.base_url}）。请确认已打开 LM Studio 并启动本地服务器、"
                 "加载了模型，再回到这里重试。"
             ) from error
         except httpx.RequestError as error:
             raise ModelUnavailableError(
-                "连接本地模型服务出错"
+                "连接模型服务出错"
                 f"（{self.base_url}）。请检查模型服务是否正常运行、网络是否通畅。"
             ) from error
         except (KeyError, TypeError, ValueError) as error:
@@ -177,8 +183,8 @@ class OpenAICompatibleProvider:
             {
                 "type": "text",
                 "text": (
-                    f"{prompt}\n以下 {len(image_paths)} 张图片按文件页码顺序排列，"
-                    "请合并理解为同一份文件，不要遗漏后续页。"
+                    f"{prompt}\n以下 {len(image_paths)} 张图片按所列输入范围顺序排列，"
+                    "这些范围可能不连续；仅依据提供内容理解，不推测或拼接缺失部分。"
                 ),
             }
         ]
@@ -196,11 +202,10 @@ class OpenAICompatibleProvider:
         payload = {
             "model": self.model_name,
             "temperature": self.temperature if self.temperature is not None else 0.1,
-            "max_tokens": 2000,
             "messages": [
                 {
                     "role": "system",
-                    "content": system_prompt or _DEFAULT_SYSTEM_PROMPT,
+                    "content": (system_prompt or _DEFAULT_SYSTEM_PROMPT) + "\n仅返回符合指定结构的 JSON 对象。",
                 },
                 {
                     "role": "user",
@@ -230,11 +235,10 @@ class OpenAICompatibleProvider:
         payload = {
             "model": self.model_name,
             "temperature": self.temperature if self.temperature is not None else 0.1,
-            "max_tokens": 2000,
             "messages": [
                 {
                     "role": "system",
-                    "content": system_prompt or _DEFAULT_SYSTEM_PROMPT,
+                    "content": (system_prompt or _DEFAULT_SYSTEM_PROMPT) + "\n仅返回符合指定结构的 JSON 对象。",
                 },
                 {
                     "role": "user",
@@ -266,9 +270,12 @@ class OpenAICompatibleProvider:
                 headers=self._headers(),
             )
             response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
+            choice = response.json()["choices"][0]
+            if choice.get("finish_reason") in {"length", "content_filter"}:
+                raise ModelResponseError("模型输出未完成，结果没有保存为成功。原件仍保留，请调整模型输出设置或缩小处理范围后重试。")
+            content = choice["message"]["content"]
             payload = json.loads(_extract_json_text(content))
-            return result_type.model_validate(_unwrap_scalar_wrappers(payload))
+            return result_type.model_validate({key: _unwrap_scalar_wrappers(value) for key, value in payload.items()} if isinstance(payload, dict) else payload)
         except httpx.TimeoutException as error:
             raise ModelTimeoutError(
                 "处理超时：模型可能未加载、正在加载或响应缓慢，"
@@ -284,17 +291,17 @@ class OpenAICompatibleProvider:
             raise ModelRequestRejectedError(
                 "模型服务拒绝了请求"
                 + _response_error_detail(error.response)
-                + "，请检查模型名称是否与本地模型服务中实际加载的模型一致。"
+                + "，请检查当前模型方案的鉴权、模型名称和接口支持情况。"
             ) from error
         except httpx.ConnectError as error:
             raise ModelUnavailableError(
-                "无法连接本地模型服务"
+                "无法连接模型服务"
                 f"（{self.base_url}）。请确认已打开 LM Studio 并启动本地服务器、"
-                "加载了模型，再重新上传文件。"
+                "加载了模型，再重试任务；原件仍保留。"
             ) from error
         except httpx.RequestError as error:
             raise ModelUnavailableError(
-                "连接本地模型服务出错"
+                "连接模型服务出错"
                 f"（{self.base_url}）。请检查模型服务是否正常运行、网络是否通畅。"
             ) from error
         except (KeyError, TypeError, ValueError) as error:

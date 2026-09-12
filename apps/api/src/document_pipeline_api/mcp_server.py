@@ -1,5 +1,7 @@
 import os
 import mimetypes
+from functools import wraps
+from inspect import iscoroutinefunction
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -9,6 +11,8 @@ from starlette.datastructures import Headers, UploadFile
 from document_pipeline_api.config import Settings
 from document_pipeline_api.db import build_engine
 from document_pipeline_api.migrations import upgrade_database
+from document_pipeline_api.models.task import TaskRecord
+from document_pipeline_api.model_diagnostics import safe_diagnostic
 from document_pipeline_api.schemas.data_tables import DataRowUpdate
 from document_pipeline_api.schemas.tasks import TaskRead
 from document_pipeline_api.services.data_rows import update_data_row
@@ -62,7 +66,38 @@ def create_mcp_server(
         json_response=True,
     )
 
-    @server.tool(name="get_capabilities")
+    from document_pipeline_api.services.clear_data import clear_journal_path
+    from document_pipeline_api.services.file_operation_lock import file_operation_lock
+    generation_path = settings.storage_dir.parent / "runtime" / "clear-data-result.json"
+
+    def generation():
+        try:
+            return generation_path.read_bytes()
+        except FileNotFoundError:
+            return b""
+
+    initial_generation = generation()
+
+    def guarded_tool(*, name):
+        def register(function):
+            if iscoroutinefunction(function):
+                @wraps(function)
+                async def guarded_async(*args, **kwargs):
+                    with file_operation_lock(settings.storage_dir):
+                        if clear_journal_path(settings).exists() or generation() != initial_generation:
+                            raise ValueError("本地数据已清除或正在清除，请重新连接 MCP 并确认权限。")
+                        return await function(*args, **kwargs)
+                return server.tool(name=name)(guarded_async)
+            @wraps(function)
+            def guarded(*args, **kwargs):
+                with file_operation_lock(settings.storage_dir):
+                    if clear_journal_path(settings).exists() or generation() != initial_generation:
+                        raise ValueError("本地数据已清除或正在清除，请重新连接 MCP 并确认权限。")
+                    return function(*args, **kwargs)
+            return server.tool(name=name)(guarded)
+        return register
+
+    @guarded_tool(name="get_capabilities")
     def mcp_get_capabilities() -> dict[str, object]:
         """返回当前 MCP 实例实际开放的能力；未授权工具不会注册。"""
         return {
@@ -79,6 +114,7 @@ def create_mcp_server(
             "fact_write": write_enabled,
             "task_control": task_control_enabled,
             "file_access": file_access_enabled,
+            "table_export": file_access_enabled and data_read_enabled,
             "result_read": result_read_enabled,
             "data_read": data_read_enabled,
             "task_read": task_read_enabled,
@@ -89,7 +125,26 @@ def create_mcp_server(
 
     if task_read_enabled:
 
-        @server.tool(name="list_tasks")
+        @guarded_tool(name="get_task")
+        def mcp_get_task(task_id: str) -> dict[str, object]:
+            """按导入返回的任务 ID 查询进度与待处理事项，无需反复扫描任务列表。"""
+            with session_factory() as session:
+                task = session.get(TaskRecord, task_id)
+                if task is None:
+                    raise ValueError("任务不存在。")
+                return TaskRead.model_validate(task).model_dump(mode="json")
+
+        @guarded_tool(name="get_task_diagnostics")
+        def mcp_get_task_diagnostics(task_id: str) -> dict[str, object]:
+            """按需读取当前处理尝试的有界失败诊断，已遮蔽常见凭证与路径。"""
+            with session_factory() as session:
+                task = session.get(TaskRecord, task_id)
+                if task is None:
+                    raise ValueError("任务不存在。")
+                return {"code": task.failure_code, "attempt": task.attempt_count,
+                        "detail": safe_diagnostic(task.failure_detail or task.failure_message or "当前任务没有失败诊断。")}
+
+        @guarded_tool(name="list_tasks")
         def mcp_list_tasks(
             status: str | None = None,
             search: str | None = None,
@@ -115,7 +170,7 @@ def create_mcp_server(
 
     if result_read_enabled:
 
-        @server.tool(name="get_task_result")
+        @guarded_tool(name="get_task_result")
         def mcp_get_task_result(task_id: str) -> dict[str, object]:
             """读取一个任务的结构化提取结果和校验问题。"""
             with session_factory() as session:
@@ -123,7 +178,7 @@ def create_mcp_server(
 
     if template_read_enabled:
 
-        @server.tool(name="list_templates")
+        @guarded_tool(name="list_templates")
         def mcp_list_templates(include_inactive: bool = False) -> list[dict[str, object]]:
             """列出模板、字段和规则，供模型理解可处理的数据结构。"""
             with session_factory() as session:
@@ -134,13 +189,13 @@ def create_mcp_server(
 
     if data_read_enabled:
 
-        @server.tool(name="list_data_tables")
+        @guarded_tool(name="list_data_tables")
         def mcp_list_data_tables() -> list[dict[str, object]]:
             """列出原始数据表及其行数，不返回全部行。"""
             with session_factory() as session:
                 return [table.model_dump(mode="json") for table in list_data_tables(session)]
 
-        @server.tool(name="get_data_table")
+        @guarded_tool(name="get_data_table")
         def mcp_get_data_table(
             table_id: str,
             page: int = 1,
@@ -158,7 +213,7 @@ def create_mcp_server(
                     search=search,
                 ).model_dump(mode="json")
 
-        @server.tool(name="aggregate_data_table")
+        @guarded_tool(name="aggregate_data_table")
         def mcp_aggregate_data_table(
             table_id: str,
             value_field: str | None = None,
@@ -175,13 +230,13 @@ def create_mcp_server(
                     search=search,
                 )
 
-        @server.tool(name="list_data_views")
+        @guarded_tool(name="list_data_views")
         def mcp_list_data_views(table_id: str) -> list[dict[str, object]]:
             """列出原始表已有的分 Sheet 视图。"""
             with session_factory() as session:
                 return [view.model_dump(mode="json") for view in list_data_views(session, table_id)]
 
-        @server.tool(name="get_data_view")
+        @guarded_tool(name="get_data_view")
         def mcp_get_data_view(
             table_id: str,
             view_id: str,
@@ -201,7 +256,7 @@ def create_mcp_server(
 
     if write_enabled:
 
-        @server.tool(name="update_data_row")
+        @guarded_tool(name="update_data_row")
         def mcp_update_data_row(
             table_id: str,
             row_id: int,
@@ -223,7 +278,7 @@ def create_mcp_server(
 
     if task_control_enabled:
 
-        @server.tool(name="control_task")
+        @guarded_tool(name="control_task")
         def mcp_control_task(task_id: str, action: str) -> dict[str, object]:
             """暂停、恢复、重试或取消一个任务；所有转换复用产品状态机。"""
             with session_factory() as session:
@@ -247,7 +302,7 @@ def create_mcp_server(
                         enqueue_task(task.id)
                 return TaskRead.model_validate(task).model_dump(mode="json")
 
-        @server.tool(name="select_task_template")
+        @guarded_tool(name="select_task_template")
         def mcp_select_task_template(task_id: str, template_id: str) -> dict[str, object]:
             """为待选任务选择任意当前有效模板并重新入队。"""
             with session_factory() as session:
@@ -263,7 +318,7 @@ def create_mcp_server(
 
     if file_access_enabled:
 
-        @server.tool(name="create_task_from_file")
+        @guarded_tool(name="create_task_from_file")
         async def mcp_create_task_from_file(
             file_path: str,
             template_mode: str = "smart",
@@ -301,13 +356,15 @@ def create_mcp_server(
                 # itself, so it must also release the source handle on every error path.
                 await upload.close()
 
-        @server.tool(name="export_data_table")
+    if file_access_enabled and data_read_enabled:
+
+        @guarded_tool(name="export_data_table")
         def mcp_export_data_table(
             table_id: str,
             output_path: str,
             format: str = "csv",
         ) -> dict[str, object]:
-            """把表导出为 CSV 或 JSON 到允许目录；拒绝覆盖已有文件。"""
+            """需要数据读取和文件访问权限，把表导出到允许目录；拒绝覆盖已有文件。"""
             if format not in {"csv", "json"}:
                 raise ValueError("format 只允许 csv 或 json。")
             path = _resolve_allowed_file(output_path, resolved_roots, must_exist=False)
@@ -323,6 +380,9 @@ def create_mcp_server(
 
 def main() -> None:
     settings = Settings.local()
+    from document_pipeline_api.services.integration_config import apply_integration_config, integration_config_path
+    if integration_config_path(settings.storage_dir.parent).exists():
+        apply_integration_config(settings.storage_dir.parent)
     write_enabled = os.getenv("DOCUMENT_PIPELINE_MCP_WRITE_ENABLED", "").lower() in {
         "1",
         "true",

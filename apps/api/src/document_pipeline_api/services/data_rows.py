@@ -17,6 +17,7 @@ from document_pipeline_api.schemas.data_tables import (
     DataRowUpdate,
 )
 from document_pipeline_api.schemas.extraction import DocumentKind
+from document_pipeline_api.schemas.input_scope import InputScope
 from document_pipeline_api.services.templates import get_template_version
 
 
@@ -52,6 +53,8 @@ BUILTIN_ITEM_KEYS = {
 
 def data_row_read(row: DataRowRecord) -> DataRowRead:
     return DataRowRead(
+        review_pending=row.review_pending,
+        input_scope=InputScope.model_validate_json(row.input_scope_json) if row.input_scope_json else None,
         id=row.id,
         task_id=row.task_id,
         item_index=row.item_index,

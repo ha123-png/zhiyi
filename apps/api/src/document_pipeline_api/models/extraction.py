@@ -27,4 +27,5 @@ class ExtractionRecord(Base):
     result_json: Mapped[str] = mapped_column(Text)
     validation_json: Mapped[str] = mapped_column(Text)
     evidence_json: Mapped[str] = mapped_column(Text, default="[]")
+    input_scope_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

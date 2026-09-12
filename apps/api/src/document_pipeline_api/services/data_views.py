@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -13,14 +14,20 @@ from document_pipeline_api.models import (
 from document_pipeline_api.models.task import utc_now
 from document_pipeline_api.schemas.data_tables import DataViewDetail, DataViewRead
 from document_pipeline_api.services.data_rows import data_row_read
-from document_pipeline_api.services.data_tables import table_columns
+from document_pipeline_api.services.data_tables import table_columns, table_presentation
 
 
 def create_split_views(
     session: Session,
     table_id: str,
     field_key: str,
+    *,
+    by_file: bool = False,
 ) -> list[DataViewRead]:
+    # Empty is not a valid user field key. Persist it as the source-identity
+    # discriminator, preserving existing field-view records without migration.
+    if by_file:
+        field_key = ""
     table = session.get(DataTableRecord, table_id)
     if table is None:
         raise HTTPException(status_code=404, detail="没有找到这个数据表。")
@@ -33,14 +40,15 @@ def create_split_views(
         raise HTTPException(status_code=422, detail="空表不能创建分 Sheet。")
 
     grouped: dict[str, tuple[object, int]] = {}
+    names: dict[str, str] = {}
     field_exists = False
     for row in rows:
         values = json.loads(row.row_json)
-        if field_key not in values:
+        if not by_file and field_key not in values:
             continue
         field_exists = True
-        value = values[field_key]
-        if value is None:
+        value = row.task_id if by_file else values[field_key]
+        if value is None and not by_file:
             continue
         if isinstance(value, (dict, list)):
             raise HTTPException(
@@ -48,6 +56,8 @@ def create_split_views(
                 detail="分 Sheet 字段只能是文字、数字或真假值。",
             )
         serialized = _canonical_json(value)
+        if by_file:
+            names[serialized] = str(values.get("source_filename") or "来源文件") if value else "无来源文件"
         previous = grouped.get(serialized)
         grouped[serialized] = (value, (previous[1] if previous else 0) + 1)
     if not field_exists:
@@ -65,14 +75,20 @@ def create_split_views(
         ).all()
     }
     created_at = utc_now()
+    duplicate_names = Counter(names.values())
+    name_ordinals: Counter[str] = Counter()
     records: list[DataViewRecord] = []
     for serialized, (value, _) in grouped.items():
+        label = names.get(serialized, str(value))
+        if by_file and duplicate_names[label] > 1:
+            name_ordinals[label] += 1
+            label = f"{label[:116]} · 文件 {name_ordinals[label]}"
         record = existing.get(serialized)
         if record is None:
             record = DataViewRecord(
                 id=str(uuid4()),
                 table_id=table_id,
-                name=str(value)[:128],
+                name=label[:128],
                 field_key=field_key,
                 field_value_json=serialized,
                 created_at=created_at,
@@ -108,6 +124,7 @@ def get_data_view(
     *,
     page: int = 1,
     page_size: int = 100,
+    search: str | None = None,
 ) -> DataViewDetail:
     table = session.get(DataTableRecord, table_id)
     record = session.scalar(
@@ -118,15 +135,17 @@ def get_data_view(
     )
     if table is None or record is None:
         raise HTTPException(status_code=404, detail="没有找到这个分 Sheet。")
-    row_count = _view_row_count(session, record)
+    row_count = _view_row_count(session, record, search=search)
     rows = _rows_for_view(
         session,
         record,
         offset=(page - 1) * page_size,
         limit=page_size,
+        search=search,
     )
     base = _data_view_read(record, row_count=row_count)
     return DataViewDetail(
+        presentation=table_presentation(session, table),
         **base.model_dump(),
         source_table_name=table.name,
         columns=table_columns(session, table),
@@ -159,35 +178,42 @@ def _rows_for_view(
     *,
     offset: int = 0,
     limit: int | None = None,
+    search: str | None = None,
 ) -> list[DataRowRecord]:
-    json_type, comparison, path = _view_filter(record)
     statement = (
         select(DataRowRecord)
         .where(
             DataRowRecord.table_id == record.table_id,
-            func.json_type(DataRowRecord.row_json, path) == json_type,
-            func.json_extract(DataRowRecord.row_json, path) == comparison,
+            _view_predicate(record),
         )
         .order_by(DataRowRecord.id)
         .offset(offset)
     )
+    if search:
+        statement = statement.where(DataRowRecord.row_json.ilike(f"%{search}%"))
     if limit is not None:
         statement = statement.limit(limit)
     return list(session.scalars(statement).all())
 
 
-def _view_row_count(session: Session, record: DataViewRecord) -> int:
-    json_type, comparison, path = _view_filter(record)
+def _view_row_count(session: Session, record: DataViewRecord, *, search: str | None = None) -> int:
     return (
         session.scalar(
             select(func.count(DataRowRecord.id)).where(
                 DataRowRecord.table_id == record.table_id,
-                func.json_type(DataRowRecord.row_json, path) == json_type,
-                func.json_extract(DataRowRecord.row_json, path) == comparison,
+                _view_predicate(record),
+                DataRowRecord.row_json.ilike(f"%{search}%") if search else True,
             )
         )
         or 0
     )
+
+
+def _view_predicate(record: DataViewRecord):
+    if record.field_key == "":
+        return DataRowRecord.task_id == json.loads(record.field_value_json)
+    json_type, comparison, path = _view_filter(record)
+    return (func.json_type(DataRowRecord.row_json, path) == json_type) & (func.json_extract(DataRowRecord.row_json, path) == comparison)
 
 
 def _view_filter(record: DataViewRecord) -> tuple[str, object, str]:

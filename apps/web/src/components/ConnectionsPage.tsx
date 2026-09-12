@@ -532,7 +532,7 @@ export function ConnectionsPage() {
               <div className="setting-row">
                 <div>
                   <div className="settings-name">文件访问</div>
-                  <div className="small muted">允许 AI 从指定目录导入文件 / 导出表格</div>
+                  <div className="small muted">允许 AI 从指定目录导入文件；导出表格还需开启“读取数据仓库”</div>
                 </div>
                 <button
                   aria-label="文件访问"

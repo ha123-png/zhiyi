@@ -92,4 +92,25 @@ describe("DocumentPreview", () => {
       "/api/v1/tasks/task-docx/preview/images/1",
     );
   });
+
+  it("distinguishes a truncated preview from model input and retains the original link", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ kind: "text", text: "只显示开头", truncated: true, image_count: 0 }),
+    }));
+    render(<DocumentPreview contentType="text/plain" filename="完整.txt" pageNumber={1}
+      scale={1} url="/api/v1/tasks/long/file" />);
+    expect(await screen.findByText(/预览仅显示开头 5 个字符/)).toBeInTheDocument();
+    expect(screen.getByText(/这不是模型的读取范围/)).toBeInTheDocument();
+    expect(screen.getByText("下载完整原件")).toHaveAttribute("href", "/api/v1/tasks/long/file");
+  });
+
+  it("keeps access to the original when Office preview fails", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("预览资源超限")));
+    render(<DocumentPreview contentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      filename="大表.xlsx" pageNumber={1} scale={1} url="/api/v1/tasks/large/file" />);
+    expect(await screen.findByText("预览资源超限")).toBeInTheDocument();
+    expect(screen.getByText("下载完整原件")).toHaveAttribute("download", "大表.xlsx");
+    expect(screen.getByText(/预览失败不影响已保存的原件/)).toBeInTheDocument();
+  });
 });

@@ -1,3 +1,4 @@
+import { Disclosure } from "./Disclosure";
 import { useEffect, useState } from "react";
 import {
   ChevronDown,
@@ -22,6 +23,7 @@ import {
 } from "../api";
 import type { ModelStatus, SystemSettings, SystemStatus } from "../types";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { ClearLocalData } from "./ClearLocalData";
 import { Icon } from "./Icon";
 import { ExistingLocalModelSettings } from "./ExistingLocalModelSettings";
 import { ModelProfilesSettings } from "./ModelProfilesSettings";
@@ -142,7 +144,7 @@ export function SettingsPage({
   }
 
   const toggleSetting = async (
-    key: "image_convert" | "office_convert" | "word_include_images",
+    key: "image_convert" | "office_convert" | "word_include_images" | "allow_limited_input",
   ) => {
     if (!settings) return;
     const next = { ...settings, [key]: !settings[key] };
@@ -155,7 +157,7 @@ export function SettingsPage({
             ? "图片自动格式转换"
             : key === "office_convert"
               ? "Office 文档自动转换"
-              : "Word 内嵌图片"
+              : key === "word_include_images" ? "Word 内嵌图片" : "限制发送给模型的内容"
         }，新上传的文件立即生效。`,
       );
     } catch (reason) {
@@ -163,6 +165,15 @@ export function SettingsPage({
       setSettings(settings);
     }
   };
+
+  async function saveLimit(key: "upload_limit_mb" | "input_text_limit" | "input_page_limit" | "input_row_limit" | "input_docx_image_limit", raw: string) {
+    if (!settings) return;
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < 1) { setSettingsError("请输入大于零的整数。"); return; }
+    if (settings[key] === value) return;
+    try { const saved = await updateSystemSettings({ [key]: value }); setSettings(saved); setSettingsError(null); }
+    catch (reason) { setSettingsError(reason instanceof Error ? reason.message : "保存失败，请重试。"); }
+  }
 
   const handleClearHistory = async () => {
     setClearBusy(true);
@@ -186,7 +197,7 @@ export function SettingsPage({
     try {
       localStorage.removeItem("theme");
       setResetOpen(false);
-      setNotice("本地偏好已重置，页面正在刷新…");
+      setNotice("主题已恢复为跟随系统，页面正在刷新…");
       setTimeout(() => window.location.reload(), 800);
     } finally {
       setResetBusy(false);
@@ -320,7 +331,7 @@ export function SettingsPage({
             icon={FileCog}
             id="formats"
             onToggle={toggleCard}
-            support="图片类（webp/bmp/tiff/gif）自动转 PNG；Word/Excel/文本提取文字后渲染识别。Word 默认只提取文本，可开启连同内嵌图片一起识别。关闭总开关后对应格式将无法上传。"
+            support="图片类（webp/bmp/tiff/gif）自动转 PNG；Word/Excel/文本按原始结构提取文字并交给模型。Word 默认只提取文本，可开启连同内嵌图片一起识别。关闭总开关后对应格式将无法上传。"
             title="导出/入文件配置"
           >
             <div className="settings-toggles">
@@ -385,6 +396,32 @@ export function SettingsPage({
                   <span />
                 </button>
               </div>
+              <div className="input-settings-panel">
+                <h3>文件接收与读取</h3>
+                <label className="input-limit-field">单文件上传上限
+                  <span className="input-with-unit"><input type="number" min="1" defaultValue={settings?.upload_limit_mb ?? 50} key={`upload-${settings?.upload_limit_mb}`} onBlur={(event) => void saveLimit("upload_limit_mb", event.target.value)} /><span>MB</span></span>
+                </label>
+                <p className="small muted">防止误传过大的文件。超过此大小会停止上传，不代表 AI 无法处理。</p>
+                <div className="setting-row">
+                  <div><div className="settings-name">限制发送给模型的内容</div>
+                    <p className="small muted">开启后只提供文件开头，到上限即停止，结果可能缺少信息。原件仍完整保存，具体范围可在来源详情查看。</p></div>
+                  <button aria-label="限制发送给模型的内容" aria-pressed={Boolean(settings?.allow_limited_input)} className={`toggle ${settings?.allow_limited_input ? "on" : "off"}`} type="button" disabled={!settings} onClick={() => void toggleSetting("allow_limited_input")}><span /></button>
+                </div>
+                {settings?.allow_limited_input && <div className="input-limits-grid">{([
+                  ["input_text_limit", "从开头读取文字", "字符", 20000, 1, 100000],
+                  ["input_page_limit", "PDF 页数／多帧图片帧数", "页／帧", 10, 1, 100],
+                  ["input_row_limit", "Excel 非空行", "行", 500, 1, 10000],
+                  ["input_docx_image_limit", "Word 内嵌图片", "张", 10, 1, 100],
+                ] as const).map(([key, label, unit, fallback, min, max]) => <label className="input-limit-field" key={`${key}-${settings[key]}`}>
+                  {label}<span className="input-with-unit"><input aria-label={label} type="number" min={min} defaultValue={settings[key] ?? fallback} onBlur={(event) => void saveLimit(key, event.target.value)} /><span>{unit}</span></span>
+                  <input aria-label={`${label}滑块`} type="range" min={min} max={Math.max(max, settings[key] ?? fallback)} defaultValue={settings[key] ?? fallback} onPointerUp={(event) => void saveLimit(key, event.currentTarget.value)} onKeyUp={(event) => void saveLimit(key, event.currentTarget.value)} />
+                </label>)}</div>}
+                <Disclosure className="reading-help" title="如何读取">
+                  <p>关闭限制时，知意提供全部可读取内容，由 AI 服务决定能否接受；超时或服务拒绝会明确提示，不会偷偷截取后重试。</p>
+                  <p>PDF 从第 1 页、多帧图片从第 1 帧开始连续读取。Excel 按工作表顺序累计非空行，同时受文字上限限制；Word 达到文字或图片上限即停止。达到上限后，后续内容不会交给 AI，跨越读取边界的信息可能不完整。</p>
+                  <p>实际读取位置可在结果的来源详情中查询。安全解压和像素限制仍生效。设置只影响新上传文件，普通重试沿用原设置；选择按当前读取设置重试，才会重新确定范围。</p>
+                </Disclosure>
+              </div>
               {settingsError && <div className="small danger-text">{settingsError}</div>}
             </div>
           </SettingsCard>
@@ -402,7 +439,7 @@ export function SettingsPage({
               <div className="setting-row">
                 <div>
                   <div className="settings-name">清理历史数据</div>
-                  <div className="small muted">删除已完成/失败/取消任务及其原文件；数据表保留但断开追溯</div>
+                  <div className="small muted">删除已完成/失败/取消任务及内部原件；数据表保留但断开追溯，外部副本保留</div>
                 </div>
                 <button className="btn danger sm" type="button" onClick={() => setClearOpen(true)}>
                   <Icon icon={Trash2} size={13} /> 清理
@@ -410,13 +447,14 @@ export function SettingsPage({
               </div>
               <div className="setting-row">
                 <div>
-                  <div className="settings-name">重置所有设置</div>
-                  <div className="small muted">恢复本地偏好为默认值（主题等），立即刷新</div>
+                  <div className="settings-name">重置界面主题</div>
+                  <div className="small muted">恢复为跟随系统并刷新页面；不改变模型配置和业务数据</div>
                 </div>
                 <button className="btn danger sm" type="button" onClick={() => setResetOpen(true)}>
                   <Icon icon={RotateCcw} size={13} /> 重置
                 </button>
               </div>
+              <ClearLocalData />
             </div>
           </SettingsCard>
 
@@ -426,7 +464,7 @@ export function SettingsPage({
       <ConfirmDialog
         open={clearOpen}
         title="清理历史数据"
-        description="将删除全部已完成、失败、已取消任务的处理历史、校验记录和原文件。数据表中已确认的数据保留，但会断开与原文件的追溯。此操作不可恢复。"
+        description="将删除全部已完成、失败、已取消任务的处理历史、校验记录和知意内部原件。数据表中已确认的数据保留，但会断开与原文件的追溯。已导出的外部副本和备份保留。此操作不可恢复。"
         confirmText="清除历史"
         buttonLabel="确认清理"
         busy={clearBusy}
@@ -435,8 +473,8 @@ export function SettingsPage({
       />
       <ConfirmDialog
         open={resetOpen}
-        title="重置所有设置"
-        description="将把主题等本地偏好恢复为默认值并刷新页面；模型方案与业务数据不受影响。"
+        title="重置界面主题"
+        description="将把主题恢复为跟随系统并刷新页面；模型方案与业务数据不受影响。"
         confirmText="重置"
         buttonLabel="确认重置"
         busy={resetBusy}

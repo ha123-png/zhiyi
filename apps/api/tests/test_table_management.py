@@ -1,4 +1,5 @@
 from io import BytesIO
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -35,6 +36,34 @@ def _add_row(client: TestClient, table_id: str, **values) -> dict:
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+def test_file_groups_use_identity_across_pages_and_include_unlinked_rows(tmp_path):
+    with _client(tmp_path) as client:
+        table = _create_manual_table(client)
+        with client.app.state.session_factory() as session:
+            for task_id in ("source-a", "source-b"):
+                session.add(TaskRecord(id=task_id, filename="同名.pdf", content_type="application/pdf",
+                    size_bytes=1, sha256=task_id, storage_path=f"{task_id}.pdf", template_mode="invoice", status="completed"))
+            session.flush()
+            for index in range(12):
+                session.add(DataRowRecord(table_id=table["id"], task_id="source-a" if index < 9 else "source-b",
+                    item_index=index + 1, row_json=json.dumps({"source_filename": "同名.pdf", "seller_name": f"记录{index}"})))
+            session.add(DataRowRecord(table_id=table["id"], item_index=1, row_json='{"seller_name":"手工记录"}'))
+            session.commit()
+        result = client.post(f"/api/v1/tables/{table['id']}/split", json={"field_key": "source_filename", "group_by": "file"})
+        assert result.status_code == 200, result.text
+        views = result.json()
+        assert sorted(view["row_count"] for view in views) == [1, 3, 9]
+        assert {view["name"] for view in views if view["field_value"]} == {"同名.pdf · 文件 1", "同名.pdf · 文件 2"}
+        source = next(view for view in views if view["field_value"] == "source-a")
+        page = client.get(f"/api/v1/tables/{table['id']}/views/{source['id']}?page=3&page_size=4")
+        assert page.status_code == 200, page.text
+        assert page.json()["row_count"] == 9
+        assert len(page.json()["rows"]) == 1
+        assert page.json()["rows"][0]["task_id"] == "source-a"
+        assert next(view for view in views if view["field_value"] is None)["name"] == "无来源文件"
+        assert client.get(f"/api/v1/tables/{table['id']}").json()["row_count"] == 13
 
 
 def test_manual_empty_row_edit_allows_missing_field(tmp_path) -> None:

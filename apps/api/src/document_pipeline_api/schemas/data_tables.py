@@ -1,9 +1,13 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
+from document_pipeline_api.schemas.templates import TemplatePresentation
+from document_pipeline_api.schemas.input_scope import InputScope
 
 
 class ConfirmRequest(BaseModel):
+    filename: str | None = Field(default=None, max_length=512)
     expected_review_version: int = Field(ge=0)
     # 指定目标表；不传则用任务绑定的目标表，仍无则回退默认模板唯一表。
     target_table_id: str | None = None
@@ -52,6 +56,8 @@ class MergeTablesRequest(BaseModel):
 
 
 class DataRowRead(BaseModel):
+    review_pending: bool | None = None
+    input_scope: InputScope | None = None
     id: int
     task_id: str | None
     item_index: int
@@ -75,6 +81,7 @@ class CustomColumnCreate(BaseModel):
 
 
 class DataTableDetail(DataTableRead):
+    presentation: TemplatePresentation = Field(default_factory=TemplatePresentation)
     columns: list[ColumnDef]
     page: int
     page_size: int
@@ -100,6 +107,7 @@ class DataRowRevisionRead(BaseModel):
 
 class SplitViewsRequest(BaseModel):
     field_key: str = Field(min_length=1, max_length=128)
+    group_by: Literal["field", "file"] = "field"
 
 
 class DataViewRead(BaseModel):
@@ -114,6 +122,7 @@ class DataViewRead(BaseModel):
 
 
 class DataViewDetail(DataViewRead):
+    presentation: TemplatePresentation = Field(default_factory=TemplatePresentation)
     source_table_name: str
     columns: list[ColumnDef]
     page: int

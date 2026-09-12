@@ -39,9 +39,23 @@ it("builds a required rule without exposing internal field paths", () => {
   fireEvent.click(screen.getByRole("button", { name: "添加校验规则" }));
 
   expect(onChange).toHaveBeenCalledWith([
-    { kind: "required", field: "header.document_number" },
+    { kind: "required", field: "header.document_number", severity: "error" },
   ]);
   expect(screen.queryByText("header.document_number")).not.toBeInTheDocument();
+});
+
+it("keeps numeric allowed values numeric and rejects reversed bounds", () => {
+  const onChange = vi.fn();
+  render(<DeterministicRulesEditor disabled={false} fields={fields} rules={[]} onChange={onChange} />);
+  fireEvent.change(screen.getByLabelText("规则类型"), { target: { value: "enum" } });
+  fireEvent.change(screen.getByLabelText("检查字段"), { target: { value: "items[].amount" } });
+  fireEvent.change(screen.getByPlaceholderText("例如：有效，作废"), { target: { value: "0,1" } });
+  fireEvent.click(screen.getByRole("button", { name: "添加校验规则" }));
+  expect(onChange.mock.calls[0][0][0].values).toEqual([0, 1]);
+  fireEvent.change(screen.getByLabelText("规则类型"), { target: { value: "range" } });
+  fireEvent.change(screen.getByLabelText("最小值（可空）"), { target: { value: "10" } });
+  fireEvent.change(screen.getByLabelText("最大值（可空）"), { target: { value: "2" } });
+  expect(screen.getByRole("button", { name: "添加校验规则" })).toBeDisabled();
 });
 
 it("explains that natural-language requirements are not deterministic checks", () => {
@@ -55,6 +69,6 @@ it("explains that natural-language requirements are not deterministic checks", (
   );
 
   expect(
-    screen.getByText("暂无自定义校验规则。上面的“AI 理解要求”只会提示 AI，不会自动报错。"),
+    screen.getByText("暂无校验规则。"),
   ).toBeInTheDocument();
 });

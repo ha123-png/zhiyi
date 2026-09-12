@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -11,12 +12,15 @@ from document_pipeline_api.models import (
     ExtractionRecord,
     TaskRecord,
     TemplateRecord,
+    TemplateRestorationRecord,
     TemplateVersionRecord,
 )
 from document_pipeline_api.models.task import utc_now
 from document_pipeline_api.schemas.templates import (
+    TemplateBehavior,
     TemplateBody,
     TemplateRead,
+    TemplateVersionSummary,
 )
 
 
@@ -242,6 +246,70 @@ def get_template_version(
     return _to_read(template, version)
 
 
+def list_template_versions(session: Session, template_id: str, before: int | None = None) -> list[TemplateVersionSummary]:
+    if session.get(TemplateRecord, template_id) is None:
+        raise HTTPException(status_code=404, detail="没有找到这个模板。")
+    statement = select(TemplateVersionRecord).where(TemplateVersionRecord.template_id == template_id)
+    if before is not None:
+        statement = statement.where(TemplateVersionRecord.version < before)
+    return [TemplateVersionSummary(version=v.version, name=v.name, created_at=v.created_at,
+                                   field_count=len(json.loads(v.fields_json)))
+            for v in session.scalars(statement.order_by(TemplateVersionRecord.version.desc()).limit(50))]
+
+
+def list_template_restorations(session: Session, template_id: str):
+    get_template(session, template_id)
+    return session.scalars(select(TemplateRestorationRecord).where(
+        TemplateRestorationRecord.template_id == template_id,
+    ).order_by(TemplateRestorationRecord.id.desc()).limit(20)).all()
+
+
+def _check_template_timestamp(template: TemplateRecord, expected: datetime | None) -> None:
+    if expected is None:
+        return  # Older API clients still use expected_version.
+    def utc_naive(value: datetime) -> datetime:
+        return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+    if utc_naive(template.updated_at) != utc_naive(expected):
+        raise HTTPException(status_code=409, detail="模板已经更新，请刷新后重试。")
+
+
+def _switch_current_version(session: Session, template: TemplateRecord, version: int, now: datetime) -> None:
+    # Check again in SQL: two restores must not both succeed from the same state.
+    result = session.execute(update(TemplateRecord).where(
+        TemplateRecord.id == template.id,
+        TemplateRecord.current_version == template.current_version,
+        TemplateRecord.updated_at == template.updated_at,
+    ).values(current_version=version, updated_at=now).execution_options(synchronize_session=False))
+    if result.rowcount != 1:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="模板已经更新，请刷新后重试。")
+    session.refresh(template)
+
+
+def restore_template_version(session: Session, template_id: str, version: int, expected_version: int,
+                             expected_updated_at: datetime | None = None) -> TemplateRead:
+    current = get_template(session, template_id)
+    template = session.get(TemplateRecord, template_id)
+    if current.is_system:
+        raise HTTPException(status_code=409, detail="内置模板不能直接修改，请先复制。")
+    if not current.is_active:
+        raise HTTPException(status_code=409, detail="这个模板已停用，请先恢复后再编辑。")
+    if current.version != expected_version:
+        raise HTTPException(status_code=409, detail="模板已经更新，请关闭历史并刷新模板后重试。")
+    _check_template_timestamp(template, expected_updated_at)
+    source = get_template_version(session, template_id, version)
+    if version == current.version:
+        raise HTTPException(status_code=409, detail="所选版本已经是当前版本。")
+    _ensure_unique_name(session, source.name, exclude_id=template_id)
+    _normalize_body(TemplateBody.model_validate(source.model_dump(include=set(TemplateBody.model_fields))))
+    now = utc_now()
+    _switch_current_version(session, template, version, now)
+    session.add(TemplateRestorationRecord(template_id=template_id, from_version=current.version,
+                                          to_version=version, created_at=now))
+    _commit_or_conflict(session)
+    return get_template(session, template_id)
+
+
 def _active_name_exists(
     session: Session,
     name: str,
@@ -313,6 +381,7 @@ def copy_template(session: Session, template_id: str) -> TemplateRead:
                     "validation_rules",
                     "deterministic_rules",
                     "output_mapping",
+                    "behavior",
                 }
             ),
             "name": _unused_copy_name(session, source.name),
@@ -329,7 +398,7 @@ def copy_template(session: Session, template_id: str) -> TemplateRead:
         updated_at=now,
     )
     session.add(template)
-    version = _version_record(template.id, 1, body, now)
+    version = _version_record(template.id, 1, _normalize_body(body), now)
     session.add(version)
     _commit_or_conflict(session)
     return _to_read(template, version)
@@ -340,6 +409,7 @@ def update_template(
     template_id: str,
     expected_version: int,
     body: TemplateBody,
+    expected_updated_at: datetime | None = None,
 ) -> TemplateRead:
     template = session.get(TemplateRecord, template_id)
     if template is None:
@@ -353,18 +423,20 @@ def update_template(
             status_code=409,
             detail="模板已经更新，请刷新后再保存。",
         )
+    _check_template_timestamp(template, expected_updated_at)
     _ensure_unique_name(session, body.name, exclude_id=template_id)
     now = utc_now()
-    next_version = template.current_version + 1
+    next_version = (session.scalar(select(func.max(TemplateVersionRecord.version)).where(
+        TemplateVersionRecord.template_id == template_id,
+    )) or 0) + 1
     version = _version_record(
         template.id,
         next_version,
         _normalize_body(body),
         now,
     )
+    _switch_current_version(session, template, next_version, now)
     session.add(version)
-    template.current_version = next_version
-    template.updated_at = now
     _commit_or_conflict(session)
     return _to_read(template, version)
 
@@ -423,6 +495,7 @@ def delete_template(session: Session, template_id: str) -> None:
             status_code=409,
             detail="该模板已被任务或数据表引用，不能删除，只能停用。",
         )
+    session.execute(delete(TemplateRestorationRecord).where(TemplateRestorationRecord.template_id == template_id))
     # 删除所有历史版本，再删模板；从它复制出来的模板解除溯源引用（副本本身仍独立可用）
     session.execute(
         delete(TemplateVersionRecord).where(
@@ -439,6 +512,12 @@ def delete_template(session: Session, template_id: str) -> None:
 
 
 def _normalize_body(body: TemplateBody) -> TemplateBody:
+    parts = [body.extra_instructions] if body.extra_instructions else []
+    existing = {line.strip() for line in body.extra_instructions.splitlines()}
+    for hint in body.validation_rules:
+        if hint.strip() and hint.strip() not in existing and f"\n{hint.strip()}\n" not in f"\n{body.extra_instructions.strip()}\n":
+            parts.append(hint)
+            existing.add(hint.strip())
     fields = []
     # 表格最终是扁平列结构；无论抬头/明细，用户可见列名都必须唯一，避免建表、
     # 导出和合并时两个同名字段互相覆盖。内部 key 在分区内仍独立校验。
@@ -480,8 +559,26 @@ def _normalize_body(body: TemplateBody) -> TemplateBody:
                     status_code=422,
                     detail=f"检查规则要求“{path}”是数字字段。",
                 )
+    presentation = body.behavior.presentation
+    valid_references = {f"{field.section}.{field.key}" for field in fields}
+    references = [
+        *presentation.primary_fields,
+        *presentation.collapsed_fields,
+        *([presentation.title_field] if presentation.title_field else []),
+    ]
+    for reference in references:
+        if reference not in valid_references:
+            raise HTTPException(
+                status_code=422,
+                detail=f"卡片设置引用了不存在的字段“{reference}”，请重新选择。",
+            )
     return body.model_copy(
-        update={"fields": fields, "output_mapping": output_mapping}
+        update={
+            "fields": fields,
+            "output_mapping": output_mapping,
+            "extra_instructions": "\n".join(parts),
+            "validation_rules": [],
+        }
     )
 
 
@@ -507,6 +604,7 @@ def _version_record(
             ensure_ascii=False,
         ),
         output_mapping_json=json.dumps(body.output_mapping, ensure_ascii=False),
+        behavior_json=body.behavior.model_dump_json(),
         created_at=created_at,
     )
 
@@ -537,6 +635,7 @@ def _version_matches(version: TemplateVersionRecord, body: TemplateBody) -> bool
         and json.loads(version.deterministic_rules_json)
         == [rule.model_dump(mode="json") for rule in body.deterministic_rules]
         and json.loads(version.output_mapping_json) == body.output_mapping
+        and TemplateBehavior.model_validate_json(version.behavior_json) == body.behavior
     )
 
 
@@ -559,6 +658,7 @@ def _to_read(
         validation_rules=json.loads(version.validation_rules_json),
         deterministic_rules=json.loads(version.deterministic_rules_json),
         output_mapping=json.loads(version.output_mapping_json),
+        behavior=json.loads(version.behavior_json),
         created_at=template.created_at,
         updated_at=template.updated_at,
     )

@@ -34,6 +34,23 @@ import type {
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
 
+export interface LocalExportBinding {
+  revision: number;
+  enabled: boolean;
+  parent_path: string | null;
+  destination: string | null;
+}
+
+export async function getLocalExportBinding(templateId: string): Promise<LocalExportBinding> {
+  return readResponse(await fetch(`${API_BASE_URL}/templates/${encodeURIComponent(templateId)}/local-export`));
+}
+
+export async function saveLocalExportBinding(templateId: string, body: { expected_revision: number; enabled: boolean; parent_path: string | null }): Promise<LocalExportBinding> {
+  return readResponse(await fetch(`${API_BASE_URL}/templates/${encodeURIComponent(templateId)}/local-export`, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  }));
+}
+
 export function getIntegrationBaseUrl(): string {
   const integrationPath = API_BASE_URL.replace(
     /\/api\/v1\/?$/,
@@ -89,6 +106,7 @@ export async function getTasks(options?: {
   limit?: number;
   offset?: number;
   activeOnly?: boolean;
+  exportPending?: boolean;
   status?: string;
   search?: string;
   templateId?: string;
@@ -98,6 +116,7 @@ export async function getTasks(options?: {
   if (options?.limit != null) params.set("limit", String(options.limit));
   if (options?.offset) params.set("offset", String(options.offset));
   if (options?.activeOnly) params.set("active_only", "true");
+  if (options?.exportPending) params.set("export_pending", "true");
   if (options?.status) params.set("status", options.status);
   if (options?.search) params.set("search", options.search);
   if (options?.templateId) params.set("template_id", options.templateId);
@@ -106,6 +125,12 @@ export async function getTasks(options?: {
   return readResponse<Task[]>(
     await apiFetch(`${API_BASE_URL}/tasks${query ? `?${query}` : ""}`),
   );
+}
+
+export async function actOnTaskExport(taskId: string, body: { action: "retry" | "skip"; filename?: string; parent_path?: string; acknowledge_uncertain?: boolean }): Promise<Task> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/tasks/${encodeURIComponent(taskId)}/export`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  }));
 }
 
 /** 历史页统计：各状态任务计数，支持与任务列表相同的筛选参数。 */
@@ -347,6 +372,7 @@ export interface TaskEvent {
   status: TaskStatus;
   filename: string;
   failure_message?: string | null;
+  export_status?: string | null;
 }
 
 export function subscribeTaskEvents(
@@ -366,9 +392,9 @@ export function subscribeTaskEvents(
   return () => source.close();
 }
 
-export async function retryTask(taskId: string): Promise<Task> {
+export async function retryTask(taskId: string, useCurrentSettings = false): Promise<Task> {
   return readResponse<Task>(
-    await apiFetch(`${API_BASE_URL}/tasks/${taskId}/retry`, {
+    await apiFetch(`${API_BASE_URL}/tasks/${taskId}/retry${useCurrentSettings ? "?use_current_settings=true" : ""}`, {
       method: "POST",
     }),
   );
@@ -447,7 +473,7 @@ export async function getSystemSettings(): Promise<SystemSettings> {
 }
 
 export async function updateSystemSettings(
-  settings: SystemSettings,
+  settings: Partial<SystemSettings>,
 ): Promise<SystemSettings> {
   return readResponse<SystemSettings>(
     await apiFetch(`${API_BASE_URL}/system/settings`, {
@@ -468,6 +494,25 @@ export async function clearHistory(confirmText: string): Promise<{ cleared_count
   );
 }
 
+export interface ClearDataStatus {
+  data_directory: string;
+  original_directory: string;
+  incomplete: boolean;
+  result: { state: string; completed_at: string | number; message?: string } | null;
+}
+
+export async function getClearDataStatus(): Promise<ClearDataStatus> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/system/admin/clear-data`));
+}
+
+export async function clearAllLocalData(): Promise<{ scheduled: boolean; state?: string }> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/system/admin/clear-data`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm_text: "清除全部本地数据" }),
+  }));
+}
+
 export async function getExtraction(taskId: string): Promise<Extraction> {
   return readResponse<Extraction>(
     await apiFetch(`${API_BASE_URL}/tasks/${taskId}/result`),
@@ -479,6 +524,7 @@ export async function updateReview(
   expectedVersion: number,
   result: ExtractionResult,
   ignoredIssueIndices: number[] = [],
+  filename?: string,
 ): Promise<Extraction> {
   return readResponse<Extraction>(
     await apiFetch(`${API_BASE_URL}/tasks/${taskId}/review`, {
@@ -488,6 +534,7 @@ export async function updateReview(
         expected_version: expectedVersion,
         result,
         ignored_issue_indices: ignoredIssueIndices,
+        filename,
       }),
     }),
   );
@@ -505,6 +552,10 @@ export async function selectTaskTemplate(
       body: JSON.stringify({ template_id: templateId ?? null, target_table_id: targetTableId ?? null }),
     }),
   );
+}
+
+export async function acceptTaskInputScope(taskId: string): Promise<Task> {
+  return readResponse<Task>(await apiFetch(`${API_BASE_URL}/tasks/${taskId}/input-scope`, { method: "POST" }));
 }
 
 export async function confirmTask(
@@ -599,6 +650,7 @@ export async function generateTemplateDraft(
 
 export async function createTemplate(
   draft: TemplateDraft,
+  expectedUpdatedAt?: string,
 ): Promise<ExtractionTemplate> {
   return readResponse<ExtractionTemplate>(
     await apiFetch(`${API_BASE_URL}/templates`, {
@@ -623,17 +675,35 @@ export async function updateTemplate(
   templateId: string,
   expectedVersion: number,
   draft: TemplateDraft,
+  expectedUpdatedAt?: string,
 ): Promise<ExtractionTemplate> {
   return readResponse<ExtractionTemplate>(
     await apiFetch(`${API_BASE_URL}/templates/${templateId}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...draft, expected_version: expectedVersion }),
+      body: JSON.stringify({ ...draft, expected_version: expectedVersion, expected_updated_at: expectedUpdatedAt }),
     }),
   );
 }
 
 /* ---- Data tables ---- */
+export interface TemplateVersionSummary { version: number; name: string; created_at: string; field_count: number }
+export async function getTemplateVersions(id: string, before?: number): Promise<TemplateVersionSummary[]> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/templates/${id}/versions${before ? `?before=${before}` : ""}`));
+}
+export async function getTemplateVersion(id: string, version: number): Promise<ExtractionTemplate> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/templates/${id}/versions/${version}`));
+}
+export async function restoreTemplateVersion(id: string, version: number, expectedVersion: number, expectedUpdatedAt?: string): Promise<ExtractionTemplate> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/templates/${id}/versions/${version}/restore`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expected_version: expectedVersion, expected_updated_at: expectedUpdatedAt }),
+  }));
+}
+
+export interface TemplateRestoration { id: number; from_version: number; to_version: number; created_at: string }
+export async function getTemplateRestorations(id: string): Promise<TemplateRestoration[]> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/templates/${id}/restorations`));
+}
 
 export async function getTables(): Promise<DataTableRead[]> {
   return readResponse<DataTableRead[]>(await apiFetch(`${API_BASE_URL}/tables`));
@@ -794,12 +864,13 @@ export async function getRowRevisions(
 export async function createSplitViews(
   tableId: string,
   fieldKey: string,
+  groupBy: "field" | "file" = "field",
 ): Promise<DataViewRead[]> {
   return readResponse<DataViewRead[]>(
     await apiFetch(`${API_BASE_URL}/tables/${tableId}/split`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ field_key: fieldKey }),
+      body: JSON.stringify({ field_key: fieldKey, group_by: groupBy }),
     }),
   );
 }
@@ -809,11 +880,13 @@ export async function getTableView(
   viewId: string,
   page: number,
   pageSize: number,
+  search?: string,
 ): Promise<DataViewDetail> {
   const params = new URLSearchParams({
     page: String(page),
     page_size: String(pageSize),
   });
+  if (search) params.set("search", search);
   return readResponse<DataViewDetail>(
     await fetch(
       `${API_BASE_URL}/tables/${tableId}/views/${viewId}?${params.toString()}`,
@@ -927,4 +1000,14 @@ export async function saveIntegrationPermissions(payload: {
       body: JSON.stringify(payload),
     }),
   );
+}
+
+export async function getTaskDiagnostics(taskId: string): Promise<{ detail: string; code: string | null; attempt: number }> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/tasks/${taskId}/diagnostics`));
+}
+
+export async function previewTemplatePattern(pattern: string, text: string): Promise<{ valid: boolean; matches: boolean; message: string }> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/templates/rules/preview-pattern`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pattern, text }),
+  }));
 }

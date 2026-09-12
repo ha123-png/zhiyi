@@ -120,9 +120,15 @@ describe("ExtractPage", () => {
   });
 
   it("shows honest page-only evidence and saves the edited draft", async () => {
+    const scroll = vi.fn();
+    HTMLElement.prototype.scrollIntoView = scroll;
     render(<ExtractPage initialTask={task} />);
 
     const amount = await screen.findByText("372", { selector: ".extract-header-value" });
+    expect(screen.getByText("手动 · 发票")).toBeInTheDocument();
+    expect(scroll).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("radio", { name: "智能匹配" }));
+    expect(screen.getByText("手动 · 发票")).toBeInTheDocument();
     fireEvent.click(amount);
     expect(screen.getByText("仅确认来自第 1 页，暂无可靠区域")).toBeInTheDocument();
 

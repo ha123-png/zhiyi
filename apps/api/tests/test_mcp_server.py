@@ -26,6 +26,20 @@ def test_mcp_exposes_no_business_tools_by_default(tmp_path: Path) -> None:
     assert "update_data_row" not in names
 
 
+@pytest.mark.parametrize("marker", ["clear-data-pending.json", "clear-data-result.json"])
+def test_existing_mcp_connection_refuses_tools_during_or_after_clear(tmp_path: Path, marker: str) -> None:
+    server = create_mcp_server(_settings(tmp_path))
+    asyncio.run(server.call_tool("get_capabilities", {}))
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(exist_ok=True)
+    (runtime / marker).write_text('{"state":"succeeded"}', encoding="utf-8")
+    with pytest.raises(Exception, match="重新连接 MCP"):
+        asyncio.run(server.call_tool("get_capabilities", {}))
+    if marker == "clear-data-result.json":
+        replacement = create_mcp_server(_settings(tmp_path))
+        asyncio.run(replacement.call_tool("get_capabilities", {}))
+
+
 def test_mcp_read_capabilities_are_independently_registered(tmp_path: Path) -> None:
     server = create_mcp_server(
         _settings(tmp_path),
@@ -37,6 +51,8 @@ def test_mcp_read_capabilities_are_independently_registered(tmp_path: Path) -> N
     assert _tool_names(server) == {
         "get_capabilities",
         "list_tasks",
+        "get_task",
+        "get_task_diagnostics",
         "list_templates",
         "get_task_result",
         "list_data_tables",
@@ -79,7 +95,10 @@ def test_mcp_privileged_capabilities_are_independently_registered(
     )
     names = _tool_names(server)
     assert {"control_task", "select_task_template"} <= names
-    assert {"create_task_from_file", "export_data_table"} <= names
+    assert "create_task_from_file" in names
+    assert "export_data_table" not in names
+    with_export = create_mcp_server(settings, file_access_enabled=True, data_read_enabled=True, allowed_file_roots=(allowed,))
+    assert "export_data_table" in _tool_names(with_export)
     assert "update_data_row" not in names
 
 

@@ -54,6 +54,9 @@ export function GlobalTaskCard({
   onPause,
   onResume,
   onDelete,
+  onOpenPending,
+  pendingCount,
+  reviewCount,
 }: {
   tasks: Task[];
   onPause?: (taskId: string) => void;
@@ -61,6 +64,9 @@ export function GlobalTaskCard({
   onResume?: (taskId: string) => void;
   /** 删除任务（含原文件）：仅对可删除状态（如已暂停）显示 */
   onDelete?: (taskId: string) => void;
+  onOpenPending?: () => void;
+  pendingCount?: number;
+  reviewCount?: number;
 }) {
   const [now, setNow] = useState(() => Date.now());
   // 计时锚点 = 任务真正开始处理的时刻：任务进入处理中/校验中时从 0 清零重新计，
@@ -84,7 +90,7 @@ export function GlobalTaskCard({
     ?? nextQueuedTask
     ?? tasks.find((task) => activeStatuses.includes(task.status));
   const waitingForTemplate = tasks.filter(
-    (task) => task.status === "waiting_for_template",
+    (task) => task.status === "waiting_for_template" || (task.status === "completed" && ["failed", "needs_rebind"].includes(task.file_export?.status ?? "")),
   );
   const waitingForReview = tasks.filter((task) => task.status === "needs_review");
 
@@ -182,25 +188,26 @@ export function GlobalTaskCard({
   }
 
   // 待选模板：提醒不计时
-  if (waitingForTemplate.length > 0) {
+  if ((pendingCount ?? waitingForTemplate.length) > 0) {
     return (
       <section className="gtb-card" aria-label="当前任务状态" aria-live="polite">
         <Icon icon={FileSearch} size={17} />
         <div className="gtb-info">
-          <div className="gtb-file">等待你选择模板</div>
-          <div className="gtb-stage">{waitingForTemplate.length} 份文件 · 此时不计处理耗时</div>
+          <div className="gtb-file">有待处理事项</div>
+          <div className="gtb-stage">{pendingCount ?? waitingForTemplate.length} 份文件 · 此时不计处理耗时</div>
         </div>
+        {onOpenPending && <button className="btn secondary sm" type="button" onClick={onOpenPending}>查看事项</button>}
       </section>
     );
   }
 
-  if (waitingForReview.length > 0) {
+  if ((reviewCount ?? waitingForReview.length) > 0) {
     return (
       <section className="gtb-card" aria-label="当前任务状态" aria-live="polite">
         <Icon icon={Check} size={17} />
         <div className="gtb-info">
           <div className="gtb-file">等待你确认</div>
-          <div className="gtb-stage">{waitingForReview.length} 份文件需要审核</div>
+          <div className="gtb-stage">{reviewCount ?? waitingForReview.length} 份文件需要审核</div>
         </div>
       </section>
     );

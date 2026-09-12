@@ -14,11 +14,13 @@
     "dev:worker": "set DOCUMENT_PIPELINE_DATA_DIR=.local/runtime/data&& set DOCUMENT_PIPELINE_QUEUE_DB=.local/runtime/data/queue.db&& uv --cache-dir .uv-cache run --project apps/api huey_consumer document_pipeline_api.worker.huey -w 1 -k thread -d 0.01 -m 0.01 -b 1",
     "build:web": "npm --workspace apps/web run build",
     "test:web": "npm --workspace apps/web run test",
+    "test:browser": "node scripts/verify-browser.cjs",
     "test:api": "uv --cache-dir .uv-cache run --project apps/api pytest apps/api/tests",
     "lint:api": "uv --cache-dir .uv-cache run --project apps/api ruff check apps/api/src apps/api/tests"
   },
   "devDependencies": {
-    "concurrently": "9.2.4"
+    "concurrently": "9.2.4",
+    "playwright": "1.63.0"
   },
   "overrides": {
     "nanoid": "3.3.17"

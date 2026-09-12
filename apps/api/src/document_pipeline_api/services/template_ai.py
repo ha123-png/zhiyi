@@ -26,6 +26,8 @@ from document_pipeline_api.schemas.rules import (
     SumExpression,
 )
 from document_pipeline_api.schemas.templates import (
+    TemplateBehavior,
+    TemplatePresentation,
     TemplateDraft,
     TemplateDraftField,
     TemplateDraftRuleSuggestion,
@@ -50,11 +52,16 @@ SYSTEM_PROMPT = (
     "规则：\n"
     "1. 只输出字段结构，不提取具体数值，不编造样例中没有的信息。\n"
     "2. 字段必须来自样例文件的真实内容，或用户需求明确要求的内容。\n"
-    "3. 字段数量控制在 3 到 20 个，只列真正需要提取的字段。\n"
+    "3. 字段最多 20 个。用户指定字段数量、名称、类型或归属时严格遵守，不自行增加字段或改类型；"
+    "例如用户要求全部文本时，日期、金额字段也必须使用 text。没有指定数量时只列真正需要的字段。\n"
     "4. 每个字段：label=中文名；section=header（每份文件一次）或 item（每条明细重复）；"
     "example=典型示例值（没有就留空）；value_type=text|number|date|boolean。\n"
     "5. description=用一句话说明这份模板适用于哪些文件、要提取什么（30 字以内）。\n"
-    "6. 严格输出 JSON，不要任何解释、客套或代码围栏。"
+    "6. 严格输出 JSON，不要任何解释、客套或代码围栏。\n"
+    "7. 必须输出 presentation_mode（table 或 card）。用户明确要求卡片或表格时使用指定方式，"
+    "只有未指定时才根据内容建议：数字明细适合 table，长文本适合 card。"
+    "字段按阅读顺序排列，第一个字段用作卡片标题；不要输出标题选择、优先字段或折叠字段配置。"
+    "不生成文件路径，不替用户开启重命名或局部提取。"
 )
 
 # 示范格式：刻意只用结构骨架与占位说明，不出现任何具体业务词
@@ -64,6 +71,7 @@ OUTPUT_FORMAT_HINT = (
     '{\n'
     '  "name": "对这类文件的一个简短名称",\n'
     '  "description": "<一句话说明这份模板适用什么文件、提取什么>",\n'
+    '  "presentation_mode": "<用户指定的 table 或 card；未指定时再建议>",\n'
     '  "fields": [\n'
     '    {"label": "<字段的中文名称>", "section": "<header 或 item>", '
     '"example": "<该字段的典型示例值，没有就留空>", "value_type": "<text 或 number 或 date 或 boolean>"}\n'
@@ -90,8 +98,9 @@ class AiGeneratedTemplate(BaseModel):
 
     name: str | None = None
     description: str | None = None
-    fields: list[AiGeneratedField] = Field(default_factory=list)
+    fields: list[AiGeneratedField] = Field(min_length=1)
     rules: list["AiGeneratedRule"] = Field(default_factory=list)
+    presentation_mode: str | None = None
 
 
 class AiGeneratedRule(BaseModel):
@@ -111,6 +120,7 @@ class AiGeneratedRule(BaseModel):
     result_field: str | None = None
     result_section: str | None = None
     severity: str | None = None
+    rationale: str | None = Field(default=None, max_length=512)
 
 
 def _clean_field(field: AiGeneratedField, *, with_examples: bool, index: int) -> TemplateDraftField | None:
@@ -204,6 +214,11 @@ def generate_template_draft(
         if owns_client:
             client.close()
 
+    warnings = []
+    if raw.presentation_mode not in {"table", "card"}:
+        warnings.append("AI 未返回有效的默认展示方式，草稿暂用表格，请核对后保存。")
+    if any(f.section not in ALLOWED_SECTIONS or f.value_type not in ALLOWED_VALUE_TYPES for f in raw.fields):
+        warnings.append("部分字段的类型或分区缺失／无效，已使用文本／整份文件作为缺失项默认值，请核对。")
     fields = [
         cleaned
         for index, field in enumerate(raw.fields)
@@ -214,6 +229,8 @@ def generate_template_draft(
             status_code=422,
             detail="没有生成有效字段。请补充需求描述或上传样例文件后重试。",
         )
+    if len(fields) != len(raw.fields) or len(fields) > MAX_FIELDS:
+        warnings.append("部分无效或超过 20 个的字段未纳入草稿，请对照需求检查字段是否齐全。")
     fields = fields[:MAX_FIELDS]
     name = (raw.name or "").strip()[:128]
     description = (raw.description or "").strip()[:512]
@@ -222,13 +239,20 @@ def generate_template_draft(
         name=name,
         description=description,
         fields=fields,
+        warnings=warnings,
         rule_suggestions=suggestions,
+        behavior=TemplateBehavior(presentation=TemplatePresentation(
+            mode="card" if raw.presentation_mode == "card" else "table",
+        )),
     )
 
 
 def _rule_generation_hint() -> str:
     return (
         "\n请同时建议少量确定性校验规则，放入 rules。不要为了凑数生成规则。"
+        "每条规则用 rationale 解释依据，指出来自用户哪项明确要求或样例中哪项明确约定。"
+        "不能仅因字段名或一个样例就假定必填、0–100 范围、封闭选项或计算公式；没有依据就不建议。"
+        "默认 severity=warning，只有用户明确要求强制检查时才用 error。"
         "规则只能使用字段列表中完全相同的中文 label：\n"
         "- 必填：{kind:'required', field:'字段名', section:'header|item'}\n"
         "- 范围：{kind:'range', field:'字段名', section:'header|item', minimum:0, maximum:100}\n"
@@ -367,6 +391,8 @@ def _rule_summary(raw: AiGeneratedRule) -> str:
 
 
 def _rule_explanation(raw: AiGeneratedRule) -> str:
+    if raw.rationale and raw.rationale.strip():
+        return "AI 建议依据（请核对）：" + raw.rationale.strip()
     if raw.kind == "required":
         return "避免关键字段为空，导致后续查询、匹配或导出缺少依据。"
     if raw.kind == "range":

@@ -1,3 +1,5 @@
+import { summarizeRule } from "../ruleDescriptions";
+import { PatternRulePreview } from "./PatternRulePreview";
 import { useMemo, useState } from "react";
 import type {
   DeterministicRule,
@@ -34,6 +36,8 @@ export function DeterministicRulesEditor({ disabled, fields, rules, onChange }: 
   const [leftField, setLeftField] = useState("");
   const [rightField, setRightField] = useState("");
   const [resultField, setResultField] = useState("");
+  const [severity, setSeverity] = useState<"error" | "warning">("error");
+  const [tolerance, setTolerance] = useState("0.01");
   const labels = new Map(available.map((field) => [pathFor(field), field.label]));
 
   function addRule() {
@@ -49,11 +53,20 @@ export function DeterministicRulesEditor({ disabled, fields, rules, onChange }: 
       resultField,
     });
     if (rule) {
-      onChange([...rules, rule]);
+      if (rule.kind === "enum") {
+        const type = available.find(field => pathFor(field) === fieldPath)?.value_type;
+        rule.values = rule.values.map(value => type === "number" ? Number(value) : type === "boolean" ? value === "true" : value);
+      }
+      onChange([...rules, { ...rule, severity, ...(rule.kind === "equation" ? { tolerance: Number(tolerance) } : {}) }]);
     }
   }
 
-  const canAdd = canBuildRule({
+  const selectedType = available.find(field => pathFor(field) === fieldPath)?.value_type;
+  const validChoice = kind === "range" ? selectedType === "number"
+    : kind === "enum" ? splitValues(values).every(value => selectedType === "number" ? Number.isFinite(Number(value)) : selectedType === "boolean" ? ["true", "false"].includes(value) : true)
+    : true;
+  const validTolerance = !["row_multiply", "sum"].includes(kind) || (tolerance.trim() !== "" && Number.isFinite(Number(tolerance)) && Number(tolerance) >= 0 && Number(tolerance) <= 1000000);
+  const canAdd = validChoice && validTolerance && canBuildRule({
     kind,
     fieldPath,
     minimum,
@@ -70,10 +83,11 @@ export function DeterministicRulesEditor({ disabled, fields, rules, onChange }: 
       <div className="deterministic-rules-head">
         <div>
           <strong>自定义校验规则</strong>
-          <span>必填、数字范围、指定值、行内计算（如 数量 × 单价 = 金额）、合计核对（如 明细之和 = 抬头合计）等。字段都由你指定，适用于任何单据；由程序自动执行并报错，不依赖 AI。</span>
+          <span>由程序检查必填、范围和计算关系，标出需要核对的结果。</span>
         </div>
         <span className="badge neutral">{rules.length} 条</span>
       </div>
+      <p className="support">规则只标出需要核对的结果，不修改数据。除“不能为空”外，null 空值跳过检查；需要防止缺失时请同时添加必填规则。0 是有效数字。合计只累加已有数字，缺项请另设必填。</p>
 
       {rules.length > 0 ? (
         <div className="deterministic-rule-list">
@@ -92,7 +106,7 @@ export function DeterministicRulesEditor({ disabled, fields, rules, onChange }: 
           ))}
         </div>
       ) : (
-        <div className="support">暂无自定义校验规则。上面的“AI 理解要求”只会提示 AI，不会自动报错。</div>
+        <div className="support">暂无校验规则。</div>
       )}
 
       {available.length === 0 ? (
@@ -145,14 +159,18 @@ export function DeterministicRulesEditor({ disabled, fields, rules, onChange }: 
             <label>
               <span>允许的值（用中文逗号或英文逗号分开）</span>
               <input className="form-input" disabled={disabled} onChange={(e) => setValues(e.target.value)} placeholder="例如：有效，作废" value={values} />
+              <span className="support">文字区分大小写且精确匹配；数字字段填数字，是否字段填 true、false。</span>
             </label>
           ) : null}
 
           {kind === "pattern" ? (
+            <div>
             <label>
-              <span>安全格式表达式</span>
-              <input className="form-input" disabled={disabled} onChange={(e) => setPattern(e.target.value)} placeholder="例如：PO-\d{3}" value={pattern} />
+              <span>格式表达式（正则）</span>
+              <input className="form-input" disabled={disabled} maxLength={128} onChange={(e) => setPattern(e.target.value)} placeholder="例如：PO-\d{3}" value={pattern} />
             </label>
+            <PatternRulePreview pattern={pattern} disabled={disabled} />
+            </div>
           ) : null}
 
           {kind === "row_multiply" ? (
@@ -170,6 +188,9 @@ export function DeterministicRulesEditor({ disabled, fields, rules, onChange }: 
             </div>
           ) : null}
 
+          {["row_multiply", "sum"].includes(kind) ? <label><span>允许误差</span><input className="form-input" disabled={disabled} type="number" min="0" max="1000000" step="0.01" value={tolerance} onChange={event => setTolerance(event.target.value)} /><span className="support">两侧数值差的绝对值不超过此值即通过，不会改变或四舍五入原结果。</span></label> : null}
+          <label><span>发现问题时</span><select className="form-select" disabled={disabled} value={severity} onChange={event => setSeverity(event.target.value as "error" | "warning")}><option value="error">错误：需要核对</option><option value="warning">提醒：建议核对</option></select></label>
+          {!validChoice || !validTolerance || (kind === "range" && minimum !== "" && maximum !== "" && Number(minimum) > Number(maximum)) ? <p className="support" role="alert">请检查字段类型、允许值、范围上下限或允许误差。</p> : null}
           <button className="btn secondary sm" disabled={disabled || !canAdd} onClick={addRule} type="button">
             添加校验规则
           </button>
@@ -222,7 +243,9 @@ interface BuilderState {
 
 function canBuildRule(state: BuilderState): boolean {
   if (state.kind === "required") return Boolean(state.fieldPath);
-  if (state.kind === "range") return Boolean(state.fieldPath && (state.minimum || state.maximum));
+  if (state.kind === "range") return Boolean(state.fieldPath && (state.minimum || state.maximum))
+    && [state.minimum, state.maximum].every(value => value === "" || Number.isFinite(Number(value)))
+    && !(state.minimum !== "" && state.maximum !== "" && Number(state.minimum) > Number(state.maximum));
   if (state.kind === "enum") return Boolean(state.fieldPath && splitValues(state.values).length);
   if (state.kind === "pattern") return Boolean(state.fieldPath && state.pattern);
   if (state.kind === "row_multiply") return Boolean(state.leftField && state.rightField && state.resultField);
@@ -266,23 +289,4 @@ function equation(left: RuleExpression, right: RuleExpression, field: string): D
 
 function splitValues(value: string): string[] {
   return value.split(/[，,]/).map((item) => item.trim()).filter(Boolean);
-}
-
-function summarizeRule(rule: DeterministicRule, labels: Map<string, string>): string {
-  const label = labels.get(rule.field) ?? rule.field;
-  if (rule.kind === "required") return `${label}不能为空`;
-  if (rule.kind === "range") return `${label}范围：${rule.minimum ?? "不限"} ～ ${rule.maximum ?? "不限"}`;
-  if (rule.kind === "enum") return `${label}只能是：${rule.values.join("、")}`;
-  if (rule.kind === "pattern") return `${label}需符合指定文字格式`;
-  return `${expressionText(rule.left, labels)} = ${expressionText(rule.right, labels)}`;
-}
-
-function expressionText(expression: RuleExpression, labels: Map<string, string>): string {
-  if (expression.op === "field") return labels.get(expression.path) ?? expression.path;
-  if (expression.op === "sum") {
-    return `${labels.get(expression.path) ?? expression.path}之和`;
-  }
-  if (expression.op === "constant") return String(expression.value);
-  const symbols = { add: "+", subtract: "−", multiply: "×", divide: "÷" };
-  return `${expressionText(expression.left, labels)} ${symbols[expression.op]} ${expressionText(expression.right, labels)}`;
 }

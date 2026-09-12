@@ -1,11 +1,12 @@
+import { Disclosure } from "./Disclosure";
 import { useEffect, useRef, useState } from "react";
 import {
   Archive,
-  ChevronDown,
   ChevronRight,
   Copy,
   Download,
   FileText,
+  GripVertical,
   Info,
   Loader2,
   Plus,
@@ -38,8 +39,14 @@ import type {
 } from "../types";
 import { desktopApi } from "../desktop";
 import { DeterministicRulesEditor } from "./DeterministicRulesEditor";
+import { PresentationSettings, TemplateNameSettings, cleanPresentation } from "./PresentationSettings";
 import { Icon } from "./Icon";
 import { Toast, useToast } from "./Toast";
+import { TemplateExportSettings, type TemplateExportHandle } from "./TemplateExportSettings";
+
+import { editableTemplate, mergeTemplateHints, moveTemplateField } from "../templateEditing";
+import { useFieldSort } from "../useFieldSort";
+import { TemplateHistory } from "./TemplateHistory";
 
 const emptyField: TemplateField = {
   label: "",
@@ -53,17 +60,17 @@ const emptyDraft: TemplateDraft = {
   name: "",
   description: "",
   extra_instructions: "",
-  fields: [{ ...emptyField }],
+  fields: [{ ...emptyField, key: `field_${crypto.randomUUID().replaceAll("-", "")}` }],
   validation_rules: [],
   deterministic_rules: [],
   output_mapping: {},
 };
 
 const fieldTypeOptions: { value: TemplateField["value_type"]; label: string }[] = [
-  { value: "text", label: "text" },
-  { value: "number", label: "number" },
-  { value: "date", label: "date" },
-  { value: "boolean", label: "boolean" },
+  { value: "text", label: "文本" },
+  { value: "number", label: "数字" },
+  { value: "date", label: "日期" },
+  { value: "boolean", label: "是非" },
 ];
 
 export function TemplatesPage() {
@@ -71,6 +78,8 @@ export function TemplatesPage() {
   const [selectedId, setSelectedId] = useState("");
   const [draft, setDraft] = useState<TemplateDraft>(emptyDraft);
   const [version, setVersion] = useState(0);
+  const savedDraft = useRef<string>("");
+  const exportSettings = useRef<TemplateExportHandle>(null);
   const [isSystem, setIsSystem] = useState(false);
   const [isActive, setIsActive] = useState(true);
   const [isNew, setIsNew] = useState(true);
@@ -80,6 +89,10 @@ export function TemplatesPage() {
   const [aiOpen, setAiOpen] = useState(false);
   const [expandedField, setExpandedField] = useState<number | null>(null);
   const importInput = useRef<HTMLInputElement>(null);
+  const [fieldAnnouncement, setFieldAnnouncement] = useState("");
+  const [historyOpen, setHistoryOpen] = useState(false);
+
+  const fieldSort = useFieldSort(draft.fields.map(f => `${f.section}:${f.key}`).join("|"), moveField);
 
   // AI 生成模板弹窗
   const [aiFiles, setAiFiles] = useState<File[]>([]);
@@ -151,6 +164,7 @@ export function TemplatesPage() {
     setIsActive(template.is_active ?? true);
     setIsNew(false);
     setDraft(toDraft(template));
+    savedDraft.current = JSON.stringify(toDraft(template));
     setExpandedField(null);
     setMessage("");
   }
@@ -163,7 +177,7 @@ export function TemplatesPage() {
     setIsNew(true);
     setDraft({
       ...emptyDraft,
-      fields: [{ ...emptyField }],
+      fields: [{ ...emptyField, key: `field_${crypto.randomUUID().replaceAll("-", "")}` }],
       output_mapping: {},
     });
     setExpandedField(null);
@@ -185,6 +199,13 @@ export function TemplatesPage() {
       fields: current.fields.filter((_, fieldIndex) => fieldIndex !== index),
     }));
     setExpandedField(null);
+  }
+
+  function moveField(from: number, to: number) {
+    if (isSystem || saving || !isActive || to < 0 || to >= draft.fields.length) return;
+    setDraft((current) => ({ ...current, fields: moveTemplateField(current.fields, from, to) }));
+    setExpandedField(expanded => expanded === null ? null : expanded === from ? to : from < to && expanded > from && expanded <= to ? expanded - 1 : from > to && expanded >= to && expanded < from ? expanded + 1 : expanded);
+    setFieldAnnouncement(`已将${draft.fields[from].label || "字段"}移到第 ${to + 1} 位`);
   }
 
   async function handleCopy(templateId?: string) {
@@ -364,6 +385,7 @@ export function TemplatesPage() {
       const saved = await createTemplate({
         name: finalName,
         description: aiDraftDescription.trim() || aiDraft?.description || "",
+        behavior: cleanPresentation(aiDraft?.behavior, aiDraftFields.map((f) => ({ ...f, instructions: "", example: f.example ?? "" }))),
         extra_instructions: "",
         fields: aiDraftFields.map((field) => ({
           label: field.label,
@@ -398,16 +420,24 @@ export function TemplatesPage() {
   async function handleSave() {
     setSaving(true);
     try {
-      const saved = isNew
-        ? await createTemplate(draft)
-        : await updateTemplate(selectedId, version, draft);
-      await refreshTemplates(saved.id);
-      notify(
-        isNew
-          ? "模板已创建。接入文件处理将在智能匹配阶段完成。"
-          : `已保存为第 ${saved.version} 版，旧任务和旧数据不受影响。`,
-        "success",
-      );
+      let savedId = selectedId;
+      let savedVersion = version;
+      const definitionChanged = isNew || JSON.stringify(draft) !== savedDraft.current;
+      if (definitionChanged) {
+        const saved = isNew
+          ? await createTemplate({ ...draft, behavior: cleanPresentation(draft.behavior, draft.fields) })
+          : await updateTemplate(selectedId, version, { ...draft, behavior: cleanPresentation(draft.behavior, draft.fields) }, templates.find(t => t.id === selectedId)?.updated_at);
+        savedId = saved.id;
+        savedVersion = saved.version;
+        // Keep the successful schema revision if the local binding save fails.
+        // Retrying must not create a second version or discard unsaved path input.
+        setVersion(saved.version);
+        savedDraft.current = JSON.stringify(draft);
+        if (isNew) { setSelectedId(saved.id); setIsNew(false); }
+      }
+      await exportSettings.current?.save();
+      await refreshTemplates(savedId);
+      notify(definitionChanged ? `模板已保存（第 ${savedVersion} 版）。` : "设置已保存。", "success");
     } catch (error) {
       notify(error instanceof Error ? error.message : "模板保存失败。", "error");
     } finally {
@@ -473,6 +503,7 @@ export function TemplatesPage() {
         validation_rules: imported.validation_rules ?? [],
         deterministic_rules: imported.deterministic_rules ?? [],
         output_mapping: imported.output_mapping ?? {},
+        behavior: imported.behavior,
       });
       await refreshTemplates(saved.id);
       notify(`已导入模板“${saved.name}”。`, "success");
@@ -493,7 +524,7 @@ export function TemplatesPage() {
     && draft.fields.length > 0
     && draft.fields.every((field) => field.label.trim().length > 0);
 
-  const typeLabel = isSystem ? "内置" : isNew ? "新建" : `第 ${version} 版`;
+  const typeLabel = isSystem ? "内置" : isNew ? "新建" : "自定义";
   const supportText = `${typeLabel}模板${isActive ? "" : " · 已停用"} · ${draft.fields.length} 个字段 · ${draft.description || "尚未填写用途"}`;
   const editorDisabled = isSystem || saving || !isActive;
 
@@ -503,7 +534,7 @@ export function TemplatesPage() {
         <span className="eyebrow">配置</span>
         <h1>模板管理</h1>
         <p className="support">
-          管理提取模板 · 保存会创建新版本，已处理文件和表格不受影响
+          定义提取内容与默认展示，已处理文件和表格不受影响
         </p>
       </header>
 
@@ -520,6 +551,7 @@ export function TemplatesPage() {
           <div className="tpl-side-actions">
             <button
               className="btn primary sm"
+              disabled={saving}
               onClick={() => {
                 // 每次打开都从空白开始，避免残留上次生成的数据
                 resetAiState();
@@ -533,6 +565,7 @@ export function TemplatesPage() {
             </button>
             <button
               className="btn secondary sm"
+              disabled={saving}
               onClick={startNew}
               type="button"
             >
@@ -580,11 +613,12 @@ export function TemplatesPage() {
                 <div
                   className={`template-list-item ${active ? "active" : ""} ${template.is_active === false ? "inactive" : ""}`}
                   key={template.id}
-                  onClick={() => selectTemplate(template)}
+                  aria-disabled={saving}
+                  onClick={() => { if (!saving) selectTemplate(template); }}
                   role="button"
                   tabIndex={0}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
+                    if (!saving && (event.key === "Enter" || event.key === " ")) {
                       event.preventDefault();
                       selectTemplate(template);
                     }
@@ -643,6 +677,7 @@ export function TemplatesPage() {
             <div>
               <h3>{draft.name || "未命名模板"}</h3>
               <div className="support">{supportText}</div>
+              {!isNew && <button className="link-btn template-history-link" onClick={() => setHistoryOpen(true)}>第 {version} 版 · 查看历史</button>}
             </div>
             <div className="tpl-detail-actions">
               {!isSystem && !isNew ? (
@@ -680,6 +715,7 @@ export function TemplatesPage() {
                   复制
                 </button>
               ) : null}
+              {isSystem && <button className="btn secondary" disabled={saving} onClick={() => void handleSave()} type="button"><Icon icon={Save} size={13} />保存</button>}
               {isSystem ? (
                 <button
                   className="btn primary"
@@ -739,7 +775,12 @@ export function TemplatesPage() {
             />
           </div>
 
-          <div className="field-list">
+          <PresentationSettings value={draft.behavior} disabled={editorDisabled}
+            onChange={(behavior) => setDraft((current) => ({ ...current, behavior }))} />
+          <p className="support field-order-hint">字段顺序用于表格和卡片；第一个字段作为卡片标题。</p>
+          <span className="visually-hidden" role="status">{fieldAnnouncement}</span>
+          <div className="field-list" ref={fieldSort.list}>
+            {fieldSort.placeholder && <div className="field-sort-placeholder" aria-hidden="true" style={fieldSort.placeholder} />}
             <div className="field-row header">
               <span>字段名</span>
               <span>类型</span>
@@ -749,8 +790,19 @@ export function TemplatesPage() {
             {draft.fields.map((field, index) => {
               const expanded = expandedField === index;
               return (
-                <div key={`${field.section}:${field.key ?? `new-${index}`}`}>
+                <div key={`${field.section}:${field.key ?? `new-${index}`}`} data-field-index={index}
+                  className="template-field">
                   <div className={`field-row ${expanded ? "has-sub" : ""}`}>
+                    <div className="field-name-control">
+                      <button type="button" className="field-drag-handle" disabled={editorDisabled}
+                        aria-label={`移动字段 ${field.label || index + 1}`} title="拖动排序，或聚焦后按上下方向键移动"
+                        onPointerDown={event => fieldSort.onPointerDown(event, index)}
+                        onPointerMove={fieldSort.onPointerMove} onPointerUp={fieldSort.onPointerUp}
+                        onPointerCancel={fieldSort.onPointerCancel}
+                        onLostPointerCapture={fieldSort.onPointerCancel}
+                        onKeyDown={(event) => { if (event.key === "ArrowUp" || event.key === "ArrowDown") { event.preventDefault(); moveField(index, index + (event.key === "ArrowUp" ? -1 : 1)); } }}>
+                        <Icon icon={GripVertical} size={15} />
+                      </button>
                     <input
                       aria-label="字段名"
                       className="form-input"
@@ -759,6 +811,7 @@ export function TemplatesPage() {
                       placeholder="字段名，例如：供应商名称"
                       value={field.label}
                     />
+                    </div>
                     <select
                       aria-label="字段类型"
                       className="form-input"
@@ -857,7 +910,7 @@ export function TemplatesPage() {
                 onClick={() =>
                   setDraft((current) => ({
                     ...current,
-                    fields: [...current.fields, { ...emptyField }],
+                    fields: [...current.fields, { ...emptyField, key: `field_${crypto.randomUUID().replaceAll("-", "")}` }],
                   }))
                 }
                 type="button"
@@ -874,51 +927,21 @@ export function TemplatesPage() {
               className="form-textarea"
               disabled={editorDisabled}
               id="tpl-extra"
-              maxLength={4000}
               onChange={(event) =>
                 setDraft((current) => ({
                   ...current,
                   extra_instructions: event.target.value,
+                  validation_rules: [],
                 }))
               }
-              placeholder="针对此模板的补充提示，持久化保存。例如：发票可能为扫描件，注意识别手写金额"
+              placeholder="补充文件的理解或提取要求，例如：以手写修改后的内容为准"
               rows={2}
-              value={draft.extra_instructions}
+              value={mergeTemplateHints(draft.extra_instructions, draft.validation_rules)}
             />
           </div>
 
-          <details className="template-advanced collapse">
-            <summary>
-              <span>高级设置 · AI 理解要求 / 自定义校验规则</span>
-              <Icon icon={ChevronDown} size={14} className="template-advanced-caret" />
-            </summary>
-            <div className="collapse-content">
-              <div className="template-advanced-body">
-              <div className="form-field">
-                <label className="form-label" htmlFor="tpl-rules">
-                  给 AI 的理解要求（不会自动报错，每行一条）
-                </label>
-                <textarea
-                  className="form-textarea"
-                  disabled={editorDisabled}
-                  id="tpl-rules"
-                  onChange={(event) =>
-                    setDraft((current) => ({
-                      ...current,
-                      validation_rules: event.target.value
-                        .split("\n")
-                        .map((line) => line.trim())
-                        .filter(Boolean),
-                    }))
-                  }
-                  placeholder="例如：如果有手写修改，以手写内容为准"
-                  rows={3}
-                  value={draft.validation_rules.join("\n")}
-                />
-                <span className="support">
-                  这里帮助 AI 理解文件，但不能保证执行。金额、必填等硬性要求请添加为下方系统检查。
-                </span>
-              </div>
+          <Disclosure className="template-advanced" title="高级设置">
+            <div className="template-advanced-body">
               <DeterministicRulesEditor
                 disabled={editorDisabled}
                 fields={draft.fields}
@@ -930,9 +953,10 @@ export function TemplatesPage() {
                 }
                 rules={draft.deterministic_rules}
               />
+          <TemplateNameSettings value={draft.behavior} disabled={editorDisabled} onChange={(behavior) => setDraft((current) => ({ ...current, behavior }))} />
+          {!isNew && selectedId && <TemplateExportSettings ref={exportSettings} key={selectedId} templateId={selectedId} disabled={saving || !isActive} />}
             </div>
-            </div>
-          </details>
+          </Disclosure>
         </div>
       </div>
 
@@ -987,6 +1011,8 @@ export function TemplatesPage() {
               ) : aiDraft ? (
                 /* 阶段 3：草稿预览 + 编辑 */
                 <div className="ai-draft">
+                  {(aiDraft.warnings ?? []).map(warning => <p className="callout" role="status" key={warning}>{warning}</p>)}
+                  <Disclosure title="本次生成依据"><p style={{ whiteSpace: "pre-wrap" }}>{aiRequirement}</p><p className="support">请核对字段数量、类型、分区和默认展示。草稿尚未应用到任何文件。</p></Disclosure>
                   <div className="form-field">
                     <label className="form-label" htmlFor="ai-draft-name">模板名称</label>
                     <input
@@ -1008,6 +1034,9 @@ export function TemplatesPage() {
                       placeholder="说明这份模板适用什么文件、要提取什么（AI 已生成，可修改）"
                     />
                   </div>
+                  <PresentationSettings
+                    value={aiDraft?.behavior} disabled={saving}
+                    onChange={(behavior) => setAiDraft((current) => current ? { ...current, behavior } : current)} />
                   <div className="ai-draft-label">字段（可修改、删除、新增）</div>
                   <div className="ai-draft-fields">
                     {aiDraftFields.map((field, index) => (
@@ -1071,13 +1100,16 @@ export function TemplatesPage() {
                     onClick={() =>
                       setAiDraftFields((current) => [
                         ...current,
-                        { key: `field_${current.length + 1}`, label: "", section: "header", example: "", value_type: "text" },
+                        { key: `field_${crypto.randomUUID().replaceAll("-", "")}`, label: "", section: "header", example: "", value_type: "text" },
                       ])
                     }
                     type="button"
                   >
                     <Icon icon={Plus} size={13} /> 添加字段
                   </button>
+                  <Disclosure className="template-advanced" title="高级设置"><div className="template-advanced-body">
+                  <TemplateNameSettings value={aiDraft?.behavior} disabled={saving} onChange={(behavior) => setAiDraft((current) => current ? { ...current, behavior } : current)} />
+                  </div></Disclosure>
                   {aiDraft.rule_suggestions.length > 0 ? (
                     <div className="form-field" style={{ marginTop: 16 }}>
                       <div className="ai-draft-label">AI 建议的校验规则</div>
@@ -1137,7 +1169,7 @@ export function TemplatesPage() {
                       拖拽文件到此处，或点击选择
                     </div>
                     <div className="tpl-item-meta" style={{ marginTop: 4 }}>
-                      支持 PDF / 图片 · 可上传多个样例（可不传，仅凭需求描述生成）
+                      支持 PDF / 图片 · 每份 PDF 分析首页。关键字段在后续页时，可上传该页图片；也可只填写需求。
                     </div>
                   </div>
                   <input
@@ -1282,12 +1314,15 @@ export function TemplatesPage() {
         </div>
       ) : null}
       <Toast toast={toast} onDismiss={clear} />
+      {historyOpen && templates.find(t => t.id === selectedId) && <TemplateHistory current={templates.find(t => t.id === selectedId)!}
+        dirty={JSON.stringify(draft) !== savedDraft.current} onClose={() => setHistoryOpen(false)}
+        onRestored={restored => { setHistoryOpen(false); setTemplates(items => items.map(t => t.id === restored.id ? restored : t)); selectTemplate(restored); notify(`已将第 ${restored.version} 版设为当前版本。`, "success"); }} />}
     </section>
   );
 }
 
 function toDraft(template: ExtractionTemplate): TemplateDraft {
-  return {
+  const draft: TemplateDraft = {
     name: template.name,
     description: template.description,
     extra_instructions: template.extra_instructions,
@@ -1295,5 +1330,7 @@ function toDraft(template: ExtractionTemplate): TemplateDraft {
     validation_rules: [...template.validation_rules],
     deterministic_rules: structuredClone(template.deterministic_rules ?? []),
     output_mapping: { ...template.output_mapping },
+    behavior: template.behavior ? structuredClone(template.behavior) : undefined,
   };
+  return template.is_system ? draft : editableTemplate(draft);
 }

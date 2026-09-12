@@ -45,6 +45,9 @@ class SingleInstance:
             self.file.close()
 
 
+_CLEAR_DATA_SENTINEL = "__clear_all_local_data__"
+
+
 class _ControlServer(ThreadingHTTPServer):
     token: str
     stop_event: threading.Event
@@ -62,7 +65,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.server.stop_event.set()
             return
-        if self.path != "/restore":
+        if self.path not in {"/restore", "/clear-data"}:
             self.send_error(404)
             return
         try:
@@ -72,6 +75,10 @@ class _ControlHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             name = payload["name"]
             if not isinstance(name, str) or len(name) > 255:
+                raise ValueError
+            if self.path == "/clear-data" and name != _CLEAR_DATA_SENTINEL:
+                raise ValueError
+            if self.path == "/restore" and name == _CLEAR_DATA_SENTINEL:
                 raise ValueError
         except (ValueError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
             self.send_error(400)
@@ -235,6 +242,9 @@ def run_supervisor(
 
         while True:
             active_stop_event.clear()
+            # Maintenance can remove logs after the child handles close.
+            # Recreate the owned directory for every launch, including restart.
+            logs_dir.mkdir(parents=True, exist_ok=True)
             processes: list[subprocess.Popen[bytes]] = []
             with ExitStack() as child_stack:
                 job = child_stack.enter_context(KillOnCloseJob())
@@ -303,7 +313,26 @@ def run_supervisor(
                 control.restore_name = None
             if restore_name is None:
                 break
-            _perform_supervised_restore(active_data_dir, restore_name)
+            if restore_name == _CLEAR_DATA_SENTINEL:
+                _perform_supervised_clear_data(active_data_dir)
+            else:
+                _perform_supervised_restore(active_data_dir, restore_name)
+
+
+def _perform_supervised_clear_data(data_dir: Path) -> None:
+    from document_pipeline_api.config import Settings
+    from document_pipeline_api.services.clear_data import clear_local_data
+    try:
+        result = clear_local_data(Settings(database_url=f"sqlite:///{data_dir / 'document-pipeline.db'}", storage_dir=data_dir / "uploads"))
+        result["message"] = "全部本地数据已清除，正在重新启动应用。外部副本、备份和模型文件保留。"
+    except Exception:
+        result = {"state": "failed", "message": "清除未完成，部分数据可能已清理。请重试清除；未清理外部副本、备份或模型文件。"}
+    result["completed_at"] = time.time()
+    _write_state(data_dir / "runtime" / "clear-data-result.json", result)
+
+
+def request_clear_data(data_dir: Path) -> bool:
+    return request_restore(data_dir, _CLEAR_DATA_SENTINEL, _control_path="/clear-data")
 
 
 def _perform_supervised_restore(data_dir: Path, name: str) -> None:
@@ -356,7 +385,7 @@ def _wait_for_instance_release(lock_path: Path, timeout: float = 10.0) -> bool:
     return False
 
 
-def request_restore(data_dir: Path, name: str) -> bool:
+def request_restore(data_dir: Path, name: str, *, _control_path: str = "/restore") -> bool:
     """请求正式监督器安全停子进程、恢复并重启；不直接操作任何 PID。"""
     active_data_dir = data_dir.resolve()
     state_path = active_data_dir / "runtime" / "supervisor.json"
@@ -374,7 +403,7 @@ def request_restore(data_dir: Path, name: str) -> bool:
             return False
         body = json.dumps({"name": name}).encode("utf-8")
         request = Request(
-            f"http://127.0.0.1:{port}/restore",
+            f"http://127.0.0.1:{port}{_control_path}",
             data=body,
             method="POST",
             headers={

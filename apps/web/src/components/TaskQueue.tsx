@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { Icon } from "./Icon";
+import { PartialInputAction } from "./InputScopeDetails";
 import type { Task, TaskStatus } from "../types";
 
 interface TaskQueueProps {
@@ -51,7 +52,7 @@ const groups: Group[] = [
   },
   {
     key: "review",
-    label: "待选模板/表",
+    label: "待处理事项",
     statuses: ["waiting_for_template", "needs_review"],
     empty: "暂无需要你处理的文件",
     icon: HelpCircle,
@@ -88,7 +89,7 @@ const templateNames = {
 
 const statusHelp: Record<TaskStatus, string> = {
   created: "文件已安全保存",
-  waiting_for_template: "匹配不唯一，需要选择模板",
+  waiting_for_template: "需要你确认，请查看待处理事项",
   queued: "已排队，将按顺序处理",
   processing: "正在识别原文件",
   validating: "正在执行字段与领域校验",
@@ -106,7 +107,7 @@ const badgeText: Partial<Record<TaskStatus, string>> = {
   processing: "处理中",
   validating: "校验中",
   paused: "已暂停",
-  waiting_for_template: "待匹配",
+  waiting_for_template: "待处理",
   needs_review: "待审核",
   completed: "完成",
   cancelled: "已取消",
@@ -214,7 +215,7 @@ export function TaskQueue({
                     </span>
                   </div>
 
-                  {isWaiting ? (
+                  {isWaiting && task.pending_reason === "input_scope" ? <PartialInputAction task={task} /> : isWaiting ? (
                     <div className="match-failed-box">
                       <p>智能匹配未命中，请手动选择模板，或重试匹配。</p>
                       <div className="row">

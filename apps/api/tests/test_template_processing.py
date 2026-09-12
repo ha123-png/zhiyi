@@ -50,6 +50,8 @@ def test_matching_uses_only_template_name_and_description(tmp_path: Path) -> Non
     assert template.description in provider.prompt
     assert "绝不能进入分类提示的秘密字段" not in provider.prompt
     assert "字段内部说明" not in provider.prompt
+    assert '"template_ids":[]' in provider.prompt
+    assert "不添加理由" in provider.prompt
 
 
 def test_matching_rejects_unknown_template_id(tmp_path: Path) -> None:
@@ -59,6 +61,13 @@ def test_matching_rejects_unknown_template_id(tmp_path: Path) -> None:
 
     with pytest.raises(Exception, match="不存在的模板"):
         match_template(tmp_path / "document.png", [_template()], provider)
+
+
+def test_matching_rejects_duplicate_candidate_as_false_ambiguity(tmp_path: Path) -> None:
+    template = _template()
+    provider = FakeProvider({"outcome": "ambiguous", "template_ids": [template.id, template.id]})
+    with pytest.raises(Exception, match="重复的模板候选"):
+        match_template(tmp_path / "document.png", [template], provider)
 
 
 def test_dynamic_schema_separates_header_and_repeating_items() -> None:
@@ -94,6 +103,16 @@ def test_extraction_prompt_contains_fields_only_after_selection() -> None:
     assert "绝不能进入分类提示的秘密字段" in prompt
     assert "每条明细重复" in prompt
     assert "无法判断时留空" in prompt
+
+
+def test_prompt_omits_empty_placeholders_and_keeps_filename_opt_in():
+    template = _template().model_copy(update={"description": "", "extra_instructions": ""})
+    prompt = build_template_extraction_prompt(template)
+    assert "未补充" not in prompt and "示例：无" not in prompt
+    assert "额外要求：" not in prompt and "校验要求：" not in prompt
+    assert "file_name_advice" not in prompt
+    assert "file_name_advice" in build_template_extraction_prompt(template, include_filename=True)
+    assert "类型 number" in prompt and "不合并相似行" in prompt
 
 
 def _template() -> TemplateRead:

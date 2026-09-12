@@ -245,4 +245,18 @@ describe("GlobalTaskCard", () => {
     expect(screen.queryByRole("button", { name: /重试/ })).not.toBeInTheDocument();
     expect(screen.getByText("当前空闲")).toBeInTheDocument();
   });
+
+  it("offers pending recovery for a failed copy without calling extraction failed", () => {
+    const open = vi.fn();
+    const task = { ...processingTask, status: "completed", file_export: { status: "failed" } } as Task;
+    const { rerender } = render(<GlobalTaskCard tasks={[task]} onOpenPending={open} />);
+    expect(screen.getByText("有待处理事项")).toBeInTheDocument();
+    expect(screen.queryByText("当前空闲")).not.toBeInTheDocument();
+    expect(screen.queryByText("处理失败")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "查看事项" }));
+    expect(open).toHaveBeenCalledOnce();
+    rerender(<GlobalTaskCard tasks={[{ ...task, file_export: { ...task.file_export!, status: "skipped" } }]} onOpenPending={open} />);
+    expect(screen.getByText("当前空闲")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "查看事项" })).not.toBeInTheDocument();
+  });
 });

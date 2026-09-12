@@ -17,16 +17,40 @@ class TemplateField(BaseModel):
     value_type: Literal["text", "number", "date", "boolean"] = "text"
 
 
+class TemplatePresentation(BaseModel):
+    """Portable presentation preferences; references use header.key / item.key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["table", "card"] = "table"
+    title_field: str | None = Field(default=None, max_length=160)
+    primary_fields: list[str] = Field(default_factory=list, max_length=3)
+    collapsed_fields: list[str] = Field(default_factory=list, max_length=100)
+
+
+class TemplateBehavior(BaseModel):
+    """Versioned product choices, deliberately excluding local filesystem paths."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    presentation: TemplatePresentation = Field(default_factory=TemplatePresentation)
+    requires_complete_input: bool = True
+    suggest_filename: bool = False
+
+
 class TemplateBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, max_length=128)
     description: str = Field(default="", max_length=512)
-    extra_instructions: str = Field(default="", max_length=4000)
+    # Legacy understanding rules had no per-rule length limit. Consolidating them
+    # must not truncate an existing template; the HTTP request limit still applies.
+    extra_instructions: str = ""
     fields: list[TemplateField] = Field(min_length=1, max_length=100)
     validation_rules: list[str] = Field(default_factory=list, max_length=50)
     deterministic_rules: list[ValidationRule] = Field(default_factory=list, max_length=50)
     output_mapping: dict[str, str] = Field(default_factory=dict)
+    behavior: TemplateBehavior = Field(default_factory=TemplateBehavior)
 
 
 class TemplateCreate(TemplateBody):
@@ -35,6 +59,28 @@ class TemplateCreate(TemplateBody):
 
 class TemplateUpdate(TemplateBody):
     expected_version: int = Field(ge=1)
+    expected_updated_at: datetime | None = None
+
+
+class TemplateVersionSummary(BaseModel):
+    version: int
+    name: str
+    created_at: datetime
+    field_count: int
+
+
+class TemplateVersionRestore(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=1)
+    expected_updated_at: datetime | None = None
+
+
+class TemplateRestorationRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    from_version: int
+    to_version: int
+    created_at: datetime
 
 
 class TemplateFieldRead(TemplateField):
@@ -88,4 +134,6 @@ class TemplateDraft(BaseModel):
     name: str = ""
     description: str = ""
     fields: list[TemplateDraftField]
+    behavior: TemplateBehavior = Field(default_factory=TemplateBehavior)
     rule_suggestions: list[TemplateDraftRuleSuggestion] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)

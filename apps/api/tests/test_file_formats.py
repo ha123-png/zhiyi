@@ -9,6 +9,7 @@ from document_pipeline_api.services.file_formats import (
     MAX_LINES_PER_PAGE,
     UnsupportedImageError,
     UnsupportedTextFileError,
+    extract_docx_blocks,
     extract_text,
     inspect_image_frame_count,
     normalize_image,
@@ -16,6 +17,27 @@ from document_pipeline_api.services.file_formats import (
     render_text_pages,
     split_text_pages,
 )
+
+
+def test_word_preview_accepts_plain_document_without_relationships(tmp_path: Path):
+    path = tmp_path / "plain.docx"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("word/document.xml", '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>正文仍可阅读</w:t></w:r></w:p></w:body></w:document>''')
+    assert extract_docx_blocks(path, max_uncompressed_bytes=10000) == [
+        {"type": "paragraph", "text": "正文仍可阅读"},
+    ]
+
+
+def test_word_preview_keeps_image_in_heading(tmp_path: Path):
+    path = tmp_path / "heading.docx"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("word/document.xml", '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>图示题目</w:t><w:drawing><a:blip r:embed="rId1"/></w:drawing></w:r></w:p></w:body></w:document>''')
+        archive.writestr("word/_rels/document.xml.rels", '<Relationships><Relationship Id="rId1" Target="media/image1.png"/></Relationships>')
+        archive.writestr("word/media/image1.png", b"image-placeholder")
+    assert extract_docx_blocks(path, max_uncompressed_bytes=10000) == [
+        {"type": "heading", "level": 1, "text": "图示题目"},
+        {"type": "image", "image_index": 1, "caption": "图片 1"},
+    ]
 
 
 def _bmp_bytes() -> bytes:
@@ -60,6 +82,18 @@ def test_image_frame_limit_is_enforced(tmp_path: Path) -> None:
 
     with pytest.raises(UnsupportedImageError, match="3 页"):
         inspect_image_frame_count(source, max_frames=2)
+
+
+def test_selected_frames_keep_positions_and_pixels(tmp_path: Path):
+    source = tmp_path / "three.tiff"
+    frames = [Image.new("RGB", (8, 8), color) for color in ("red", "green", "blue")]
+    frames[0].save(source, save_all=True, append_images=frames[1:], format="TIFF")
+    paths = render_image_frames(source, tmp_path / "rendered", "task", max_frames=2, frame_numbers=[1, 3])
+    assert [p.name for p in paths] == ["task-image-1.png", "task-image-3.png"]
+    with Image.open(paths[-1]) as image:
+        assert image.getpixel((0, 0)) == (0, 0, 255)
+    with pytest.raises(UnsupportedImageError, match="总像素"):
+        render_image_frames(source, tmp_path / "unsafe", "task", max_frames=2, frame_numbers=[1, 3], max_total_pixels=100)
 
 
 def test_extract_plain_text_utf8_and_gbk(tmp_path: Path) -> None:

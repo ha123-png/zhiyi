@@ -1,5 +1,9 @@
 import json
+import os
+import sqlite3
 import threading
+import sys
+from types import SimpleNamespace
 from io import BytesIO
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -13,6 +17,62 @@ from document_pipeline_api.desktop import (
     _wait_for_desktop_url,
     run_desktop,
 )
+
+
+def test_open_export_folder_is_read_only_and_missing_copy_does_not_reappear(monkeypatch, tmp_path):
+    root = tmp_path / "data"
+    root.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    copy = external / "copy.png"
+    copy.write_bytes(b"external-user-owned-copy")
+    database = root / "document-pipeline.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, export_state_json TEXT)")
+        connection.execute("INSERT INTO tasks VALUES (?, ?)", ("task-1", json.dumps({"status": "completed", "actual_path": str(copy)})))
+    before = database.read_bytes()
+    opened = []
+    monkeypatch.setattr(os, "startfile", lambda path, operation: opened.append((path, operation)), raising=False)
+    api = _DesktopApi(root)
+    assert api.open_export_folder("task-1") == str(external)
+    assert opened == [(str(external), "explore")]
+    assert copy.read_bytes() == b"external-user-owned-copy"
+    copy.rename(external / "user-renamed.png")
+    with pytest.raises(ValueError, match="移动、改名或删除"):
+        api.open_export_folder("task-1")
+    assert len(opened) == 1
+    assert not copy.exists()
+    assert database.read_bytes() == before
+    with pytest.raises(ValueError, match="没有已完成"):
+        api.open_export_folder("task-1' OR 1=1 --")
+
+
+def test_open_export_folder_reports_shell_permission_failure(monkeypatch, tmp_path):
+    target = tmp_path / "copy.png"
+    target.write_bytes(b"safe")
+    with sqlite3.connect(tmp_path / "document-pipeline.db") as connection:
+        connection.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, export_state_json TEXT)")
+        connection.execute("INSERT INTO tasks VALUES (?, ?)", ("one", json.dumps({"status": "completed", "actual_path": str(target)})))
+    def denied(*args):
+        raise PermissionError("synthetic refusal")
+    monkeypatch.setattr(os, "startfile", denied, raising=False)
+    with pytest.raises(ValueError, match="内部原件预览不受影响"):
+        _DesktopApi(tmp_path).open_export_folder("one")
+    assert target.read_bytes() == b"safe"
+
+
+def test_template_folder_picker_does_not_change_default_export_directory(monkeypatch, tmp_path: Path) -> None:
+    selected = tmp_path / "chosen"
+    selected.mkdir()
+    monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(FOLDER_DIALOG="folder"))
+    api = _DesktopApi(tmp_path / "data")
+    api._window = SimpleNamespace(create_file_dialog=lambda kind: [str(selected)])
+    before = api.get_export_directory()
+    assert api.choose_folder() == str(selected.resolve())
+    assert api.get_export_directory() == before
+    assert not api._settings_path.exists()
+    assert api.choose_export_directory() == str(selected.resolve())
+    assert api.get_export_directory() == str(selected.resolve())
 
 
 def test_desktop_export_defaults_to_output_and_avoids_overwrite(
@@ -58,6 +118,35 @@ def test_desktop_exports_template_json_to_output(tmp_path: Path) -> None:
     assert first == tmp_path / "output" / "成绩表.template.json"
     assert second == tmp_path / "output" / "成绩表.template (2).json"
     assert first.read_text(encoding="utf-8") == '{"name":"成绩表"}'
+
+
+def test_manual_download_never_overwrites_a_file_created_during_download(monkeypatch, tmp_path):
+    api = _DesktopApi(tmp_path)
+    target = tmp_path / "output" / "table.xlsx"
+    target.parent.mkdir()
+    existing_partial = target.with_name(".table.xlsx.partial")
+    existing_partial.write_bytes(b"unrelated partial file")
+
+    def response(*args, **kwargs):
+        target.write_bytes(b"user file created while download started")
+        return BytesIO(b"downloaded workbook")
+
+    monkeypatch.setattr("document_pipeline_api.desktop.urlopen", response)
+    with pytest.raises(ValueError, match="同名"):
+        api.export_table("http://127.0.0.1:8811/api/v1/tables/one/export.xlsx", "table.xlsx")
+    assert target.read_bytes() == b"user file created while download started"
+    assert existing_partial.read_bytes() == b"unrelated partial file"
+    assert set(target.parent.iterdir()) == {target, existing_partial}
+
+
+def test_manual_template_export_never_overwrites_racing_target(monkeypatch, tmp_path):
+    api = _DesktopApi(tmp_path)
+    target = tmp_path / "template.json"
+    target.write_bytes(b"user template")
+    monkeypatch.setattr(api, "_export_target", lambda name: target)
+    with pytest.raises(ValueError, match="同名"):
+        api.export_template("template.json", '{"name":"new"}')
+    assert target.read_bytes() == b"user template"
 
 
 def test_desktop_downloads_original_file_through_local_api(
@@ -126,11 +215,19 @@ def test_desktop_bridge_does_not_expose_native_window(tmp_path: Path) -> None:
 
     assert "window" not in vars(api)
     assert all(not key.startswith("window") for key in vars(api))
+    # pywebview recursively exposes public object methods (including Path.unlink/rename).
+    assert all(name.startswith("_") for name in vars(api))
+    public = {name for name in dir(api) if not name.startswith("_")}
+    assert public == {"get_export_directory", "choose_export_directory", "choose_folder",
+                      "open_export_folder", "export_template", "download_task_file", "export_table"}
 
 
 def test_secondary_desktop_instance_focuses_existing_window(monkeypatch, tmp_path: Path) -> None:
     class ExistingInstance:
         already_running = True
+
+        def __init__(self, title):
+            assert title == "知意"
 
         def __enter__(self):
             return self
@@ -142,7 +239,7 @@ def test_secondary_desktop_instance_focuses_existing_window(monkeypatch, tmp_pat
     monkeypatch.setattr("document_pipeline_api.desktop._DesktopInstance", ExistingInstance)
     monkeypatch.setattr(
         "document_pipeline_api.desktop._focus_existing_window",
-        lambda: focused.append(True) or True,
+        lambda title: focused.append(title == "知意") or True,
     )
     monkeypatch.setattr(
         "document_pipeline_api.desktop._run_primary_desktop",
@@ -152,6 +249,16 @@ def test_secondary_desktop_instance_focuses_existing_window(monkeypatch, tmp_pat
     run_desktop(tmp_path)
 
     assert focused == [True]
+
+
+def test_desktop_mutex_separates_acceptance_from_formal_window():
+    from document_pipeline_api.desktop import _DesktopInstance
+
+    formal = _DesktopInstance()
+    acceptance = _DesktopInstance("知意 · 升级验收")
+    assert formal._mutex_name == "Local\\ZhiyiDesktopWindow"
+    assert acceptance._mutex_name != formal._mutex_name
+    assert acceptance._mutex_name == _DesktopInstance("知意 · 升级验收")._mutex_name
 
 
 def test_application_icon_uses_frozen_root_without_evaluating_source_fallback(
@@ -214,7 +321,8 @@ def test_initial_window_position_is_unavailable_off_windows(monkeypatch) -> None
     assert _initial_window_position(1440, 920) is None
 
 
-def test_desktop_window_closes_supervisor(monkeypatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize("window_title", ["知意", "知意 · 升级验收"])
+def test_desktop_window_closes_supervisor(monkeypatch, tmp_path: Path, window_title: str) -> None:
     closed_handlers: list[object] = []
     before_show_handlers: list[object] = []
     calls: dict[str, object] = {}
@@ -265,6 +373,9 @@ def test_desktop_window_closes_supervisor(monkeypatch, tmp_path: Path) -> None:
     class PrimaryInstance:
         already_running = False
 
+        def __init__(self, title):
+            assert title == window_title
+
         def __enter__(self):
             return self
 
@@ -293,11 +404,11 @@ def test_desktop_window_closes_supervisor(monkeypatch, tmp_path: Path) -> None:
         lambda *_args, **_kwargs: "http://127.0.0.1:8877/",
     )
 
-    run_desktop(tmp_path, 8877)
+    run_desktop(tmp_path, 8877, window_title=window_title)
 
     assert calls["supervisor"] == (tmp_path.resolve(), 8877, False)
     title, window_options = calls["window"]
-    assert title == "知意"
+    assert title == window_title
     assert window_options["url"] == "http://127.0.0.1:8877/"
     assert window_options["min_size"] == (1080, 680)
     assert calls["move"] == (240, 80)

@@ -1,38 +1,31 @@
-import { ArrowRight, Bot, Braces, Database, FileCheck2, FileInput, FileText, History, Layers3, Plug, Settings2, ShieldCheck, TableProperties, Upload } from "lucide-react";
+import { ArrowRight, FileText, CheckCheck, Library } from "lucide-react";
 import type { NavigationKey } from "../types";
 import { Icon } from "./Icon";
+import { Disclosure } from "./Disclosure";
 
-const core: Array<{ icon: typeof Upload; title: string; text: string; target: NavigationKey; action: string }> = [
-  { icon: Bot, title: "1. 启用视觉模型", text: "本地使用可连接 LM Studio 或 Ollama，并在设置中启动服务、加载支持图片的模型；也可以配置兼容的云端视觉模型。", target: "settings", action: "配置视觉模型" },
-  { icon: FileText, title: "2. 准备字段模板", text: "模板定义最终要得到哪些表头字段和明细列。发票、送货单可直接使用内置模板；其他业务文件可手工创建，也可让 AI 根据样例生成草稿。", target: "templates", action: "管理模板" },
-  { icon: Upload, title: "3. 上传并提取", text: "明确知道用途时直接指定模板；混合文件可使用智能匹配。系统会按任务顺序连续处理，不需要手工守着模型。", target: "extract", action: "开始提取" },
-  { icon: FileCheck2, title: "4. 核对并确认", text: "结果先经过字段类型、必填项和业务规则校验。有问题时对照原文件修改；只有确认后的数据才进入仓库。", target: "history", action: "查看待确认" },
-  { icon: Database, title: "5. 汇总与交付", text: "在数据仓库合并、筛选、补充备注列，并按当前表头与合并关系导出 XLSX；桌面版可固定默认导出文件夹。", target: "tables", action: "打开数据仓库" },
-];
-
-const features: Array<{ icon: typeof Upload; title: string; text: string; target: NavigationKey; action: string }> = [
-  { icon: Layers3, title: "智能匹配预选池", text: "只让模型在用途明确、互不混淆的模板中选择。无法确定时任务停在待选模板，不会悄悄写入错误的数据表。", target: "settings", action: "配置预选池" },
-  { icon: TableProperties, title: "模板与附加列", text: "模板字段参与模型提取；数据表中后加的列只用于备注或业务补充，可选择按表头合并或按明细逐行填写，不污染原始提取记录。", target: "templates", action: "查看模板" },
-  { icon: History, title: "文件历史与追溯", text: "查看每份文件的状态、耗时、所用模型、原始结果、人工修改和确认记录。失败任务可重试，重试会重新计时。", target: "history", action: "打开历史" },
-  { icon: FileInput, title: "导入、合并与导出", text: "导入表格时按字段取并集，不同字段不会静默丢失；重复表头可以保留。导出 XLSX 会保留列色、列宽和表头合并关系。", target: "tables", action: "管理数据" },
-  { icon: ShieldCheck, title: "备份与数据边界", text: "本地方案中文件不离开电脑；激活云端方案前必须确认数据传输。重要业务数据可导出备份并在新环境恢复。", target: "backups", action: "查看备份" },
-  { icon: Plug, title: "模型方案", text: "LM Studio、Ollama 适合本地隐私处理；云端模型通常更快或更强。不同方案可独立保存，每个任务会记录实际使用的方案版本。", target: "settings", action: "管理方案" },
-  { icon: Braces, title: "MCP 与外部接口", text: "需要让其他工具调用知意时，到接口页复制按当前安装位置动态生成的配置，并按需开启读取、任务控制、写入或文件访问权限。", target: "connections", action: "查看接口" },
-  { icon: Settings2, title: "文件格式与桌面设置", text: "支持 PDF、常见图片及开启转换后的 Word、Excel和文本。桌面版可设置导出目录、主题和启动引导；浏览器版沿用浏览器下载规则。", target: "settings", action: "打开设置" },
+const questions: { title: string; text: string; target: NavigationKey; action: string }[] = [
+  { title: "第一次用，先配置什么？", text: "先在设置中启用一个模型方案。处理图片或扫描 PDF 需要支持图片的模型；本地模型服务需要启动并加载模型。云端方案会把本次处理的内容发送给对应服务，激活前请确认。随后选择现有模板，或根据自己的文件创建模板。", target: "settings", action: "设置模型" },
+  { title: "模板怎么越用越顺手？", text: "用模板定义要提取的字段。一份字段顺序同时决定表格和卡片，首字段作卡片标题；可拖动，也可聚焦手柄后按上下方向键。补充要求写在额外提示词，必填、范围和计算关系放在程序校验中。内置模板需先复制。点击版本号可查看历史，恢复会将选定版本设为当前，不重复创建版本，也不改旧任务。", target: "templates", action: "查看模板" },
+  { title: "数据进了仓库，为什么还提示待核对？", text: "提取结果会先进入仓库；有规则提示或名称需要确认时，来源会标为待核对，导出时也会保留提示。请回到待处理事项核对并确认。直接编辑表格不会自动完成来源核对；导入或合并的独立副本保留当时的状态。仍在处理或等待模板的文件可能还没有数据。", target: "workspace", action: "查看待处理" },
+  { title: "长文件会全部交给 AI 吗？", text: "默认提供全部可读取内容；开启发送限制后，从文件开头连续读取到你设置的边界，结果可能缺少后续信息。内部原件始终完整保留，实际范围在来源与处理详情中查看。模型可能拒绝过大的请求，完整发送也不保证提取完整。", target: "settings", action: "查看读取设置" },
+  { title: "原件、建议名称和导出副本是什么关系？", text: "内部原件由知意保存，用于预览和追溯。名称建议在同一次提取中生成，默认关闭，有意义的原名会保留。外部副本也是可选项，复制完整文件到指定位置；不会覆盖同名文件，也不会自动改名、移动或删除已经导出的副本。完整原件在文件历史下载。", target: "history", action: "查看文件历史" },
+  { title: "表格和卡片会不会各存一份数据？", text: "两种展示使用同一份数据。一条明细对应一张卡片，整份文件字段由同文件的明细共享。仓库后加的列只用于人工补充，不让模型重复提取；分组也不会复制数据。可以直接编辑、筛选并导出 Excel。", target: "tables", action: "打开数据仓库" },
+  { title: "换模型或调整设置，会影响旧任务吗？", text: "任务保留当时的模型方案版本和读取设置。普通重试沿用旧设置，明确选择按当前读取设置重试才改变读取范围。旧密钥不可用时会报错，不会悄悄用另一个模型继续处理。", target: "settings", action: "管理模型方案" },
+  { title: "升级、换电脑前，需要保留什么？", text: "先导出业务备份，并妥善保存自己导出的文件。备份恢复可保留业务记录和内部原件；外部副本由你独立管理，恢复后需核对本机目录绑定。清除全部本地数据会删除业务记录、内部原件、配置和保存密钥，但不删除外部副本、备份或程序。", target: "backups", action: "管理备份" },
+  { title: "如何让其他工具或 AI 使用知意？", text: "接口页提供当前安装位置对应的配置。按需启用查询、事实修改、任务控制或文件访问，文件操作还受允许目录约束。只查询时无需开放写能力。", target: "connections", action: "查看接口与权限" },
 ];
 
 export function GuidePage({ onNavigate }: { onNavigate: (key: NavigationKey) => void }) {
-  const navigate = (target: NavigationKey, title: string) => {
-    if (title === "智能匹配预选池") sessionStorage.setItem("zhiyi-settings-anchor", "smart-pool-settings");
-    onNavigate(target);
-  };
   return <div className="view guide-page">
-    <div className="page-header"><div className="eyebrow">使用说明</div><h1>先走通核心链路，再按需使用高级功能</h1><div className="support">所有功能都围绕“文件 → 结构化结果 → 人工确认 → 数据仓库”展开。</div></div>
-    <section className="guide-section"><div className="section-heading"><div><div className="eyebrow">核心链路</div><h2>第一次使用，按这五步完成</h2></div></div>
-      <div className="guide-flow">{core.map((step) => <article className="card guide-step" key={step.title}><div className="guide-step-icon"><Icon icon={step.icon} size={20} /></div><div><h3>{step.title}</h3><p>{step.text}</p><button className="btn secondary sm" type="button" onClick={() => onNavigate(step.target)}>{step.action}<Icon icon={ArrowRight} size={13} /></button></div></article>)}</div>
-    </section>
-    <section className="guide-section"><div className="section-heading"><div><div className="eyebrow">重要功能</div><h2>知道这些，才算完整使用知意</h2></div></div>
-      <div className="guide-feature-grid">{features.map((feature) => <article className="card guide-feature" key={feature.title}><div className="guide-step-icon"><Icon icon={feature.icon} size={19} /></div><div><h3>{feature.title}</h3><p>{feature.text}</p><button className="btn ghost sm" type="button" onClick={() => navigate(feature.target, feature.title)}>{feature.action}<Icon icon={ArrowRight} size={13} /></button></div></article>)}</div>
-    </section>
+    <div className="page-header"><div className="eyebrow">帮助</div><h1>使用说明</h1><p className="support">先完成一份文件，其他能力在需要时再了解。</p></div>
+    <div className="guide-start">
+      {[
+        { icon: FileText, number: "01", title: "告诉知意要什么", text: "选择模板，放入文件。", action: "开始提取", target: "extract" as NavigationKey },
+        { icon: CheckCheck, number: "02", title: "核对，再确认", text: "对照原件检查结果，处理需要你决定的事项。", action: "查看待处理", target: "workspace" as NavigationKey },
+        { icon: Library, number: "03", title: "积累，也能复用", text: "在仓库阅读、汇总和导出，下一批继续用同一模板。", action: "打开数据仓库", target: "tables" as NavigationKey },
+      ].map(step => <section className="card guide-step" key={step.number}><div className="guide-step-marker"><Icon icon={step.icon} size={18} /><span>{step.number}</span></div><h2>{step.title}</h2><p>{step.text}</p><button className="btn ghost sm" onClick={() => onNavigate(step.target)}>{step.action}<Icon icon={ArrowRight} size={13} /></button></section>)}
+    </div>
+    <div className="card guide-questions"><div className="panel-title"><div><h3>常见问题</h3><p className="support">需要时展开查看，或直接前往对应页面。</p></div></div>{questions.map(q => <Disclosure key={q.title} title={q.title}><p>{q.text}</p><button className="btn ghost sm" onClick={() => onNavigate(q.target)}>{q.action}<Icon icon={ArrowRight} size={13} /></button></Disclosure>)}</div>
+    <p className="guide-footnote">模型结果需要核对。知意保留原件与处理记录，帮助你判断和修正。</p>
   </div>;
 }

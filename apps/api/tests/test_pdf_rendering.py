@@ -50,3 +50,31 @@ def test_rejects_pdf_over_explicit_page_limit(tmp_path: Path) -> None:
 
     with pytest.raises(UnsupportedPdfError, match="3 页.*2 页处理上限"):
         render_pdf_pages(pdf_path, tmp_path / "rendered", max_pages=2)
+
+
+def test_pdf_pixel_budget_rejects_before_rendering_oversized_page(tmp_path: Path) -> None:
+    source = tmp_path / "large-page.pdf"
+    create_pdf(source, pages=1)
+    output = tmp_path / "rendered"
+    with pytest.raises(UnsupportedPdfError, match="像素安全上限"):
+        render_pdf_pages(source, output, max_pages=1, max_total_pixels=100)
+    assert not list(output.glob("*.png"))
+    assert source.is_file()
+
+
+def test_selected_pdf_images_keep_original_page_numbers(tmp_path: Path):
+    pdf_path = tmp_path / "eighty.pdf"
+    create_pdf(pdf_path, pages=80)
+    pages = render_pdf_pages(pdf_path, tmp_path / "rendered", max_pages=4,
+                             page_numbers=[1, 2, 79, 80], scale=0.25)
+    assert [page.name for page in pages] == ["page-1.png", "page-2.png", "page-79.png", "page-80.png"]
+    assert len(list((tmp_path / "rendered").glob("*.png"))) == 4
+
+
+@pytest.mark.parametrize("numbers", [[], [0], [1, 1], [2, 1], [4]])
+def test_invalid_pdf_scope_fails_before_rendering(tmp_path: Path, numbers):
+    pdf_path = tmp_path / "three.pdf"
+    create_pdf(pdf_path, pages=3)
+    with pytest.raises(UnsupportedPdfError, match="处理范围"):
+        render_pdf_pages(pdf_path, tmp_path / "rendered", max_pages=3, page_numbers=numbers)
+    assert not (tmp_path / "rendered").exists()

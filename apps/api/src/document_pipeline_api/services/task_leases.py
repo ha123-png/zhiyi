@@ -1,3 +1,4 @@
+from document_pipeline_api.model_diagnostics import safe_diagnostic, diagnostic_summary
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import uuid4
@@ -45,6 +46,7 @@ def acquire_task_lease(
             lease_expires_at=expires_at,
             failure_code=None,
             failure_message=None,
+            failure_detail=None,
             # 任务真正开始处理时重置计时起点，避免批量排队时叠加前面任务的处理时间
             started_at=claimed_at,
             updated_at=claimed_at,
@@ -155,7 +157,8 @@ def fail_leased_task(
             lease_token=None,
             lease_expires_at=None,
             failure_code=code,
-            failure_message=message[:512],
+            failure_message=diagnostic_summary(message),
+            failure_detail=safe_diagnostic(message),
             updated_at=failed_at,
         )
     )

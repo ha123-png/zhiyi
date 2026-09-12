@@ -16,6 +16,7 @@ def build_model_provider(
             settings.model_base_url,
             settings.model_name,
             context_length=settings.model_context_length,
+            api_key=settings.model_api_key,
             temperature=settings.model_temperature,
             timeout_seconds=timeout_seconds,
         )

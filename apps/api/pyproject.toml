@@ -1,6 +1,6 @@
 [project]
 name = "document-pipeline-api"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local-first multimodal document data pipeline API"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -15,6 +15,7 @@ dependencies = [
   "pypdfium2>=5.12.1",
   "python-multipart==0.0.31",
   "pywebview==6.1",
+  "regex==2026.9.10",
   "sqlalchemy==2.0.51",
   "uvicorn[standard]==0.35.0",
 ]

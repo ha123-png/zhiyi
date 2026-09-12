@@ -20,26 +20,24 @@ from document_pipeline_api.models import (
     ReviewRevisionRecord,
 )
 from document_pipeline_api.models.task import TaskRecord, utc_now
-from document_pipeline_api.public_errors import public_error_message
 from document_pipeline_api.services.file_formats import (
     CONVERTIBLE_IMAGE_TYPES,
-    RASTER_IMAGE_TYPES,
     TEXT_CONTENT_TYPES,
     UnsupportedImageError,
     UnsupportedTextFileError,
-    extract_text,
-    inspect_image_frame_count,
-    split_text_pages,
 )
 from document_pipeline_api.services.pdf_rendering import (
     UnsupportedPdfError,
-    inspect_pdf_page_count,
 )
 from document_pipeline_api.services.model_runtime import model_snapshot_values
+from document_pipeline_api.services.processing_input import prepare_input, policy_from_settings
+from document_pipeline_api.services.input_scope import InputBudgetError
+from document_pipeline_api.schemas.input_scope import InputPolicy
 from document_pipeline_api.services.queue_pause import clear_pause_if_queue_empty
-from document_pipeline_api.services.system_settings import get_bool_setting
+from document_pipeline_api.services.system_settings import get_bool_setting, upload_limit_bytes
 from document_pipeline_api.services.templates import get_active_template
 from document_pipeline_api.storage_paths import task_storage_name
+from document_pipeline_api.services.file_operation_lock import guard_file_operation
 
 
 ALLOWED_CONTENT_TYPES = {
@@ -110,64 +108,22 @@ async def create_task_from_upload(
         with temporary_path.open("wb") as target:
             while chunk := await upload.read(1024 * 1024):
                 size += len(chunk)
-                if size > settings.max_upload_bytes:
+                if size > upload_limit_bytes(session, settings.max_upload_bytes):
                     raise HTTPException(
                         status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-                        detail="文件超过当前允许的大小。",
+                        detail="文件超过你设置的单文件上传上限，尚未保存。请在设置中调整上限后重新上传。",
                     )
                 digest.update(chunk)
                 target.write(chunk)
 
-        page_count = 1
-        if upload.content_type == "application/pdf":
-            try:
-                page_count = inspect_pdf_page_count(
-                    temporary_path,
-                    max_pages=settings.max_pdf_pages,
-                )
-            except UnsupportedPdfError as error:
-                raise HTTPException(
-                    status_code=422,
-                    detail=public_error_message(error, "PDF 无法读取，请确认文件未损坏或未加密。"),
-                ) from error
-            except Exception as error:
-                raise HTTPException(
-                    status_code=422,
-                    detail="PDF 文件损坏或无法读取。",
-                ) from error
-        elif upload.content_type in TEXT_CONTENT_TYPES:
-            try:
-                text = extract_text(
-                    temporary_path,
-                    upload.content_type,
-                    max_uncompressed_bytes=settings.max_import_uncompressed_bytes,
-                    max_rows=settings.max_import_rows,
-                    max_columns=settings.max_import_columns,
-                )
-                text_pages = split_text_pages(
-                    text,
-                    max_pages=settings.max_pdf_pages,
-                )
-                page_count = len(text_pages)
-            except UnsupportedTextFileError as error:
-                raise HTTPException(
-                    status_code=422,
-                    detail=public_error_message(error, "图片无法读取，请换一张清晰、未损坏的图片。"),
-                ) from error
-        elif upload.content_type in RASTER_IMAGE_TYPES:
-            try:
-                page_count = inspect_image_frame_count(
-                    temporary_path,
-                    expected_content_type=upload.content_type,
-                    max_frames=settings.max_pdf_pages,
-                    max_total_pixels=settings.max_image_total_pixels,
-                )
-            except UnsupportedImageError as error:
-                raise HTTPException(
-                    status_code=422,
-                    detail=public_error_message(error, "文档无法读取，请确认文件未损坏或未加密。"),
-                ) from error
-
+        policy = policy_from_settings(session)
+        try:
+            prepared, page_count = prepare_input(temporary_path, upload.content_type, settings, policy)
+        except (UnsupportedTextFileError, UnsupportedImageError, UnsupportedPdfError, InputBudgetError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(status_code=422, detail="文件损坏或无法读取，请确认文件有效且未加密。") from error
+        processing_units = max(1, sum(unit.text is None for unit in prepared.units))
         sha256 = digest.hexdigest()
         duplicate_id = session.scalar(
             select(TaskRecord.id)
@@ -187,6 +143,7 @@ async def create_task_from_upload(
             content_type=upload.content_type,
             size_bytes=size,
             page_count=page_count,
+            processing_units=processing_units,
             sha256=sha256,
             storage_path=task_storage_name(task_id, upload.content_type),
             template_mode="manual" if selected_template else template_mode,
@@ -197,6 +154,12 @@ async def create_task_from_upload(
             duplicate_of_task_id=duplicate_id,
             target_table_id=target_table_id,
         )
+        task = session.get(TaskRecord, task_id)
+        task.input_policy_json = policy.model_dump_json()
+        task.input_plan_json = prepared.scope.model_dump_json()
+        if selected_template is not None:
+            from document_pipeline_api.services.local_exports import snapshot_task_export
+            snapshot_task_export(session, task, selected_template)
         session.commit()
         task = session.get(TaskRecord, task_id)
         if task is None:
@@ -234,6 +197,7 @@ def _insert_task_if_capacity_available(
     content_type: str,
     size_bytes: int,
     page_count: int,
+    processing_units: int,
     sha256: str,
     storage_path: str,
     template_mode: str,
@@ -245,7 +209,7 @@ def _insert_task_if_capacity_available(
     capacity_conditions = _capacity_conditions(
         settings,
         additional_bytes=size_bytes,
-        additional_pages=page_count,
+        additional_pages=processing_units,
     )
     now = utc_now()
     columns = [
@@ -254,6 +218,7 @@ def _insert_task_if_capacity_available(
         "content_type",
         "size_bytes",
         "page_count",
+        "processing_units",
         "sha256",
         "storage_path",
         "template_mode",
@@ -290,6 +255,7 @@ def _insert_task_if_capacity_available(
         literal(content_type),
         literal(size_bytes),
         literal(page_count),
+        literal(processing_units),
         literal(sha256),
         literal(storage_path),
         literal(template_mode),
@@ -340,7 +306,7 @@ def _capacity_conditions(
         .scalar_subquery()
     )
     active_pages = (
-        select(func.coalesce(func.sum(TaskRecord.page_count), 0))
+        select(func.coalesce(func.sum(func.coalesce(TaskRecord.processing_units, TaskRecord.page_count)), 0))
         .where(active_filter)
         .scalar_subquery()
     )
@@ -357,7 +323,7 @@ def _capacity_error(settings: Settings) -> HTTPException:
         detail=(
             "当前待处理文件容量不足，请等待部分任务完成后再试。"
             f"当前上限为 {settings.max_active_tasks} 个文件、"
-            f"{settings.max_active_bytes} 字节、{settings.max_active_pages} 页。"
+            f"{settings.max_active_bytes} 字节、{settings.max_active_pages} 个输入容量单位。"
         ),
         headers={"Retry-After": "5"},
     )
@@ -376,12 +342,22 @@ ACTIVE_TASK_STATUSES = {
 }
 
 
+def task_name_matches(search: str):
+    pattern = f"%{search}%"
+    return (
+        TaskRecord.filename.ilike(pattern)
+        | func.json_extract(TaskRecord.file_name_json, "$.confirmed_filename").ilike(pattern)
+        | func.json_extract(TaskRecord.export_state_json, "$.confirmed_name").ilike(pattern)
+    )
+
+
 def list_tasks(
     session: Session,
     *,
     limit: int = 100,
     offset: int = 0,
     active_only: bool = False,
+    export_pending: bool = False,
     status: str | None = None,
     search: str | None = None,
     template_id: str | None = None,
@@ -402,11 +378,16 @@ def list_tasks(
         statement = statement.where(
             TaskRecord.status.in_(ACTIVE_TASK_STATUSES)
         )
+    if export_pending:
+        statement = statement.where(
+            TaskRecord.status == TaskStatus.COMPLETED.value,
+            func.json_extract(TaskRecord.export_state_json, "$.status").in_(["failed", "needs_rebind"]),
+        )
     if status is not None:
         statement = statement.where(TaskRecord.status == status)
     if search:
         statement = statement.where(
-            TaskRecord.filename.ilike(f"%{search}%")
+            task_name_matches(search)
         )
     if template_id:
         statement = statement.where(TaskRecord.template_id == template_id)
@@ -454,6 +435,7 @@ def retry_task(
     session: Session,
     settings: Settings,
     task_id: str,
+    *, use_current_settings: bool = False,
 ) -> TaskRecord:
     task = session.get(TaskRecord, task_id)
     if task is None:
@@ -465,6 +447,16 @@ def retry_task(
     except InvalidTaskTransition as error:
         raise HTTPException(status_code=409, detail="只有失败任务可以重试。") from error
 
+    policy_values = {}
+    if use_current_settings:
+        from document_pipeline_api.storage_paths import resolve_task_storage_path
+        policy = policy_from_settings(session)
+        try:
+            prepared, _ = prepare_input(resolve_task_storage_path(settings.storage_dir, task), task.content_type, settings, policy)
+        except (UnsupportedTextFileError, UnsupportedImageError, UnsupportedPdfError, InputBudgetError, OSError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        policy_values = {"input_policy_json": policy.model_dump_json(), "input_plan_json": prepared.scope.model_dump_json(),
+                         "processing_units": max(1, sum(unit.text is None for unit in prepared.units))}
     result = session.execute(
         update(TaskRecord)
         .where(
@@ -473,15 +465,17 @@ def retry_task(
             *_capacity_conditions(
                 settings,
                 additional_bytes=task.size_bytes,
-                additional_pages=task.page_count,
+                additional_pages=policy_values.get("processing_units", task.processing_units or task.page_count),
             ),
         )
         .values(
+            **policy_values,
             status=next_state.status.value,
             lease_token=None,
             lease_expires_at=None,
             failure_code=None,
             failure_message=None,
+            failure_detail=None,
             # 重试后计时从零重新开始：重置本次处理尝试的开始时间
             started_at=utc_now(),
             updated_at=utc_now(),
@@ -545,6 +539,11 @@ def select_task_template(
     # 从全部当前有效模板中选择；否则一次分类遗漏会把任务永久困在待选状态。
     template = get_active_template(session, template_id)
     version = candidate["version"] if candidate is not None else template.version
+    from document_pipeline_api.services.local_exports import build_export_snapshot
+    from document_pipeline_api.services.templates import get_template_version
+    export_snapshot = task.export_state_json
+    if task.template_id != template_id or export_snapshot is None:
+        export_snapshot = build_export_snapshot(session, get_template_version(session, template_id, version))
     next_status = TaskState(status=TaskStatus(task.status)).transition_to(
         TaskStatus.QUEUED
     ).status.value
@@ -556,13 +555,15 @@ def select_task_template(
             *_capacity_conditions(
                 settings,
                 additional_bytes=task.size_bytes,
-                additional_pages=task.page_count,
+                additional_pages=task.processing_units or task.page_count,
             ),
         )
         .values(
             template_id=template_id,
             template_version=version,
+            export_state_json=export_snapshot,
             candidate_templates_json="[]",
+            pending_reason=None,
             status=next_status,
             # 选择模板重新入队：本次处理尝试重新开始计时
             started_at=utc_now(),
@@ -577,6 +578,29 @@ def select_task_template(
     if updated_task is None:
         raise RuntimeError("模板选择后的任务不存在。")
     return updated_task
+
+
+def accept_task_scope(session: Session, settings: Settings, task_id: str) -> TaskRecord:
+    task = session.get(TaskRecord, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="没有找到这个任务。")
+    if task.status != TaskStatus.WAITING_FOR_TEMPLATE.value or task.pending_reason != "input_scope" or not task.input_policy_json:
+        raise HTTPException(status_code=409, detail="这个任务当前不需要确认读取范围。")
+    policy = InputPolicy.model_validate_json(task.input_policy_json)
+    policy.accept_partial = True
+    policy.allow_limited_input = True
+    result = session.execute(update(TaskRecord).where(
+        TaskRecord.id == task_id,
+        TaskRecord.status == TaskStatus.WAITING_FOR_TEMPLATE.value,
+        TaskRecord.pending_reason == "input_scope",
+        *_capacity_conditions(settings, additional_bytes=task.size_bytes, additional_pages=task.processing_units or task.page_count),
+    ).values(input_policy_json=policy.model_dump_json(), pending_reason=None,
+             status=TaskStatus.QUEUED.value, started_at=utc_now(), updated_at=utc_now()))
+    if result.rowcount != 1:
+        session.rollback()
+        raise _capacity_error(settings)
+    session.commit()
+    return session.get(TaskRecord, task_id)
 
 
 def pause_task(session: Session, task_id: str) -> TaskRecord:
@@ -639,7 +663,7 @@ def resume_task(
             *_capacity_conditions(
                 settings,
                 additional_bytes=task.size_bytes,
-                additional_pages=task.page_count,
+                additional_pages=task.processing_units or task.page_count,
             ),
         )
         .values(
@@ -678,12 +702,13 @@ def _task_storage_paths(
     tasks: list[TaskRecord],
 ) -> list[object]:
     """解析任务原文件路径；引用无效的任务不阻塞删除。"""
-    from document_pipeline_api.storage_paths import resolve_task_storage_path
+    from document_pipeline_api.storage_paths import resolve_task_storage_path, ensure_managed_path
 
     paths: list[object] = []
     for task in tasks:
         try:
-            paths.append(resolve_task_storage_path(settings.storage_dir, task))
+            path = resolve_task_storage_path(settings.storage_dir, task)
+            paths.append(ensure_managed_path(settings.storage_dir, path))
         except ValueError:
             continue
     return paths
@@ -722,6 +747,7 @@ def _discard_task_files(paths: list[object]) -> None:
             continue
 
 
+@guard_file_operation
 def delete_task(session: Session, settings: Settings, task_id: str) -> int:
     """删除单个历史任务：断开数据行溯源、删除提取/确认/评审记录与原文件。
 
@@ -746,6 +772,7 @@ def delete_task(session: Session, settings: Settings, task_id: str) -> int:
     return kept_rows or 0
 
 
+@guard_file_operation
 def delete_tasks_batch(
     session: Session, settings: Settings, task_ids: list[str]
 ) -> tuple[int, int]:
@@ -783,6 +810,7 @@ def delete_tasks_batch(
     return len(deletable), kept_rows or 0
 
 
+@guard_file_operation
 def clear_history(session: Session, settings: Settings) -> int:
     """清理全部历史任务：已完成/失败/取消/待确认，保留进行中任务和数据表数据。"""
     tasks = list(

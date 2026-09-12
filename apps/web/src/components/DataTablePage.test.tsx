@@ -18,6 +18,44 @@ const columns = [
 ];
 
 describe("DataTablePage", () => {
+  it("keeps pending source information visible in both presentations", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/tables")) return response([table]);
+      if (url.endsWith("/views") || url.includes("/templates")) return response([]);
+      return response({ ...table, columns, page: 1, page_size: 10, rows: [{ id: 1, task_id: null, item_index: 1, version: 1,
+        review_pending: true, values: { seller_name: "待核对内容", source_filename: "合成资料.txt" }, created_at: "", updated_at: "" }] });
+    }));
+    render(<DataTablePage />);
+    expect(await screen.findByText("本页有 1 条来源待核对的数据")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "卡片" }));
+    expect(await screen.findByText("来源待核对", { selector: ".badge" })).toBeInTheDocument();
+    expect(screen.getByText("本页有 1 条来源待核对的数据")).toBeInTheDocument();
+  });
+
+  it("uses the measured card capacity and returns table mode to ten rows", async () => {
+    const sizes: number[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/tables")) return response([{ ...table, row_count: 6 }]);
+      if (url.endsWith("/views") || url.includes("/templates")) return response([]);
+      const params = new URL(url, "http://localhost").searchParams;
+      const size = Number(params.get("page_size") || 10);
+      const page = Number(params.get("page") || 1);
+      sizes.push(size);
+      return response({ ...table, row_count: 6, columns, presentation: { mode: "card", primary_fields: [], collapsed_fields: [] }, page, page_size: size,
+        rows: Array.from({ length: 6 }, (_, i) => ({ id: i + 1, task_id: null, item_index: i, version: 1, values: { seller_name: `记录${i + 1}` }, created_at: "", updated_at: "" })).slice((page - 1) * size, page * size) });
+    }));
+    render(<DataTablePage />);
+    await waitFor(() => expect(screen.getAllByRole("article")).toHaveLength(2));
+    await waitFor(() => expect(sizes.at(-1)).toBe(2));
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+    await waitFor(() => expect(screen.getAllByRole("article")[0]).toHaveTextContent("记录3"));
+    fireEvent.click(screen.getByRole("button", { name: "表格" }));
+    await waitFor(() => expect(sizes.at(-1)).toBe(10));
+    expect(screen.queryByRole("article")).not.toBeInTheDocument();
+  });
+
   beforeEach(() => {
     vi.stubGlobal(
       "fetch",
@@ -93,6 +131,29 @@ describe("DataTablePage", () => {
     );
   });
 
+  it("shows one collapsed source disclosure for multiple partial rows from the same task", async () => {
+    const originalFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const original = await originalFetch(String(input), init);
+      if (!String(input).includes("/tables/invoice-v1?")) return original;
+      const data = await original.json();
+      data.rows[0].input_scope = {
+        version: 1, rule: "head_tail_v1", coverage: "partial", selected_units: 2, total_units: 10,
+        selected: [{ kind: "page", start: 1, end: 1 }, { kind: "page", start: 10, end: 10 }],
+        omitted: [{ location: { kind: "page", start: 2, end: 9 }, reason: "input_budget" }],
+        text_characters: 0, text_budget: 200, image_budget: 2, notes: [],
+      };
+      data.rows[0].values.source_filename = "长发票.pdf";
+      data.rows.push({ ...data.rows[0], id: 2, item_index: 1 });
+      return response(data);
+    }));
+    render(<DataTablePage />);
+    const summary = await screen.findByText("本页有局部读取的数据 · 查看来源范围");
+    expect(summary.closest("details")).not.toHaveAttribute("open");
+    expect(screen.getAllByText("长发票.pdf · 局部读取")).toHaveLength(1);
+    expect(screen.getByText(/第 2–9 页/)).toHaveTextContent("达到设置的读取上限");
+  });
+
   it("exposes a working keyboard column resize handle and full cell value", async () => {
     const { container } = render(<DataTablePage />);
 
@@ -120,12 +181,12 @@ describe("DataTablePage", () => {
     fireEvent.change(screen.getByRole("combobox", { name: "用于分类的字段" }), {
       target: { value: "seller_name" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "创建分 Sheet" }));
+    fireEvent.click(screen.getByRole("button", { name: "应用分组" }));
 
     const view = await screen.findByRole("button", { name: /供应商甲/ });
     fireEvent.click(view);
 
-    expect(await screen.findByText("视图 · 来源 发票")).toBeInTheDocument();
+    expect(await screen.findByText("分组 · 发票")).toBeInTheDocument();
   });
 
   it("disables multi-sheet export until split-sheet views exist", async () => {

@@ -21,6 +21,82 @@ def client(tmp_path: Path) -> TestClient:
         yield test_client
 
 
+def test_history_restore_selects_version_and_preserves_existing_contracts(client: TestClient, tmp_path: Path):
+    copied = client.post("/api/v1/templates/builtin-invoice/copy").json()
+    base = {key: copied[key] for key in ("name", "description", "extra_instructions", "fields", "validation_rules", "deterministic_rules", "output_mapping", "behavior")}
+    url = f"/api/v1/templates/{copied['id']}"
+    table = client.post("/api/v1/tables", json={"name": "已有数据", "template_key": copied["id"]}).json()
+    table_before = client.get(f"/api/v1/tables/{table['id']}").json()
+    binding_before = client.get(f"{url}/local-export").json()
+    old = client.get(f"{url}/versions/1").json()
+    updated = client.put(url, json={**base, "fields": list(reversed(base["fields"])), "extra_instructions": "新增提示", "expected_version": 1})
+    assert updated.status_code == 200
+    assert [v["version"] for v in client.get(f"{url}/versions").json()] == [2, 1]
+    assert [v["version"] for v in client.get(f"{url}/versions?before=2").json()] == [1]
+    assert client.post(f"{url}/versions/1/restore", json={"expected_version": 1}).status_code == 409
+    assert client.post(f"{url}/versions/2/restore", json={"expected_version": 2}).status_code == 409
+    restored = client.post(f"{url}/versions/1/restore", json={"expected_version": 2})
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["version"] == 1
+    assert [v["version"] for v in client.get(f"{url}/versions").json()] == [2, 1]
+    events = client.get(f"{url}/restorations").json()
+    assert [(e["from_version"], e["to_version"]) for e in events] == [(2, 1)]
+    for key in base:
+        assert restored.json()[key] == base[key]
+    historical = client.get(f"{url}/versions/1").json()
+    for key in base:
+        assert historical[key] == old[key]
+    assert client.get(f"{url}/local-export").json() == binding_before
+    assert client.get(f"/api/v1/tables/{table['id']}").json() == table_before
+    assert client.post("/api/v1/templates/builtin-invoice/versions/1/restore", json={"expected_version": 2}).status_code == 409
+    assert client.get(f"{url}/versions/999").status_code == 404
+    assert client.get("/api/v1/templates/missing/versions").status_code == 404
+
+
+def test_restore_round_trip_rejects_stale_editor_and_allocates_unused_version(client: TestClient):
+    created = client.post("/api/v1/templates", json=_user_template_body("版本切换")).json()
+    url = f"/api/v1/templates/{created['id']}"
+    v2 = client.put(url, json={**_editable_body(created), "description": "第二版", "expected_version": 1}).json()
+    # A queued task continues to reference version 2, even after the current version changes.
+    from document_pipeline_api.models import TaskRecord
+    with client.app.state.session_factory() as session:
+        session.add(TaskRecord(id="old-snapshot", filename="test.txt", content_type="text/plain", size_bytes=1,
+                               sha256="snapshot", storage_path="test.txt", template_mode="custom",
+                               template_id=created["id"], template_version=2, status="queued"))
+        session.commit()
+    assert client.post(f"{url}/versions/1/restore", json={"expected_version": 2}).json()["version"] == 1
+    current = client.post(f"{url}/versions/2/restore", json={"expected_version": 1}).json()
+    stale = {"expected_version": 2, "expected_updated_at": v2["updated_at"]}
+    assert client.put(url, json={**_editable_body(v2), **stale}).status_code == 409
+    assert client.post(f"{url}/versions/1/restore", json=stale).status_code == 409
+    assert len(client.get(f"{url}/restorations").json()) == 2
+    assert client.post(f"{url}/versions/1/restore", json={"expected_version": 2, "expected_updated_at": current["updated_at"]}).status_code == 200
+    saved = client.put(url, json={**_editable_body(created), "description": "新编辑", "expected_version": 1})
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["version"] == 3
+    assert client.get(f"{url}/versions/2").json()["description"] == "第二版"
+    with client.app.state.session_factory() as session:
+        assert session.get(TaskRecord, "old-snapshot").template_version == 2
+
+
+def test_restore_name_conflict_archive_and_delete_log(client: TestClient):
+    created = client.post("/api/v1/templates", json=_user_template_body("旧名字")).json()
+    url = f"/api/v1/templates/{created['id']}"
+    assert client.put(url, json={**_editable_body(created), "name": "新名字", "expected_version": 1}).status_code == 200
+    other = client.post("/api/v1/templates", json=_user_template_body("旧名字")).json()
+    assert client.post(f"{url}/versions/1/restore", json={"expected_version": 2}).status_code == 422
+    assert client.get(f"{url}/restorations").json() == []
+    client.delete(f"/api/v1/templates/{other['id']}")
+    client.post(f"{url}/archive")
+    assert client.post(f"{url}/versions/1/restore", json={"expected_version": 2}).status_code == 409
+    client.post(f"{url}/restore")
+    assert client.post(f"{url}/versions/1/restore", json={"expected_version": 2}).status_code == 200
+    assert client.delete(url).status_code == 204
+    from document_pipeline_api.models import TemplateRestorationRecord
+    with client.app.state.session_factory() as session:
+        assert session.scalars(select(TemplateRestorationRecord)).all() == []
+
+
 def test_builtin_templates_are_seeded_and_read_only(client: TestClient) -> None:
     response = client.get("/api/v1/templates")
 

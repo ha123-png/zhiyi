@@ -1,3 +1,4 @@
+import { TaskFailureDetails } from "./TaskFailureDetails";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
@@ -13,6 +14,7 @@ import {
   deleteTask,
   deleteTasksBatch,
   getTasks,
+  getTaskSummary,
   getTables,
   getTemplates,
   retryTask,
@@ -24,11 +26,13 @@ import type { DataTableRead, ExtractionTemplate, Task, TaskStatus } from "../typ
 import { parseServerTime } from "../time";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { Icon } from "./Icon";
+import { PartialInputAction } from "./InputScopeDetails";
+import { TaskExportDetails } from "./TaskExportDetails";
 
 // 状态 → 中文文案（对齐原型队列语义：等待中/处理中/已暂停/已完成/失败）
 const STATUS_TEXT: Record<TaskStatus, string> = {
   created: "等待中",
-  waiting_for_template: "待选模板/表",
+  waiting_for_template: "待处理事项",
   queued: "等待中",
   processing: "处理中",
   validating: "校验中",
@@ -73,7 +77,7 @@ function templateLabel(t: Task, templateNames: Record<string, string>): string {
 
 interface TaskQueuePageProps {
   /** 全局处理日志（App 层由 SSE 事件生成，覆盖所有状态变化，页面切换不丢失）。 */
-  logs?: { time: string; message: string }[];
+  logs?: { time: string; message: string; taskId?: string }[];
   onOpenTask?: (task: Task) => void;
   onOpenData?: (task: Task) => void;
 }
@@ -101,26 +105,48 @@ export function TaskQueuePage({
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [retryingAll, setRetryingAll] = useState(false);
+  const [exportPage, setExportPage] = useState(0);
+  const [waitingPage, setWaitingPage] = useState(0);
+  const [exportPendingTasks, setExportPendingTasks] = useState<Task[]>([]);
+  const [matchFailedTasks, setMatchFailedTasks] = useState<Task[]>([]);
+  const [pendingTotals, setPendingTotals] = useState({ exports: 0, waiting: 0 });
+  const requestNumber = useRef(0);
+  const pendingPageSize = 50;
 
   const load = useCallback(async () => {
+    const currentRequest = ++requestNumber.current;
     try {
       setError(null);
       // 活动任务必须按状态查询，不能假设它们一定处于最近 N 条；否则大量新历史
       // 会把旧的待选模板/暂停任务挤出列表。近期终态仅用于本页摘要。
-      const [active, recent] = await Promise.all([
+      const [active, recent, exports, waiting, summary] = await Promise.all([
         getTasks({ limit: 1000, activeOnly: true }),
         getTasks({ limit: 500 }),
+        getTasks({ limit: pendingPageSize, offset: exportPage * pendingPageSize, exportPending: true }),
+        getTasks({ limit: pendingPageSize, offset: waitingPage * pendingPageSize, status: "waiting_for_template" }),
+        getTaskSummary(),
       ]);
+      if (currentRequest !== requestNumber.current) return;
+      const exportItems = exports.filter((task) => task.status === "completed" && ["failed", "needs_rebind"].includes(task.file_export?.status ?? ""));
+      const waitingItems = waiting.filter((task) => task.status === "waiting_for_template");
+      setExportPendingTasks(exportItems);
+      setMatchFailedTasks(waitingItems);
+      setPendingTotals({ exports: summary.pending_exports ?? exportItems.length, waiting: summary.waiting_for_action ?? waitingItems.length });
+      setExportPage((page) => Math.min(page, Math.max(0, Math.ceil((summary.pending_exports ?? exports.length) / pendingPageSize) - 1)));
+      setWaitingPage((page) => Math.min(page, Math.max(0, Math.ceil((summary.waiting_for_action ?? waiting.length) / pendingPageSize) - 1)));
       const merged = new Map(recent.map((task) => [task.id, task]));
       active.forEach((task) => merged.set(task.id, task));
+      exports.forEach((task) => merged.set(task.id, task));
+      waiting.forEach((task) => merged.set(task.id, task));
       const all = Array.from(merged.values());
       setTasks(all);
     } catch (err) {
+      if (currentRequest !== requestNumber.current) return;
       setError(err instanceof Error ? err.message : "加载任务失败");
     } finally {
-      setLoading(false);
+      if (currentRequest === requestNumber.current) setLoading(false);
     }
-  }, []);
+  }, [exportPage, waitingPage]);
 
   useEffect(() => {
     load();
@@ -129,6 +155,7 @@ export function TaskQueuePage({
       typeof EventSource === "undefined" ? undefined : subscribeTaskEvents(load);
     const timer = setInterval(load, 1500);
     return () => {
+      requestNumber.current += 1;
       clearInterval(timer);
       unsub?.();
     };
@@ -149,9 +176,9 @@ export function TaskQueuePage({
     setCollapsed((s) => ({ ...s, [key]: !s[key] }));
   const isCardCollapsed = (key: string) => !!collapsed[key];
 
-  const handleRetry = async (taskId: string) => {
+  const handleRetry = async (taskId: string, useCurrentSettings = false) => {
     try {
-      await retryTask(taskId);
+      await retryTask(taskId, useCurrentSettings);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "重试任务失败");
@@ -298,9 +325,6 @@ export function TaskQueuePage({
     ["processing", "queued", "created", "paused", "validating"].includes(t.status),
   );
   // 待选模板
-  const matchFailedTasks = tasks.filter(
-    (t) => t.status === "waiting_for_template",
-  );
   // 最近完成：今天的才叫“最近”（completed / needs_review）
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
@@ -408,30 +432,30 @@ export function TaskQueuePage({
           </div>
 
           {/* Match failed (待选模板：黄) —— 始终显示卡片，无数据时展示空状态占位 */}
-          <div className="task-queue-card is-warning">
+          <div className="task-queue-card is-warning pending-actions-card">
             <div
               className={`task-queue-header collapsible${isCardCollapsed("match") ? " is-collapsed" : ""}`}
               onClick={() => toggleCard("match")}
             >
               <h3>
-                <Icon icon={HelpCircle} size={15} /> 待选模板/表
+                <Icon icon={HelpCircle} size={15} /> 待处理事项
               </h3>
               <div className="header-center">
-                <span className="badge warn">{matchFailedTasks.length}</span>
+                <span className="badge warn">{pendingTotals.waiting + pendingTotals.exports}</span>
               </div>
               <div className="header-actions">
                 <Icon className="card-caret" icon={ChevronDown} size={16} />
                 {matchFailedTasks.length > 0 && (
                   <button
                     className="btn ghost sm"
-                    title="批量删除全部待选模板任务（没有产生记录，确认后直接删除）"
+                    title="批量删除本页待选模板或待确认范围任务，不包含副本事项"
                     disabled={busyTaskId !== null}
                     onClick={(e) => {
                       e.stopPropagation();
                       setBatchDeleteMatchOpen(true);
                     }}
                   >
-                    <Icon icon={Trash2} size={12} /> 批量删除
+                    <Icon icon={Trash2} size={12} /> 删除本页待选任务
                   </button>
                 )}
               </div>
@@ -439,10 +463,31 @@ export function TaskQueuePage({
             <div className={"collapsible-region" + (isCardCollapsed("match") ? " is-collapsed" : "")}>
               <div className="collapsible-inner">
                 <div className="task-list">
-                  {matchFailedTasks.length === 0 && (
-                    <div className="task-empty">暂无待选模板/表任务</div>
+                  {matchFailedTasks.length === 0 && exportPendingTasks.length === 0 && (
+                    <div className="task-empty">暂无待处理事项</div>
                   )}
+                  {exportPendingTasks.map((task) => <div className="task-item" key={`export-${task.id}`}>
+                    <div className="task-row-top"><span className="task-name">{task.filename}</span><span className="badge warn">副本待处理</span></div>
+                    <TaskExportDetails task={task} expanded onUpdated={() => void load()} />
+                    <button className="btn ghost sm" onClick={() => onOpenTask?.(task)}>查看提取结果</button>
+                  </div>)}
+                  {pendingTotals.exports > pendingPageSize && <div className="row" aria-label="副本事项翻页">
+                    <button className="btn secondary sm" disabled={exportPage === 0} onClick={() => setExportPage((page) => page - 1)}>上一页副本</button>
+                    <span className="small muted">副本事项 {exportPage + 1}/{Math.ceil(pendingTotals.exports / pendingPageSize)} 页 · 共 {pendingTotals.exports} 份</span>
+                    <button className="btn secondary sm" disabled={(exportPage + 1) * pendingPageSize >= pendingTotals.exports} onClick={() => setExportPage((page) => page + 1)}>下一页副本</button>
+                  </div>}
+                  {pendingTotals.waiting > pendingPageSize && <div className="row" aria-label="待选事项翻页">
+                    <button className="btn secondary sm" disabled={waitingPage === 0} onClick={() => setWaitingPage((page) => page - 1)}>上一页待选</button>
+                    <span className="small muted">模板与范围事项 {waitingPage + 1}/{Math.ceil(pendingTotals.waiting / pendingPageSize)} 页 · 共 {pendingTotals.waiting} 份</span>
+                    <button className="btn secondary sm" disabled={(waitingPage + 1) * pendingPageSize >= pendingTotals.waiting} onClick={() => setWaitingPage((page) => page + 1)}>下一页待选</button>
+                  </div>}
                   {matchFailedTasks.map((t) => {
+                    if (t.pending_reason === "input_scope") return <div className="task-item" key={t.id}>
+                      <div className="task-row-top"><span className="task-name">{t.filename}</span><span className="badge warn">待确认范围</span></div>
+                      <PartialInputAction task={t} onUpdated={() => void load()} />
+                      <button className="btn ghost sm" onClick={() => onOpenTask?.(t)}>查看任务</button>
+                      <button className="btn ghost sm danger-btn" onClick={() => setDeleteMatchTarget(t)}>删除任务</button>
+                    </div>;
                     const choosingTable = t.candidate_templates.some((candidate) => candidate.description?.includes("指定表不符"));
                     const options = choosingTable
                       ? tables.filter((table) => {
@@ -616,10 +661,11 @@ export function TaskQueuePage({
                           {t.status === "cancelled"
                             ? "任务已取消，可清除该记录"
                             : (t.failure_message ?? "处理失败，可重试")}
+                          {t.status === "failed" && <TaskFailureDetails taskId={t.id} />}
                         </div>
                         <div className="task-actions">
                           {t.status === "failed" && (
-                            <button className="btn ghost sm" onClick={() => handleRetry(t.id)}>重试</button>
+                            <><button className="btn ghost sm" onClick={() => handleRetry(t.id)}>重试</button><button className="btn ghost sm" title="使用当前文件读取设置重新准备输入；模型仍沿用任务绑定的方案" onClick={() => handleRetry(t.id, true)}>按当前读取设置重试</button></>
                           )}
                           <button
                             className="btn ghost sm danger-btn"
@@ -650,7 +696,7 @@ export function TaskQueuePage({
             logs.map((log, index) => (
               <div className="queue-log-entry" key={index}>
                 <span className="queue-log-time">{log.time}</span>
-                <span className="queue-log-msg">{log.message}</span>
+                <div className="queue-log-msg">{log.message}{log.taskId && <TaskFailureDetails taskId={log.taskId} />}</div>
               </div>
             ))
           )}
@@ -671,7 +717,7 @@ export function TaskQueuePage({
       <ConfirmDialog
         open={batchDeleteMatchOpen}
         title="批量删除任务"
-        description={`将删除 ${matchFailedTasks.length} 个待选模板任务（都没有产生任何数据记录）。确认删除吗？`}
+        description={`将删除本页 ${matchFailedTasks.length} 个待选模板或待确认范围任务及知意内部原件。已确认的数据行保留但断开原件追溯；外部副本不受影响。其他页任务不会删除。确认删除吗？`}
         buttonLabel="确认删除"
         busy={busyTaskId === "batch"}
         onConfirm={() => void handleBatchDeleteMatch()}

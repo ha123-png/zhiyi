@@ -103,7 +103,8 @@ def create_app(
             ensure_builtin_templates(session)
             leave_experimental_one_click_profile(session)
             ensure_default_local_profile(session)
-        if active_settings.queue_enabled:
+        from document_pipeline_api.services.clear_data import clear_journal_path
+        if active_settings.queue_enabled and not clear_journal_path(active_settings).exists():
             from document_pipeline_api.services.queueing import recover_missing_queued_tasks
             from document_pipeline_api.services.task_leases import (
                 recover_expired_task_leases,
@@ -136,9 +137,41 @@ def create_app(
     application.state.settings = active_settings
     application.state.model_secret_store = model_secret_store
     application.state.session_factory = sessionmaker(engine, expire_on_commit=False)
+    import threading
+    application.state.maintenance_condition = threading.Condition()
+    application.state.maintenance_active = False
+    application.state.active_mutations = 0
+
+    @application.middleware("http")
+    async def maintenance_barrier(request: Request, call_next):
+        from document_pipeline_api.services.clear_data import clear_journal_path
+        mutation = request.method not in {"GET", "HEAD", "OPTIONS"}
+        clearing = request.url.path == "/api/v1/system/admin/clear-data"
+        if mutation:
+            with application.state.maintenance_condition:
+                if application.state.maintenance_active or (clear_journal_path(active_settings).exists() and not clearing):
+                    return JSONResponse(status_code=503, content={"detail": "本地数据正在清除或上次清除未完成，请在设置中完成清除后再继续。"})
+                application.state.active_mutations += 1
+        try:
+            return await call_next(request)
+        finally:
+            if mutation:
+                with application.state.maintenance_condition:
+                    application.state.active_mutations -= 1
+                    application.state.maintenance_condition.notify_all()
+    def upload_limit_bytes():
+        from document_pipeline_api.services.clear_data import clear_journal_path
+        if application.state.maintenance_active or clear_journal_path(active_settings).exists():
+            return None
+        from document_pipeline_api.services.system_settings import get_setting
+        with application.state.session_factory() as session:
+            value = get_setting(session, "upload_limit_mb", "")
+            return int(value) * 1024 * 1024 if value else None
+
     application.add_middleware(
         RequestSizeLimitMiddleware,
         max_bytes=active_settings.max_request_bytes,
+        upload_limit=upload_limit_bytes,
     )
     application.add_middleware(
         TrustedHostMiddleware,

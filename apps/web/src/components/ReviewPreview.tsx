@@ -28,6 +28,7 @@ import type {
   TemplateValue,
 } from "../types";
 import { Icon } from "./Icon";
+import { InputScopeDetails, PartialInputAction } from "./InputScopeDetails";
 
 interface ReviewPreviewProps {
   confirmation: Confirmation | null;
@@ -190,7 +191,7 @@ export function ReviewPreview({
         <div>
           <span className="eyebrow">
             {confirmation
-              ? `已自动入表 · ${confirmation.table_name}表 · ${confirmation.row_count} 行`
+              ? `已入表 · ${confirmation.table_name}表 · ${confirmation.row_count} 行`
               : extraction
               ? `校验问题 · 第 ${extraction.review_version} 版 · ${extraction.validation_issues.length} 处规则提示`
               : "提取数据"}
@@ -260,10 +261,10 @@ export function ReviewPreview({
         />
       ) : task.status === "waiting_for_template" ? (
         <PendingWorkspace task={task}>
-          <TemplateChoice
+          {task.pending_reason === "input_scope" ? <PartialInputAction task={task} /> : <TemplateChoice
             onSelect={(templateId) => onSelectTemplate(task.id, templateId)}
             task={task}
-          />
+          />}
         </PendingWorkspace>
       ) : !extraction || !draft ? (
         <PendingWorkspace
@@ -291,6 +292,7 @@ export function ReviewPreview({
           </div>
 
           <div className="field-pane">
+            {extraction.input_scope?.coverage === "partial" && <p className="small muted">仅处理部分内容</p>}
             <div className="pane-toolbar">
               <span>可编辑结果</span>
               <span>
@@ -333,6 +335,7 @@ export function ReviewPreview({
             ) : (
               <div className="review-empty">没有找到这次处理使用的模板版本。</div>
             )}
+            <InputScopeDetails scope={extraction.input_scope} label="来源与处理详情" />
           </div>
         </div>
       )}

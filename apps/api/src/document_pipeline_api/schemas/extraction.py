@@ -4,6 +4,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from document_pipeline_api.schemas.templates import TemplateRead
+from document_pipeline_api.schemas.input_scope import InputScope, SourceRange
+from document_pipeline_api.schemas.file_name import FileNameRead
 
 
 class DocumentKind(StrEnum):
@@ -92,9 +94,11 @@ class FieldEvidence(BaseModel):
     status: Literal["page_only", "located", "unavailable", "user_edited"]
     source: Literal["system", "model_reported", "user"]
     location_verified: bool
+    location: SourceRange | None = None
 
 
 class ExtractionRead(BaseModel):
+    file_name: FileNameRead | None = None
     task_id: str
     document_kind: DocumentKind
     template_id: str | None
@@ -108,9 +112,11 @@ class ExtractionRead(BaseModel):
     result: DocumentExtraction | TemplateExtraction
     validation_issues: list[ValidationIssue]
     evidence: list[FieldEvidence]
+    input_scope: InputScope | None = None
 
 
 class ReviewUpdate(BaseModel):
+    filename: str | None = Field(default=None, max_length=512)
     model_config = ConfigDict(extra="forbid")
 
     expected_version: int = Field(ge=0)

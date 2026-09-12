@@ -147,19 +147,28 @@ def render_image_frames(
     max_frames: int,
     expected_content_type: str | None = None,
     max_total_pixels: int | None = None,
+    frame_numbers: list[int] | None = None,
 ) -> list[Path]:
-    """把图片的全部帧按原顺序渲染为独立 PNG 页。"""
+    """按原始帧号渲染 PNG；未指定范围时保持处理全部帧的旧行为。"""
     frame_count = inspect_image_frame_count(
         src,
         expected_content_type=expected_content_type,
-        max_frames=max_frames,
+        max_frames=max_frames if frame_numbers is None else None,
         max_total_pixels=max_total_pixels,
     )
+    if frame_numbers is not None and (
+        not frame_numbers or frame_numbers != sorted(set(frame_numbers))
+        or frame_numbers[0] < 1 or frame_numbers[-1] > frame_count
+        or len(frame_numbers) > max_frames
+    ):
+        raise UnsupportedImageError("图片处理范围必须是预算内有效、递增且不重复的原始帧号。")
+    selected = frame_numbers if frame_numbers is not None else list(range(1, frame_count + 1))
     out_dir.mkdir(parents=True, exist_ok=True)
     rendered: list[Path] = []
     try:
         with Image.open(src) as source:
-            for index in range(frame_count):
+            for frame_number in selected:
+                index = frame_number - 1
                 source.seek(index)
                 target = out_dir / f"{task_id}-image-{index + 1}.png"
                 _image_frame_to_rgb(source).save(target, "PNG")
@@ -245,7 +254,11 @@ def extract_docx_blocks(
     try:
         with zipfile.ZipFile(path) as archive:
             document_bytes = archive.read("word/document.xml")
-            rels_bytes = archive.read("word/_rels/document.xml.rels")
+            rels_bytes = (
+                archive.read("word/_rels/document.xml.rels")
+                if "word/_rels/document.xml.rels" in archive.namelist()
+                else b"<Relationships/>"
+            )
             media_names = sorted(
                 info.filename
                 for info in archive.infolist()
@@ -325,6 +338,8 @@ def _docx_paragraph_blocks(
     if heading_level:
         if text:
             blocks.append({"type": "heading", "level": heading_level, "text": text})
+        for image_index in image_refs:
+            blocks.append({"type": "image", "image_index": image_index, "caption": f"图片 {image_index}"})
         return
     # 纯文本段：区分列表项与普通段落
     is_list = p_pr is not None and p_pr.find(f"{{{_W_NS}}}numPr") is not None

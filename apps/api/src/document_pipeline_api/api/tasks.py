@@ -1,4 +1,5 @@
 import json
+from document_pipeline_api.schemas.file_export import ExportAction
 import mimetypes
 import zipfile
 from datetime import datetime
@@ -48,6 +49,7 @@ from document_pipeline_api.services.tasks import (
     retry_task,
     retry_tasks,
     select_task_template,
+    accept_task_scope,
 )
 from document_pipeline_api.services.file_formats import (
     UnsupportedTextFileError,
@@ -110,10 +112,12 @@ class DocxPreviewRead(BaseModel):
 
 @router.get("", response_model=list[TaskRead])
 def get_tasks(
+    request: Request,
     session: SessionDependency,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
     active_only: bool = False,
+    export_pending: bool = False,
     status: str | None = None,
     search: str | None = None,
     template_id: str | None = None,
@@ -130,6 +134,7 @@ def get_tasks(
         limit=limit,
         offset=offset,
         active_only=active_only,
+        export_pending=export_pending,
         status=status,
         search=search,
         template_id=template_id,
@@ -164,6 +169,7 @@ def get_tasks(
     return [
         TaskRead.model_validate(task).model_copy(
             update={
+                "internal_storage": _storage_description(request.app.state.settings, task),
                 "record_count": record_counts.get(task.id, 0),
                 "processing_elapsed_seconds": elapsed_seconds.get(task.id),
                 "processing_engine": processing_engines.get(task.id),
@@ -172,6 +178,15 @@ def get_tasks(
         )
         for task in tasks
     ]
+
+
+def _storage_description(settings, task):
+    if not task.internal_storage:
+        return None
+    try:
+        return {**task.internal_storage, "absolute_path": str(resolve_task_storage_path(settings.storage_dir, task))}
+    except (ValueError, OSError):
+        return {**task.internal_storage, "error": "原件位置无法验证，请检查存储目录。"}
 
 
 def _extraction_snapshot_rows(document_kind: str, result_json: str) -> int:
@@ -209,20 +224,33 @@ def tasks_summary(
     """
     statement = select(TaskRecord.status, func.count()).group_by(TaskRecord.status)
     if search:
-        statement = statement.where(TaskRecord.filename.ilike(f"%{search}%"))
+        from document_pipeline_api.services.tasks import task_name_matches
+        statement = statement.where(task_name_matches(search))
     if template_id:
         statement = statement.where(TaskRecord.template_id == template_id)
     if since is not None:
         statement = statement.where(TaskRecord.updated_at >= since)
     rows = session.execute(statement).all()
     summary = TasksSummary(total=sum(count for _, count in rows))
+    from document_pipeline_api.services.tasks import ACTIVE_TASK_STATUSES
     for status_value, count in rows:
+        if status_value in ACTIVE_TASK_STATUSES:
+            summary.active += count
+        if status_value == TaskStatus.WAITING_FOR_TEMPLATE.value:
+            summary.waiting_for_action = count
         if status_value == TaskStatus.COMPLETED.value:
             summary.completed = count
         elif status_value == TaskStatus.NEEDS_REVIEW.value:
             summary.needs_review = count
         elif status_value == TaskStatus.FAILED.value:
             summary.failed = count
+    export_count = select(func.count()).select_from(TaskRecord).where(
+        TaskRecord.status == TaskStatus.COMPLETED.value,
+        func.json_extract(TaskRecord.export_state_json, "$.status").in_(["failed", "needs_rebind"]),
+    )
+    if statement.whereclause is not None:
+        export_count = export_count.where(statement.whereclause)
+    summary.pending_exports = session.scalar(export_count) or 0
     return summary
 
 
@@ -244,6 +272,8 @@ async def create_task(
         template_id,
         target_table_id=target_table_id,
     )
+    from document_pipeline_api.services.internal_storage import classify_task_original
+    classify_task_original(session, settings, task.id)
     frozen = freeze_new_task_if_paused(session, task.id)
     if settings.queue_enabled and not frozen:
         from document_pipeline_api.services.queueing import enqueue_task
@@ -264,9 +294,9 @@ def cancel(request: Request, task_id: str, session: SessionDependency) -> TaskRe
 
 
 @router.post("/{task_id}/retry", response_model=TaskRead)
-def retry(request: Request, task_id: str, session: SessionDependency) -> TaskRead:
+def retry(request: Request, task_id: str, session: SessionDependency, use_current_settings: bool = False) -> TaskRead:
     settings: Settings = request.app.state.settings
-    task = retry_task(session, settings, task_id)
+    task = retry_task(session, settings, task_id, use_current_settings=use_current_settings)
     frozen = freeze_new_task_if_paused(session, task.id)
     if settings.queue_enabled and not frozen:
         from document_pipeline_api.services.queueing import enqueue_task
@@ -365,6 +395,8 @@ def select_template(
             0,
             target_table_id=selection.target_table_id,
         )
+        from document_pipeline_api.services.task_exports import process_task_export
+        process_task_export(session, settings, task_id)
         task = session.get(TaskRecord, confirmation.task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="没有找到这个任务。")
@@ -377,6 +409,8 @@ def select_template(
         task_id,
         selection.template_id,
     )
+    from document_pipeline_api.services.internal_storage import classify_task_original
+    classify_task_original(session, settings, task.id)
     frozen = freeze_new_task_if_paused(session, task.id)
     if settings.queue_enabled and not frozen:
         from document_pipeline_api.services.queueing import enqueue_task
@@ -385,9 +419,36 @@ def select_template(
     return TaskRead.model_validate(task)
 
 
+@router.post("/{task_id}/input-scope", response_model=TaskRead)
+def accept_scope(request: Request, task_id: str, session: SessionDependency) -> TaskRead:
+    settings: Settings = request.app.state.settings
+    task = accept_task_scope(session, settings, task_id)
+    frozen = freeze_new_task_if_paused(session, task.id)
+    if settings.queue_enabled and not frozen:
+        from document_pipeline_api.services.queueing import enqueue_task
+        enqueue_task(task.id)
+    return TaskRead.model_validate(task)
+
+
+@router.get("/{task_id}/diagnostics")
+def task_diagnostics(task_id: str, session: SessionDependency):
+    from document_pipeline_api.model_diagnostics import safe_diagnostic
+    task = session.get(TaskRecord, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在。")
+    detail = task.failure_detail or task.failure_message or "当前任务没有失败诊断。"
+    return {"code": task.failure_code, "detail": safe_diagnostic(detail), "attempt": task.attempt_count}
+
+
 @router.get("/{task_id}/result", response_model=ExtractionRead)
 def result(task_id: str, session: SessionDependency) -> ExtractionRead:
     return get_extraction(session, task_id)
+
+
+@router.post("/{task_id}/export", response_model=TaskRead)
+def export_action(task_id: str, body: ExportAction, request: Request, session: SessionDependency) -> TaskRecord:
+    from document_pipeline_api.services.task_exports import act_on_task_export
+    return act_on_task_export(session, request.app.state.settings, task_id, body)
 
 
 @router.put("/{task_id}/review", response_model=ExtractionRead)
@@ -395,8 +456,12 @@ def update_review(
     task_id: str,
     update: ReviewUpdate,
     session: SessionDependency,
+    request: Request,
 ) -> ExtractionRead:
-    return save_review(session, task_id, update)
+    result = save_review(session, task_id, update)
+    from document_pipeline_api.services.task_exports import process_task_export
+    process_task_export(session, request.app.state.settings, task_id)
+    return result
 
 
 @router.post("/{task_id}/confirm", response_model=ConfirmationRead)
@@ -404,13 +469,18 @@ def confirm(
     task_id: str,
     request: ConfirmRequest,
     session: SessionDependency,
+    http_request: Request,
 ) -> ConfirmationRead:
-    return confirm_task(
+    confirmation = confirm_task(
         session,
         task_id,
         request.expected_review_version,
         target_table_id=request.target_table_id,
+        filename=request.filename,
     )
+    from document_pipeline_api.services.task_exports import process_task_export
+    process_task_export(session, http_request.app.state.settings, task_id)
+    return confirmation
 
 
 @router.get("/{task_id}/confirmation", response_model=ConfirmationRead)

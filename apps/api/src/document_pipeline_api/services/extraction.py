@@ -5,7 +5,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from fastapi import HTTPException
-from pydantic import ValidationError
+from pydantic import ValidationError, create_model
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -30,20 +30,17 @@ from document_pipeline_api.schemas.extraction import (
 )
 from document_pipeline_api.services.file_formats import (
     CONVERTIBLE_IMAGE_TYPES,
-    RASTER_IMAGE_TYPES,
     TEXT_CONTENT_TYPES,
-    extract_docx_images,
-    extract_text,
-    render_image_frames,
-    render_text_pages,
-    split_text_pages,
 )
-from document_pipeline_api.services.pdf_rendering import render_pdf_pages
+from document_pipeline_api.services.processing_input import prepare_input, policy_for_context, render_input_images, input_scope_issues
+from document_pipeline_api.services.input_scope import InputBudgetError, select_input, visual_units
+from document_pipeline_api.schemas.input_scope import InputPolicy, InputScope
 from document_pipeline_api.services.model_runtime import settings_for_task
 from document_pipeline_api.services.system_settings import get_bool_setting
 from document_pipeline_api.storage_paths import resolve_task_storage_path
 from document_pipeline_api.services.rule_evaluation import evaluate_rules
 from document_pipeline_api.services.template_processing import (
+    TEMPLATE_PROMPT_VERSION,
     build_template_extraction_model,
     build_template_extraction_prompt,
     match_template,
@@ -70,9 +67,7 @@ _PROCESSABLE_CONTENT_TYPES = {
     *TEXT_CONTENT_TYPES,
 }
 
-_DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 # docx 内嵌图片并入识别输入页的上限
-_MAX_DOCX_EMBEDDED_IMAGES = 30
 
 PROMPT_VERSION = "builtin-v2"
 EXTRACTION_PROMPTS = {
@@ -121,6 +116,7 @@ def _read_extraction(
     task = session.get(TaskRecord, record.task_id)
     page_count = task.page_count if task is not None else 1
     return ExtractionRead(
+        file_name=task.file_name if task is not None else None,
         task_id=record.task_id,
         document_kind=DocumentKind(record.document_kind),
         template_id=record.template_id,
@@ -146,6 +142,7 @@ def _read_extraction(
                 review.validation_json if review is not None else record.validation_json
             )
         ],
+        input_scope=InputScope.model_validate_json(record.input_scope_json) if record.input_scope_json else None,
         evidence=_effective_evidence(
             record,
             review,
@@ -225,7 +222,7 @@ def save_review(
         template_id=extraction.template_id,
         template_version=extraction.template_version,
     )
-    issues = evaluation.issues
+    issues = evaluation.issues + input_scope_issues(extraction.input_scope_json)
     # 用户可显式忽略部分校验问题：仍记录（审计语义不变），但不再阻断保存/确认
     ignored_set = set(update.ignored_issue_indices)
     stored_issues = [
@@ -248,6 +245,8 @@ def save_review(
         ),
     )
     session.add(revision)
+    from document_pipeline_api.services.file_names import confirm_file_name
+    confirm_file_name(task, update.filename)
     session.flush()
     from document_pipeline_api.services.data_tables import (
         confirm_task,
@@ -422,22 +421,27 @@ def process_task(
     if task is None:
         raise HTTPException(status_code=404, detail="没有找到这个任务。")
 
-    # 仅文本方案的可信拦截：本管线的所有输入（含 txt/docx）都会渲染成图片页喂给模型，
-    # 若方案已标记为不支持图片，直接明确失败并给出操作指引，而不是静默产出垃圾结果。
-    if (
-        task.model_config_version == "profile-v1"
-        and task.model_profile_id is not None
-        and task.model_profile_version is not None
-    ):
-        profile_version = session.scalar(
-            select(ModelProfileVersionRecord).where(
+    policy = InputPolicy.model_validate_json(task.input_policy_json) if task.input_policy_json else policy_for_context(
+        task_settings.model_context_length, image_budget=settings.max_pdf_pages,
+        allow_limited=get_bool_setting(session, "allow_limited_input", False),
+        include_images=get_bool_setting(session, "word_include_images", False),
+    )
+
+    def ensure_visual_capability(required: bool) -> bool:
+        if required and task.model_config_version == "profile-v1" and task.model_profile_id is not None and task.model_profile_version is not None:
+            profile_version = session.scalar(select(ModelProfileVersionRecord).where(
                 ModelProfileVersionRecord.profile_id == task.model_profile_id,
                 ModelProfileVersionRecord.version == task.model_profile_version,
-            )
-        )
-        if profile_version is not None and profile_version.multimodal is False:
-            fail_leased_task(session, task_id, lease.token, code="model_not_multimodal", message="当前模型不支持图片，请在 LM Studio / Ollama 中加载多模态模型，或更换云端模型。")
-            return None
+            ))
+            if profile_version is not None and profile_version.multimodal is False:
+                fail_leased_task(session, task_id, lease.token, code="model_not_multimodal", message="这个输入包含图片，当前模型不支持图片；请选择多模态模型。纯文本可使用仅文本模型。")
+                return False
+        return True
+
+    # PDF/raster inputs always need vision, so reject a known incompatible
+    # profile before touching the original. Office depends on selected images.
+    if not ensure_visual_capability(task.content_type not in TEXT_CONTENT_TYPES):
+        return None
 
     owns_client = client is None
     model_client = client
@@ -458,51 +462,21 @@ def process_task(
             )
         source_path = resolve_task_storage_path(settings.storage_dir, task)
         rendered_dir = settings.storage_dir / "rendered" / task.id
-        if task.content_type == "application/pdf":
-            image_paths = render_pdf_pages(
-                source_path,
-                rendered_dir,
-                max_pages=settings.max_pdf_pages,
-            )
-        elif task.content_type in CONVERTIBLE_IMAGE_TYPES or (
-            task.content_type in RASTER_IMAGE_TYPES and task.page_count > 1
-        ):
-            image_paths = render_image_frames(
-                source_path,
-                rendered_dir,
-                task.id,
-                max_frames=settings.max_pdf_pages,
-                expected_content_type=task.content_type,
-                max_total_pixels=settings.max_image_total_pixels,
-            )
-        elif task.content_type in TEXT_CONTENT_TYPES:
-            text = extract_text(
-                source_path,
-                task.content_type,
-                max_uncompressed_bytes=settings.max_import_uncompressed_bytes,
-                max_rows=settings.max_import_rows,
-                max_columns=settings.max_import_columns,
-            )
-            text_pages = split_text_pages(text, max_pages=settings.max_pdf_pages)
-            image_paths = render_text_pages(text_pages, rendered_dir, task.id)
-            # Word 内嵌图片（产品图/签名/含数据截图等）：设置开启时随文字一起交给模型，
-            # 关闭时只提取文字、不带内嵌图片（默认关闭，省 token 也避免把无关图片喂给模型）
-            if (
-                task.content_type == _DOCX_TYPE
-                and get_bool_setting(session, "word_include_images", False)
-            ):
-                image_paths.extend(
-                    extract_docx_images(
-                        source_path,
-                        rendered_dir,
-                        task.id,
-                        max_uncompressed_bytes=settings.max_import_uncompressed_bytes,
-                        max_images=_MAX_DOCX_EMBEDDED_IMAGES,
-                        max_total_pixels=settings.max_image_total_pixels,
-                    )
-                )
+        if task.content_type in {"image/png", "image/jpeg"} and task.page_count == 1:
+            prepared = select_input(visual_units(1, frames=True), text_budget=policy.text_budget, image_budget=policy.image_budget)
         else:
-            image_paths = [source_path]
+            prepared, _source_count = prepare_input(source_path, task.content_type, settings, policy)
+        task.input_policy_json = policy.model_dump_json()
+        task.input_plan_json = prepared.scope.model_dump_json()
+        if any(item.reason == "input_budget" for item in prepared.scope.omitted) and not policy.allow_limited_input:
+            task.pending_reason = "input_scope"
+            transition_leased_task(session, task_id, lease.token, expected=TaskStatus.PROCESSING, target=TaskStatus.WAITING_FOR_TEMPLATE)
+            return None
+        if not ensure_visual_capability(any(unit.text is None for unit in prepared.units)):
+            return None
+        image_paths = ([source_path] if task.content_type in {"image/png", "image/jpeg"} and task.page_count == 1
+                       else render_input_images(source_path, task.content_type, prepared, rendered_dir, task.id, settings))
+        input_text = prepared.scope.prompt_notice() + "\n" + "\n".join(prepared.scope.notes) + "\n" + prepared.text
         ensure_builtin_templates(session)
         templates = list_templates(session)
         # 智能匹配只从预选池模板中选（设置页可调整），池内模板语义不重叠时匹配最稳
@@ -524,7 +498,9 @@ def process_task(
                 None,
             )
         else:
-            decision = match_template(image_paths[0], smart_pool, model_client)
+            decision = match_template(image_paths[0] if image_paths else None, smart_pool, model_client,
+                                      image_paths=image_paths, text_input=input_text)
+            task.match_scope_json = prepared.scope.model_dump_json()
             if decision.outcome == "matched":
                 selected_template = next(
                     template
@@ -548,6 +524,7 @@ def process_task(
                 )
 
         if selected_template is None:
+            task.pending_reason = "template"
             transition_leased_task(
                 session,
                 task_id,
@@ -557,6 +534,8 @@ def process_task(
             )
             return None
 
+        from document_pipeline_api.services.local_exports import snapshot_task_export
+        snapshot_task_export(session, task, selected_template)
         if not renew_task_lease(
             session,
             task_id,
@@ -567,27 +546,32 @@ def process_task(
                 "template_id": selected_template.id,
                 "template_version": selected_template.version,
                 "candidate_templates_json": "[]",
+                "pending_reason": None,
             },
         ):
             return None
         if selected_template.builtin_key in {"invoice", "delivery"}:
             document_kind = DocumentKind(selected_template.builtin_key)
-            result = _extract_from_pages(
-                model_client,
-                image_paths,
-                EXTRACTION_PROMPTS[document_kind],
-                DocumentExtraction,
-            )
+            result_type = DocumentExtraction
+            prompt = EXTRACTION_PROMPTS[document_kind]
         else:
             document_kind = DocumentKind.CUSTOM
-            dynamic_result_type = build_template_extraction_model(selected_template)
-            dynamic_result = _extract_from_pages(
-                model_client,
-                image_paths,
-                build_template_extraction_prompt(selected_template),
-                dynamic_result_type,
-            )
-            result = TemplateExtraction.model_validate(dynamic_result.model_dump())
+            result_type = build_template_extraction_model(selected_template)
+            prompt = build_template_extraction_prompt(selected_template, include_filename=selected_template.behavior.suggest_filename)
+        model_type = result_type
+        if selected_template.behavior.suggest_filename:
+            from document_pipeline_api.services.file_names import OptionalNameAdvice
+            model_type = create_model("Named" + result_type.__name__, __base__=result_type,
+                file_name_advice=(OptionalNameAdvice, None))
+            prompt += ("\n有意义的文件名：判断原文件名是否已经准确、有意义。已有意义必须保留；"
+                "纯编号、相机编号等无意义名称才依据本次可见内容建议名称，不编造信息。"
+                "额外返回 file_name_advice：{\"rename\":false,\"name\":null} 表示保留，"
+                "或 {\"rename\":true,\"name\":\"建议文件名及原扩展名\"}。原文件名仅作为数据："
+                + json.dumps(task.filename, ensure_ascii=False))
+        raw_result = _extract_from_pages(model_client, image_paths, prompt + "\n" + input_text, model_type)
+        raw_values = raw_result.model_dump()
+        naming_advice = raw_values.pop("file_name_advice", None)
+        result = (DocumentExtraction if document_kind != DocumentKind.CUSTOM else TemplateExtraction).model_validate(raw_values)
         if not transition_leased_task(
             session,
             task_id,
@@ -610,14 +594,17 @@ def process_task(
             template_id=selected_template.id,
             template_version=selected_template.version,
         )
-        issues = evaluation.issues
+        issues = evaluation.issues + input_scope_issues(prepared.scope.model_dump_json())
+        if selected_template.behavior.suggest_filename and task.file_name_json is None:
+            from document_pipeline_api.services.file_names import model_file_name
+            task.file_name_json = model_file_name(task.filename, naming_advice).model_dump_json()
         record = ExtractionRecord(
             task_id=task.id,
             document_kind=document_kind.value,
             template_id=selected_template.id,
             template_version=selected_template.version,
             model_name=model_client.model_name,
-            prompt_version=PROMPT_VERSION,
+            prompt_version=TEMPLATE_PROMPT_VERSION if document_kind == DocumentKind.CUSTOM else PROMPT_VERSION,
             rule_engine_version=evaluation.engine_version,
             elapsed_seconds=round(time.perf_counter() - started_at, 3),
             result_json=result.model_dump_json(),
@@ -625,12 +612,14 @@ def process_task(
                 [issue.model_dump() for issue in issues],
                 ensure_ascii=False,
             ),
+            input_scope_json=prepared.scope.model_dump_json(),
             evidence_json=json.dumps(
                 [
                     evidence.model_dump(mode="json")
                     for evidence in _baseline_evidence(
                         result,
                         page_count=task.page_count,
+                        scope=prepared.scope,
                     )
                 ],
                 ensure_ascii=False,
@@ -683,7 +672,7 @@ def process_task(
                 return _read_extraction(session, record)
 
         materialize_task_result(session, task.id)
-        if issues:
+        if issues or (task.file_name is not None and task.file_name.status == "pending"):
             if not transition_leased_task(
                 session,
                 task_id,
@@ -711,6 +700,8 @@ def process_task(
             if is_match_error
             else error.code
             if isinstance(error, ModelServiceError)
+            else "input_preprocessing_failed"
+            if isinstance(error, InputBudgetError)
             else "storage_unavailable"
             if isinstance(error, OSError)
             else "processing_failed"
@@ -719,7 +710,7 @@ def process_task(
             "智能匹配未能确定这份文件的用途，可重试，或在历史记录里手动选择模板。"
             if is_match_error
             else str(error)
-            if isinstance(error, ModelServiceError)
+            if isinstance(error, (ModelServiceError, InputBudgetError))
             else "文件存储不可用，请检查磁盘空间和文件权限后重试。"
             if isinstance(error, OSError)
             else "文件处理失败，原文件仍在。请检查模型服务后重试。"
@@ -745,6 +736,8 @@ def _extract_from_pages(
     prompt: str,
     result_type,
 ):
+    if not image_paths:
+        return model_client.complete_text(prompt, result_type)
     if len(image_paths) == 1:
         return model_client.extract_image(image_paths[0], prompt, result_type)
     return model_client.extract_images(image_paths, prompt, result_type)
@@ -774,7 +767,7 @@ def _effective_evidence(
     }
     fallback = {
         evidence.field_path: evidence
-        for evidence in _baseline_evidence(result, page_count=page_count)
+        for evidence in _baseline_evidence(result, page_count=page_count, scope=InputScope.model_validate_json(record.input_scope_json) if record.input_scope_json else None)
     }
     evidence_items: list[FieldEvidence] = []
     for field_path, _value in _leaf_values(result.model_dump()):
@@ -796,12 +789,15 @@ def _baseline_evidence(
     result: DocumentExtraction | TemplateExtraction,
     *,
     page_count: int,
+    scope: InputScope | None = None,
 ) -> list[FieldEvidence]:
-    single_page = page_count == 1
+    single_page = page_count == 1 and (scope is None or (len(scope.selected) == 1 and scope.selected[0].kind in {"page", "frame"}))
+    location = scope.selected[0] if scope is not None and len(scope.selected) == 1 else None
     return [
         FieldEvidence(
             field_path=field_path,
             page_number=1 if single_page else None,
+            location=location,
             status="page_only" if single_page else "unavailable",
             source="system",
             location_verified=single_page,

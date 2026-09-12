@@ -68,6 +68,8 @@ import type {
 import { serverDate } from "../time";
 import { Icon } from "./Icon";
 import { EditableText } from "./EditableText";
+import { CardCollection } from "./CardCollection";
+import { InputScopeDetails } from "./InputScopeDetails";
 
 // --- Types ---
 
@@ -81,7 +83,8 @@ interface ColumnDef {
   userDefined: boolean;
 }
 
-const PAGE_SIZE = 10;
+const TABLE_PAGE_SIZE = 10;
+
 const IDENTITY_KEYS = new Set(["source_filename", "item_index"]);
 
 // --- Helpers ---
@@ -119,6 +122,7 @@ export function DataTablePage({
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [revisionsOpen, setRevisionsOpen] = useState(false);
+  const [revisionSource, setRevisionSource] = useState<DataRowRead | null>(null);
   const [revisions, setRevisions] = useState<DataRowRevision[]>([]);
   const [revisionsLoading, setRevisionsLoading] = useState(false);
   const [revisionsError, setRevisionsError] = useState<string | null>(null);
@@ -128,6 +132,7 @@ export function DataTablePage({
   const [tablesError, setTablesError] = useState<string | null>(null);
 
   const [currentTableId, setCurrentTableId] = useState<string | null>(null);
+  const [presentationOverrides, setPresentationOverrides] = useState<Record<string, "table" | "card">>({});
   const [tableDetail, setTableDetail] = useState<DataTableDetail | DataViewDetail | null>(null);
   const [tableLoading, setTableLoading] = useState(false);
   const [tableError, setTableError] = useState<string | null>(null);
@@ -140,6 +145,7 @@ export function DataTablePage({
   const [views, setViews] = useState<DataViewRead[]>([]);
   const [currentViewId, setCurrentViewId] = useState<string | null>(null);
   const [splitFieldKey, setSplitFieldKey] = useState("");
+  const [groupBy, setGroupBy] = useState<"none" | "file" | "field">("field");
   const [splitting, setSplitting] = useState(false);
 
   const [hiddenCols, setHiddenCols] = useState<string[]>([]);
@@ -197,6 +203,42 @@ export function DataTablePage({
       .catch(() => setTemplates([]));
   }, []);
 
+  const detailMatches = tableDetail && ("table_id" in tableDetail ? tableDetail.table_id : tableDetail.id) === currentTableId;
+  const presentationMode = (currentTableId && presentationOverrides[currentTableId]) || (detailMatches ? tableDetail.presentation?.mode : undefined) || "table";
+  const cardArea = useRef<HTMLDivElement>(null);
+  const presentationPages = useRef<Record<string, Partial<Record<"table" | "card", number>>>>({});
+  const [cardCapacity, setCardCapacity] = useState(2);
+  const cardCapacityRef = useRef(2);
+  const pageSize = presentationMode === "card" ? cardCapacity : TABLE_PAGE_SIZE;
+  useEffect(() => {
+    const area = cardArea.current;
+    if (presentationMode !== "card" || !area || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(([entry]) => {
+      const width = Math.max(0, entry.contentRect.width - 32);
+      const height = Math.max(0, entry.contentRect.height - 32);
+      const columns = Math.max(1, Math.min(3, Math.floor((width + 16) / 316)));
+      const rowCount = height >= 600 ? 2 : 1;
+      area.style.setProperty("--card-columns", String(columns));
+      area.style.setProperty("--card-rows", String(rowCount));
+      const previous = cardCapacityRef.current;
+      const next = columns * rowCount;
+      if (previous !== next) {
+        cardCapacityRef.current = next;
+        setCardCapacity(next);
+        setPage(p => Math.floor((p - 1) * previous / next) + 1);
+      }
+    });
+    observer.observe(area);
+    return () => observer.disconnect();
+  }, [presentationMode, currentTableId]);
+
+  useEffect(() => {
+    const area = cardArea.current;
+    if (!area?.animate || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const motion = area.animate([{ opacity: 0.45 }, { opacity: 1 }], { duration: 170, easing: "ease-out" });
+    return () => motion.cancel();
+  }, [presentationMode, currentTableId, currentViewId]);
+
   // 加载表详情（选中表 / 翻页 / 编辑刷新时触发）
   useEffect(() => {
     if (currentTableId === null) {
@@ -207,8 +249,8 @@ export function DataTablePage({
     setTableLoading(true);
     setTableError(null);
     const request = currentViewId
-      ? getTableView(currentTableId, currentViewId, page, PAGE_SIZE)
-      : getTable(currentTableId, page, PAGE_SIZE, searchText);
+      ? getTableView(currentTableId, currentViewId, page, pageSize, searchText)
+      : getTable(currentTableId, page, pageSize, searchText);
     request
       .then((detail) => {
         if (!cancelled) {
@@ -225,7 +267,7 @@ export function DataTablePage({
     return () => {
       cancelled = true;
     };
-  }, [currentTableId, currentViewId, page, searchText, reloadTrigger]);
+  }, [currentTableId, currentViewId, page, pageSize, searchText, reloadTrigger]);
 
   useEffect(() => {
     if (!currentTableId) {
@@ -253,14 +295,14 @@ export function DataTablePage({
     let cancelled = false;
     void (async () => {
       try {
-        const first = await getTable(currentTableId, 1, PAGE_SIZE);
+        const first = await getTable(currentTableId, 1, pageSize);
         if (cancelled) return;
         const scanPages = Math.min(
-          Math.max(1, Math.ceil(first.row_count / PAGE_SIZE)),
+          Math.max(1, Math.ceil(first.row_count / pageSize)),
           50,
         );
         for (let p = 1; p <= scanPages; p += 1) {
-          const detail = p === 1 ? first : await getTable(currentTableId, p, PAGE_SIZE);
+          const detail = p === 1 ? first : await getTable(currentTableId, p, pageSize);
           if (cancelled) return;
           if (detail.rows.some((r) => r.task_id === highlightTaskId)) {
             setPage(p);
@@ -274,7 +316,7 @@ export function DataTablePage({
     return () => {
       cancelled = true;
     };
-  }, [highlightTaskId, currentTableId, currentViewId]);
+  }, [highlightTaskId, currentTableId, currentViewId, pageSize]);
 
   // Excel 手感：点击表格外部任意处退出编辑态
   useEffect(() => {
@@ -305,19 +347,21 @@ export function DataTablePage({
   const visibleColumns = columns.filter((col) => !hiddenCols.includes(col.key));
   const widthFor = (col: ColumnDef) => columnWidths[col.key] ?? col.width;
   const tableMinWidth = 44 + visibleColumns.reduce((sum, col) => sum + widthFor(col), 0);
-  const rows = tableDetail?.rows ?? [];
+  const rows = (tableDetail?.rows ?? []).slice(0, pageSize);
+
+  const contentUnit = presentationMode === "card" ? "条内容" : "行";
   const totalRows = tableDetail?.row_count ?? 0;
-  const totalPages = Math.max(1, Math.ceil(totalRows / PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
 
   const selectedCount = selectedRows.length;
-  const allSelected = rows.length > 0 && selectedRows.length === rows.length;
+  const allSelected = rows.length > 0 && rows.every((row) => selectedRows.includes(row.id));
 
   const currentSheetName =
     tableDetail?.name ?? tables.find((t) => t.id === currentTableId)?.name ?? "";
   const currentSheetSource =
     tableDetail && "source_table_name" in tableDetail
-      ? `视图 · 来源 ${tableDetail.source_table_name}`
-      : "文档提取";
+      ? `分组 · ${tableDetail.source_table_name}`
+      : "全部记录";
 
   const mergePreviewRows = mergeSelection.reduce(
     (sum, id) => sum + (tables.find((t) => t.id === id)?.row_count ?? 0),
@@ -351,7 +395,7 @@ export function DataTablePage({
   );
 
   // 网格铺满：一页固定 10 行网格，有 x 行数据就补 10-x 个空网格行
-  const placeholderCount = Math.max(0, PAGE_SIZE - rows.length);
+  const placeholderCount = Math.max(0, pageSize - rows.length);
   const searchQuery = searchText.trim().toLowerCase();
 
   function selectTable(id: string) {
@@ -604,12 +648,16 @@ export function DataTablePage({
   }
 
   async function handleCreateSplitViews() {
-    if (!currentTableId || !splitFieldKey) return;
+    if (!currentTableId || (groupBy === "field" && !splitFieldKey)) return;
+    if (groupBy === "none") { setCurrentViewId(null); setPage(1); setSplitModalOpen(false); return; }
     setSplitting(true);
     setTableError(null);
     try {
-      const created = await createSplitViews(currentTableId, splitFieldKey);
+      const created = await createSplitViews(currentTableId, groupBy === "file" ? "source_filename" : splitFieldKey, groupBy);
       setViews(created);
+      setCurrentViewId(created[0]?.id ?? null);
+      setPage(1);
+      setSelectedRows([]);
       setSplitModalOpen(false);
       setSplitFieldKey("");
     } catch (err) {
@@ -663,7 +711,7 @@ export function DataTablePage({
     try {
       await addDataRow(currentTableId, {});
       // 跳转到新行所在页（空行追加在末尾），让用户立即看到并直接编辑
-      setPage(Math.max(1, Math.ceil((totalRows + 1) / PAGE_SIZE)));
+      setPage(Math.max(1, Math.ceil((totalRows + 1) / pageSize)));
       setReloadTrigger((n) => n + 1);
       await getTables().then(setTables);
     } catch (err) {
@@ -712,6 +760,7 @@ export function DataTablePage({
 
   async function openRevisions(rowId: number) {
     if (!currentTableId) return;
+    setRevisionSource(rows.find((row) => row.id === rowId) ?? null);
     setRevisionsOpen(true);
     setRevisionsLoading(true);
     setRevisionsError(null);
@@ -730,7 +779,7 @@ export function DataTablePage({
   let rowIndexCounter = 0;
 
   return (
-    <div className="view">
+    <div className={`view${presentationMode === "card" ? " presentation-card" : ""}`}>
       {jumpNotice && (
         <div className="callout warning" style={{ marginBottom: 16 }}>
           {jumpNotice}
@@ -756,11 +805,10 @@ export function DataTablePage({
             </button>
             <button
               className="btn secondary sm"
-              disabled={!currentTableId || columns.length <= 1}
+              disabled={!currentTableId}
               onClick={() => setSplitModalOpen(true)}
-              title={columns.length <= 1 ? "当前表没有可用于分 Sheet 的字段" : undefined}
             >
-              <Icon icon={Table2} size={15} /> 分 Sheet
+              <Icon icon={Table2} size={15} /> {presentationMode === "card" ? "分组" : "分 Sheet"}
             </button>
             <div className="toolbar-divider" />
             <button
@@ -848,6 +896,15 @@ export function DataTablePage({
           </div>
         </div>
 
+        <div className="datastore-compact-navigation">
+          <label className="visually-hidden" htmlFor="compact-table">选择数据表或分组</label>
+          <select id="compact-table" className="form-select" value={currentViewId ? `view:${currentViewId}` : `table:${currentTableId ?? ""}`}
+            onChange={(event) => { const value = event.target.value; if (value.startsWith("view:")) selectView(value.slice(5)); else selectTable(value.slice(6)); }}>
+            <optgroup label="数据表">{tables.map((table) => <option key={table.id} value={`table:${table.id}`}>{table.name} · {table.row_count}</option>)}</optgroup>
+            {views.length > 0 && <optgroup label="当前表的分组">{views.map((view) => <option key={view.id} value={`view:${view.id}`}>{view.name}</option>)}</optgroup>}
+          </select>
+          <button className="btn ghost sm icon-only" title="新建表" onClick={() => { setNewTableName(""); setNewTableTemplate(""); setCreateModalOpen(true); }}><Icon icon={Plus} size={14} /></button>
+        </div>
         {/* Sheet tree + detail + 可拖拽分隔条 */}
         <div className={`datastore-split${resizingColKey ? " dragging-col" : ""}`}>
           <div className="sheet-tree" style={{ width: `${sidebarWidth}px`, flexShrink: 0 }}>
@@ -911,10 +968,10 @@ export function DataTablePage({
                     onClick={() =>
                       setTreeGroupsOpen((s) => ({ ...s, views: !s.views }))
                     }
-                    title={treeGroupsOpen.views ? "收起分 Sheet 视图" : "展开分 Sheet 视图"}
+                    title={`${treeGroupsOpen.views ? "收起" : "展开"}${presentationMode === "card" ? "内容分组" : "分 Sheet 视图"}`}
                   >
                     <Icon icon={ChevronDown} size={16} />
-                    <span className="sheet-tree-group-label">分 Sheet 视图</span>
+                    <span className="sheet-tree-group-label">{presentationMode === "card" ? "内容分组" : "分 Sheet 视图"}</span>
                   </button>
                   <div className={`sheet-tree-group-body${treeGroupsOpen.views ? " open" : ""}`}>
                     <div className="sheet-tree-group-inner">
@@ -932,7 +989,7 @@ export function DataTablePage({
                     ))
                   ) : (
                     <div className="sheet-tree-empty">
-                      {currentTableId ? "当前表还没有分 Sheet 视图" : "选择一张表查看其视图"}
+                      {currentTableId ? "尚未分组，可从上方“分组”选择文件或字段" : "选择一张表查看其视图"}
                     </div>
                   )}
                     </div>
@@ -975,7 +1032,7 @@ export function DataTablePage({
                     onBlur={() => void commitRenameSheet()}
                   />
                 )}
-                <div className="support">共 <span>{totalRows}</span> 行 · 来源 <span>{currentSheetSource}</span></div>
+                <div className="support">共 <span>{totalRows}</span> {contentUnit} · <span>{currentSheetSource}</span></div>
               </div>
               <div className="sheet-detail-actions">
                 {!currentViewId && currentTableId ? (
@@ -1024,9 +1081,9 @@ export function DataTablePage({
                     className="btn xs primary"
                     disabled={busyAction}
                     onClick={() => void handleAddRow()}
-                    title="在表尾新增一行空记录，直接在表格里填写"
+                    title={presentationMode === "card" ? "新增空白内容，展开卡片后填写" : "在表尾新增一行空记录，直接在表格里填写"}
                   >
-                    <Icon icon={Plus} size={14} /> 新增一行
+                    <Icon icon={Plus} size={14} /> {presentationMode === "card" ? "新增内容" : "新增一行"}
                   </button>
                   <button className="btn xs secondary" onClick={() => setFieldFilterOpen(true)}>
                     <Icon icon={Columns3} size={14} /> 字段筛选
@@ -1036,14 +1093,50 @@ export function DataTablePage({
                   </button>
                 </div>
                 <div className="row-actions-right">
+                  <div className="presentation-switch" aria-label="内容展示方式">
+                    {(["table", "card"] as const).map((mode) => <button key={mode} className={`btn xs ${presentationMode === mode ? "primary" : "ghost"}`}
+                      disabled={!currentTableId} aria-pressed={presentationMode === mode}
+                      onClick={() => {
+                        if (!currentTableId || mode === presentationMode) return;
+                        const key = `${currentTableId}/${currentViewId ?? ""}`;
+                        const remembered = presentationPages.current[key] ?? {};
+                        remembered[presentationMode] = page;
+                        presentationPages.current[key] = remembered;
+                        const size = mode === "table" ? TABLE_PAGE_SIZE : cardCapacity;
+                        setPage(Math.min(Math.max(1, Math.ceil(totalRows / size)), remembered[mode] ?? Math.floor((page - 1) * pageSize / size) + 1));
+                        setPresentationOverrides({ ...presentationOverrides, [currentTableId]: mode });
+                      }}>
+                      {mode === "table" ? "表格" : "卡片"}
+                    </button>)}
+                  </div>
                   {selectedCount > 0 && (
                     <span className="row-selected-hint">已选 <strong>{selectedCount}</strong> 行 · <button className="link-btn" onClick={() => setSelectedRows([])}>取消</button></span>
                   )}
-                  <span className="row-total-hint">共 <span>{totalRows}</span> 行</span>
+                  <span className="row-total-hint">共 <span>{totalRows}</span> {contentUnit}</span>
                 </div>
               </div>
-              <div className="data-table-scroll">
-                {tableLoading ? (
+              {rows.some((row) => row.review_pending) && (
+                <details className="support" style={{ padding: "8px 16px", color: "var(--warning-text)", overflowWrap: "anywhere" }}>
+                  <summary>本页有 {rows.filter((row) => row.review_pending).length} 条来源待核对的数据</summary>
+                  <p>请在文件历史中处理来源任务的校验提示。直接编辑表格不会重新执行提取校验；导出会保留待核对标记。</p>
+                  {rows.filter((row, index) => row.review_pending && !rows.slice(0, index).some((previous) => previous.review_pending &&
+                    (previous.task_id ?? previous.values.__row_group ?? previous.id) === (row.task_id ?? row.values.__row_group ?? row.id)
+                  )).map((row) => <p key={row.id}>{String(row.values.source_filename || `内容 ${row.id}`)}{!row.task_id && " · 来源已移除或来自导入/合并，保留原待核对状态"}</p>)}
+                </details>
+              )}
+              {presentationMode === "table" && rows.some((row) => row.input_scope?.coverage === "partial") && (
+                <details className="support" style={{ padding: "8px 16px", overflowWrap: "anywhere" }}>
+                  <summary>本页有局部读取的数据 · 查看来源范围</summary>
+                  <p>这些结果只基于文件的部分内容，不能代表全文或全部明细。修改表中数据不会改变当时的读取范围。</p>
+                  {rows.filter((row, index) => row.input_scope?.coverage === "partial" && !rows.slice(0, index).some((previous) =>
+                    (previous.task_id ?? previous.values.__row_group ?? previous.id) === (row.task_id ?? row.values.__row_group ?? row.id)
+                    && JSON.stringify(previous.input_scope) === JSON.stringify(row.input_scope)
+                  )).map((row) => <InputScopeDetails key={row.id} scope={row.input_scope}
+                    label={String(row.values.source_filename || `内容 ${row.id}`)} originalAvailable={Boolean(row.task_id)} />)}
+                </details>
+              )}
+              <div className="data-table-scroll" ref={cardArea}>
+                {tableLoading && !detailMatches ? (
                   <div style={{ padding: 48, textAlign: "center" }}>
                     <Icon icon={Loader2} size={24} className="spin" />
                   </div>
@@ -1053,6 +1146,10 @@ export function DataTablePage({
                     <div>这张表还没有数据</div>
                     <div className="small muted">使用“新增一行”或“导入”开始填写</div>
                   </div>
+                ) : presentationMode === "card" && currentTableId ? (
+                  <CardCollection key={`${currentTableId}:${currentViewId}`} tableId={currentTableId} rows={rows}
+                    searchText={searchText} columns={tableDetail?.columns ?? []} hiddenFields={hiddenCols} presentation={tableDetail?.presentation}
+                    selectedRows={selectedRows} onSelect={setSelectedRows} onChanged={() => setReloadTrigger((n) => n + 1)} highlightTaskId={highlightTaskId} />
                 ) : (
                   <table className="data-table" style={{ minWidth: `${tableMinWidth}px` }}>
                     <colgroup>
@@ -1220,7 +1317,7 @@ export function DataTablePage({
                 )}
               </div>
               <div className="table-footer">
-                <span className="footer-info">显示 <span>{rows.length === 0 ? 0 : (page - 1) * PAGE_SIZE + 1}</span>-<span>{(page - 1) * PAGE_SIZE + rows.length}</span> 行，共 <span>{totalRows}</span> 行</span>
+                <span className="footer-info">显示 <span>{rows.length === 0 ? 0 : (page - 1) * pageSize + 1}</span>-<span>{(page - 1) * pageSize + rows.length}</span> {contentUnit}，共 <span>{totalRows}</span> {contentUnit}</span>
                 <div className="pagination">
                   <button className="btn icon-only sm" disabled={page <= 1} onClick={() => goToPage(1)} title="第一页">
                     <Icon icon={ChevronsLeft} size={14} />
@@ -1333,16 +1430,21 @@ export function DataTablePage({
           <div className="modal-card" onClick={(event) => event.stopPropagation()} style={{ maxWidth: 480 }}>
             <div className="modal-head">
               <div>
-                <div className="modal-eyebrow"><Icon icon={Table2} size={15} /> 分 Sheet</div>
-                <h3>按一个字段建立分组视图</h3>
-                <div className="support">数据仍只保存一份；分 Sheet 只是同一批数据的分类视图。</div>
+                <div className="modal-eyebrow"><Icon icon={Table2} size={15} /> 内容分组</div>
+                <h3>选择分组方式</h3>
+                <div className="support">按来源文件或字段浏览，数据仍只保存一份。</div>
               </div>
               <button className="btn ghost sm icon-only" onClick={() => setSplitModalOpen(false)}>
                 <Icon icon={X} size={16} />
               </button>
             </div>
             <div className="modal-body">
-              <label className="form-field">
+              <label className="form-field"><span className="form-label">分组方式</span>
+                <select className="form-select" value={groupBy} onChange={(event) => setGroupBy(event.target.value as "none" | "file" | "field")}>
+                  <option value="none">不分组</option><option value="file">按来源文件</option><option value="field">按字段</option>
+                </select>
+              </label>
+              {groupBy === "field" && <label className="form-field">
                 <span className="form-label">用于分类的字段</span>
                 <select
                   className="form-select"
@@ -1354,17 +1456,17 @@ export function DataTablePage({
                     <option key={column.key} value={column.key}>{column.label}</option>
                   ))}
                 </select>
-              </label>
+              </label>}
             </div>
             <div className="modal-foot">
               <button className="btn ghost" onClick={() => setSplitModalOpen(false)}>取消</button>
               <button
                 className="btn primary"
-                disabled={!splitFieldKey || splitting}
+                disabled={(groupBy === "field" && !splitFieldKey) || splitting}
                 onClick={() => void handleCreateSplitViews()}
               >
                 {splitting ? <Icon icon={Loader2} size={15} className="spin" /> : <Icon icon={Table2} size={15} />}
-                创建分 Sheet
+                应用分组
               </button>
             </div>
           </div>
@@ -1575,6 +1677,7 @@ export function DataTablePage({
                 </div>
               )}
             </div>
+            <InputScopeDetails scope={revisionSource?.input_scope} label="来源与处理详情" originalAvailable={Boolean(revisionSource?.task_id)} />
             <div className="modal-foot">
               <button className="btn primary" onClick={() => setRevisionsOpen(false)}>关闭</button>
             </div>

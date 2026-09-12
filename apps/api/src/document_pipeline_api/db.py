@@ -24,7 +24,11 @@ def build_engine(database_url: str) -> Engine:
                 if ":memory:" not in database_url:
                     cursor.execute("PRAGMA journal_mode=WAL")
                     cursor.execute("PRAGMA synchronous=NORMAL")
-            finally:
+            except Exception:
+                cursor.close()
+                dbapi_connection.close()
+                raise
+            else:
                 cursor.close()
 
     return engine

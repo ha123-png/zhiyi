@@ -173,6 +173,41 @@ def test_restore_relocates_files_and_preserves_previous_data_as_rollback(
             assert restored.storage_path == f"{source_task_id}.png"
 
 
+def test_restore_disables_bindings_and_requires_new_export_confirmation(tmp_path: Path) -> None:
+    from document_pipeline_api.schemas.file_export import TaskExportState
+    source_settings = _settings(tmp_path / "source")
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "user-file.txt"
+    sentinel.write_text("belongs to user", encoding="utf-8")
+    with TestClient(create_app(source_settings)) as client:
+        template = client.get("/api/v1/templates").json()[0]
+        url = f"/api/v1/templates/{template['id']}/local-export"
+        assert client.put(url, json={"expected_revision": 0, "enabled": True, "parent_path": str(external)}).status_code == 200
+        task_id = _upload(client)
+        with client.app.state.session_factory() as session:
+            task = session.get(TaskRecord, task_id)
+            task.export_state_json = TaskExportState(status="exporting", destination=str(external / "发票"), binding_revision=1).model_dump_json()
+            session.commit()
+    archive = create_business_backup(source_settings, tmp_path / "portable.dpbak")
+    target_dir = tmp_path / "target"
+    target_settings = _settings(target_dir)
+    with TestClient(create_app(target_settings)):
+        pass
+    restore_business_backup(target_settings, archive, target_dir)
+    with TestClient(create_app(target_settings)) as client:
+        binding = client.get(url).json()
+        assert binding["enabled"] is False
+        assert binding["revision"] == 2
+        with client.app.state.session_factory() as session:
+            state = session.get(TaskRecord, task_id).file_export
+            assert state.status == "needs_rebind"
+            assert state.destination == str(external / "发票")
+            assert state.error_code == "backup_restored"
+    assert list(external.iterdir()) == [sentinel]
+    assert sentinel.read_text(encoding="utf-8") == "belongs to user"
+
+
 def test_restore_install_failure_rolls_back_exact_previous_state(
     tmp_path: Path,
     monkeypatch,
@@ -259,10 +294,29 @@ def test_restore_upgrades_a_portable_0009_database_before_install(tmp_path: Path
 
     with sqlite3.connect(target_dir / "document-pipeline.db") as connection:
         assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-            "0023_model_profile_multimodal",
+            "0033_row_review_pending",
         )
         assert connection.execute(
             "SELECT storage_path FROM tasks WHERE id = ?", (task_id,)
         ).fetchone() == (f"{task_id}.png",)
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
     assert (target_dir / "uploads" / f"{task_id}.png").read_bytes() == original
+
+
+def test_backup_preserves_selected_template_version_and_restoration_log(tmp_path: Path):
+    settings = _settings(tmp_path / "source")
+    with TestClient(create_app(settings)) as client:
+        body = {"name": "可恢复模板", "fields": [{"key": "title", "label": "标题"}]}
+        template = client.post("/api/v1/templates", json=body).json()
+        url = f"/api/v1/templates/{template['id']}"
+        assert client.put(url, json={**body, "description": "第二版", "expected_version": 1}).status_code == 200
+        assert client.post(f"{url}/versions/1/restore", json={"expected_version": 2}).status_code == 200
+        log = client.get(f"{url}/restorations").json()
+    archive = create_business_backup(settings, tmp_path / "restore-history.dpbak")
+    destination = tmp_path / "destination"
+    target = _settings(destination)
+    restore_business_backup(target, archive, destination)
+    with TestClient(create_app(target)) as client:
+        assert client.get(url).json()["version"] == 1
+        assert client.get(f"{url}/restorations").json() == log
+        assert [v["version"] for v in client.get(f"{url}/versions").json()] == [2, 1]

@@ -76,6 +76,10 @@ class StubModelClient:
     def close(self) -> None:
         pass
 
+    def complete_text(self, prompt, result_type):
+        self.text_prompt = prompt
+        return StubModelClient.extract_image(self, None, prompt, result_type)
+
 
 def test_wrong_target_table_keeps_extraction_and_reselect_confirms_without_rerun(
     tmp_path: Path,
@@ -823,12 +827,13 @@ def test_docx_embedded_images_follow_word_include_images_setting(tmp_path: Path)
     Base.metadata.create_all(engine)
     buffer = io.BytesIO()
     document_xml = (
-        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-        "<w:body><w:p><w:r><w:t>发票正文</w:t></w:r></w:p></w:body></w:document>"
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<w:body><w:p><w:r><w:t>发票正文</w:t><w:drawing><a:blip r:embed="rId1"/></w:drawing></w:r></w:p></w:body></w:document>'
     )
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("word/document.xml", document_xml)
         archive.writestr("word/media/image1.png", PNG_BYTES)
+        archive.writestr("word/_rels/document.xml.rels", '<Relationships><Relationship Id="rId1" Target="media/image1.png"/></Relationships>')
     docx_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     settings = Settings(
         database_url=f"sqlite:///{tmp_path / 'docx-images.db'}",
@@ -856,6 +861,12 @@ def test_docx_embedded_images_follow_word_include_images_setting(tmp_path: Path)
             )
             session.commit()
             result = process_task(session, settings, task_id, client=client)
+            if result is None:
+                from document_pipeline_api.services.tasks import accept_task_scope
+                assert session.get(TaskRecord, task_id).pending_reason == "input_scope"
+                assert client.page_names == []
+                accept_task_scope(session, settings, task_id)
+                result = process_task(session, settings, task_id, client=client)
             assert result is not None
         return client
 
@@ -872,8 +883,8 @@ def test_docx_embedded_images_follow_word_include_images_setting(tmp_path: Path)
         set_bool_setting(session, "word_include_images", False)
         session.commit()
     text_only = run_task("docx-text-only")
-    assert text_only.page_names
-    assert all("-docx-image-" not in name for name in text_only.page_names)
+    assert text_only.page_names == []
+    assert "发票正文" in text_only.text_prompt
 
 
 def _add_task(session: Session, image: Path, task_id: str) -> TaskRecord:

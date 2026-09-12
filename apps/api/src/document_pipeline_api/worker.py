@@ -34,10 +34,17 @@ def stop_heartbeat() -> None:
 @huey.task(name="extract_document")
 def run_extraction(task_id: str) -> None:
     settings = Settings.local()
+    from document_pipeline_api.services.clear_data import clear_journal_path
+    if clear_journal_path(settings).exists():
+        return
     engine = build_engine(settings.database_url)
     try:
         with Session(engine) as session:
             process_task(session, settings, task_id)
+            from document_pipeline_api.services.internal_storage import classify_task_original
+            classify_task_original(session, settings, task_id)
+            from document_pipeline_api.services.task_exports import process_task_export
+            process_task_export(session, settings, task_id)
     finally:
         engine.dispose()
 
@@ -51,10 +58,17 @@ def _recover_interrupted_tasks() -> None:
     from document_pipeline_api.services.queueing import recover_missing_queued_tasks
 
     settings = Settings.local()
+    from document_pipeline_api.services.clear_data import clear_journal_path
+    if clear_journal_path(settings).exists():
+        return
     engine = build_engine(settings.database_url)
     try:
         with Session(engine) as session:
             recover_expired_task_leases(session)
             recover_missing_queued_tasks(session)
+            from document_pipeline_api.services.internal_storage import recover_internal_storage
+            recover_internal_storage(session, settings)
+            from document_pipeline_api.services.task_exports import recover_pending_exports
+            recover_pending_exports(session, settings)
     finally:
         engine.dispose()

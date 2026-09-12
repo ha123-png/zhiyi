@@ -64,4 +64,15 @@ class TemplateVersionRecord(Base):
     validation_rules_json: Mapped[str] = mapped_column(Text, default="[]")
     deterministic_rules_json: Mapped[str] = mapped_column(Text, default="[]")
     output_mapping_json: Mapped[str] = mapped_column(Text, default="{}")
+    behavior_json: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class TemplateRestorationRecord(Base):
+    __tablename__ = "template_restorations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    template_id: Mapped[str] = mapped_column(ForeignKey("templates.id"), index=True)
+    from_version: Mapped[int] = mapped_column(Integer)
+    to_version: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
