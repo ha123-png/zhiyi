@@ -162,19 +162,20 @@ try {
     Sign-ReleaseArtifact (Join-Path $distRoot "Zhiyi\ZhiyiCLI.exe")
 
     if ($BuildInstaller) {
-        $makensis = Get-Command makensis.exe -ErrorAction SilentlyContinue
+        $makensisCommand = Get-Command makensis.exe -CommandType Application -ErrorAction SilentlyContinue
+        $makensis = if ($makensisCommand) { $makensisCommand.Source } else { $null }
         if (-not $makensis) {
             $standardMakensis = Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"
-            if (Test-Path -LiteralPath $standardMakensis) { $makensis = Get-Item -LiteralPath $standardMakensis }
+            if (Test-Path -LiteralPath $standardMakensis) { $makensis = $standardMakensis }
         }
         if (-not $makensis) {
             $workspaceMakensis = Join-Path $projectRoot ".local\tools\nsis\makensis.exe"
-            if (Test-Path -LiteralPath $workspaceMakensis) { $makensis = Get-Item -LiteralPath $workspaceMakensis }
+            if (Test-Path -LiteralPath $workspaceMakensis) { $makensis = $workspaceMakensis }
         }
         if (-not $makensis) { throw "NSIS compiler makensis.exe was not found." }
         $installerOutput = Join-Path $distRoot "installer"
         New-Item -ItemType Directory -Path $installerOutput -Force | Out-Null
-        & $makensis.FullName "/INPUTCHARSET" "UTF8" "/DAPP_VERSION=$Version" "/DBUILD_ROOT=$distRoot" "/DOUTPUT_DIR=$installerOutput" (Join-Path $projectRoot "packaging\installer.nsi")
+        & $makensis "/INPUTCHARSET" "UTF8" "/DAPP_VERSION=$Version" "/DBUILD_ROOT=$distRoot" "/DOUTPUT_DIR=$installerOutput" (Join-Path $projectRoot "packaging\installer.nsi")
         if ($LASTEXITCODE -ne 0) { throw "Installer build failed." }
         Sign-ReleaseArtifact (Join-Path $installerOutput "Zhiyi-$Version-win-x64-setup.exe")
     }
