@@ -434,7 +434,12 @@ SCHEMA_REVISIONS["0034_assistant"] = SCHEMA_REVISIONS["0033_row_review_pending"]
 SCHEMA_REVISIONS["0035_assistant_native_context"] = SCHEMA_REVISIONS["0034_assistant"]
 SCHEMA_REVISIONS["0036_dashboard_usage"] = SCHEMA_REVISIONS["0035_assistant_native_context"] | DASHBOARD_SCHEMA.keys()
 SCHEMA_REVISIONS["0037_model_context_policy"] = SCHEMA_REVISIONS["0036_dashboard_usage"]
+GROWTH_SCHEMA = {"file_name_sequences": {"template_id", "day", "value"}, "assistant_events": {"run_id", "sequence", "payload_json"}}
+EXPECTED_SCHEMA.update(GROWTH_SCHEMA)
+EXPECTED_SCHEMA["assistant_runs"] = EXPECTED_SCHEMA["assistant_runs"] | {"stream_version", "snapshot_sequence"}
+SCHEMA_REVISIONS["0038_growth_and_streaming"] = SCHEMA_REVISIONS["0037_model_context_policy"] | GROWTH_SCHEMA.keys()
 COLUMNS_INTRODUCED_BY_REVISION = {
+    "0038_growth_and_streaming": {**GROWTH_SCHEMA, "assistant_runs": {"stream_version", "snapshot_sequence"}},
     "0037_model_context_policy": {"model_profile_versions": {"context_policy"}},
     "0036_dashboard_usage": DASHBOARD_SCHEMA,
     "0035_assistant_native_context": {"assistant_messages": {"native_context_json"}},

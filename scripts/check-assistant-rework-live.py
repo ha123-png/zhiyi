@@ -201,7 +201,7 @@ def main():
             raise RuntimeError("Trend groups or values are incorrect.")
         vision = run(
             "请调用 read_original_page，用视觉读取这个文件第 1 页，告诉我订单编号和总额。不要依据文件名推测。",
-            {"task_ids": ["ask-source-image"]},
+            {"task_ids": ["fd4051b8-42de-4947-803d-fa971e7ec621"]},
         )
         text = "\n".join(
             p["text"]

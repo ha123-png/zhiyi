@@ -102,6 +102,29 @@ def automatic_file_name(original: str, decision: object, values: dict) -> FileNa
     return state
 
 
+def fixed_file_name(session, task: TaskRecord, template) -> FileNameRead:
+    """Allocate once in the same transaction as the saved task, including concurrent imports."""
+    from sqlalchemy import text
+
+    if task.file_name is not None:
+        return task.file_name
+    created = task.created_at
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    day = created.astimezone().date().isoformat()
+    sequence = session.execute(text(
+        "INSERT INTO file_name_sequences (template_id, day, value) VALUES (:template, :day, 1) "
+        "ON CONFLICT(template_id, day) DO UPDATE SET value = value + 1 RETURNING value"
+    ), {"template": template.id, "day": day}).scalar_one()
+    label = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', template.name).strip(' .')[:60] or '文件'
+    chosen = f"{day}_{label}_{sequence:03d}{Path(task.filename).suffix}"
+    validate_copy_name(chosen)
+    state = FileNameRead(status="confirmed", strategy="fixed", suggested_filename=chosen,
+        confirmed_filename=chosen, explanation="按导入日期、模板和序号命名；重试沿用名称，上传原名保留。")
+    state.decisions.append(FileNameDecision(before=task.filename, after=chosen, confirmed_at=datetime.now(timezone.utc).isoformat()))
+    return state
+
+
 def adopt_pending_file_names(session) -> int:
     """Upgrade unaccepted name advice, preserving reviewed names and file bytes."""
     import json

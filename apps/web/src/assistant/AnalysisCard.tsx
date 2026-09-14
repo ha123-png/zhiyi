@@ -154,7 +154,7 @@ function AnalysisCardView({
             {data.map((row, i) => (
               <tr key={i}>
                 {keys.map((k) => (
-                  <td key={k}>{fmt(row[k])}</td>
+                  <td key={k}><span className="ask-cell-value" title={fmt(row[k])}>{fmt(row[k])}</span></td>
                 ))}
                 {analysis.rows && <td>—</td>}
               </tr>
@@ -162,7 +162,7 @@ function AnalysisCardView({
             {analysis.rows?.map((row) => (
               <tr key={row.row_id}>
                 {keys.map((k) => (
-                  <td key={k}>{fmt(row.values[k])}</td>
+                  <td key={k}><span className="ask-cell-value" title={fmt(row.values[k])}>{fmt(row.values[k])}</span></td>
                 ))}
                 <td>
                   <button
@@ -241,7 +241,7 @@ function AnalysisCardView({
       );
     }
     const height = expanded
-      ? 460
+      ? "clamp(240px, calc(90dvh - 290px), 460px)"
       : actualType === "horizontal_bar"
         ? Math.min(520, Math.max(260, data.length * 30))
         : 280;
@@ -455,9 +455,11 @@ function AnalysisCardView({
         {actualType !== "donut" && <div className="ask-chart-readout" ref={expanded ? setExpandedTooltipHost : setTooltipHost}>
           <span className="ask-chart-readout-hint">移至图形或使用方向键查看数值</span>
         </div>}
-        <ResponsiveContainer width="100%" height={height}>
-          {chart}
-        </ResponsiveContainer>
+        <div style={{ height }}>
+          <ResponsiveContainer width="100%" height="100%">
+            {chart}
+          </ResponsiveContainer>
+        </div>
         {actualType === "donut" && (
           <div className="ask-donut-center">
             <span title={hovered != null ? fmt(data[hovered]?.[x]) : name(series[0])}>
@@ -483,6 +485,35 @@ function AnalysisCardView({
       </div>
     );
   }
+  const legend = actualType !== "table" && actualType !== "metric" && (
+        <div className="ask-chart-legend">
+          {(actualType === "pie" || actualType === "donut"
+            ? data.map((r) => String(r[x]))
+            : series.map(name)
+          ).map((label, i) => (
+            actualType === "pie" || actualType === "donut" ?
+              <button type="button" key={label + i} title={`${label} · ${fmt(data[i]?.[series[0]])}`}
+                aria-label={`${label}：${fmt(data[i]?.[series[0]])}`}
+                onFocus={() => setHovered(i)} onBlur={() => setHovered(null)}
+                onMouseEnter={() => setHovered(i)} onMouseLeave={() => setHovered(null)}>
+                <i style={{ background: colors[i % colors.length] }} />
+                <span>{label}</span>
+                <b>{fmt(data[i]?.[series[0]])}</b>
+              </button> : <span key={label + i} title={label}>
+                <svg className="ask-series-symbol" width="25" height="12" viewBox="0 0 25 12" aria-hidden="true" data-series-kind={actualType === "line" || (actualType === "composed" && (mixedCounts ? series[i].startsWith("count:") : i > 0)) ? "line" : actualType === "area" ? "area" : actualType === "scatter" ? "scatter" : "bar"}>
+                  {actualType === "line" || (actualType === "composed" && (mixedCounts ? series[i].startsWith("count:") : i > 0)) ? <>
+                    <line x1="1" x2="24" y1="6" y2="6" stroke={colors[i % colors.length]} strokeWidth="2" strokeDasharray={i ? "5 4" : undefined} />
+                    <circle cx="12.5" cy="6" r="2.5" fill="var(--card)" stroke={colors[i % colors.length]} strokeWidth="1.5" />
+                  </> : actualType === "area" ? <>
+                    <path d="M1 10V5L9 2L16 6L24 3V10Z" fill={colors[i % colors.length]} fillOpacity=".2" />
+                    <path d="M1 5L9 2L16 6L24 3" fill="none" stroke={colors[i % colors.length]} strokeWidth="2" />
+                  </> : actualType === "scatter" ? <circle cx="12.5" cy="6" r="3" fill={colors[i % colors.length]} />
+                    : <rect x="6" y="1" width="13" height="10" rx="1" fill={colors[i % colors.length]} />}
+                </svg>{label}
+              </span>
+          ))}
+        </div>
+      );
   return (
     <section className="ask-analysis">
       <header>
@@ -522,39 +553,11 @@ function AnalysisCardView({
         animate={{ opacity: 1 }} transition={{ duration: reduced ? 0 : .18 }}>
         {graphic(false)}
       </motion.div>
-      {actualType !== "table" && actualType !== "metric" && (
-        <div className="ask-chart-legend">
-          {(actualType === "pie" || actualType === "donut"
-            ? data.map((r) => String(r[x]))
-            : series.map(name)
-          ).map((label, i) => (
-            actualType === "pie" || actualType === "donut" ?
-              <button type="button" key={label + i} title={`${label} · ${fmt(data[i]?.[series[0]])}`}
-                aria-label={`${label}：${fmt(data[i]?.[series[0]])}`}
-                onFocus={() => setHovered(i)} onBlur={() => setHovered(null)}
-                onMouseEnter={() => setHovered(i)} onMouseLeave={() => setHovered(null)}>
-                <i style={{ background: colors[i % colors.length] }} />
-                <span>{label}</span>
-                <b>{fmt(data[i]?.[series[0]])}</b>
-              </button> : <span key={label + i} title={label}>
-                <svg className="ask-series-symbol" width="25" height="12" viewBox="0 0 25 12" aria-hidden="true" data-series-kind={actualType === "line" || (actualType === "composed" && (mixedCounts ? series[i].startsWith("count:") : i > 0)) ? "line" : actualType === "area" ? "area" : actualType === "scatter" ? "scatter" : "bar"}>
-                  {actualType === "line" || (actualType === "composed" && (mixedCounts ? series[i].startsWith("count:") : i > 0)) ? <>
-                    <line x1="1" x2="24" y1="6" y2="6" stroke={colors[i % colors.length]} strokeWidth="2" strokeDasharray={i ? "5 4" : undefined} />
-                    <circle cx="12.5" cy="6" r="2.5" fill="var(--card)" stroke={colors[i % colors.length]} strokeWidth="1.5" />
-                  </> : actualType === "area" ? <>
-                    <path d="M1 10V5L9 2L16 6L24 3V10Z" fill={colors[i % colors.length]} fillOpacity=".2" />
-                    <path d="M1 5L9 2L16 6L24 3" fill="none" stroke={colors[i % colors.length]} strokeWidth="2" />
-                  </> : actualType === "scatter" ? <circle cx="12.5" cy="6" r="3" fill={colors[i % colors.length]} />
-                    : <rect x="6" y="1" width="13" height="10" rx="1" fill={colors[i % colors.length]} />}
-                </svg>{label}
-              </span>
-          ))}
-        </div>
-      )}
+      {legend}
       {analysis.source.scope_description && <p className="ask-notice">{analysis.source.scope_description}</p>}
       {analysis.warnings.filter(w => /尚待|待确认|未计入|无法|缺失|无效|未记录|不能|不代表完整|部分读取/.test(w)).map((w, i) =>
         <p className="ask-quality-summary" key={i}>{w}</p>)}
-      {analysis.truncated && <p className="ask-quality-summary">仅展示前 {data.length || analysis.rows?.length || 0} 项，不表示完整占比。</p>}
+      {analysis.truncated && <p className="ask-quality-summary">{analysis.rows ? `共 ${analysis.source.row_count} 条记录，预览 ${analysis.rows.length} 条。` : `共 ${analysis.group_count ?? "多"} 组，展示前 ${data.length} 组；统计总计包含完整查询范围。`}</p>}
       <Fold title="数据与来源" className="ask-analysis-details">
       <div className="ask-analysis-evidence">
       {actualType !== "table" && table()}
@@ -592,9 +595,6 @@ function AnalysisCardView({
       </footer>
         <p className="ask-notice">
           这是生成时保存的快照，后续数据变化不会自动改写。
-          {analysis.truncated
-            ? `仅展示前 ${data.length || analysis.rows?.length || 0} 项，不表示完整占比。`
-            : ""}
         </p>
         {analysis.warnings.map((w, i) => (
           <p className="ask-notice" key={i}>
@@ -638,8 +638,11 @@ function AnalysisCardView({
                 <X size={18} />
               </button>
             </header>
+            <p className="ask-chart-description">{analysis.source.row_count} 条记录 · {analysis.source.document_count} 份来源</p>
+            {analysis.truncated && <p className="ask-quality-summary">{analysis.rows ? `共 ${analysis.source.row_count} 条记录，预览 ${analysis.rows.length} 条。` : `共 ${analysis.group_count ?? "多"} 组，展示前 ${data.length} 组；统计总计包含完整查询范围。`}</p>}
             {graphic(true)}
-            {actualType !== "table" && table()}
+            {legend}
+            {actualType !== "table" && <Fold title="查看底层数据">{table()}</Fold>}
           </>
         )}
       </dialog>

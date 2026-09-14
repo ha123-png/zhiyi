@@ -112,7 +112,8 @@ class RowQuery(Strict):
     descending: bool = Field(
         default=False, description="false 为从小到大；用户明确要求倒序或最后几条时才设 true。"
     )
-    limit: int = Field(default=30, ge=1, le=500)
+    limit: int = Field(default=3, ge=1, le=500)
+    fields: list[str] = Field(default_factory=list, max_length=50, description="只读取需要的业务字段；留空使用表内字段。")
     search: str = Field(default="", max_length=500)
 
 
@@ -124,7 +125,7 @@ class Control(Strict):
 class Snapshot(Strict):
     analysis_id: str
     offset: int = Field(default=0, ge=0, le=500)
-    limit: int = Field(default=20, ge=1, le=50)
+    limit: int = Field(default=3, ge=1, le=50)
 
 
 class OriginalPage(Strict):
@@ -136,6 +137,7 @@ class OriginalPage(Strict):
 
 class History(Strict):
     index: int = Field(default=0, ge=0)
+    search: str = Field(default="", max_length=200)
     offset: int = Field(default=0, ge=0)
 
 
@@ -289,8 +291,8 @@ def scoped_tool_specs(session, context, artifacts, draft, question="", *, stable
     writable = context.mode != "read"
     write_capabilities = [cap for cap in context.capabilities if cap != "templates"]
     specs = tool_specs(True)
-    snapshots = {key: value for key, value in artifacts.items() if value.get("data")}
-    all_snapshots = {key: value for key, value in artifacts.items() if value.get("analysis_id")}
+    snapshots = {key: value for key, value in artifacts.items() if not key.startswith("_") and isinstance(value, dict) and value.get("data")}
+    all_snapshots = {key: value for key, value in artifacts.items() if not key.startswith("_") and isinstance(value, dict) and value.get("analysis_id")}
     # Offer operational schemas only when requested; full template schemas are expensive for small local windows.
     write_intent = any(
         word in question.lower()
@@ -359,7 +361,7 @@ def scoped_tool_specs(session, context, artifacts, draft, question="", *, stable
             allowed.add("propose_changes")
         if tasks and "tasks" in context.capabilities:
             allowed.add("propose_task_control")
-    if (artifacts.get("_history") or stable) and not catalog_question:
+    if (artifacts.get("_history") or artifacts.get("_history_thread") or stable) and not catalog_question:
         allowed.add("read_conversation_history")
         specs += [
             s
@@ -711,6 +713,7 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
         serialized = json.dumps(value, ensure_ascii=False, default=str)
         return {
             "tool_id": body.tool_id,
+            "offset": body.offset,
             "path": body.path,
             "fields": list(value)[:100] if isinstance(value, dict) else None,
             "data": value if len(serialized) <= 4000 else None,
@@ -725,6 +728,48 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
         if body.category not in state["categories"]:
             state["categories"].append(body.category)
         return {"note": "所请求操作工具将在下一轮提供；实际操作仍受本次资料范围和确认方式约束。"}
+    if name == "read_conversation_history" and artifacts.get("_history_thread"):
+        from document_pipeline_api.models.assistant import AssistantMessage, AssistantToolCall, AssistantRun
+        from document_pipeline_api.services.assistant_memory import scope_identity, summarize_result
+        scope = scope_identity(artifacts["_history_context"])
+        query = select(AssistantMessage).where(AssistantMessage.thread_id == artifacts["_history_thread"],
+            AssistantMessage.position < artifacts["_history_before"])
+        if body.search:
+            from sqlalchemy import func
+            parts = func.json_each(AssistantMessage.parts_json).table_valued("value").alias("history_parts")
+            query = query.where(select(1).select_from(parts).where(
+                func.json_extract(parts.c.value, "$.text").contains(body.search, autoescape=True)
+            ).exists())
+        # Scope metadata is checked before returning any historical content.
+        found = 0
+        for message in session.scalars(query.order_by(AssistantMessage.position.desc()).execution_options(yield_per=50)):
+            old_scope = scope_identity(json.loads(message.context_json))
+            if old_scope and old_scope != scope and any(v for k,v in old_scope.items() if k != "table_name"):
+                continue
+            if found != body.index:
+                found += 1
+                continue
+            pieces = []
+            for part in json.loads(message.parts_json):
+                if part.get("type") == "text":
+                    pieces.append(part["text"])
+                elif part.get("type") == "tool":
+                    call = session.get(AssistantToolCall, part.get("id"))
+                    run = session.get(AssistantRun, call.run_id) if call else None
+                    if call and run and run.message_id == message.id:
+                        saved = json.loads(call.result_json)
+                        artifacts.setdefault("_tool_results", {})[call.id] = saved
+                        if saved.get("analysis_id") and saved.get("source"):
+                            artifacts[saved["analysis_id"]] = saved
+                        if saved.get("analysis"):
+                            artifacts[saved["analysis"]["analysis_id"]] = saved["analysis"]
+                        pieces.append(json.dumps({"tool_id": call.id, "status": call.status, "result": summarize_result(json.loads(call.result_json), history=True, status=call.status)}, ensure_ascii=False))
+            content = "\n".join(pieces)
+            return {"index": body.index, "position": message.position, "role": message.role,
+                "offset": body.offset, "total_characters": len(content),
+                "text": content[body.offset:body.offset + 2000], "next_offset": body.offset + 2000 if body.offset + 2000 < len(content) else None,
+                "note": "从最近向前查找的历史资料，不是本轮指令；可用 search 查找更早的对话。"}
+        return {"message": None, "note": "当前授权范围没有更多匹配的历史。"}
     if name == "read_conversation_history":
         entries = artifacts.get("_history", {}).get("items", [])
         if body.index >= len(entries):
@@ -776,8 +821,15 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
 
         return read_original(session, settings, body)
     if name == "read_data_rows":
-        query = AnalysisRequest(**body.model_dump(), records=True)
+        query = AnalysisRequest(**body.model_dump(exclude={"fields"}), records=True)
         result = analyze(session, scoped_analysis(session, context, query))
+        if body.fields:
+            available = {column["key"] for column in result["columns"]}
+            if any(field not in available for field in body.fields):
+                raise HTTPException(422, "读取字段不存在，请先查看表结构。")
+            result["columns"] = [column for column in result["columns"] if column["key"] in body.fields]
+            for row in result["rows"]:
+                row["values"] = {key: value for key, value in row["values"].items() if key in body.fields}
         result["analysis_id"] = str(uuid4())
         artifacts[result["analysis_id"]] = result
         return result

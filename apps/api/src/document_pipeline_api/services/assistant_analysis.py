@@ -1,6 +1,8 @@
 """Bounded, deterministic analysis over the same facts as the warehouse."""
 
 from collections import defaultdict
+from bisect import insort
+from types import SimpleNamespace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import json
@@ -192,13 +194,41 @@ def analyze(session, request: AnalysisRequest):
     # Apply the exact business predicates while streaming, before the result cap.
     # A narrow date range in a large table must not fail on unrelated old rows.
     rows = []
-    for record in session.scalars(query.execution_options(yield_per=1000)):
+    kept_fields = set(fields) | {"__row_group"}
+    # Unit checks are part of correctness even when the user did not request
+    # the unit column. Unrelated free text never needs to stay in an aggregate.
+    kept_fields.update(c.key for c in columns.values() if c.label.strip() in {"币种", "货币", "货币单位", "单位", "计量单位"}
+        or c.key.rsplit(".", 1)[-1].casefold() in {"currency", "currency_code", "unit", "measurement_unit"})
+    candidates, candidate_values, seen_documents = [], {}, set()
+    for record in session.scalars(query.execution_options(yield_per=100)):
         values = json.loads(record.row_json)
         if request.search and request.search.casefold() not in json.dumps(values, ensure_ascii=False).casefold():
             continue
         if not all(matches(values.get(f.field), f) for f in request.filters):
             continue
-        rows.append((record, values))
+        light = SimpleNamespace(id=record.id, task_id=record.task_id, row_version=record.row_version,
+            review_pending=record.review_pending, input_scope_json=record.input_scope_json)
+        rows.append((light, {key: values[key] for key in kept_fields if key in values}))
+        if request.records:
+            document = document_key(light, values)
+            eligible = request.grain != "document" or document not in seen_documents
+            if request.grain == "document":
+                seen_documents.add(document)
+            if eligible:
+                if request.sort == "row_id" and "row_id" not in columns:
+                    rank = (record.id,)
+                elif request.sort:
+                    value = values.get(request.sort)
+                    numeric = number(value)
+                    rank = (value is not None, numeric is not None, numeric or Decimal(0), str(value or ""))
+                else:
+                    rank = (record.id,)
+                descending = bool(request.sort and request.descending)
+                insort(candidates, (rank, -record.id if descending else record.id, record.id))
+                candidate_values[record.id] = (light, values)
+                if len(candidates) > request.limit:
+                    removed = candidates.pop(0 if descending else -1)
+                    del candidate_values[removed[2]]
         if len(rows) > 100000:
             raise HTTPException(422, "筛选后仍超过十万条记录，请缩小日期或资料范围；没有返回局部统计。")
     warnings = validate_measure_units(columns, rows, request.metrics)
@@ -253,25 +283,13 @@ def analyze(session, request: AnalysisRequest):
         "generated_at": datetime.now().astimezone().isoformat(),
     }
     if request.records:
-        if request.sort == "row_id" and "row_id" not in columns:
-            rows.sort(key=lambda rv: rv[0].id, reverse=request.descending)
-        elif request.sort:
-            key = request.sort
-            rows.sort(
-                key=lambda rv: (
-                    rv[1].get(key) is not None,
-                    number(rv[1].get(key)) is not None,
-                    number(rv[1].get(key)) or Decimal(0),
-                    str(rv[1].get(key) or ""),
-                ),
-                reverse=request.descending,
-            )
+        ordered = reversed(candidates) if request.sort and request.descending else candidates
         return {
             "source": source,
             "columns": [c.model_dump() for c in columns.values()],
             "rows": [
                 {"row_id": r.id, "version": r.row_version, "task_id": r.task_id, "values": v}
-                for r, v in rows[: request.limit]
+                for r, v in (candidate_values[item[2]] for item in ordered)
             ],
             "truncated": len(rows) > request.limit,
             "warnings": warnings,

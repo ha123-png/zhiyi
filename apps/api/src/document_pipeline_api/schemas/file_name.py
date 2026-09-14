@@ -11,6 +11,7 @@ class FileNameDecision(BaseModel):
 class FileNameRead(BaseModel):
     model_config = ConfigDict(extra="forbid")
     version: int = 1
+    strategy: Literal["ai", "fixed"] = "ai"
     status: Literal["pending", "confirmed"] = "pending"
     suggested_filename: str
     confirmed_filename: str | None = None

@@ -101,10 +101,8 @@ def create_app(
         )
 
         with application.state.session_factory() as session:
-            from sqlalchemy import update
-            from document_pipeline_api.models import AssistantRun
-            session.execute(update(AssistantRun).where(AssistantRun.status.in_(["running", "waiting", "cancelling"])).values(status="interrupted", error="应用已重启；已保存生成内容，请重新提问。"))
-            session.commit()
+            from document_pipeline_api.services.assistant_events import recover_interrupted_runs
+            recover_interrupted_runs(session)
             ensure_builtin_templates(session)
             leave_experimental_one_click_profile(session)
             ensure_default_local_profile(session)

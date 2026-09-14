@@ -36,6 +36,7 @@ class TemplateBehavior(BaseModel):
     presentation: TemplatePresentation = Field(default_factory=TemplatePresentation)
     requires_complete_input: bool = True
     suggest_filename: bool = False
+    filename_mode: Literal["ai", "fixed"] = "ai"
 
 
 class TemplateBody(BaseModel):

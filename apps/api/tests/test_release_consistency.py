@@ -225,7 +225,7 @@ def test_large_extraction_exposes_business_fields_and_real_read_paths():
                             'template': {'instructions': 'x' * 10000}, 'evidence': [], 'validation_issues': []}}
     brief = summarize_result(source)
     assert brief['result_preview']['header']['seller'] == '合成商家'
-    assert len(brief['result_preview']['items']) == 5 and brief['item_count'] == 100
+    assert len(brief['result_preview']['items']) == 3 and brief['item_count'] == 100
     for path in brief['read_paths']:
         value = source
         for key in path:

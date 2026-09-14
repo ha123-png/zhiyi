@@ -103,6 +103,7 @@ def test_behavior_is_versioned_and_copied(client):
             "collapsed_fields": ["item.answer"],
         },
         "suggest_filename": True,
+        "filename_mode": "fixed",
         "requires_complete_input": False,
     }
     response = client.put(
@@ -115,6 +116,7 @@ def test_behavior_is_versioned_and_copied(client):
         old = get_template_version(session, created["id"], 1)
         assert old.behavior.presentation.mode == "table"
         assert old.behavior.suggest_filename is False
+        assert old.behavior.filename_mode == "ai"
     copied = client.post(f"/api/v1/templates/{created['id']}/copy")
     assert copied.status_code == 201
     assert copied.json()["behavior"] == body["behavior"]

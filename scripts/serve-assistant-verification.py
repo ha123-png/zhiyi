@@ -183,6 +183,7 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--real-model", action="store_true")
+    parser.add_argument("--measure", action="store_true", help="Record request sizes only, for synthetic scale verification")
     args = parser.parse_args()
     project = Path(__file__).resolve().parents[1]
     root = args.data_dir.resolve()
@@ -260,7 +261,7 @@ if __name__ == "__main__":
                             )
                         )
                     session.commit()
-                if not session.get(TaskRecord, "ask-source-image"):
+                if not session.get(TaskRecord, "fd4051b8-42de-4947-803d-fa971e7ec621"):
                     from PIL import Image, ImageDraw, ImageFont
                     import hashlib
 
@@ -268,7 +269,7 @@ if __name__ == "__main__":
                         parents=True, exist_ok=True
                     )
                     path = (
-                        application.state.settings.storage_dir / "ask-source-image.png"
+                        application.state.settings.storage_dir / "fd4051b8-42de-4947-803d-fa971e7ec621.png"
                     )
                     image = Image.new("RGB", (800, 480), "white")
                     draw = ImageDraw.Draw(image)
@@ -279,7 +280,7 @@ if __name__ == "__main__":
                     image.save(path)
                     session.add(
                         TaskRecord(
-                            id="ask-source-image",
+                            id="fd4051b8-42de-4947-803d-fa971e7ec621",
                             sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                             filename="合成订单图.png",
                             storage_path=path.name,
@@ -326,4 +327,24 @@ if __name__ == "__main__":
     if not args.real_model:
         app.state.conversation_factory = ScriptedConversation
         app.state.assistant_simulated = True
+    elif args.measure:
+        from document_pipeline_api.model_providers.conversation import ConversationProvider
+        import time
+
+        class MeasuredConversation(ConversationProvider):
+            def stream(self, messages, tools):
+                previews = []
+                for message in messages:
+                    if message.get("role") == "tool":
+                        try:
+                            value = json.loads(message["content"])
+                            previews.append({"characters": len(message["content"]), "rows": len(value.get("data", [])) if isinstance(value.get("data"), list) else None})
+                        except (ValueError, TypeError):
+                            pass
+                with (root / "request-sizes.jsonl").open("a", encoding="utf-8") as file:
+                    file.write(json.dumps({"time": time.time(), "messages": len(messages), "tools": len(tools),
+                        "characters": len(json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False)),
+                        "previews": previews, "unrequested_long_note": "SCALE_LONG_NOTE" in json.dumps(messages, ensure_ascii=False)}) + "\n")
+                yield from super().stream(messages, tools)
+        app.state.conversation_factory = MeasuredConversation
     uvicorn.run(app, host="127.0.0.1", port=args.port)

@@ -15,7 +15,8 @@ export function templateDifferences(current: TemplateDraft, target: TemplateDraf
   add("额外提示词", mergeTemplateHints(current.extra_instructions, current.validation_rules), mergeTemplateHints(target.extra_instructions, target.validation_rules));
   const mode = (t: TemplateDraft) => t.behavior?.presentation.mode === "card" ? "卡片" : "表格";
   add("默认展示", mode(current), mode(target));
-  add("有意义的文件名", current.behavior?.suggest_filename ? "开启" : "关闭", target.behavior?.suggest_filename ? "开启" : "关闭");
+  add("命名方式", current.behavior?.filename_mode === "fixed" ? "固定规则" : "AI 命名", target.behavior?.filename_mode === "fixed" ? "固定规则" : "AI 命名");
+  add("文件命名", current.behavior?.suggest_filename ? "开启" : "关闭", target.behavior?.suggest_filename ? "开启" : "关闭");
   const oldFields = new Map(current.fields.map(f => [fieldId(f), f]));
   const newFields = new Map(target.fields.map(f => [fieldId(f), f]));
   for (const [key, f] of oldFields) if (!newFields.has(key)) add(`移除字段 · ${f.label}`, `${f.section === "header" ? "整份文件" : "每条明细"} / ${typeNames[f.value_type]}`, "恢复后不再提取此字段", true);

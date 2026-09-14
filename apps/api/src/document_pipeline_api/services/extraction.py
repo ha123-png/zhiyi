@@ -562,9 +562,9 @@ def process_task(
         else:
             document_kind = DocumentKind.CUSTOM
             result_type = build_template_extraction_model(selected_template)
-            prompt = build_template_extraction_prompt(selected_template, include_filename=selected_template.behavior.suggest_filename)
+            prompt = build_template_extraction_prompt(selected_template, include_filename=selected_template.behavior.suggest_filename and selected_template.behavior.filename_mode == "ai")
         model_type = result_type
-        if selected_template.behavior.suggest_filename:
+        if selected_template.behavior.suggest_filename and selected_template.behavior.filename_mode == "ai":
             from document_pipeline_api.services.file_names import OptionalNameAdvice
             model_type = create_model("Named" + result_type.__name__, __base__=result_type,
                 file_name_advice=(OptionalNameAdvice, None))
@@ -603,8 +603,9 @@ def process_task(
         )
         issues = evaluation.issues + input_scope_issues(prepared.scope.model_dump_json())
         if selected_template.behavior.suggest_filename and task.file_name_json is None:
-            from document_pipeline_api.services.file_names import automatic_file_name, confirm_file_name
-            task.file_name_json = automatic_file_name(task.filename, naming_advice, raw_values).model_dump_json()
+            from document_pipeline_api.services.file_names import automatic_file_name, confirm_file_name, fixed_file_name
+            name = fixed_file_name(session, task, selected_template) if selected_template.behavior.filename_mode == "fixed" else automatic_file_name(task.filename, naming_advice, raw_values)
+            task.file_name_json = name.model_dump_json()
             confirm_file_name(task)
         record = ExtractionRecord(
             task_id=task.id,

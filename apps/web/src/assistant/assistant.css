@@ -687,6 +687,7 @@
 }
 .ask-data-scroll table {
   width: 100%;
+  min-width: max-content;
   border-collapse: collapse;
 }
 .ask-data-scroll th {
@@ -702,8 +703,11 @@
   border-bottom: 1px solid var(--border);
   text-align: left;
   max-width: 320px;
-  overflow-wrap: anywhere;
+  white-space: nowrap;
+  overflow-wrap: normal;
 }
+.ask-data-scroll td > .ask-cell-value { display: block; max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+.ask-load-more { display: block; margin: 12px auto; color: var(--muted-foreground); font-size: .8125rem; }
 .ask-settings-popover {
   width: 500px;
   max-width: calc(100vw - 28px);

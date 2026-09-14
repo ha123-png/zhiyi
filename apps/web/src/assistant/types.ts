@@ -95,6 +95,7 @@ export type Part =
   | ({ type: "tool" } & ToolRecord);
 export interface Message {
   id: string;
+  position?: number;
   role: "user" | "assistant";
   parts: Part[];
   context: BusinessContext;
@@ -102,6 +103,8 @@ export interface Message {
 }
 export interface Run {
   id: string;
+  message_id?: string;
+  stream_cursor?: number;
   status: string;
   error: string | null;
   model: string;
@@ -117,6 +120,8 @@ export interface Thread {
 }
 export interface ThreadDetail extends Thread {
   partial?: boolean;
+  has_more?: boolean;
+  oldest_position?: number;
   messages: Message[];
   runs: Run[];
   tools: ToolRecord[];

@@ -29,7 +29,7 @@ import { parseServerTime } from "../time";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { Icon } from "./Icon";
 import { PartialInputAction } from "./InputScopeDetails";
-import { TaskExportDetails } from "./TaskExportDetails";
+import { TaskExportAction } from "./TaskExportDetails";
 
 // 状态 → 中文文案（对齐原型队列语义：等待中/处理中/已暂停/已完成/失败）
 const STATUS_TEXT: Record<TaskStatus, string> = {
@@ -419,7 +419,7 @@ export function TaskQueuePage({
                   {activeTasks.map((t) => (
                     <div className="task-item" key={t.id}>
                       <div className="task-row-top">
-                        <span className="task-name">{taskDisplayName(t)}</span>
+                        <span className="task-name" title={taskDisplayName(t)}>{taskDisplayName(t)}</span>
                         <span
                           className={`badge ${["processing", "validating"].includes(t.status) ? "live-blue" : "info"}`}
                         >
@@ -488,7 +488,7 @@ export function TaskQueuePage({
                     <div className="task-empty">暂无待处理事项</div>
                   )}
                   {reviewTasks.map(task => <div className="task-item" key={`review-${task.id}`}>
-                    <div className="task-row-top"><span className="task-name">{taskDisplayName(task)}</span><span className="badge warn">待核对</span></div>
+                    <div className="task-row-top"><span className="task-name" title={taskDisplayName(task)}>{taskDisplayName(task)}</span><span className="badge warn">待核对</span></div>
                     <div className="task-row-bottom"><span className="small muted">提取结果需要确认，与文件历史的校验问题同步。</span><button className="btn secondary sm" onClick={() => onOpenTask?.(task)}>核对结果</button></div>
                   </div>)}
                   {pendingTotals.review > pendingPageSize && <div className="row" aria-label="待核对事项翻页">
@@ -498,9 +498,8 @@ export function TaskQueuePage({
                   </div>}
                   {pendingTotals.failed > 0 && <button className="btn secondary sm" onClick={() => { setCollapsed(previous => ({ ...previous, failed: false })); document.getElementById("queue-failed")?.scrollIntoView({ block: "start" }); }}>{pendingTotals.failed} 个失败或取消任务待处理 · 查看</button>}
                   {exportPendingTasks.map((task) => <div className="task-item" key={`export-${task.id}`}>
-                    <div className="task-row-top"><span className="task-name">{taskDisplayName(task)}</span><span className="badge warn">副本待处理</span></div>
-                    <TaskExportDetails task={task} expanded onUpdated={() => void load()} />
-                    <button className="btn ghost sm" onClick={() => onOpenTask?.(task)}>查看提取结果</button>
+                    <div className="task-row-top"><span className="task-name" title={taskDisplayName(task)}>{taskDisplayName(task)}</span><span className="badge warn">副本待处理</span></div>
+                    <TaskExportAction task={task} onUpdated={() => void load()} />
                   </div>)}
                   {pendingTotals.exports > pendingPageSize && <div className="row" aria-label="副本事项翻页">
                     <button className="btn secondary sm" disabled={exportPage === 0} onClick={() => setExportPage((page) => page - 1)}>上一页副本</button>
@@ -514,7 +513,7 @@ export function TaskQueuePage({
                   </div>}
                   {matchFailedTasks.map((t) => {
                     if (t.pending_reason === "input_scope") return <div className="task-item" key={t.id}>
-                      <div className="task-row-top"><span className="task-name">{taskDisplayName(t)}</span><span className="badge warn">待确认范围</span></div>
+                      <div className="task-row-top"><span className="task-name" title={taskDisplayName(t)}>{taskDisplayName(t)}</span><span className="badge warn">待确认范围</span></div>
                       <PartialInputAction task={t} onUpdated={() => void load()} />
                       <button className="btn ghost sm" onClick={() => onOpenTask?.(t)}>查看任务</button>
                       <button className="btn ghost sm danger-btn" onClick={() => setDeleteMatchTarget(t)}>删除任务</button>
@@ -536,7 +535,7 @@ export function TaskQueuePage({
                     return (
                       <div className="task-item" key={t.id}>
                         <div className="task-row-top">
-                          <span className="task-name">{taskDisplayName(t)}</span>
+                          <span className="task-name" title={taskDisplayName(t)}>{taskDisplayName(t)}</span>
                           <span className="badge warn">待匹配</span>
                         </div>
                         <div className="match-failed-box">
@@ -609,7 +608,7 @@ export function TaskQueuePage({
                   {completedTasks.map((t) => (
                     <div className="task-item" key={t.id}>
                       <div className="task-row-top">
-                        <span className="task-name">{taskDisplayName(t)}</span>
+                        <span className="task-name" title={taskDisplayName(t)}>{taskDisplayName(t)}</span>
                         <span className={`badge ${t.status === "needs_review" ? "warn" : "success"}`}>
                           {STATUS_TEXT[t.status]}
                         </span>
@@ -689,7 +688,7 @@ export function TaskQueuePage({
                   {failedTasks.map((t) => (
                     <div className="task-item" key={t.id}>
                       <div className="task-row-top">
-                        <span className="task-name">{taskDisplayName(t)}</span>
+                        <span className="task-name" title={taskDisplayName(t)}>{taskDisplayName(t)}</span>
                         <span className="badge danger">{STATUS_TEXT[t.status]}</span>
                       </div>
                       <div className="task-row-bottom">

@@ -54,7 +54,7 @@ def test_upgrade_database_creates_schema_from_empty_database(tmp_path) -> None:
     with engine.connect() as connection:
         assert connection.execute(
             select(_version_table(engine))
-        ).scalar_one() == "0037_model_context_policy"
+        ).scalar_one() == "0038_growth_and_streaming"
     assert "rule_engine_version" in {
         column["name"] for column in inspect(engine).get_columns("extractions")
     }
@@ -137,7 +137,7 @@ def test_unversioned_0005_database_is_not_mistaken_for_0006(tmp_path) -> None:
     with engine.connect() as connection:
         assert connection.execute(
             select(_version_table(engine))
-        ).scalar_one() == "0037_model_context_policy"
+        ).scalar_one() == "0038_growth_and_streaming"
 
 
 def test_unversioned_0006_database_is_upgraded_to_row_versions(tmp_path) -> None:
@@ -160,7 +160,7 @@ def test_unversioned_0006_database_is_upgraded_to_row_versions(tmp_path) -> None
     with engine.connect() as connection:
         assert connection.execute(
             select(_version_table(engine))
-        ).scalar_one() == "0037_model_context_policy"
+        ).scalar_one() == "0038_growth_and_streaming"
 
 
 def test_unversioned_current_database_is_adopted_without_replaying_migrations(tmp_path) -> None:
@@ -178,7 +178,7 @@ def test_unversioned_current_database_is_adopted_without_replaying_migrations(tm
 
     with engine.connect() as connection:
         assert connection.execute(select(_version_table(engine))).scalar_one() == (
-            "0037_model_context_policy"
+            "0038_growth_and_streaming"
         )
         assert connection.exec_driver_sql(
             "SELECT value FROM system_settings WHERE key = 'image_convert'"
@@ -249,7 +249,7 @@ def test_0010_recovers_when_column_was_added_before_revision_was_recorded(
 
     with engine.connect() as connection:
         assert connection.execute(select(_version_table(engine))).scalar_one() == (
-            "0037_model_context_policy"
+            "0038_growth_and_streaming"
         )
     assert [
         column["name"]
@@ -367,7 +367,7 @@ def test_0014_upgrade_keeps_tasks_referenced_by_child_rows(tmp_path) -> None:
 
     with engine.connect() as connection:
         assert connection.execute(select(_version_table(engine))).scalar_one() == (
-            "0037_model_context_policy"
+            "0038_growth_and_streaming"
         )
         assert connection.exec_driver_sql(
             "SELECT count(*) FROM tasks"

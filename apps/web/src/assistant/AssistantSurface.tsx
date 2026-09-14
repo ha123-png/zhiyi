@@ -11,6 +11,7 @@ import {
   useRef,
   useState,
   type ComponentProps,
+  type ReactNode,
 } from "react";
 import {
   ComposerPrimitive,
@@ -50,7 +51,7 @@ function AnalysisCard(props: ComponentProps<typeof LazyAnalysisCard>) {
   );
 }
 import { navigateAssistant, useAssistant } from "./AssistantProvider";
-import type { Analysis, BusinessContext, ToolRecord } from "./types";
+import type { Analysis, BusinessContext, ToolRecord, Thread } from "./types";
 
 const toolNames: Record<string, string> = {
   get_operation_tools: "准备业务操作",
@@ -357,6 +358,9 @@ function ToolCardContent({
     </section>
   );
 }
+function ResultNarrative({ folded, children }: { folded: boolean; children: ReactNode }) {
+  return folded ? <Fold title="文字说明" className="ask-result-narrative">{children}</Fold> : <>{children}</>;
+}
 function MessageView() {
   const message = useAuiState((s) => s.message);
   const ask = useAssistant();
@@ -368,6 +372,9 @@ function MessageView() {
   const context = message.metadata.custom?.context as
     | BusinessContext
     | undefined;
+  const results = message.content.flatMap(part => part.type === "tool-call" ? [(part.result as ToolRecord)?.result] : []).filter(Boolean);
+  const sameScope = (first: Analysis["source"], second: Analysis["source"]) => first.table_id === second.table_id &&
+    ["row_ids", "filters", "search", "task_id", "grain"].every(key => JSON.stringify(first.request[key] ?? null) === JSON.stringify(second.request[key] ?? null));
   const intermediate = message.content.filter(part => {
     if (part.type !== "tool-call") return false;
     const t = part.result as ToolRecord;
@@ -375,8 +382,14 @@ function MessageView() {
     return r && !r.chart && !r.draft && !r.error && t.status === "completed"
       && r.kind !== "export" && r.kind !== "operation_plan"
       && (!r.analysis_id || message.content.some(other => other.type === "tool-call"
-        && (other.result as ToolRecord)?.result?.chart?.analysis_id === r.analysis_id));
+        && (other.result as ToolRecord)?.result?.chart?.analysis_id === r.analysis_id)
+        || (r.rows && r.source && results.some(other => {
+          const final = other.analysis || other;
+          return final !== r && final.source && !final.rows && (other.chart || final.data) && sameScope(r.source!, final.source);
+        })));
   });
+  const hasResultCard = message.content.some(part => part.type === "tool-call" && !intermediate.includes(part) &&
+    ((part.result as ToolRecord)?.result?.chart || (part.result as ToolRecord)?.result?.analysis_id));
   return (
     <MessagePrimitive.Root
       className={`ask-message ask-message-${message.role}`}
@@ -397,15 +410,18 @@ function MessageView() {
         </Fold>}
         {message.content.map((part, index) =>
           intermediate.includes(part) ? null : part.type === "text" ? (
+            <ResultNarrative key={index} folded={hasResultCard && !(ask.busy && ask.detail?.messages.at(-1)?.id === message.id) &&
+              (part.text.length > 240 || /(?:^|\n)\s*(?:\d+[.)]|[-*+])\s+/.test(part.text))}>
             <ReactMarkdown
               key={index}
               remarkPlugins={[remarkGfm]}
               components={{
-                table: ({ children }) => (
-                  <div className="ask-data-scroll" tabIndex={0} aria-label="回答中的表格，可横向滚动">
+                table: ({ children }) => {
+                  const table = <div className="ask-data-scroll" tabIndex={0} aria-label="回答中的表格，可横向滚动">
                     <table>{children}</table>
-                  </div>
-                ),
+                  </div>;
+                  return hasResultCard ? <Fold title="补充表格">{table}</Fold> : table;
+                },
                 img: ({ alt }) => (
                   <span>[图片：{alt || "未加载外部图片"}]</span>
                 ),
@@ -427,6 +443,7 @@ function MessageView() {
             >
               {part.text}
             </ReactMarkdown>
+            </ResultNarrative>
           ) : part.type === "tool-call" ? (
             <ToolCard
               key={part.toolCallId}
@@ -531,6 +548,13 @@ function Conversation() {
         scrollToBottomOnThreadSwitch={false}
       >
         <div ref={scroll.content} className="ask-scroll-content">
+          {ask.detail?.has_more && <button type="button" className="ask-load-more" disabled={ask.loadingOlder} onClick={async () => {
+            const viewport = scroll.viewport.current;
+            const height = viewport?.scrollHeight || 0;
+            const top = viewport?.scrollTop || 0;
+            await ask.loadOlder();
+            requestAnimationFrame(() => { if (viewport) viewport.scrollTop = top + viewport.scrollHeight - height; });
+          }}>{ask.loadingOlder ? "正在读取…" : "查看更早的消息"}</button>}
           {!ask.detail?.messages.length && !ask.loading && (
             <div className="ask-empty">
               <span className="ask-emblem">
@@ -746,11 +770,24 @@ export function AssistantPage() {
   const [deleting, setDeleting] = useState<string | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [title, setTitle] = useState("");
-  const threads = ask.threads.filter(
-    (t) =>
-      t.archived === archived &&
-      t.title.toLocaleLowerCase().includes(search.toLocaleLowerCase()),
-  );
+  const [found, setFound] = useState<Thread[] | null>(null);
+  const [more, setMore] = useState(false);
+  const [listing, setListing] = useState(false);
+  const listVersion = useRef(0);
+  useEffect(() => {
+    const version = ++listVersion.current;
+    setFound(null); setMore(false);
+    const timer = setTimeout(() => {
+      setListing(true);
+      void ask.findThreads(search, archived).then(values => {
+        if (version === listVersion.current) { setFound(values); setMore(values.length === 60); }
+      }).catch(error => ask.setError(error.message)).finally(() => {
+        if (version === listVersion.current) setListing(false);
+      });
+    }, search ? 180 : 0);
+    return () => { clearTimeout(timer); listVersion.current++; };
+  }, [search, archived, ask.threads, ask.findThreads]);
+  const threads = found || ask.threads.filter(t => t.archived === archived && t.title.toLocaleLowerCase().includes(search.toLocaleLowerCase()));
   return (
     <div className={`ask-page ${collapsed ? "ask-history-collapsed" : ""}`}>
       <aside
@@ -898,6 +935,18 @@ export function AssistantPage() {
               </DropdownMenu.Root>
             </div>
           ))}
+          {more && <button type="button" className="ask-load-more" disabled={listing} onClick={async () => {
+            const version = listVersion.current;
+            setListing(true);
+            try {
+              const next = await ask.findThreads(search, archived, threads.length);
+              if (version === listVersion.current) {
+                setFound([...threads, ...next.filter(value => !threads.some(t => t.id === value.id))]);
+                setMore(next.length === 60);
+              }
+            } catch (error) { ask.setError(error instanceof Error ? error.message : "读取对话失败"); }
+            finally { if (version === listVersion.current) setListing(false); }
+          }}>{listing ? "正在读取…" : "更多对话"}</button>}
           {!threads.length && (
             <p className="ask-history-empty">
               {search ? "没有匹配的对话" : archived ? "暂无归档对话。" : "发送第一条消息后，便会保存在这里。"}

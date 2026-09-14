@@ -68,6 +68,7 @@ export interface FileExportState {
 }
 
 export interface FileNameState {
+  strategy?: "ai" | "fixed";
   status: "pending" | "confirmed";
   suggested_filename: string;
   confirmed_filename: string | null;
@@ -430,6 +431,7 @@ export interface TemplateBehavior {
   };
   requires_complete_input: boolean;
   suggest_filename: boolean;
+  filename_mode?: "ai" | "fixed";
 }
 
 export interface ExtractionTemplate {

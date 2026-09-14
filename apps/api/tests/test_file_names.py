@@ -72,3 +72,25 @@ def test_meaningful_names_are_not_replaced_by_a_first_item_title(original):
     result = model_file_name(original, {"rename": False, "name": None})
     assert result.suggested_filename == original
     assert result.source_fields == []
+
+
+def test_fixed_rule_names_in_the_real_extraction_path_without_asking_ai_for_a_name(tmp_path):
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'data.db'}", storage_dir=tmp_path / "uploads", queue_enabled=False)
+    class FixedModel:
+        model_name = "fixed-test"
+        def complete_text(self, prompt, result_type):
+            assert "file_name_advice" not in result_type.model_fields
+            assert "file_name_advice" not in prompt
+            return result_type.model_validate({"header": {"title": "合成记录"}, "items": []})
+    with TestClient(create_app(settings)) as client:
+        template = client.post("/api/v1/templates", json={"name":"实验记录", "fields":[{"key":"title","label":"标题","section":"header"}],
+            "behavior":{"suggest_filename":True,"filename_mode":"fixed"}}).json()
+        client.put("/api/v1/system/settings",json={"office_convert":True,"image_convert":True})
+        uploaded = client.post("/api/v1/tasks",data={"template_id":template["id"]},files={"file":("raw.txt","合成记录".encode(),"text/plain")})
+        assert uploaded.status_code == 201
+        with client.app.state.session_factory() as session:
+            result = process_task(session,settings,uploaded.json()["id"],client=FixedModel())
+            assert result.file_name.strategy == "fixed"
+            assert result.file_name.confirmed_filename.endswith("_实验记录_001.txt")
+            task = session.get(TaskRecord,uploaded.json()["id"])
+            assert task.status == "completed" and task.filename == "raw.txt"

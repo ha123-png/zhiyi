@@ -23,7 +23,7 @@ let posted: Record<string, unknown>[];
 let stored: ThreadDetail | null;
 let sources: Source[];
 class Source {
-  onmessage: ((event: { data: string }) => void) | null = null;
+  onmessage: ((event: { data: string; lastEventId?: string }) => void) | null = null;
   onerror: (() => void) | null = null;
   constructor() {
     sources.push(this);
@@ -144,6 +144,26 @@ beforeEach(() => {
 });
 
 describe("问知意", () => {
+  it("renders incremental Unicode text without polling and reconciles final saved content", async () => {
+    stored = { id: "thread", title: "真实增量通路", profile_id: "local", archived: false, updated_at: "2026-09-13T00:00:00Z",
+      messages: [{ id: "a", role: "assistant", parts: [], context: {}, created_at: "2026-09-13T00:00:00Z" }], tools: [],
+      runs: [{ id: "run", message_id: "a", stream_cursor: 0, status: "running", error: null, model: "qwen", profile_id: "local", profile_version: 1 }] };
+    render(<Shell />);
+    fireEvent.click(await screen.findByRole("button", { name: /真实增量通路.*2026/ }));
+    await waitFor(() => expect(sources.length).toBe(1));
+    const reads = () => vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes("/assistant/threads/thread")).length;
+    const before = reads();
+    const event = { data: JSON.stringify({ type: "text.delta", part_index: 0, offset: 0, text: "你好😀，这是增量文字。" }), lastEventId: "1" };
+    act(() => { sources[0].onmessage?.(event); sources[0].onmessage?.(event); });
+    expect(await screen.findByText("你好😀，这是增量文字。")).toBeVisible();
+    expect(reads()).toBe(before);
+    stored.messages[0].parts = [{ type: "text", text: "最终核对后的回答。" }];
+    stored.runs[0].status = "completed";
+    stored.runs[0].stream_cursor = 2;
+    act(() => sources[0].onmessage?.({ data: JSON.stringify({ type: "run.completed", status: "completed" }), lastEventId: "2" }));
+    expect(await screen.findByText("最终核对后的回答。")).toBeVisible();
+    expect(screen.queryByText("你好😀，这是增量文字。")).not.toBeInTheDocument();
+  });
   it("loads actual resource lists automatically and retains named selections across categories", async () => {
     render(<Shell />);
     fireEvent.click(screen.getByRole("button", { name: "对话设置" }));

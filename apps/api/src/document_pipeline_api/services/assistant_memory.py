@@ -130,6 +130,17 @@ def native_context_segment(raw, profile_id, profile_version, saved_tools, *, par
         return None
 
 
+def preview_values(value):
+    """Preview long cells without changing the durable business values."""
+    if isinstance(value, str):
+        return value if len(value) <= 320 else value[:320] + "…（长内容预览，可按需读取）"
+    if isinstance(value, list):
+        return [preview_values(v) for v in value[:3]]
+    if isinstance(value, dict):
+        return {k: preview_values(v) for k, v in value.items()}
+    return value
+
+
 def summarize_result(result, *, history=False, status=None):
     if result.get("chart") and result.get("analysis"):
         return {
@@ -139,9 +150,9 @@ def summarize_result(result, *, history=False, status=None):
             "notice": result.get("notice"),
             "note": "图已展示，统计数据见对应快照；没有再次读取原表。",
         }
-    if result.get("analysis_id"):
+    if result.get("analysis_id") and result.get("source"):
         source = result["source"]
-        limit = 3 if history else 12
+        limit = 1 if history else 3
         data = result.get("rows", result.get("data", []))
         return {
             "analysis_id": result["analysis_id"],
@@ -154,7 +165,7 @@ def summarize_result(result, *, history=False, status=None):
             "metric_labels": result.get("metric_labels"),
             "columns": result.get("columns"),
             "group_count": result.get("group_count"),
-            "data": data[:limit],
+            "data": preview_values(data[:limit]),
             "warnings": result.get("warnings"),
             "notice": f"完整快照已保存。此上下文仅列 {min(limit, len(data))}/{len(data)} 项；需要其他项调用 read_analysis_snapshot；完整图表直接引用 analysis_id。",
         }
@@ -171,8 +182,8 @@ def summarize_result(result, *, history=False, status=None):
                     "label": i["label"], "name": i.get("name"),
                     "operation": {k: i["operation"].get(k) for k in ("kind", "changes", "table_id")},
                     "affected_count": len(i["affected"]),
-                    "changes": i["affected"][:12],
-                    "partial": len(i["affected"]) > 12,
+                    "changes": preview_values(i["affected"][:3]),
+                    "partial": len(i["affected"]) > 3,
                 }
                 for i in result["items"][:12]
             ],
@@ -183,7 +194,7 @@ def summarize_result(result, *, history=False, status=None):
     if result.get("extraction") and len(encode(result)) > 6000:
         extraction = result["extraction"]
         business = extraction.get("result", {})
-        preview = {**business, "items": business.get("items", [])[:5]} if isinstance(business, dict) else None
+        preview = preview_values({**business, "items": business.get("items", [])[:3]}) if isinstance(business, dict) else None
         if len(encode(preview)) > 6000:
             preview = None
         return {
@@ -193,7 +204,7 @@ def summarize_result(result, *, history=False, status=None):
             "item_count": len(business.get("items", [])) if isinstance(business, dict) else None,
             "validation_issues": extraction.get("validation_issues", [])[:10],
             "read_paths": [["extraction", key] for key in ("result", "validation_issues", "evidence", "input_scope") if key in extraction],
-            "notice": "已提供当前提取字段和前五条明细。完整资料保存在工具记录，其他内容可直接用 read_tool_result 的 read_paths 中相应数组读取；预览不代表全部明细。",
+            "notice": "已提供当前提取字段和前三条明细，长字段为预览。完整资料保存在工具记录，其他内容可直接用 read_tool_result 的 read_paths 中相应数组读取；预览不代表全部明细。",
         }
     if history:
         value = {
@@ -221,8 +232,8 @@ def summarize_result(result, *, history=False, status=None):
     if result.get("rows"):
         return {
             **result,
-            "rows": result["rows"][:12],
-            "context_notice": f"向模型提供前 {min(12, len(result['rows']))} 条；完整查询结果已保存，更多记录请进一步过滤。",
+            "rows": preview_values(result["rows"][:3]),
+            "context_notice": f"向模型提供前 {min(3, len(result['rows']))} 条，长字段为预览；完整查询结果已保存，更多记录请进一步过滤或回读。",
         }
     return result
 
@@ -296,3 +307,48 @@ def compact_history(history, limit=6500):
             return [summary, *recent], True
         questions.pop(0)
     return recent, True
+
+
+def model_result(result, tool_id, budget=6000):
+    """Transport budget only; the original result remains available in local storage."""
+    summary = summarize_result(result)
+    value = {"tool_id": tool_id, **summary}
+    if len(encode(value)) <= budget:
+        return value
+    small = {"tool_id": tool_id, "context_limited": True,
+        "notice": "有界预览；完整结果保存在本机，可用 read_tool_result 按字段和偏移读取。预览不能代表全部记录。"}
+    # Preserve facts/identifiers first. Even error messages, column lists and
+    # user-controlled names must obey the transport budget.
+    for key in ("analysis_id", "snapshot_id", "reference", "source", "totals", "row_count", "group_count",
+                "status", "error", "path", "offset", "total", "total_characters", "next_offset", "request", "metric_labels", "columns"):
+        if key in summary:
+            candidate = {**small, key: preview_values(summary[key])}
+            if len(encode(candidate)) <= budget * 0.7:
+                small = candidate
+    if isinstance(summary.get("text"), str) and "offset" in summary:
+        text = summary["text"]
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if len(encode({**small, "text": text[:mid], "next_offset": summary["offset"] + mid})) <= budget:
+                lo = mid
+            else:
+                hi = mid - 1
+        return {**small, "text": text[:lo], "next_offset": summary["offset"] + lo if lo < len(text) else summary.get("next_offset")}
+    for key in ("rows", "data", "items"):
+        if isinstance(summary.get(key), list):
+            values = []
+            for item in summary[key][:3]:
+                candidate = {**small, key: [*values, preview_values(item)]}
+                if len(encode(candidate)) > budget - 80:
+                    break
+                values.append(preview_values(item))
+            small[key] = values
+            if key == "items" and "offset" in summary:
+                small["next_offset"] = summary["offset"] + len(values) if len(values) < len(summary[key]) else summary.get("next_offset")
+                if not values and summary[key]:
+                    # A wide single item needs field-level reading. Avoid a
+                    # non-advancing pagination loop.
+                    small["next_offset"] = None
+                    small["read_path"] = [key, "0"]
+    return small

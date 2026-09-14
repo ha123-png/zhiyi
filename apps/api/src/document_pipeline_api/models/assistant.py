@@ -52,8 +52,24 @@ class AssistantRun(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     usage_json: Mapped[str] = mapped_column(Text, default="{}")
     events_json: Mapped[str] = mapped_column(Text, default="[]")
+    stream_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    snapshot_sequence: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class AssistantEvent(Base):
+    __tablename__ = "assistant_events"
+    run_id: Mapped[str] = mapped_column(ForeignKey("assistant_runs.id", ondelete="CASCADE"), primary_key=True)
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True)
+    payload_json: Mapped[str] = mapped_column(Text)
+
+
+class FileNameSequence(Base):
+    __tablename__ = "file_name_sequences"
+    template_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    day: Mapped[str] = mapped_column(String(10), primary_key=True)
+    value: Mapped[int] = mapped_column(Integer)
 
 
 class AssistantToolCall(Base):

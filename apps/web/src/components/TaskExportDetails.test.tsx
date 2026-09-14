@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { actOnTaskExport } from "../api";
 import type { Task } from "../types";
-import { TaskExportDetails } from "./TaskExportDetails";
+import { TaskExportDetails, TaskExportAction } from "./TaskExportDetails";
 
 vi.mock("../api", () => ({ actOnTaskExport: vi.fn() }));
 const task = { id: "copy-task", filename: "原名.png", status: "completed", file_export: {
@@ -11,6 +11,17 @@ const task = { id: "copy-task", filename: "原名.png", status: "completed", fil
 } } as Task;
 beforeEach(() => vi.clearAllMocks());
 afterEach(() => { delete window.pywebview; });
+
+it("keeps recovery controls out of the overview and completes them in a focused dialog", async () => {
+  vi.mocked(actOnTaskExport).mockResolvedValue({ ...task, file_export: { ...task.file_export!, status: "skipped" } });
+  render(<TaskExportAction task={task} />);
+  expect(screen.queryByLabelText("副本名称（保留扩展名）")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "处理" }));
+  expect(screen.getByRole("dialog", { name: "处理原件副本" })).toBeVisible();
+  expect(screen.getByLabelText("副本名称（保留扩展名）")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "跳过此次副本导出" }));
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: "处理原件副本" })).not.toBeInTheDocument());
+});
 
 it("reports a moved external copy without retrying export or changing extraction status", async () => {
   const open = vi.fn().mockRejectedValue(new Error("原副本位置已不可用，内部原件预览不受影响。"));

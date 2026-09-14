@@ -122,7 +122,7 @@ it("keeps negative amounts and incomplete groups out of proportion charts", () =
   expect(screen.getByText("-200")).toBeInTheDocument();
   rerender(<AnalysisCard analysis={{ ...analysis, truncated: true, data: [{ label: "收入", "sum:total": 500 }, { label: "支出", "sum:total": 200 }] }} navigate={() => {}} />);
   expect(screen.queryByRole("option", { name: "环形图" })).not.toBeInTheDocument();
-  expect(screen.getByText(/仅展示前 2 项，不表示完整占比/)).toBeInTheDocument();
+  expect(screen.getByText(/展示前 2 组；统计总计包含完整查询范围/)).toBeInTheDocument();
 });
 
 it("keeps currency and partial-source limitations visible before opening provenance", () => {

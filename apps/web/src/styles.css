@@ -1108,16 +1108,15 @@
       flex-direction: column;
       gap: calc(var(--space-4) * 2);
       padding: calc(var(--space-4) * 2.5);
-      /* 固定高度：恰好完整露出 3 条任务（3×92 + 2×8 + 上下 padding 20 = 312），
+      /* 固定高度：完整露出约 3 条任务，保留 44px 的按钮触控区，
          任务再多时内部滚动，四卡仍能一屏放下 */
-      height: 312px;
+      height: 336px;
       overflow-y: auto;
     }
-    /* Recovery forms need one continuous page scroll, unlike compact status lists. */
+    /* Recovery actions open separately; all overview lists retain the same height. */
     .pending-actions-card .task-list {
-      height: auto;
-      min-height: 312px;
-      overflow-y: visible;
+      height: 336px;
+      overflow-y: auto;
     }
     /* 空状态：居中文字（不再用占位卡片） */
     .task-empty {
@@ -1170,6 +1169,7 @@
       gap: calc(var(--space-4) * 3);
     }
     .task-name {
+      flex: 1 1 0;
       font-size: 1rem;
       font-weight: 600;
       letter-spacing: var(--tracking-tight);
@@ -1186,7 +1186,17 @@
       align-items: center;
       gap: calc(var(--space-4) * 2);
     }
-    .task-actions { display: flex; gap: calc(var(--space-4) * 1.5); }
+    .task-row-top > .badge, .task-row-bottom > .btn { flex-shrink: 0; white-space: nowrap; }
+    .task-actions { display: flex; flex-shrink: 0; gap: calc(var(--space-4) * 1.5); }
+    .task-meta { min-width: 0; }
+    .task-reason { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-text-muted); font-size: .875rem; }
+    .task-recovery-dialog { width: min(540px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); padding: 24px; border: 1px solid var(--color-border); border-radius: var(--radius-md); color: var(--color-text); background: var(--card); overflow: auto; }
+    .task-recovery-dialog::backdrop { background: rgb(0 0 0 / 24%); }
+    .task-recovery-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; }
+    .task-recovery-dialog h3 { font-size: 1.125rem; margin: 0; }
+    .task-export-form { display: grid; gap: 16px; }
+    .task-export-form p { margin: 0; }
+    .task-export-form .button-row { display: flex; gap: 8px; flex-wrap: wrap; }
     .match-failed-box {
       padding: calc(var(--space-4) * 3.5);
       border-radius: var(--radius-sm);

@@ -6,7 +6,7 @@ export function FileNameConfirmation({ original, state, value, onChange, disable
 }) {
   if (!state) return null;
   const chosen = value ?? state.confirmed_filename ?? state.suggested_filename ?? original;
-  return <Disclosure className="presentation-settings" title={`文件名称 · ${chosen === original ? "保留原名" : "内容名称"}`}>
+  return <Disclosure className="presentation-settings" title={`文件名称 · ${chosen === original ? "保留原名" : state.strategy === "fixed" ? "固定名称" : "内容名称"}`}>
     <p className="support" style={{ overflowWrap: "anywhere" }}>上传原名：{original}</p>
     <label className="form-label" htmlFor="confirmed-file-name">文件名称（保留扩展名）</label>
     <input id="confirmed-file-name" className="form-input" disabled={disabled} value={chosen} onChange={(event) => onChange(event.target.value)} />

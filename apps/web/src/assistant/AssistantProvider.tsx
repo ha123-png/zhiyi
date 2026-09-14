@@ -16,11 +16,13 @@ import {
 import { getModelProfiles } from "../api";
 import type { ModelProfile } from "../types";
 import { assistantApi, assistantBase } from "./api";
-import type { BusinessContext, Reference, Thread, ThreadDetail } from "./types";
+import type { BusinessContext, Message, Reference, Thread, ThreadDetail, ToolRecord } from "./types";
 import "./assistant.css";
 import { consentKey } from "./consent";
+import { applyDeltas, mergePage, type TextDelta } from "./stream";
 
 const running = new Set(["running", "waiting", "cancelling"]);
+const convertMessage = (message: ThreadMessageLike) => message;
 function currentContext(context: BusinessContext): BusinessContext {
   return { ...context, ...(context.capabilities ? { capabilities: context.capabilities.filter(value => value !== "templates") } : {}) };
 }
@@ -52,6 +54,9 @@ function useController() {
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const deltas = useRef(new Map<string, TextDelta[]>());
+  const streamCleanup = useRef<(() => void) | null>(null);
   const activeId = useRef<string | null>(null);
   const submitting = useRef(false);
   const submission = useRef<{ signature: string; id: string } | null>(null);
@@ -120,6 +125,7 @@ function useController() {
     return () => {
       mounted = false;
       observer.current?.close();
+      streamCleanup.current?.();
     };
   }, [loadModels, reloadThreads]);
   const refresh = useCallback(async (id: string, runId?: string) => {
@@ -131,14 +137,13 @@ function useController() {
       throw new Error("对话暂时无法读取，请重试。");
     if (activeId.current === id && seq === refreshSequence.current) {
       setDetail(previous => {
-        if (!next.partial || !previous || previous.id !== id) return next;
-        const merge = <T extends { id: string }>(old: T[], incoming: T[]) => {
-          const incomingMap = new Map(incoming.map(value => [value.id, value]));
-          const oldIds = new Set(old.map(value => value.id));
-          return [...old.map(value => incomingMap.get(value.id) || value), ...incoming.filter(value => !oldIds.has(value.id))];
-        };
-        return { ...next, partial: false, messages: merge(previous.messages, next.messages),
-          tools: merge(previous.tools, next.tools), runs: merge(previous.runs, next.runs) };
+        let merged = next.partial && previous?.id === id ? mergePage(previous, next) : next;
+        for (const run of next.runs) {
+          const pending = running.has(run.status) ? (deltas.current.get(run.id) || []).filter(event => event.sequence > (run.stream_cursor || 0)) : [];
+          deltas.current.set(run.id, pending);
+          merged = applyDeltas(merged, run.id, pending);
+        }
+        return merged;
       });
       for (const tool of next.tools || []) {
         if (tool.status === "approved") {
@@ -165,13 +170,26 @@ function useController() {
   const observe = useCallback(
     (id: string, runId: string) => {
       observer.current?.close();
+      streamCleanup.current?.();
       const source = new EventSource(
         `${assistantBase}/runs/${encodeURIComponent(runId)}/events`,
       );
       observer.current = source;
-      let lastRefresh = 0;
       let failures = 0;
-      let refreshing = false;
+      let frame: ReturnType<typeof setTimeout> | undefined;
+      let checkpoint: ReturnType<typeof setTimeout> | undefined;
+      let received: TextDelta[] = [];
+      const flush = () => {
+        frame = undefined;
+        const batch = received;
+        received = [];
+        setDetail(previous => previous?.id === id ? applyDeltas(previous, runId, batch) : previous);
+      };
+      const sync = () => {
+        checkpoint = undefined;
+        void refresh(id, runId).catch((e) => setError(e.message));
+      };
+      streamCleanup.current = () => { clearTimeout(frame); clearTimeout(checkpoint); deltas.current.clear(); };
       source.onopen = () => { setStatus("正在接收回答…"); };
       source.onmessage = (event) => {
         failures = 0;
@@ -184,16 +202,26 @@ function useController() {
           message?: string;
           error?: string;
           status?: string;
+          text?: string;
+          part_index?: number;
+          offset?: number;
         };
         if (data.message) setStatus(data.message);
-        if (data.type === "text.delta") setStatus("正在回答…");
-        if ((!refreshing && Date.now() - lastRefresh > 350) || data.type !== "text.delta") {
-          lastRefresh = Date.now();
-          refreshing = true;
-          void refresh(id, runId).catch((e) => setError(e.message)).finally(() => { refreshing = false; });
+        if (data.type === "text.delta" && typeof data.part_index === "number" && typeof data.offset === "number") {
+          setStatus("正在回答…");
+          const delta = { sequence: Number(event.lastEventId), part_index: data.part_index, offset: data.offset, text: data.text || "" };
+          const pending = deltas.current.get(runId) || [];
+          pending.push(delta);
+          deltas.current.set(runId, pending);
+          received.push(delta);
+          if (!frame) frame = setTimeout(flush, 24);
+        } else if (!checkpoint) {
+          checkpoint = setTimeout(sync, 60);
         }
         if (data.type === "run.completed") {
           source.close();
+          clearTimeout(frame); clearTimeout(checkpoint);
+          flush(); sync();
           setStatus(
             data.status === "cancelled" ? "已停止，生成内容已保存" : "",
           );
@@ -229,6 +257,7 @@ function useController() {
     async (id: string) => {
       if (submitting.current) return;
       observer.current?.close();
+      streamCleanup.current?.();
       activeId.current = id;
       setLoading(true);
       setError("");
@@ -256,6 +285,7 @@ function useController() {
   const newThread = useCallback(() => {
     if (submitting.current) return;
     observer.current?.close();
+    streamCleanup.current?.();
     activeId.current = null;
     setDetail(null);
     setBusy(false);
@@ -265,6 +295,18 @@ function useController() {
     setError("");
     setStatus("");
   }, []);
+  const findThreads = useCallback((search: string, archived: boolean, offset = 0) =>
+    assistantApi<Thread[]>(`/threads?search=${encodeURIComponent(search)}&archived=${archived}&offset=${offset}&limit=60`), []);
+  async function loadOlder() {
+    if (!detail?.has_more || loadingOlder) return;
+    const id = detail.id;
+    setLoadingOlder(true);
+    try {
+      const next = await assistantApi<ThreadDetail>(`/threads/${encodeURIComponent(id)}?before=${detail.oldest_position}&limit=60`);
+      if (activeId.current === id) setDetail(previous => previous?.id === id ? mergePage(previous, next, true) : previous);
+    } catch (e) { setError(e instanceof Error ? e.message : "读取历史失败"); }
+    finally { setLoadingOlder(false); }
+  }
   async function send(text: string) {
     if (submitting.current || busy) return;
     if (!profile) {
@@ -394,9 +436,14 @@ function useController() {
       setError(e instanceof Error ? e.message : "保存失败");
     }
   }
-  const messages = useMemo<ThreadMessageLike[]>(
-    () =>
-      (detail?.messages ?? []).map((m) => ({
+  const messageCache = useRef(new WeakMap<Message, { tools: (ToolRecord | undefined)[]; value: ThreadMessageLike }>());
+  const messages = useMemo<ThreadMessageLike[]>(() => {
+    const tools = new Map(detail?.tools.map(tool => [tool.id, tool]));
+    return (detail?.messages ?? []).map(m => {
+      const references = m.parts.filter(p => p.type === "tool").map(p => tools.get(p.id));
+      const cached = messageCache.current.get(m);
+      if (cached && references.every((value, index) => value === cached.tools[index])) return cached.value;
+      const value: ThreadMessageLike = {
         id: m.id,
         role: m.role,
         createdAt: new Date(m.created_at),
@@ -408,16 +455,18 @@ function useController() {
                 toolCallId: p.id,
                 toolName: p.name,
                 args: {},
-                result: detail?.tools.find((t) => t.id === p.id) ?? p,
+                result: tools.get(p.id) ?? p,
               },
         ),
         metadata: { custom: { context: m.context } },
-      })),
-    [detail],
-  );
+      };
+      messageCache.current.set(m, { tools: references, value });
+      return value;
+    });
+  }, [detail]);
   const runtime = useExternalStoreRuntime({
     messages,
-    convertMessage: (message) => message,
+    convertMessage,
     isRunning: busy,
     isLoading: loading,
     isDisabled: !!detail?.archived,
@@ -470,6 +519,9 @@ function useController() {
     status,
     busy,
     loading,
+    loadingOlder,
+    loadOlder,
+    findThreads,
     switchThread,
     newThread,
     mutateThread,

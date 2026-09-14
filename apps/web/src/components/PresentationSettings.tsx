@@ -9,8 +9,14 @@ export function defaultBehavior(): TemplateBehavior {
 export function TemplateNameSettings({ value, disabled, onChange }: { value?: TemplateBehavior; disabled?: boolean; onChange: (value: TemplateBehavior) => void }) {
   const behavior = value ?? defaultBehavior();
   return <div className="form-field template-feature">
-    <label className="form-label"><input type="checkbox" checked={behavior.suggest_filename} disabled={disabled} onChange={(event) => onChange({ ...behavior, suggest_filename: event.target.checked })} /> 有意义的文件名</label>
-    <p className="support">提取时自动填写内容名称，已有意义的原名可保留。可直接编辑，无需单独采纳；原名始终可追溯，新副本使用最终名称。</p>
+    <label className="form-label"><input type="checkbox" checked={behavior.suggest_filename} disabled={disabled} onChange={(event) => onChange({ ...behavior, suggest_filename: event.target.checked })} /> 文件命名</label>
+    {behavior.suggest_filename && <>
+      <select className="form-select" aria-label="文件命名方式" disabled={disabled} value={behavior.filename_mode ?? "ai"} onChange={event => onChange({ ...behavior, filename_mode: event.target.value as "ai" | "fixed" })}>
+        <option value="ai">AI 命名 · 根据内容建议</option>
+        <option value="fixed">固定规则 · 日期_模板_序号</option>
+      </select>
+      <p className="support">{behavior.filename_mode === "fixed" ? "例如 2026-09-14_发票_001.jpg。使用导入日期，同日同模板递增；重试沿用名称。" : "根据内容自动命名，可在额外要求中表达命名偏好；已有意义的原名可保留。"} 上传原名始终保留。</p>
+    </>}
   </div>;
 }
 
