@@ -7,7 +7,7 @@ SetCompressor /SOLID zlib
 !include "FileFunc.nsh"
 
 !ifndef APP_VERSION
-  !define APP_VERSION "0.3.0"
+  !define APP_VERSION "0.4.0"
 !endif
 !ifndef BUILD_ROOT
   !error "BUILD_ROOT must point to the PyInstaller dist directory"

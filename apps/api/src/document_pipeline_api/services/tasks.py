@@ -343,11 +343,12 @@ ACTIVE_TASK_STATUSES = {
 
 
 def task_name_matches(search: str):
-    pattern = f"%{search}%"
+    pattern = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
     return (
-        TaskRecord.filename.ilike(pattern)
-        | func.json_extract(TaskRecord.file_name_json, "$.confirmed_filename").ilike(pattern)
-        | func.json_extract(TaskRecord.export_state_json, "$.confirmed_name").ilike(pattern)
+        TaskRecord.filename.ilike(pattern, escape="\\")
+        | func.json_extract(TaskRecord.file_name_json, "$.confirmed_filename").ilike(pattern, escape="\\")
+        | func.json_extract(TaskRecord.file_name_json, "$.suggested_filename").ilike(pattern, escape="\\")
+        | func.json_extract(TaskRecord.export_state_json, "$.confirmed_name").ilike(pattern, escape="\\")
     )
 
 
@@ -384,7 +385,7 @@ def list_tasks(
             func.json_extract(TaskRecord.export_state_json, "$.status").in_(["failed", "needs_rebind"]),
         )
     if status is not None:
-        statement = statement.where(TaskRecord.status == status)
+        statement = statement.where(TaskRecord.status.in_(status.split(",")))
     if search:
         statement = statement.where(
             task_name_matches(search)

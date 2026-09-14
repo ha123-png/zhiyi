@@ -1,7 +1,7 @@
 import json
 
 from fastapi import HTTPException
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.models import (
@@ -89,11 +89,10 @@ def update_data_row(
     # 新增的空行或原本缺失字段的行，在编辑缺失字段时不应被误判为"表里没有该字段"。
     from document_pipeline_api.services.data_tables import table_columns
 
-    valid_keys = {column.key for column in table_columns(session, table)}
+    table_column_defs = table_columns(session, table)
+    valid_keys = {column.key for column in table_column_defs}
     before = json.loads(row.row_json)
     _validate_row_changes(valid_keys, before, request.changes)
-
-    table_column_defs = table_columns(session, table)
 
     # 合并表没有 task_id，但用 __row_group 表示同一份原文件。表头在界面上是
     # 跨明细合并单元格，因此编辑时也必须同步到同组所有行并分别留下修订；
@@ -106,14 +105,12 @@ def update_data_row(
         propagated = header_keys & request.changes.keys()
         related_rows = [row]
         if row_group and propagated:
-            candidates = session.scalars(
-                select(DataRowRecord).where(DataRowRecord.table_id == table_id)
+            related_rows = session.scalars(
+                select(DataRowRecord).where(
+                    DataRowRecord.table_id == table_id,
+                    func.json_extract(DataRowRecord.row_json, "$.__row_group") == row_group,
+                )
             ).all()
-            related_rows = [
-                candidate
-                for candidate in candidates
-                if json.loads(candidate.row_json).get("__row_group") == row_group
-            ]
         changed_at = utc_now()
         for current in related_rows:
             before_json = current.row_json

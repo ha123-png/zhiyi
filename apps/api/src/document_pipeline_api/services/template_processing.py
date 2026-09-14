@@ -126,7 +126,9 @@ def build_template_extraction_prompt(template: TemplateRead, *, include_filename
         + ("\n".join(optional) + "\n" if optional else "")
         + f"字段要求：\n{fields}\n"
         + "header 保存每份文件一次的内容，items 保存逐条重复的明细；"
-        "提供内容中没有的值使用 null，不猜测。按原件顺序保留全部已提供明细，不合并相似行。\n"
+        "提供内容中没有的值使用 null，不猜测；实际值缺失且原件仅以“未填写”等字样占位时也使用 null，"
+        "不要把占位说明当作人名、日期或金额。表示状态或备注的真实文字按字段要求保留。"
+        "按原件顺序保留全部已提供明细，不合并相似行。\n"
         f"必须返回这个 JSON 结构，字段值以实际内容替换，不添加其他键：{output_shape}\n"
         + ("该模板未定义明细字段，items 必须是空数组，不要自行生成记录。" if not item_shape else "items 中每条记录都只使用上述明细字段。")
     )

@@ -182,12 +182,14 @@ def generate_template_draft(
                 f"用户需求：{requirement}"
                 f"{example_hint}{rule_hint}"
             )
-            raw = client.extract_images(
-                image_paths,
-                prompt,
-                AiGeneratedTemplate,
-                system_prompt=SYSTEM_PROMPT,
-            )
+            from document_pipeline_api.services.model_usage import model_call
+            with model_call(session, client, "template_generation", active_settings.model_provider):
+                raw = client.extract_images(
+                    image_paths,
+                    prompt,
+                    AiGeneratedTemplate,
+                    system_prompt=SYSTEM_PROMPT,
+                )
         else:
             # 未上传样例文件：仅凭需求描述设计字段结构，不编造需求未提到的内容
             prompt = (
@@ -197,11 +199,13 @@ def generate_template_draft(
                 f"用户需求：{requirement}"
                 f"{example_hint}{rule_hint}"
             )
-            raw = client.complete_text(
-                prompt,
-                AiGeneratedTemplate,
-                system_prompt=SYSTEM_PROMPT,
-            )
+            from document_pipeline_api.services.model_usage import model_call
+            with model_call(session, client, "template_generation", active_settings.model_provider):
+                raw = client.complete_text(
+                    prompt,
+                    AiGeneratedTemplate,
+                    system_prompt=SYSTEM_PROMPT,
+                )
     except ModelServiceError as error:
         raise HTTPException(
             status_code=502,
@@ -235,6 +239,11 @@ def generate_template_draft(
     name = (raw.name or "").strip()[:128]
     description = (raw.description or "").strip()[:512]
     suggestions = _clean_rule_suggestions(raw.rules, fields) if with_rules else []
+    if with_rules and not any(suggestion.status == "accepted" for suggestion in suggestions):
+        warnings.append(
+            "本次未生成可用的校验规则，可在模板中补充。"
+            if suggestions else "本次未生成校验规则，可在模板中补充。"
+        )
     return TemplateDraft(
         name=name,
         description=description,

@@ -92,6 +92,11 @@ class TaskRecord(Base):
     )
 
     @property
+    def display_filename(self) -> str:
+        state = self.file_name
+        return (state.confirmed_filename or state.suggested_filename) if state else self.filename
+
+    @property
     def candidate_templates(self) -> list[dict[str, str | int]]:
         return json.loads(self.candidate_templates_json)
 

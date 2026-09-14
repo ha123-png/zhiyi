@@ -119,6 +119,20 @@ describe("ExtractPage", () => {
     );
   });
 
+  it("keeps validation content mounted through collapse while removing hidden controls from navigation", async () => {
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    const { container } = render(<ExtractPage initialTask={task} />);
+    const toggle = await screen.findByRole("button", { name: /校验结果/ });
+    const body = container.querySelector(".validation-panel-body");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector("#extract-validation-content")).toHaveAttribute("inert");
+    expect(container.querySelector(".validation-panel-body")).toBe(body);
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(container.querySelector("#extract-validation-content")).not.toHaveAttribute("inert");
+  });
+
   it("shows honest page-only evidence and saves the edited draft", async () => {
     const scroll = vi.fn();
     HTMLElement.prototype.scrollIntoView = scroll;
@@ -126,7 +140,7 @@ describe("ExtractPage", () => {
 
     const amount = await screen.findByText("372", { selector: ".extract-header-value" });
     expect(screen.getByText("手动 · 发票")).toBeInTheDocument();
-    expect(scroll).toHaveBeenCalledOnce();
+    await waitFor(() => expect(scroll).toHaveBeenCalledOnce());
     fireEvent.click(screen.getByRole("radio", { name: "智能匹配" }));
     expect(screen.getByText("手动 · 发票")).toBeInTheDocument();
     fireEvent.click(amount);
@@ -173,6 +187,7 @@ describe("ExtractPage", () => {
 
     // 等批次渲染完成（SSE 监听已注册）后再触发任务完成事件
     expect(await screen.findByText("队列中 1 个任务", {}, { timeout: 3000 })).toBeInTheDocument();
+    await waitFor(() => expect(taskListeners.length).toBeGreaterThan(0));
     act(() => {
       triggerTaskEvent();
     });

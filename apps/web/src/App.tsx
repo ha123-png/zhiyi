@@ -1,7 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { ModelConnectionState } from "./assistant/ModelConnectionState";
+import * as Popover from "@radix-ui/react-popover";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { AssistantProvider, useAssistant } from "./assistant/AssistantProvider";
+import { AssistantDrawer, AssistantPage, AssistantTrigger } from "./assistant/AssistantSurface";
+import { assistantApi } from "./assistant/api";
+import type { Reference } from "./assistant/types";
+import type { TemplateDraft } from "./types";
 import { BackupPage } from "./components/BackupPage";
 import { ConnectionsPage } from "./components/ConnectionsPage";
-import { DashboardPage } from "./components/DashboardPage";
 import { DataTablePage } from "./components/DataTablePage";
 import { ExtractPage } from "./components/ExtractPage";
 import { GlobalTaskCard } from "./components/TaskActivity";
@@ -24,9 +30,13 @@ import {
   pauseQueue,
   resumeQueue,
   subscribeTaskEvents,
+  taskEventsConnected,
 } from "./api";
 import type { TaskEvent } from "./api";
 import type { DemoScenario, ModelStatus, NavigationKey, SystemStatus, Task, TaskStatus } from "./types";
+
+const DashboardPage = lazy(() => import("./components/DashboardPage").then(module => ({ default: module.DashboardPage })));
+const StatisticBridge = lazy(() => import("./dashboard/StatisticBridge").then(module => ({ default: module.StatisticBridge })));
 
 function applyTheme(theme: "auto" | "light" | "dark") {
   const root = document.documentElement;
@@ -39,8 +49,18 @@ function applyTheme(theme: "auto" | "light" | "dark") {
 }
 
 export function App() {
+  return <AssistantProvider><AppContent /></AssistantProvider>;
+}
+
+function AppContent() {
+  const assistant = useAssistant();
+  const [assistantTemplate, setAssistantTemplate] = useState<string | null>(null);
+  const [assistantTemplateVersion, setAssistantTemplateVersion] = useState<number | null>(null);
+  const [assistantDraft, setAssistantDraft] = useState<TemplateDraft | null>(null);
+  const [assistantRow, setAssistantRow] = useState<number | null>(null);
   const [attentionCounts, setAttentionCounts] = useState<{ pending?: number; review?: number }>({});
   const [activePage, setActivePage] = useState<NavigationKey>("workspace");
+  const [historyEntry, setHistoryEntry] = useState<"completed" | "problems">("completed");
   const pageWrapRef = useRef<HTMLDivElement>(null);
   const pageScrollPositionsRef = useRef<Partial<Record<NavigationKey, number>>>({});
   // 跳转表竞态守卫：getConfirmation 期间用户切换页面时不再强行跳回数据表
@@ -86,13 +106,16 @@ export function App() {
 
   // 顶部只展示仍需用户关注或仍在运行的任务。终态失败属于状态监控/历史，
   // 不能让旧失败轮番占据一个无法真正清空的全局横幅。
+  const taskRequest = useRef(0);
   const loadTasks = useCallback(async () => {
+    const request = ++taskRequest.current;
     try {
       const [active, exports, summary] = await Promise.all([
         getTasks({ limit: 1000, activeOnly: true }),
         getTasks({ limit: 1000, exportPending: true }),
         getTaskSummary().catch(() => null),
       ]);
+      if (request !== taskRequest.current) return;
       setTasks(Array.from(new Map([...active, ...exports].map((task) => [task.id, task])).values()));
       setAttentionCounts({ pending: summary?.waiting_for_action == null || summary?.pending_exports == null ? undefined : summary.waiting_for_action + summary.pending_exports, review: summary?.needs_review });
     } catch {
@@ -218,6 +241,10 @@ export function App() {
 
   useEffect(() => {
     loadTasks();
+    const assistantChanged = (event: Event) => {
+      if ((event as CustomEvent<{ task_id?: string }>).detail?.task_id) void loadTasks();
+    };
+    window.addEventListener("zhiyi:assistant-changed", assistantChanged);
     void getModelStatus().then(setModelStatus).catch(() => setModelStatus(null));
     void getSystemStatus().then(setSystemStatus).catch(() => setSystemStatus(null));
     // SSE 实时推送：任务状态变化立即刷新全局任务条（上传/停止/完成马上反映）；
@@ -226,10 +253,18 @@ export function App() {
       typeof EventSource === "undefined"
         ? undefined
         : subscribeTaskEvents(handleTaskEvents);
+    let lastRefresh = Date.now();
+    const visible = () => { if (!document.hidden) { lastRefresh = Date.now(); void loadTasks(); } };
+    document.addEventListener("visibilitychange", visible);
     const timer = window.setInterval(() => {
-      loadTasks();
+      if (!document.hidden && (!taskEventsConnected() || Date.now() - lastRefresh >= 30000)) {
+        lastRefresh = Date.now(); void loadTasks();
+      }
     }, 5000);
     return () => {
+      window.removeEventListener("zhiyi:assistant-changed", assistantChanged);
+      document.removeEventListener("visibilitychange", visible);
+      taskRequest.current += 1;
       window.clearInterval(timer);
       unsub?.();
     };
@@ -266,8 +301,11 @@ export function App() {
   }, [loadTasks, notify]);
 
   const navigateTo = useCallback((page: NavigationKey) => {
-    pageScrollPositionsRef.current[activePage] = pageWrapRef.current?.scrollTop ?? 0;
-    setActivePage(page);
+    const proceed = () => {
+      pageScrollPositionsRef.current[activePage] = pageWrapRef.current?.scrollTop ?? 0;
+      setActivePage(page);
+    };
+    if (page === activePage || window.dispatchEvent(new CustomEvent("zhiyi:before-navigate", { cancelable: true, detail: { proceed } }))) proceed();
   }, [activePage]);
 
   useEffect(() => {
@@ -297,6 +335,7 @@ export function App() {
   }, [activePage]);
 
   const handleNavigate = useCallback((page: NavigationKey) => {
+    if (page === "history") setHistoryEntry("completed");
     setExtractionDemo(null);
     if (page === "extract") setSelectedTask(null);
     if (page === "tables") {
@@ -351,6 +390,23 @@ export function App() {
     [navigateTo],
   );
 
+  useEffect(() => {
+    function onReference(event: Event) {
+      const ref = (event as CustomEvent<Reference & { draft?: TemplateDraft }>).detail;
+      assistant.setDrawerOpen(false);
+      if (ref.kind === "assistant") { navigateTo("assistant"); return; }
+      if (ref.kind === "draft" && ref.draft) { setAssistantDraft(ref.draft); setAssistantTemplate(null); setAssistantTemplateVersion(null); navigateTo("templates"); return; }
+      if (ref.kind === "template") { setAssistantTemplate(ref.id); setAssistantTemplateVersion(ref.version ?? null); setAssistantDraft(null); navigateTo("templates"); return; }
+      if (ref.kind === "table" || ref.kind === "revisions") { setSelectedTableId(ref.id); setSelectedTableTemplateId(null); setHighlightTaskId(null); setAssistantRow(ref.row_id ?? null); setTableJumpNotice(ref.row_id ? `来自问知意：定位记录 #${ref.row_id}` : "来自问知意的资料引用"); navigateTo("tables"); return; }
+      if (ref.kind === "task" || ref.kind === "original") {
+        const seq = ++navSeqRef.current;
+        void assistantApi<Task>(`/references/tasks/${encodeURIComponent(ref.id)}`).then(task => { if (seq === navSeqRef.current) { setSelectedTask(task); navigateTo("extract"); } }).catch(e => notify(e.message, "error"));
+      }
+    }
+    window.addEventListener("zhiyi:assistant-navigate", onReference);
+    return () => window.removeEventListener("zhiyi:assistant-navigate", onReference);
+  }, [assistant.setDrawerOpen, navigateTo, notify]);
+
   return (
     <div className="app-shell">
       <div className="app-frame">
@@ -372,16 +428,25 @@ export function App() {
               pendingCount={attentionCounts.pending}
               reviewCount={attentionCounts.review}
             />
-            <div className="system-status-summary" role="status">
+            {activePage !== "assistant" && <AssistantTrigger />}
+            <Popover.Root><Popover.Trigger className="system-status-trigger">
+              {systemStatus == null ? "正在连接服务…" : !systemStatus.api.connected ? "服务未连接" : !systemStatus.worker.connected ? "文件处理未启动" : "服务已就绪"}
+              <span aria-hidden="true">⌄</span>
+            </Popover.Trigger>
+            <Popover.Content className="system-status-popover" align="start" sideOffset={8} collisionPadding={16}>
+            <strong>连接详情</strong><div className="system-status-summary" role="status"><span>
               {systemStatus
                 ? [systemStatus.api, systemStatus.worker]
                     .map((component) => component.message)
                     .join(" · ")
-                : "正在检查 API、任务消费者和模型服务。"}
+                : "正在检查 API、任务消费者和模型服务。"}</span>
+              <span title={modelStatus?.configuration_error || "检查提取方案的模型服务与模型名称；不代表文件提取质量。"}>提取模型：{modelStatus?.configured_model || "未配置"} · {modelStatus == null ? "检查中" : modelStatus.configuration_error ? "配置需检查" : modelStatus.connected ? "服务可达" : "未连接"}</span>
+              <ModelConnectionState/>
             </div>
+            </Popover.Content></Popover.Root>
           </div>
 
-          <div className="app-page-wrap" key={activePage} ref={pageWrapRef}>
+          <div className={`app-page-wrap ${activePage === "assistant" ? "ask-page-wrap" : ""}`} key={activePage} ref={pageWrapRef}>
             {activePage === "workspace" ? (
               <TaskQueuePage
                 logs={taskLogs}
@@ -398,18 +463,24 @@ export function App() {
                 onUploadsComplete={handleUploadsComplete}
               />
             ) : activePage === "templates" ? (
-              <TemplatesPage />
+              <TemplatesPage initialTemplateId={assistantTemplate} initialVersion={assistantTemplateVersion} initialDraft={assistantDraft} onDraftConsumed={() => setAssistantDraft(null)} />
             ) : activePage === "tables" ? (
               <DataTablePage
                 initialTemplateId={selectedTableTemplateId}
                 initialTableId={selectedTableId}
                 jumpNotice={tableJumpNotice}
                 highlightTaskId={highlightTaskId}
+                initialRowId={assistantRow}
               />
+            ) : activePage === "assistant" ? (
+              <AssistantPage />
             ) : activePage === "history" ? (
-              <HistoryPage onOpenData={openTaskData} onOpenTask={openTask} />
+              <HistoryPage initialTab={historyEntry} onOpenData={openTaskData} onOpenTask={openTask} />
             ) : activePage === "dashboard" ? (
-              <DashboardPage onNavigate={() => navigateTo("tables")} />
+              <Suspense fallback={<div className="view muted">正在打开数据仪表盘…</div>}><DashboardPage onReview={() => { setHistoryEntry("problems"); navigateTo("history"); }} onNavigate={page => { if (page === "history") setHistoryEntry("completed"); navigateTo(page); }} onOpenTable={id => {
+                setSelectedTableId(id); setSelectedTableTemplateId(null); setHighlightTaskId(null);
+                setAssistantRow(null); setTableJumpNotice(null); navigateTo("tables");
+              }} /></Suspense>
             ) : activePage === "backups" ? (
               <BackupPage />
             ) : activePage === "settings" ? (
@@ -425,6 +496,8 @@ export function App() {
           </div>
         </main>
       </div>
+      <AssistantDrawer />
+      <Suspense fallback={null}><StatisticBridge onSaved={() => notify("已添加到仪表盘，聊天中的分析快照保持原样。", "success")} /></Suspense>
       <Onboarding
         open={onboardingOpen}
         modelStatus={modelStatus}

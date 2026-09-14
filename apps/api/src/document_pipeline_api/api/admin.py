@@ -141,6 +141,8 @@ def clear_all_data_endpoint(request: Request, body: ClearHistoryRequest) -> dict
         if request.app.state.maintenance_active:
             raise HTTPException(409, "已有数据维护操作正在进行。")
         request.app.state.maintenance_active = True
+        from document_pipeline_api.api.assistant import stop_conversations
+        stop_conversations(request.app)
         deadline = time.monotonic() + 5
         while request.app.state.active_mutations > 1:
             remaining = deadline - time.monotonic()

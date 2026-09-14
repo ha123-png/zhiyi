@@ -1,4 +1,5 @@
 import os
+import pytest
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -12,6 +13,18 @@ from document_pipeline_api.services.integration_config import (
     read_integration_config,
     write_integration_config,
 )
+
+
+def test_failed_atomic_save_preserves_previous_permissions(tmp_path: Path, monkeypatch) -> None:
+    write_integration_config(tmp_path, {"mcp_data_read": True, "read_token": "synthetic"})
+    def fail_replace(*args):
+        raise OSError("synthetic disk failure")
+    monkeypatch.setattr("document_pipeline_api.services.integration_config.os.replace", fail_replace)
+    with pytest.raises(OSError, match="synthetic disk failure"):
+        write_integration_config(tmp_path, {"mcp_data_read": False})
+    assert read_integration_config(tmp_path)["mcp_data_read"] == "1"
+    assert read_integration_config(tmp_path)["read_token"] == "synthetic"
+    assert not list((tmp_path / "config").glob(".integration-*.tmp"))
 
 
 def _settings(tmp_path: Path) -> Settings:

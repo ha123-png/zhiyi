@@ -30,6 +30,24 @@ const invoice: ExtractionTemplate = {
 };
 
 describe("TemplatesPage", () => {
+  it("protects an edited template on selection and navigation, with a working cancel path", async () => {
+    const custom = { ...invoice, id: "custom", name: "验收模板", is_system: false, builtin_key: null };
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => String(input).endsWith("/local-export")
+      ? response({ revision: 0, enabled: false, parent_path: null, destination: null }) : response([custom, invoice])));
+    const { container } = render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: "验收模板" });
+    fireEvent.change(screen.getByLabelText("用途说明"), { target: { value: "不能丢失的编辑" } });
+    const other = [...container.querySelectorAll(".template-list-item")].find(e => e.textContent?.includes("发票"))!;
+    fireEvent.click(other);
+    expect(await screen.findByRole("heading", { name: "修改尚未保存" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(screen.getByLabelText("用途说明")).toHaveValue("不能丢失的编辑");
+    const proceed = vi.fn();
+    fireEvent(window, new CustomEvent("zhiyi:before-navigate", { cancelable: true, detail: { proceed } }));
+    fireEvent.click(await screen.findByRole("button", { name: "放弃修改并继续" }));
+    expect(proceed).toHaveBeenCalledOnce();
+  });
+
   it("saves a folder binding through Save without creating a template version", async () => {
     const template = { ...invoice, id: "local-template", is_system: false, builtin_key: null };
     const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
@@ -117,6 +135,17 @@ describe("TemplatesPage", () => {
     fireEvent.click(target);
     await screen.findByRole("heading", { name: "发票" });
     expect(screen.getByLabelText("模板名称")).toBeDisabled();
+  });
+
+  it("keeps field examples mounted so closing can animate without losing form values", async () => {
+    const { container } = render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: "发票" });
+    fireEvent.click(screen.getByRole("button", { name: "展开示例" }));
+    const example = screen.getByRole("textbox", { name: "字段 1 示例" });
+    fireEvent.click(screen.getByRole("button", { name: "收起示例" }));
+    expect(screen.queryByRole("textbox", { name: "字段 1 示例" })).not.toBeInTheDocument();
+    expect(container.querySelector('[aria-label="字段 1 示例"]')).toBe(example);
+    expect(container.querySelector("#template-field-detail-0")).toHaveAttribute("inert");
   });
 
   it("copies a system template before editing and saves a new version", async () => {

@@ -206,6 +206,31 @@ def test_generate_does_not_return_rules_unless_user_asks(client: TestClient) -> 
     assert draft.rule_suggestions == []
 
 
+@pytest.mark.parametrize("with_rules,rules,expected_warning", [
+    (True, [], "本次未生成校验规则，可在模板中补充。"),
+    (True, [AiGeneratedRule(kind="required", field="不存在", section="header")],
+     "本次未生成可用的校验规则，可在模板中补充。"),
+    (False, [], None),
+    (True, [AiGeneratedRule(kind="required", field="金额", section="header")], None),
+])
+def test_requested_rules_without_usable_suggestions_are_explicit(
+    client, with_rules, rules, expected_warning,
+):
+    fake = _FakeProvider(AiGeneratedTemplate(
+        presentation_mode="table",
+        fields=[AiGeneratedField(label="金额", section="header", value_type="number")],
+        rules=rules,
+    ))
+    draft = _run_generate(client, fake=fake, requirement="生成金额字段和有依据的校验规则",
+                          images=0, with_rules=with_rules)
+    assert draft.warnings == ([expected_warning] if expected_warning else [])
+    assert len(draft.fields) == 1 and draft.fields[0].label == "金额"
+    assert len(draft.rule_suggestions) == (len(rules) if with_rules else 0)
+    if rules and expected_warning:
+        assert draft.rule_suggestions[0].status == "rejected"
+        assert "不存在" in draft.rule_suggestions[0].reason
+
+
 def test_generate_sends_fixed_system_prompt(client: TestClient) -> None:
     from document_pipeline_api.services.template_ai import SYSTEM_PROMPT
 

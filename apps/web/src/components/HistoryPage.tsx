@@ -1,3 +1,4 @@
+import { taskDisplayName } from "../taskNames";
 import { FileLocation } from "./FileLocation";
 import { Disclosure } from "./Disclosure";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -91,12 +92,13 @@ const BUILTIN_LABELS: Record<string, string> = {
 type HistoryTab = "completed" | "problems" | "original";
 
 interface HistoryPageProps {
+  initialTab?: HistoryTab;
   onOpenTask?: (task: Task) => void;
   onOpenData?: (task: Task) => void;
 }
 
-export function HistoryPage({ onOpenTask, onOpenData }: HistoryPageProps = {}) {
-  const [historyTab, setHistoryTab] = useState<HistoryTab>("completed");
+export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }: HistoryPageProps = {}) {
+  const [historyTab, setHistoryTab] = useState<HistoryTab>(initialTab);
   // 当前页任务：服务端分页，万级历史不一次载入前端内存（ISSUE-067）
   const [pageTasks, setPageTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
@@ -490,6 +492,7 @@ export function HistoryPage({ onOpenTask, onOpenData }: HistoryPageProps = {}) {
   }, [extraction]);
 
   function labelFor(key: string): string {
+    key = key.replace(/^(?:header\.|items\[\d+\]\.)/, "");
     if (extraction?.template) {
       const field = extraction.template.fields.find((f) => f.key === key);
       if (field) {
@@ -743,7 +746,7 @@ export function HistoryPage({ onOpenTask, onOpenData }: HistoryPageProps = {}) {
                             title="查看原文件与提取数据"
                           >
                             <Icon icon={FileText} style={{ width: "14px", height: "14px", flexShrink: 0 }} />
-                            <span>{t.filename}</span>
+                            <span>{taskDisplayName(t)}</span>
                           </button>
                         </td>
                         <td>{templateLabel(t)}</td>
@@ -803,7 +806,7 @@ export function HistoryPage({ onOpenTask, onOpenData }: HistoryPageProps = {}) {
                             title="查看原文件与提取数据"
                           >
                             <Icon icon={FileText} style={{ width: "14px", height: "14px", flexShrink: 0 }} />
-                            <span>{p.filename}</span>
+                            <span>{taskDisplayName(p)}</span>
                           </button>
                         </td>
                         <td>{templateLabel(p)}</td>
@@ -913,7 +916,7 @@ export function HistoryPage({ onOpenTask, onOpenData }: HistoryPageProps = {}) {
                     </div>
                     <div className="hist-meta-item">
                       <span className="hist-meta-label">文件</span>
-                      <span className="hist-meta-value">{selectedTask.filename}</span>
+                      <span className="hist-meta-value">{taskDisplayName(selectedTask)}</span>
                     </div>
                     <div className="hist-meta-item">
                       <span className="hist-meta-label">模板</span>

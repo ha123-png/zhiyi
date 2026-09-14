@@ -3,15 +3,16 @@ import { expect, it, vi } from "vitest";
 import { FileNameConfirmation } from "./FileNameConfirmation";
 import { TemplateNameSettings } from "./PresentationSettings";
 
-it("keeps the original selected until the user adopts or edits the suggestion", () => {
+it("automatically uses the content name while keeping the original traceable and editable", () => {
   const changed = vi.fn();
   render(<FileNameConfirmation original="IMG_1234.png" state={{ status: "pending", suggested_filename: "数学错题.png", confirmed_filename: null, source_fields: ["title"], explanation: "来自已提取标题" }} onChange={changed} />);
-  expect(screen.getByLabelText("确认后的名称（保留扩展名）")).toHaveValue("IMG_1234.png");
-  fireEvent.click(screen.getByRole("button", { name: "采用建议" }));
-  expect(changed).toHaveBeenLastCalledWith("数学错题.png");
-  fireEvent.click(screen.getByRole("button", { name: "保留原名" }));
-  expect(changed).toHaveBeenLastCalledWith("IMG_1234.png");
-  expect(screen.getByText(/已有外部副本不会被改名/)).toBeInTheDocument();
+  fireEvent.click(screen.getByText("文件名称 · 内容名称"));
+  expect(screen.getByLabelText("文件名称（保留扩展名）")).toHaveValue("数学错题.png");
+  expect(screen.queryByRole("button", { name: "采用建议" })).not.toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("文件名称（保留扩展名）"), { target: { value: "我的错题.png" } });
+  expect(changed).toHaveBeenLastCalledWith("我的错题.png");
+  expect(screen.getByText(/上传原名：IMG_1234.png/)).toBeInTheDocument();
+  expect(screen.getByText(/已有外部副本不变/)).toBeInTheDocument();
 });
 
 it("defaults legacy templates to disabled without changing presentation", () => {

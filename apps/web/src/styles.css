@@ -117,6 +117,12 @@
       /* motion — silk */
       --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
       --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+      --dur-control: 140ms;
+      --dur-fold: 180ms;
+      --ease-fold: cubic-bezier(0.2, 0.8, 0.2, 1);
+      --control-hover: color-mix(in srgb, var(--foreground) 5%, var(--background));
+      --control-pressed: color-mix(in srgb, var(--foreground) 13%, var(--background));
+      --control-selected: color-mix(in srgb, var(--foreground) 10%, var(--background));
       --dur-fast: 200ms;
       --dur-mid: 280ms;
       --dur-slow: 380ms;
@@ -254,8 +260,9 @@
     input:focus-visible,
     select:focus-visible,
     textarea:focus-visible {
-      outline: none;
-      box-shadow: 0 0 0 2px var(--background), 0 0 0 4px var(--ring);
+      outline: 2px solid var(--ring);
+      outline-offset: 2px;
+      box-shadow: none;
     }
     ::-webkit-scrollbar { width: 8px; height: 8px; }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -711,11 +718,12 @@
       line-height: 1;
       color: var(--color-text);
       background: #ffffff;
-      transition: transform 110ms ease, background 260ms var(--ease-out), border-color 260ms var(--ease-out), color 260ms var(--ease-out), box-shadow 260ms var(--ease-out);
+      transition: transform 100ms ease, background var(--dur-control), border-color var(--dur-control), color var(--dur-control), box-shadow var(--dur-control);
     }
     .btn .lucide { flex-shrink: 0; }
-    .btn:hover { background: #f8fafc; border-color: var(--color-text-muted); }
-    .btn:active { transform: scale(0.97); }
+    .btn:hover:enabled { background: var(--control-hover); border-color: var(--color-border-strong); }
+    .btn:active:enabled { transform: scale(0.98); }
+    .btn:not(.primary):not(.active):not(.danger):not(.danger-soft):active:enabled { background: var(--control-pressed); }
 
     /* 主行动：外主色边+主色底，内白字 */
     .btn.primary {
@@ -723,7 +731,7 @@
       color: #ffffff;
       border-color: var(--color-primary);
     }
-    .btn.primary:hover {
+    .btn.primary:hover:enabled {
       background: var(--brand-700);
       border-color: var(--brand-700);
     }
@@ -733,9 +741,9 @@
       color: var(--color-text);
       border-color: var(--color-border);
     }
-    .btn.secondary:hover {
-      background: #f8fafc;
-      border-color: var(--color-text-muted);
+    .btn.secondary:hover:enabled {
+      background: var(--control-hover);
+      border-color: var(--color-border-strong);
     }
     /* 幽灵：更轻的描边（仍白底有边，风格统一） */
     .btn.ghost {
@@ -743,8 +751,8 @@
       color: var(--color-text-muted);
       border-color: transparent;
     }
-    .btn.ghost:hover {
-      background: #f8fafc;
+    .btn.ghost:hover:enabled {
+      background: var(--control-hover);
       border-color: var(--color-border);
       color: var(--color-text);
     }
@@ -754,7 +762,7 @@
       color: #ffffff;
       border-color: var(--color-danger-600);
     }
-    .btn.danger:hover { background: #b91c1c; border-color: #b91c1c; }
+    .btn.danger:hover:enabled { background: #b91c1c; border-color: #b91c1c; }
     /* 危险（轻量）：白底红边红字，用于行级删除等（外红边内白） */
     .btn.danger-soft {
       background: #ffffff;
@@ -791,7 +799,7 @@
       color: #ffffff;
       border-color: var(--color-primary);
     }
-    .btn.active:hover { background: var(--brand-700); border-color: var(--brand-700); }
+    .btn.active:hover:enabled { background: var(--brand-700); border-color: var(--brand-700); }
 
     .card {
       background: var(--card);
@@ -1073,7 +1081,7 @@
     }
     .task-queue-header.collapsible:hover { background: var(--muted); }
     .task-queue-header .card-caret {
-      transition: transform 320ms var(--ease-out);
+      transition: transform var(--dur-fold) var(--ease-fold);
       color: var(--color-text-muted);
       flex-shrink: 0;
     }
@@ -1315,6 +1323,8 @@
       margin: 0;
       font-size: 0.9375rem;
     }
+    .document-preview-with-download { display: flex; flex-direction: column; gap: 12px; min-width: 0; width: 100%; }
+    .original-download { align-self: flex-end; white-space: nowrap; }
     .document-preview-shell {
       width: 100%;
       min-width: 0;
@@ -1455,6 +1465,13 @@
       box-shadow: inset 0 0 0 2px var(--color-primary);
       background: var(--color-brand-subtle);
     }
+    .extract-header-row.is-evidence-selected,
+    .data-table td.is-evidence-selected { position: relative; z-index: 2; }
+    .extract-header-row.is-evidence-selected::after,
+    .data-table td.is-evidence-selected::after {
+      content: ""; position: absolute; inset: 0; border: 2px solid var(--color-primary);
+      pointer-events: none; z-index: 3;
+    }
 
     /* ============================================================
        Datastore — Excel style
@@ -1578,6 +1595,7 @@
       flex-direction: column;
       gap: 2px;
     }
+    /* Legacy tree selectors: live warehouse groups use sheet-tree-group-body. */
     .tree-folder { display: flex; flex-direction: column; }
     .tree-folder-head {
       display: flex;
@@ -1592,7 +1610,7 @@
       transition: background 220ms var(--ease-out);
     }
     .tree-folder-head:hover { background: var(--muted); }
-    .tree-caret { color: var(--color-text-muted); transition: transform 320ms var(--ease-out); flex-shrink: 0; }
+    .tree-caret { color: var(--color-text-muted); transition: transform var(--dur-fold) var(--ease-fold); flex-shrink: 0; }
     .tree-folder-head.collapsed .tree-caret { transform: rotate(-90deg); }
     .tree-folder-head.collapsed + .tree-folder-body { display: none; }
     .tree-folder-icon { color: var(--color-text-muted); flex-shrink: 0; }
@@ -1630,7 +1648,7 @@
     }
     .sheet-tree-group-head:hover { background: var(--muted); }
     .sheet-tree-group-head > span:nth-of-type(1) { flex: 1; text-align: left; }
-    .sheet-tree-group-head .lucide:first-child { transition: transform 320ms var(--ease-out); color: var(--color-text-muted); }
+    .sheet-tree-group-head .lucide:first-child { transition: transform var(--dur-fold) var(--ease-fold); color: var(--color-text-muted); }
     .sheet-tree-group-head.collapsed .lucide:first-child { transform: rotate(-90deg); }
     .sheet-tree-group-head.collapsed + .sheet-tree-body { display: none; }
     .sheet-count {
@@ -1885,7 +1903,7 @@
     .extract-item-count { position: absolute; right: 14px; top: 50%; transform: translateY(-50%); font-size: 0.75rem; font-weight: 600; color: var(--color-text-muted); background: #fff; padding: 2px 8px; border-radius: 999px; border: 1px solid #e5e7eb; }
     .preview-doc {
       transform-origin: top center;
-      transition: transform 320ms var(--ease-out);
+      transition: transform var(--dur-fold) var(--ease-fold);
       cursor: zoom-in;
     }
     .preview-doc-page {
@@ -2228,7 +2246,7 @@
     }
     .validation-count.zero { background: var(--color-border); color: var(--color-text-muted); }
     .validation-hint { font-size: 0.8125rem; font-weight: 400; color: var(--color-text-muted); }
-    .validation-caret { margin-left: auto; color: var(--color-text-muted); transition: transform 320ms var(--ease-out); }
+    .validation-caret { margin-left: auto; color: var(--color-text-muted); transition: transform var(--dur-fold) var(--ease-fold); }
     .validation-panel.collapsed .validation-caret { transform: rotate(-90deg); }
     .validation-panel-body {
       border-top: 1px solid var(--color-border);
@@ -2798,7 +2816,7 @@
     .panel-title.collapsible > div:first-child { flex: 1; min-width: 0; }
     .card-caret {
       flex-shrink: 0;
-      transition: transform 320ms var(--ease-out);
+      transition: transform var(--dur-fold) var(--ease-fold);
       color: var(--color-text-muted);
     }
     .panel-title.collapsible.collapsed .card-caret { transform: rotate(-90deg); }
@@ -3979,7 +3997,7 @@
       padding: calc(var(--space-4) * 4) calc(var(--space-4) * 5);
       display: grid;
       grid-template-rows: 1fr;
-      transition: grid-template-rows 300ms var(--ease-out), opacity 240ms var(--ease-out), padding 300ms var(--ease-out);
+      transition: grid-template-rows var(--dur-fold) var(--ease-fold), opacity var(--dur-fold) var(--ease-fold), padding var(--dur-fold) var(--ease-fold);
     }
     .card-body-inner { display: flex; flex-direction: column; gap: calc(var(--space-4) * 3); overflow: hidden; }
     .card.collapsible.is-collapsed > .card-body {
@@ -4049,7 +4067,7 @@
     .collapsible-region {
       display: grid;
       grid-template-rows: 1fr;
-      transition: grid-template-rows 300ms var(--ease-out), opacity 240ms var(--ease-out);
+      transition: grid-template-rows var(--dur-fold) var(--ease-fold), opacity var(--dur-fold) var(--ease-fold);
     }
     .collapsible-region.is-collapsed {
       grid-template-rows: 0fr;
@@ -4208,7 +4226,7 @@
 .sheet-tree-group-body {
   display: grid;
   grid-template-rows: 0fr;
-  transition: grid-template-rows 220ms var(--ease-out);
+  transition: grid-template-rows var(--dur-fold) var(--ease-fold);
 }
 
 .sheet-tree-group-body.open {
@@ -4680,7 +4698,7 @@
 .collapse {
   display: grid;
   grid-template-rows: 0fr;
-  transition: grid-template-rows 240ms var(--ease-out), opacity 180ms var(--ease-out);
+  transition: grid-template-rows var(--dur-fold) var(--ease-fold), opacity var(--dur-fold) var(--ease-fold);
 }
 .collapse.open {
   grid-template-rows: 1fr;
@@ -4874,6 +4892,7 @@ details.collapse[open] > .collapse-content {
   text-align: left;
 }
 .onboarding-features li { display: flex; align-items: center; gap: 8px; font-size: 0.9rem; }
+.onboarding-features li > svg { flex-shrink: 0; align-self: flex-start; margin-top: 3px; }
 .onboarding-flow {
   margin: 4px 0 10px;
   padding: 0 0 0 20px;
@@ -5322,17 +5341,15 @@ details.collapse[open] > .collapse-content {
    深色模式覆盖（硬编码浅色在 .dark 下的适配）
    原则：按钮/表格/标题跟随主题变量，文档预览页保持纸白
    ============================================================ */
-.dark .btn { background: var(--color-surface); }
-.dark .btn:hover,
-.dark .btn.secondary:hover,
-.dark .btn.ghost:hover { background: var(--muted); }
-.dark .btn.secondary,
-.dark .btn.ghost,
-.dark .btn.danger-soft { background: var(--color-surface); }
-.dark .btn:disabled:hover { background: var(--color-surface); }
+/* Theme tokens carry button states; no generic dark hover may cover a solid action. */
+.dark .btn:not(.primary):not(.active):not(.danger) { background: var(--color-surface); }
+.dark .btn:not(.primary):not(.active):not(.danger):not(.danger-soft):hover:enabled { background: var(--control-hover); }
+.dark .btn:not(.primary):not(.active):not(.danger):not(.danger-soft):active:enabled { background: var(--control-pressed); }
 .dark .btn.primary,
 .dark .btn.active { background: var(--color-primary); color: var(--color-primary-foreground); border-color: var(--color-primary); }
-.dark .btn.primary:hover { background: var(--brand-200); border-color: var(--brand-200); }
+.dark .btn.primary:hover:enabled,
+.dark .btn.active:hover:enabled { background: var(--brand-200); border-color: var(--brand-200); }
+.dark .btn.danger-soft:hover:enabled { background: var(--color-danger-50); }
 .dark .segmented button.active { background: var(--color-primary); color: var(--color-primary-foreground); }
 .dark .ai-msg.assistant .ai-msg-avatar { background: var(--color-primary); color: var(--color-primary-foreground); }
 .dark .ai-send-btn { color: var(--color-primary-foreground); }
@@ -5648,3 +5665,29 @@ details.collapse[open] > .collapse-content {
 .task-failure-details summary { cursor:pointer; }
 .task-failure-details pre { max-height:260px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; line-height:1.7; margin:8px 0; }
 .task-failure-details .support { margin:6px 0 0; }
+.mcp-table-scope { max-height: 260px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; margin: 10px 0; }
+.mcp-table-scope label { display: flex; gap: 10px; align-items: center; padding: 8px 0; overflow-wrap: anywhere; }
+.mcp-table-scope input { width: auto; flex-shrink: 0; }
+
+/* Native disclosure content keeps its markup, dimensions and lazy onToggle behavior. */
+@supports (interpolate-size: allow-keywords) {
+  :is(details.presentation-settings, details.task-failure-details, details.template-restoration-log, details.data-source-details) {
+    interpolate-size: allow-keywords;
+  }
+  :is(details.presentation-settings, details.task-failure-details, details.template-restoration-log, details.data-source-details)::details-content {
+    block-size: 0;
+    overflow: clip;
+    transition: block-size var(--dur-fold) var(--ease-fold), content-visibility var(--dur-fold) allow-discrete;
+  }
+  :is(details.presentation-settings, details.task-failure-details, details.template-restoration-log, details.data-source-details)[open]::details-content {
+    block-size: auto;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  :is(details.presentation-settings, details.task-failure-details, details.template-restoration-log, details.data-source-details)::details-content,
+  .validation-caret, .card-caret, .settings-card-caret, .sheet-tree-group-title .lucide {
+    transition: none;
+  }
+}
+
+.task-header-toggle { display:inline-flex; align-items:center; gap:inherit; padding:0; border:0; background:none; color:inherit; font:inherit; text-align:left; cursor:pointer; }

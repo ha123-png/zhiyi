@@ -9,6 +9,7 @@ import type {
   DataViewDetail,
   DataViewRead,
   DashboardSummary,
+  DashboardRange,
   Extraction,
   Confirmation,
   ExtractionTemplate,
@@ -157,14 +158,14 @@ export async function getSystemStatus(): Promise<SystemStatus> {
   return readResponse<SystemStatus>(await apiFetch(`${API_BASE_URL}/system/status`));
 }
 
-export async function getDashboardSummary(): Promise<DashboardSummary> {
+export async function getDashboardSummary(days?: DashboardRange): Promise<DashboardSummary> {
   return readResponse<DashboardSummary>(
-    await apiFetch(`${API_BASE_URL}/stats/summary`),
+    await apiFetch(`${API_BASE_URL}/stats/summary${days ? `?days=${days}` : ""}`),
   );
 }
 
-/** 仪表盘按天聚合任务数（趋势图与范围统计），不拉全量任务表。 */
-export async function getDashboardTrend(days: number): Promise<TrendPoint[]> {
+/** 当前范围按日聚合；全部历史自动选择日、月或年，不丢弃旧记录。 */
+export async function getDashboardTrend(days: DashboardRange): Promise<TrendPoint[]> {
   return readResponse<TrendPoint[]>(
     await apiFetch(`${API_BASE_URL}/stats/trend?days=${days}`),
   );
@@ -375,21 +376,34 @@ export interface TaskEvent {
   export_status?: string | null;
 }
 
+const taskEventListeners = new Set<(events: TaskEvent[]) => void>();
+let taskEventSource: EventSource | null = null;
+
+export function taskEventsConnected(): boolean {
+  return taskEventSource?.readyState === 1;
+}
+
 export function subscribeTaskEvents(
   onEvents: (events: TaskEvent[]) => void,
 ): () => void {
-  const source = new EventSource(`${API_BASE_URL}/events`);
-  source.addEventListener("task", (raw) => {
+  taskEventListeners.add(onEvents);
+  if (!taskEventSource) {
+  taskEventSource = new EventSource(`${API_BASE_URL}/events`);
+  taskEventSource.addEventListener("task", (raw) => {
     try {
       const payload = JSON.parse((raw as MessageEvent).data) as TaskEvent[];
       if (Array.isArray(payload) && payload.length > 0) {
-        onEvents(payload);
+        for (const listener of taskEventListeners) listener(payload);
       }
     } catch {
       // 忽略坏帧，连接保持
     }
   });
-  return () => source.close();
+  }
+  return () => {
+    taskEventListeners.delete(onEvents);
+    if (!taskEventListeners.size) { taskEventSource?.close(); taskEventSource = null; }
+  };
 }
 
 export async function retryTask(taskId: string, useCurrentSettings = false): Promise<Task> {
@@ -927,6 +941,8 @@ export async function getIntegrationStatus(): Promise<{
 /* ---- Integration config management (密钥生成/撤销 + MCP 权限开关) ---- */
 
 export interface IntegrationSettings {
+  data_scope?: "all" | "selected";
+  table_ids?: string[];
   read_token_set: boolean;
   write_token_set: boolean;
   task_read: boolean;
@@ -984,6 +1000,8 @@ export async function revokeIntegrationKey(
 }
 
 export async function saveIntegrationPermissions(payload: {
+  data_scope?: "all" | "selected";
+  table_ids?: string[];
   task_read: boolean;
   template_read: boolean;
   result_read: boolean;

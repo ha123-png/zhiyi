@@ -38,12 +38,22 @@ def main():
     parser.add_argument("--key-file", type=Path)
     parser.add_argument("--generation-revision", default="original")
     parser.add_argument("--with-image", action="store_true")
+    parser.add_argument("--model", help="Exact identifier of the selected provider model")
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--skip-baseline", action="store_true")
+    parser.add_argument("--reasoning-effort", default="none")
+    parser.add_argument("--skip-generation", action="store_true")
     args = parser.parse_args()
     root = (
         Path(__file__).resolve().parents[1]
         / ".local/release-model-check"
         / args.provider
     )
+    if args.output_dir:
+        allowed = (Path(__file__).resolve().parents[1] / ".local").resolve()
+        root = args.output_dir.resolve()
+        if not root.is_relative_to(allowed):
+            raise ValueError("Model evidence must stay within the workspace .local directory")
     root.mkdir(parents=True, exist_ok=True)
     ledger = root / "ledger.json"
     state = (
@@ -71,9 +81,10 @@ def main():
         "https://dashscope.aliyuncs.com/compatible-mode/v1"
         if cloud
         else "http://127.0.0.1:1234/v1",
-        "qwen3.6-flash" if cloud else "zhiyi-acceptance-qwen4b",
+        args.model or ("qwen3.6-flash" if cloud else "zhiyi-acceptance-qwen4b"),
         api_key=key,
         temperature=0,
+        reasoning_effort=args.reasoning_effort,
         timeout_seconds=120,
     )
     settings = Settings(
@@ -170,35 +181,36 @@ def main():
                 {"name": "黑色笔", "qty": 0, "price": 2, "amount": 0},
             ],
         }
-        stage = "baseline"
-        previous = subprocess.check_output(
-            [
-                "git",
-                "show",
-                "a5ee460:apps/api/src/document_pipeline_api/services/template_processing.py",
-            ]
-        ).decode()
-        function = next(
-            node
-            for node in ast.parse(previous).body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "build_template_extraction_prompt"
-        )
-        namespace = {"json": json, "TemplateRead": TemplateRead}
-        exec(
-            compile(
-                ast.Module(body=[function], type_ignores=[]), "baseline-prompt", "exec"
-            ),
-            namespace,
-        )
-        baseline = provider.complete_text(
-            namespace["build_template_extraction_prompt"](template)
-            + "\n"
-            + raw.decode(),
-            build_template_extraction_model(template),
-        )
-        state["baseline_exact"] = baseline.model_dump() == expected
-        save()
+        if not args.skip_baseline:
+            stage = "baseline"
+            previous = subprocess.check_output(
+                [
+                    "git",
+                    "show",
+                    "a5ee460:apps/api/src/document_pipeline_api/services/template_processing.py",
+                ]
+            ).decode()
+            function = next(
+                node
+                for node in ast.parse(previous).body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "build_template_extraction_prompt"
+            )
+            namespace = {"json": json, "TemplateRead": TemplateRead}
+            exec(
+                compile(
+                    ast.Module(body=[function], type_ignores=[]), "baseline-prompt", "exec"
+                ),
+                namespace,
+            )
+            baseline = provider.complete_text(
+                namespace["build_template_extraction_prompt"](template)
+                + "\n"
+                + raw.decode(),
+                build_template_extraction_model(template),
+            )
+            state["baseline_exact"] = baseline.model_dump() == expected
+            save()
         stage = "extraction"
         if "task" not in state:
             state["task"] = req(
@@ -237,36 +249,37 @@ def main():
         assert workbook.active.max_row == 4
         (root / "synthetic-export.xlsx").write_bytes(export)
         state["original_sha256"] = sha256(raw).hexdigest()
-        stage = "rule_generation" + (
-            ""
-            if args.generation_revision == "original"
-            else ":" + args.generation_revision
-        )
-        with client.app.state.session_factory() as session:
-            draft = generate_template_draft(
-                settings,
-                session,
-                requirement="为物资领用单创建模板，只要四个明细字段：物品（文本）、数量（数字）、单价（数字）、金额（数字）。用户明确规定：数量可以是零；金额应等于数量乘单价。只建议这一条计算校验作为提醒，不要求任何必填、范围或枚举规则。默认表格。",
-                image_paths=[],
-                with_examples=False,
-                with_rules=True,
-                model_client=provider,
+        if not args.skip_generation:
+            stage = "rule_generation" + (
+                ""
+                if args.generation_revision == "original"
+                else ":" + args.generation_revision
             )
-        state["draft"] = draft.model_dump(mode="json")
-        rules = draft.rule_suggestions
-        state["rules_contract"] = (
-            len(draft.fields) == 4
-            and len(rules) == 1
-            and rules[0].status == "accepted"
-            and rules[0].rule.kind == "equation"
-        )
-        state["rule_basis_present"] = bool(
-            rules and "AI 建议依据" in rules[0].explanation
-        )
-        save()
-        assert state["rules_contract"] and state["rule_basis_present"], (
-            "Inspect rule suggestions; no extra model request is issued automatically"
-        )
+            with client.app.state.session_factory() as session:
+                draft = generate_template_draft(
+                    settings,
+                    session,
+                    requirement="为物资领用单创建模板，只要四个明细字段：物品（文本）、数量（数字）、单价（数字）、金额（数字）。用户明确规定：数量可以是零；金额应等于数量乘单价。只建议这一条计算校验作为提醒，不要求任何必填、范围或枚举规则。默认表格。",
+                    image_paths=[],
+                    with_examples=False,
+                    with_rules=True,
+                    model_client=provider,
+                )
+            state["draft"] = draft.model_dump(mode="json")
+            rules = draft.rule_suggestions
+            state["rules_contract"] = (
+                len(draft.fields) == 4
+                and len(rules) == 1
+                and rules[0].status == "accepted"
+                and rules[0].rule.kind == "equation"
+            )
+            state["rule_basis_present"] = bool(
+                rules and "AI 建议依据" in rules[0].explanation
+            )
+            save()
+            assert state["rules_contract"] and state["rule_basis_present"], (
+                "Inspect rule suggestions; no extra model request is issued automatically"
+            )
         if args.with_image:
             image_path = root / "synthetic-materials.png"
             if not image_path.exists():
@@ -308,6 +321,7 @@ def main():
                 state["image_extraction"] = visual.model_dump(mode="json")
                 save()
             state["image_exact"] = state["image_extraction"]["result"] == expected
+            save()
             assert state["image_exact"]
             assert req("GET", f"/tasks/{state['image_task']}/file").content == image_raw
             state["image_sha256"] = sha256(image_raw).hexdigest()

@@ -12,7 +12,13 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import tempfile
 from pathlib import Path
+from uuid import uuid4
+
+from fastapi import HTTPException
+
+from document_pipeline_api.services.file_operation_lock import file_operation_lock
 
 CONFIG_FILE_NAME = "integration.json"
 
@@ -28,9 +34,12 @@ FIELD_TO_ENV = {
     "mcp_file_roots": "DOCUMENT_PIPELINE_MCP_FILE_ROOTS",
     "mcp_result_read": "DOCUMENT_PIPELINE_MCP_RESULT_READ_ENABLED",
     "mcp_data_read": "DOCUMENT_PIPELINE_MCP_DATA_READ_ENABLED",
+    "mcp_data_scope": "DOCUMENT_PIPELINE_MCP_DATA_SCOPE",
+    "mcp_table_ids": "DOCUMENT_PIPELINE_MCP_TABLE_IDS",
 }
 
 _ALL_FIELDS = set(FIELD_TO_ENV)
+_MCP_REVISION = "mcp_policy_revision"
 
 
 def integration_config_path(data_dir: Path) -> Path:
@@ -50,7 +59,7 @@ def read_integration_config(data_dir: Path) -> dict[str, str]:
         return {}
     cleaned: dict[str, str] = {}
     for key, value in raw.items():
-        if key not in _ALL_FIELDS:
+        if key not in _ALL_FIELDS and key != _MCP_REVISION:
             continue
         if isinstance(value, bool):
             cleaned[key] = "1" if value else "0"
@@ -58,6 +67,10 @@ def read_integration_config(data_dir: Path) -> dict[str, str]:
             cleaned[key] = os.pathsep.join(str(item) for item in value if str(item).strip())
         elif isinstance(value, str):
             cleaned[key] = value
+    if "mcp_data_scope" in raw and cleaned.get("mcp_data_scope") not in {"all", "selected"}:
+        # A damaged scope must not turn a selected-table policy into all tables.
+        cleaned["mcp_data_scope"] = "selected"
+        cleaned["mcp_table_ids"] = ""
     return cleaned
 
 
@@ -66,15 +79,24 @@ def write_integration_config(data_dir: Path, updates: dict[str, object]) -> None
 
     只接受已知字段；token 用布尔标记删除，其余按值写入。
     """
+    # A concurrent save is rejected with a retryable conflict instead of losing
+    # the other writer's permissions or credentials during read/merge/write.
+    with file_operation_lock(data_dir / "config", lock_name=".integration-config.lock"):
+        _write_integration_config(data_dir, updates)
+
+
+def _write_integration_config(data_dir: Path, updates: dict[str, object]) -> None:
     path = integration_config_path(data_dir)
     current: dict[str, object] = {}
     if path.is_file():
         try:
             current = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            current = {}
+        except (OSError, ValueError) as error:
+            raise HTTPException(409, "集成配置无法读取，原文件已保留。请从备份恢复配置后重试。") from error
     if not isinstance(current, dict):
-        current = {}
+        raise HTTPException(409, "集成配置格式损坏，原文件已保留。请从备份恢复配置后重试。")
+    previous_policy = {key: value for key, value in current.items()
+                       if key in _ALL_FIELDS and key.startswith("mcp_")}
     for key, value in updates.items():
         if key not in _ALL_FIELDS:
             continue
@@ -86,9 +108,26 @@ def write_integration_config(data_dir: Path, updates: dict[str, object]) -> None
             current[key] = value
         elif isinstance(value, list):
             current[key] = [str(item) for item in value if str(item).strip()]
+    updated_policy = {key: value for key, value in current.items()
+                      if key in _ALL_FIELDS and key.startswith("mcp_")}
+    if updated_policy != previous_policy:
+        # Detect revoke-and-restore even when an idle client made no call between
+        # both changes. HTTP credential rotation does not change this revision.
+        current[_MCP_REVISION] = uuid4().hex
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(current, ensure_ascii=False, indent=2, sort_keys=True)
-    path.write_text(payload + "\n", encoding="utf-8")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".integration-", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def apply_integration_config(data_dir: Path) -> None:
@@ -127,6 +166,8 @@ def effective_integration_settings(data_dir: Path) -> dict[str, object]:
         "template_read": enabled("mcp_template_read"),
         "result_read": enabled("mcp_result_read"),
         "data_read": enabled("mcp_data_read"),
+        "data_scope": "selected" if config.get("mcp_data_scope") == "selected" else "all",
+        "table_ids": [item for item in config.get("mcp_table_ids", "").split(os.pathsep) if item],
         "task_control": enabled("mcp_task_control"),
         "write_enabled": enabled("mcp_write_enabled"),
         "file_access": enabled("mcp_file_access"),

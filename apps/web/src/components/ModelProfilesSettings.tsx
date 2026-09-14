@@ -19,7 +19,7 @@ const EMPTY_DRAFT: ModelProfileDraft = {
   model_name: "",
   reasoning_effort: "none",
   timeout_seconds: 180,
-  context_length: 8192,
+  context_length: null,
   temperature: null,
   multimodal: null,
   acknowledge_remote_data_transfer: false,
@@ -43,6 +43,7 @@ const SERVICE_PRESETS: Record<ServicePreset, { label: string; provider: ModelPro
 };
 
 function inferPreset(draft: Pick<ModelProfileDraft, "provider" | "base_url">): ServicePreset {
+  if (draft.base_url.includes(".aliyuncs.com")) return "aliyun";
   if (draft.provider === "lm_studio") return "lm_studio";
   if (draft.provider === "ollama") return "ollama";
   if (draft.base_url.includes("dashscope.aliyuncs.com") || draft.base_url.includes("maas.aliyuncs.com")) return "aliyun";
@@ -97,7 +98,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
       model_name: profile.model_name,
       reasoning_effort: profile.reasoning_effort,
       timeout_seconds: profile.timeout_seconds,
-      context_length: profile.context_length,
+      context_length: profile.context_policy === "auto" ? null : profile.context_length,
       temperature: profile.temperature,
       multimodal: profile.multimodal,
       acknowledge_remote_data_transfer: false,
@@ -212,7 +213,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
   return (
     <>
       <div className="callout info callout-sm" style={{ marginBottom: 16 }}>
-        本地模型建议在 LM Studio 使用上下文 8192、并发 1。这里保存服务连接；新设置只影响之后上传的文件。
+        本地方案的请求预算应与模型实际加载容量一致；云端方案独立设置。新设置用于后续请求，已有任务保留原方案快照。
         云端方案的"文件离开本机"确认会在激活（使用）时弹出。
       </div>
       {error && <div className="callout danger">{error}</div>}
@@ -329,9 +330,17 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
         <span>高级设置</span>
         <Icon icon={ChevronDown} size={14} />
       </button>
-      <div className={`collapse${advancedOpen ? " open" : ""}`}>
+      <div className={`collapse${advancedOpen ? " open" : ""}`} inert={!advancedOpen} aria-hidden={!advancedOpen}>
         <div className="collapse-content">
           <div className="settings-row-2 settings-advanced-body">
+            <div className="form-field">
+              <label className="form-label" htmlFor="model-profile-context">上下文预算（Token）</label>
+              <input id="model-profile-context" className="form-input" type="number" min={1024} max={2000000}
+                value={draft.context_length ?? ""} placeholder="自动选择，可填写服务实际容量"
+                onChange={event => setDraft({ ...draft, context_length: event.target.value === "" ? null : Number(event.target.value) })} />
+              <div className="small muted">这是知意的请求预算，不会改变本地模型加载设置。留空时，已知云端参考模型容量；未知远端默认 32,768，本机默认 8,192。可按服务实际容量调整。
+                {selected?.context_policy === "auto" && <span> 当前自动预算：{selected.context_length.toLocaleString()}。</span>}</div>
+            </div>
             <div className="form-field">
               <label className="form-label" htmlFor="model-profile-temperature">温度（可选）</label>
               <input

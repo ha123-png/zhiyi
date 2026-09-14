@@ -27,6 +27,7 @@ class TasksSummary(BaseModel):
     completed: int = 0
     needs_review: int = 0
     failed: int = 0
+    cancelled: int = 0
     active: int = 0
     waiting_for_action: int = 0
     pending_exports: int = 0

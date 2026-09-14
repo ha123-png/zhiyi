@@ -2,7 +2,7 @@ import { forwardRef, useEffect, useImperativeHandle, useState } from "react";
 import { getLocalExportBinding, saveLocalExportBinding, type LocalExportBinding } from "../api";
 import { desktopApi } from "../desktop";
 
-export interface TemplateExportHandle { save: () => Promise<void> }
+export interface TemplateExportHandle { save: () => Promise<void>; isDirty: () => boolean }
 
 export const TemplateExportSettings = forwardRef<TemplateExportHandle, { templateId: string; disabled?: boolean }>(function TemplateExportSettings({ templateId, disabled = false }, ref) {
   const [binding, setBinding] = useState<LocalExportBinding | null>(null);
@@ -42,7 +42,7 @@ export const TemplateExportSettings = forwardRef<TemplateExportHandle, { templat
     } catch { setError("文件夹选择未能打开，请重试。"); }
   }
 
-  useImperativeHandle(ref, () => ({ save }));
+  useImperativeHandle(ref, () => ({ save, isDirty: () => Boolean(binding && (enabled !== binding.enabled || path !== (binding.parent_path ?? ""))) }));
   return <div className="form-field template-export-settings template-feature">
     <label className="form-label"><input type="checkbox" checked={enabled} disabled={!binding || busy || disabled}
       onChange={(event) => setEnabled(event.target.checked)} /> 自动导出原件副本</label>

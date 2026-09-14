@@ -1,6 +1,6 @@
 [project]
 name = "document-pipeline-api"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local-first multimodal document data pipeline API"
 requires-python = ">=3.12,<3.13"
 dependencies = [

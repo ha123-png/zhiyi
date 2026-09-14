@@ -4,10 +4,28 @@ import { App } from "./App";
 
 describe("App", () => {
   beforeEach(() => {
+    vi.stubGlobal("EventSource", class {
+      addEventListener() {}
+      close() {}
+    });
     vi.stubGlobal(
       "fetch",
       vi.fn().mockImplementation(async (input: string | URL) => {
         const url = String(input);
+        if (url.includes("/stats/overview")) return { ok: true, json: async () => ({
+          rows_trend: [], templates: [], model_usage: {
+            calls: 0, completed: 0, failed: 0, interrupted: 0, elapsed_ms: 0,
+            elapsed_sample_count: 0, average_elapsed_ms: null,
+            prompt_tokens: null, completion_tokens: null, total_tokens: null,
+            calls_with_usage: 0, calls_with_cache_usage: 0, cached_tokens: null,
+            cache_hit_ratio: null, cache_measured_prompt_tokens: 0,
+            by_purpose: [], coverage_start: null, history_note: "历史调用未记录用量。",
+          },
+        }) };
+        if (url.endsWith("/stats/cards")) return { ok: true, json: async () => ({ items: [], limit: 4 }) };
+        if (url.includes("/stats/summary")) return { ok: true, json: async () => ({
+          row_count: 0, table_count: 0, template_count: 0, new_rows: 0,
+        }) };
         const body = url.endsWith("/models/status")
           ? {
               connected: true,
@@ -37,19 +55,18 @@ describe("App", () => {
     render(<App />);
 
     expect(
-      screen.getByRole("heading", { name: "任务队列" }),
+      screen.getByRole("heading", { name: "状态监控" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "活动任务" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "待处理事项" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "最近完成" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "失败任务" })).toBeInTheDocument();
-    expect(await screen.findByText(/任务消费者在线/)).toHaveTextContent(
-      "API 已连接 · 任务消费者在线",
-    );
+    expect(await screen.findByRole("button", {name: /服务已就绪/})).toBeInTheDocument();
+    expect(screen.queryByText(/任务消费者在线/)).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "提取工作台" }));
+    fireEvent.click(screen.getByRole("button", { name: "文件提取" }));
 
-    expect(screen.getByRole("heading", { name: "上传文档" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "文件提取" })).toBeInTheDocument();
     expect(
       screen.getByText("拖入文件并匹配模板后，提取结果表与校验问题将显示在此"),
     ).toBeInTheDocument();
@@ -60,12 +77,14 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "仪表盘" }));
 
-    // 仪表盘已接入真实数据：KPI 标签可见，平均耗时等无后端统计的字段诚实留空
+    // Unknown model usage remains unknown; it must not become zero seconds or accuracy.
     expect(
-      screen.getByRole("heading", { name: "数据仪表盘" }),
+      await screen.findByRole("heading", { name: "数据仪表盘" }, { timeout: 5000 }),
     ).toBeInTheDocument();
-    expect(screen.getByText("累计处理文件")).toBeInTheDocument();
-    expect(screen.getByText("平均处理耗时")).toBeInTheDocument();
+    expect(await screen.findByText("文件任务")).toBeInTheDocument();
+    expect(await screen.findByText("平均调用耗时")).toBeInTheDocument();
+    expect(screen.getByText("平均调用耗时").parentElement).toHaveTextContent("—秒");
+    expect(screen.queryByText("平均提取耗时")).not.toBeInTheDocument();
 
     // 设置页已接入：配置卡可见
     fireEvent.click(screen.getByRole("button", { name: "设置" }));
@@ -132,7 +151,7 @@ describe("App", () => {
     );
 
     const { container } = render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "提取工作台" }));
+    fireEvent.click(screen.getByRole("button", { name: "文件提取" }));
     const fileInput = container.querySelector(
       'input[type="file"]',
     ) as HTMLInputElement;

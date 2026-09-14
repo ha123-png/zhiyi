@@ -1,3 +1,4 @@
+import { taskDisplayName } from "../taskNames";
 import { TaskFailureDetails } from "./TaskFailureDetails";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -21,6 +22,7 @@ import {
   retryTasksBatch,
   selectTaskTemplate,
   subscribeTaskEvents,
+  taskEventsConnected,
 } from "../api";
 import type { DataTableRead, ExtractionTemplate, Task, TaskStatus } from "../types";
 import { parseServerTime } from "../time";
@@ -109,7 +111,11 @@ export function TaskQueuePage({
   const [waitingPage, setWaitingPage] = useState(0);
   const [exportPendingTasks, setExportPendingTasks] = useState<Task[]>([]);
   const [matchFailedTasks, setMatchFailedTasks] = useState<Task[]>([]);
-  const [pendingTotals, setPendingTotals] = useState({ exports: 0, waiting: 0 });
+  const [pendingTotals, setPendingTotals] = useState({ exports: 0, waiting: 0, review: 0, failed: 0 });
+  const [reviewTasks, setReviewTasks] = useState<Task[]>([]);
+  const [failedTasks, setFailedTasks] = useState<Task[]>([]);
+  const [reviewPage, setReviewPage] = useState(0);
+  const [failedPage, setFailedPage] = useState(0);
   const requestNumber = useRef(0);
   const pendingPageSize = 50;
 
@@ -119,19 +125,29 @@ export function TaskQueuePage({
       setError(null);
       // 活动任务必须按状态查询，不能假设它们一定处于最近 N 条；否则大量新历史
       // 会把旧的待选模板/暂停任务挤出列表。近期终态仅用于本页摘要。
-      const [active, recent, exports, waiting, summary] = await Promise.all([
+      const [active, recent, exports, waiting, summary, reviews, failures] = await Promise.all([
         getTasks({ limit: 1000, activeOnly: true }),
         getTasks({ limit: 500 }),
         getTasks({ limit: pendingPageSize, offset: exportPage * pendingPageSize, exportPending: true }),
         getTasks({ limit: pendingPageSize, offset: waitingPage * pendingPageSize, status: "waiting_for_template" }),
         getTaskSummary(),
+        getTasks({ limit: pendingPageSize, offset: reviewPage * pendingPageSize, status: "needs_review" }),
+        getTasks({ limit: pendingPageSize, offset: failedPage * pendingPageSize, status: "failed,cancelled" }),
       ]);
       if (currentRequest !== requestNumber.current) return;
       const exportItems = exports.filter((task) => task.status === "completed" && ["failed", "needs_rebind"].includes(task.file_export?.status ?? ""));
       const waitingItems = waiting.filter((task) => task.status === "waiting_for_template");
       setExportPendingTasks(exportItems);
       setMatchFailedTasks(waitingItems);
-      setPendingTotals({ exports: summary.pending_exports ?? exportItems.length, waiting: summary.waiting_for_action ?? waitingItems.length });
+      const reviewItems = reviews.filter(task => task.status === "needs_review");
+      const failedItems = failures.filter(task => ["failed", "cancelled"].includes(task.status));
+      setReviewTasks(reviewItems);
+      setFailedTasks(failedItems);
+      const failedTotal = (summary.failed ?? failedItems.filter(task => task.status === "failed").length) + (summary.cancelled ?? failedItems.filter(task => task.status === "cancelled").length);
+      const reviewTotal = summary.needs_review ?? reviewItems.length;
+      setPendingTotals({ exports: summary.pending_exports ?? exportItems.length, waiting: summary.waiting_for_action ?? waitingItems.length, review: reviewTotal, failed: failedTotal });
+      setReviewPage(page => Math.min(page, Math.max(0, Math.ceil(reviewTotal / pendingPageSize) - 1)));
+      setFailedPage(page => Math.min(page, Math.max(0, Math.ceil(failedTotal / pendingPageSize) - 1)));
       setExportPage((page) => Math.min(page, Math.max(0, Math.ceil((summary.pending_exports ?? exports.length) / pendingPageSize) - 1)));
       setWaitingPage((page) => Math.min(page, Math.max(0, Math.ceil((summary.waiting_for_action ?? waiting.length) / pendingPageSize) - 1)));
       const merged = new Map(recent.map((task) => [task.id, task]));
@@ -146,16 +162,24 @@ export function TaskQueuePage({
     } finally {
       if (currentRequest === requestNumber.current) setLoading(false);
     }
-  }, [exportPage, waitingPage]);
+  }, [exportPage, waitingPage, reviewPage, failedPage]);
 
   useEffect(() => {
     load();
     // SSE 实时推送：状态变化立即刷新（暂停/恢复/完成马上反映）；轮询保留为断线兜底
     const unsub =
       typeof EventSource === "undefined" ? undefined : subscribeTaskEvents(load);
-    const timer = setInterval(load, 1500);
+    let lastRefresh = Date.now();
+    const visible = () => { if (!document.hidden) { lastRefresh = Date.now(); void load(); } };
+    document.addEventListener("visibilitychange", visible);
+    const timer = setInterval(() => {
+      if (!document.hidden && (!taskEventsConnected() || Date.now() - lastRefresh >= 30000)) {
+        lastRefresh = Date.now(); void load();
+      }
+    }, 1500);
     return () => {
       requestNumber.current += 1;
+      document.removeEventListener("visibilitychange", visible);
       clearInterval(timer);
       unsub?.();
     };
@@ -330,19 +354,16 @@ export function TaskQueuePage({
   todayStart.setHours(0, 0, 0, 0);
   const completedTasks = tasks.filter(
     (t) =>
-      (t.status === "completed" || t.status === "needs_review")
+      t.status === "completed"
       && parseServerTime(t.updated_at) >= todayStart.getTime(),
   );
   // 失败
-  const failedTasks = tasks.filter(
-    (t) => t.status === "failed" || t.status === "cancelled",
-  );
 
   return (
     <div className="view">
       <div className="page-header">
-        <div className="eyebrow">状态监控</div>
-        <h1>任务队列</h1>
+        <div className="eyebrow">任务</div>
+        <h1>状态监控</h1>
         <div className="support">实时查看文档处理状态、失败任务与最近完成记录。</div>
       </div>
 
@@ -366,7 +387,7 @@ export function TaskQueuePage({
               onClick={() => toggleCard("active")}
             >
               <h3>
-                <Icon icon={Activity} size={15} /> 活动任务
+                <button type="button" className="task-header-toggle" aria-expanded={!isCardCollapsed("active")} onClick={event => { event.stopPropagation(); toggleCard("active"); }}><Icon icon={Activity} size={15} /> 活动任务</button>
               </h3>
               <div className="header-center">
                 <span className="badge live-blue">{activeTasks.length}</span>
@@ -389,7 +410,7 @@ export function TaskQueuePage({
                 )}
               </div>
             </div>
-            <div className={"collapsible-region" + (isCardCollapsed("active") ? " is-collapsed" : "")}>
+            <div className={"collapsible-region" + (isCardCollapsed("active") ? " is-collapsed" : "")} inert={isCardCollapsed("active")} aria-hidden={isCardCollapsed("active")}>
               <div className="collapsible-inner">
                 <div className="task-list">
                   {activeTasks.length === 0 && (
@@ -398,7 +419,7 @@ export function TaskQueuePage({
                   {activeTasks.map((t) => (
                     <div className="task-item" key={t.id}>
                       <div className="task-row-top">
-                        <span className="task-name">{t.filename}</span>
+                        <span className="task-name">{taskDisplayName(t)}</span>
                         <span
                           className={`badge ${["processing", "validating"].includes(t.status) ? "live-blue" : "info"}`}
                         >
@@ -438,10 +459,10 @@ export function TaskQueuePage({
               onClick={() => toggleCard("match")}
             >
               <h3>
-                <Icon icon={HelpCircle} size={15} /> 待处理事项
+                <button type="button" className="task-header-toggle" aria-expanded={!isCardCollapsed("match")} onClick={event => { event.stopPropagation(); toggleCard("match"); }}><Icon icon={HelpCircle} size={15} /> 待处理事项</button>
               </h3>
               <div className="header-center">
-                <span className="badge warn">{pendingTotals.waiting + pendingTotals.exports}</span>
+                <span className="badge warn">{pendingTotals.waiting + pendingTotals.exports + pendingTotals.review + pendingTotals.failed}</span>
               </div>
               <div className="header-actions">
                 <Icon className="card-caret" icon={ChevronDown} size={16} />
@@ -460,14 +481,24 @@ export function TaskQueuePage({
                 )}
               </div>
             </div>
-            <div className={"collapsible-region" + (isCardCollapsed("match") ? " is-collapsed" : "")}>
+            <div className={"collapsible-region" + (isCardCollapsed("match") ? " is-collapsed" : "")} inert={isCardCollapsed("match")} aria-hidden={isCardCollapsed("match")}>
               <div className="collapsible-inner">
                 <div className="task-list">
-                  {matchFailedTasks.length === 0 && exportPendingTasks.length === 0 && (
+                  {matchFailedTasks.length === 0 && exportPendingTasks.length === 0 && reviewTasks.length === 0 && pendingTotals.failed === 0 && (
                     <div className="task-empty">暂无待处理事项</div>
                   )}
+                  {reviewTasks.map(task => <div className="task-item" key={`review-${task.id}`}>
+                    <div className="task-row-top"><span className="task-name">{taskDisplayName(task)}</span><span className="badge warn">待核对</span></div>
+                    <div className="task-row-bottom"><span className="small muted">提取结果需要确认，与文件历史的校验问题同步。</span><button className="btn secondary sm" onClick={() => onOpenTask?.(task)}>核对结果</button></div>
+                  </div>)}
+                  {pendingTotals.review > pendingPageSize && <div className="row" aria-label="待核对事项翻页">
+                    <button className="btn secondary sm" disabled={reviewPage === 0} onClick={() => setReviewPage(page => page - 1)}>上一页待核对</button>
+                    <span className="small muted">{reviewPage + 1}/{Math.ceil(pendingTotals.review / pendingPageSize)} 页 · 共 {pendingTotals.review} 份</span>
+                    <button className="btn secondary sm" disabled={(reviewPage + 1) * pendingPageSize >= pendingTotals.review} onClick={() => setReviewPage(page => page + 1)}>下一页待核对</button>
+                  </div>}
+                  {pendingTotals.failed > 0 && <button className="btn secondary sm" onClick={() => { setCollapsed(previous => ({ ...previous, failed: false })); document.getElementById("queue-failed")?.scrollIntoView({ block: "start" }); }}>{pendingTotals.failed} 个失败或取消任务待处理 · 查看</button>}
                   {exportPendingTasks.map((task) => <div className="task-item" key={`export-${task.id}`}>
-                    <div className="task-row-top"><span className="task-name">{task.filename}</span><span className="badge warn">副本待处理</span></div>
+                    <div className="task-row-top"><span className="task-name">{taskDisplayName(task)}</span><span className="badge warn">副本待处理</span></div>
                     <TaskExportDetails task={task} expanded onUpdated={() => void load()} />
                     <button className="btn ghost sm" onClick={() => onOpenTask?.(task)}>查看提取结果</button>
                   </div>)}
@@ -483,7 +514,7 @@ export function TaskQueuePage({
                   </div>}
                   {matchFailedTasks.map((t) => {
                     if (t.pending_reason === "input_scope") return <div className="task-item" key={t.id}>
-                      <div className="task-row-top"><span className="task-name">{t.filename}</span><span className="badge warn">待确认范围</span></div>
+                      <div className="task-row-top"><span className="task-name">{taskDisplayName(t)}</span><span className="badge warn">待确认范围</span></div>
                       <PartialInputAction task={t} onUpdated={() => void load()} />
                       <button className="btn ghost sm" onClick={() => onOpenTask?.(t)}>查看任务</button>
                       <button className="btn ghost sm danger-btn" onClick={() => setDeleteMatchTarget(t)}>删除任务</button>
@@ -505,7 +536,7 @@ export function TaskQueuePage({
                     return (
                       <div className="task-item" key={t.id}>
                         <div className="task-row-top">
-                          <span className="task-name">{t.filename}</span>
+                          <span className="task-name">{taskDisplayName(t)}</span>
                           <span className="badge warn">待匹配</span>
                         </div>
                         <div className="match-failed-box">
@@ -560,7 +591,7 @@ export function TaskQueuePage({
               onClick={() => toggleCard("completed")}
             >
               <h3>
-                <Icon icon={CheckCircle2} size={15} /> 最近完成
+                <button type="button" className="task-header-toggle" aria-expanded={!isCardCollapsed("completed")} onClick={event => { event.stopPropagation(); toggleCard("completed"); }}><Icon icon={CheckCircle2} size={15} /> 最近完成</button>
               </h3>
               <div className="header-center">
                 <span className="badge success">{completedTasks.length}</span>
@@ -569,7 +600,7 @@ export function TaskQueuePage({
                 <Icon className="card-caret" icon={ChevronDown} size={16} />
               </div>
             </div>
-            <div className={"collapsible-region" + (isCardCollapsed("completed") ? " is-collapsed" : "")}>
+            <div className={"collapsible-region" + (isCardCollapsed("completed") ? " is-collapsed" : "")} inert={isCardCollapsed("completed")} aria-hidden={isCardCollapsed("completed")}>
               <div className="collapsible-inner">
                 <div className="task-list">
                   {completedTasks.length === 0 && (
@@ -578,7 +609,7 @@ export function TaskQueuePage({
                   {completedTasks.map((t) => (
                     <div className="task-item" key={t.id}>
                       <div className="task-row-top">
-                        <span className="task-name">{t.filename}</span>
+                        <span className="task-name">{taskDisplayName(t)}</span>
                         <span className={`badge ${t.status === "needs_review" ? "warn" : "success"}`}>
                           {STATUS_TEXT[t.status]}
                         </span>
@@ -608,17 +639,17 @@ export function TaskQueuePage({
               onClick={() => toggleCard("failed")}
             >
               <h3>
-                <Icon icon={AlertTriangle} size={15} /> 失败任务
+                <button type="button" className="task-header-toggle" aria-expanded={!isCardCollapsed("failed")} onClick={event => { event.stopPropagation(); toggleCard("failed"); }}><Icon icon={AlertTriangle} size={15} /> 失败任务</button>
               </h3>
               <div className="header-center">
-                <span className="badge danger">{failedTasks.length}</span>
+                <span className="badge danger" id="queue-failed">{pendingTotals.failed}</span>
               </div>
               <div className="header-actions">
                 <Icon className="card-caret" icon={ChevronDown} size={16} />
                 {failedTasks.some((t) => t.status === "failed") && (
                   <button
                     className="btn ghost sm"
-                    title="全部重试"
+                    title="重试本页失败任务"
                     disabled={retryingAll}
                     onClick={(e) => {
                       e.stopPropagation();
@@ -626,34 +657,39 @@ export function TaskQueuePage({
                     }}
                   >
                     <Icon icon={retryingAll ? Loader2 : Play} size={12} className={retryingAll ? "spin" : undefined} />
-                    全部重试
+                    重试本页
                   </button>
                 )}
                 {failedTasks.length > 0 && (
                   <button
                     className="btn ghost sm"
-                    title="批量删除全部失败任务（没有产生数据，直接删除不确认）"
+                    title="批量删除本页失败任务（其他页不受影响）"
                     disabled={busyTaskId !== null}
                     onClick={(e) => {
                       e.stopPropagation();
                       void handleBatchDeleteFailed();
                     }}
                   >
-                    <Icon icon={Trash2} size={12} /> 批量删除
+                    <Icon icon={Trash2} size={12} /> 删除本页失败任务
                   </button>
                 )}
               </div>
             </div>
-            <div className={"collapsible-region" + (isCardCollapsed("failed") ? " is-collapsed" : "")}>
+            <div className={"collapsible-region" + (isCardCollapsed("failed") ? " is-collapsed" : "")} inert={isCardCollapsed("failed")} aria-hidden={isCardCollapsed("failed")}>
               <div className="collapsible-inner">
                 <div className="task-list">
                   {failedTasks.length === 0 && (
                     <div className="task-empty">暂无失败任务</div>
                   )}
+                  {pendingTotals.failed > pendingPageSize && <div className="row" aria-label="失败事项翻页">
+                    <button className="btn secondary sm" disabled={failedPage === 0} onClick={() => setFailedPage(page => page - 1)}>上一页失败任务</button>
+                    <span className="small muted">{failedPage + 1}/{Math.ceil(pendingTotals.failed / pendingPageSize)} 页 · 共 {pendingTotals.failed} 个</span>
+                    <button className="btn secondary sm" disabled={(failedPage + 1) * pendingPageSize >= pendingTotals.failed} onClick={() => setFailedPage(page => page + 1)}>下一页失败任务</button>
+                  </div>}
                   {failedTasks.map((t) => (
                     <div className="task-item" key={t.id}>
                       <div className="task-row-top">
-                        <span className="task-name">{t.filename}</span>
+                        <span className="task-name">{taskDisplayName(t)}</span>
                         <span className="badge danger">{STATUS_TEXT[t.status]}</span>
                       </div>
                       <div className="task-row-bottom">

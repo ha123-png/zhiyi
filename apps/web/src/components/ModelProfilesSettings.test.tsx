@@ -55,6 +55,6 @@ describe("ModelProfilesSettings", () => {
     });
     expect(body).not.toHaveProperty("max_tokens");
     expect(body.temperature).toBeNull();
-    expect(body.context_length).toBe(8192);
+    expect(body.context_length).toBeNull();
   });
 });

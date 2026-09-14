@@ -10,10 +10,9 @@ it("loads diagnostic on demand and copies the complete returned text", async () 
   vi.mocked(getTaskDiagnostics).mockResolvedValue({ detail, attempt: 1, code: "model_error" });
   const copy = vi.fn().mockResolvedValue(undefined);
   Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: copy } });
-  const { container } = render(<TaskFailureDetails taskId="task" />);
+  render(<TaskFailureDetails taskId="task" />);
   expect(getTaskDiagnostics).not.toHaveBeenCalled();
-  const disclosure = container.querySelector("details")!;
-  disclosure.open = true; fireEvent(disclosure, new Event("toggle"));
+  fireEvent.click(screen.getByText("诊断详情"));
   await screen.findByText(detail);
   fireEvent.click(screen.getByRole("button", { name: "复制诊断" }));
   await waitFor(() => expect(copy).toHaveBeenCalledWith(detail));

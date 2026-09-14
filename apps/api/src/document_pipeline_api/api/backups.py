@@ -238,6 +238,22 @@ def restore_backup(request: Request, name: str) -> RestoreResult:
                 detail="无法安排安全恢复，请重启应用后再试；当前数据未改变。",
             )
         return RestoreResult(restart_required=True, scheduled=True)
+    # Direct development restores must exclude background chat writes too.
+    import time
+    from document_pipeline_api.api.assistant import stop_conversations
+    condition = request.app.state.maintenance_condition
+    with condition:
+        if request.app.state.maintenance_active:
+            raise HTTPException(409, "已有数据维护操作正在进行。")
+        request.app.state.maintenance_active = True
+        stop_conversations(request.app)
+        deadline = time.monotonic() + 5
+        while request.app.state.active_mutations > 1:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                request.app.state.maintenance_active = False
+                raise HTTPException(409, "仍有写入未结束，请稍后重试恢复。")
+            condition.wait(remaining)
     try:
         session_factory = request.app.state.session_factory
         bind = getattr(session_factory, "kw", {}).get("bind")
@@ -272,6 +288,10 @@ def restore_backup(request: Request, name: str) -> RestoreResult:
             status_code=status.HTTP_409_CONFLICT,
             detail=public_error_message(error, "恢复未完成，当前数据没有改变。请重启知意后重试。"),
         ) from error
+    finally:
+        with condition:
+            request.app.state.maintenance_active = False
+            condition.notify_all()
     return RestoreResult(
         rollback_dir=str(rollback_dir),
         restart_required=True,

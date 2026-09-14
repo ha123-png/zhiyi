@@ -27,6 +27,7 @@ from document_pipeline_api.models import (
 )
 from document_pipeline_api.models.task import utc_now
 from document_pipeline_api.public_errors import public_error_message
+from document_pipeline_api.services.model_context import default_context_budget, profile_context_budget
 from document_pipeline_api.schemas.model_profiles import (
     ModelProfileBody,
     ModelProfileCreate,
@@ -338,7 +339,8 @@ def _version_record(
         model_name=body.model_name,
         reasoning_effort=body.reasoning_effort,
         timeout_seconds=body.timeout_seconds,
-        context_length=body.context_length,
+        context_length=body.context_length or default_context_budget(base_url, body.model_name),
+        context_policy="auto" if body.context_length is None else "fixed",
         temperature=body.temperature,
         multimodal=body.multimodal,
         secret_ref=secret_ref,
@@ -383,7 +385,8 @@ def _as_read(
         model_name=version.model_name,
         reasoning_effort=version.reasoning_effort,
         timeout_seconds=version.timeout_seconds,
-        context_length=version.context_length,
+        context_length=profile_context_budget(version),
+        context_policy=version.context_policy,
         temperature=version.temperature,
         multimodal=version.multimodal,
         has_api_key=version.secret_ref is not None,

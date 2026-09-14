@@ -40,7 +40,7 @@ def test_poll_task_changes_returns_only_newer_than_cursor(tmp_path) -> None:
     ids = {item["id"] for item in payload}
     assert "new" in ids
     assert "old" not in ids
-    assert new_cursor > cursor
+    assert new_cursor[0] > cursor
     # 事件载荷携带文件名与失败原因：前端全局日志与失败 toast 依赖这两个字段
     new_event = next(item for item in payload if item["id"] == "new")
     assert new_event["filename"] == "new.txt"
@@ -59,3 +59,18 @@ def test_poll_task_changes_keeps_cursor_when_no_changes(tmp_path) -> None:
         payload, new_cursor = poll_task_changes(session, cursor)
     assert payload == []
     assert new_cursor == cursor
+
+
+def test_bulk_updates_with_identical_timestamp_are_not_skipped(tmp_path) -> None:
+    engine = build_engine(f"sqlite:///{tmp_path / 'bulk.db'}")
+    Base.metadata.create_all(engine)
+    stamp = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add_all([_task(f"task-{i:03}", now=stamp) for i in range(250)])
+        session.commit()
+        cursor = stamp - timedelta(seconds=1)
+        seen = []
+        for _ in range(4):
+            payload, cursor = poll_task_changes(session, cursor)
+            seen.extend(item["id"] for item in payload)
+        assert len(seen) == len(set(seen)) == 250

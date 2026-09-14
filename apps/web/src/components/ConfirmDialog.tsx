@@ -3,6 +3,7 @@ import { Loader2, ShieldAlert } from "lucide-react";
 import { Icon } from "./Icon";
 
 interface ConfirmDialogProps {
+  tone?: "danger" | "normal";
   open: boolean;
   title: string;
   description: ReactNode;
@@ -15,6 +16,7 @@ interface ConfirmDialogProps {
 }
 
 export function ConfirmDialog({
+  tone = "danger",
   open,
   title,
   description,
@@ -80,7 +82,7 @@ export function ConfirmDialog({
       >
         <div className="modal-head modal-head-centered">
           <span className="modal-eyebrow">
-            <Icon icon={ShieldAlert} size={13} /> 危险操作
+            <Icon icon={ShieldAlert} size={13} /> {tone === "danger" ? "危险操作" : "未保存的编辑"}
           </span>
           <h3 id={titleId}>{title}</h3>
           <div className="support" id={descriptionId}>{description}</div>
@@ -110,7 +112,7 @@ export function ConfirmDialog({
             取消
           </button>
           <button
-            className="btn danger"
+            className={`btn ${tone === "danger" ? "danger" : "primary"}`}
             type="button"
             disabled={!matched || busy}
             onClick={onConfirm}

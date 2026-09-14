@@ -185,6 +185,7 @@ EXPECTED_SCHEMA = {
         "reasoning_effort",
         "timeout_seconds",
         "context_length",
+        "context_policy",
         "temperature",
         "secret_ref",
         "is_remote",
@@ -201,6 +202,19 @@ EXPECTED_SCHEMA = {
 }
 EXPECTED_SCHEMA["template_local_bindings"] = {"template_id", "revision", "enabled", "parent_path", "internal_folder"}
 EXPECTED_SCHEMA["data_rows"].add("review_pending")
+ASSISTANT_SCHEMA = {
+    "assistant_threads": {"id", "title", "profile_id", "created_at", "updated_at", "archived_at"},
+    "assistant_messages": {"id", "thread_id", "role", "position", "parts_json", "context_json", "created_at"},
+    "assistant_runs": {"id", "thread_id", "message_id", "profile_id", "profile_version", "model", "provider", "status", "error", "usage_json", "events_json", "created_at", "updated_at"},
+    "assistant_tool_calls": {"id", "run_id", "name", "arguments_json", "result_json", "status", "created_at"},
+}
+EXPECTED_SCHEMA.update(ASSISTANT_SCHEMA)
+EXPECTED_SCHEMA["assistant_messages"] = EXPECTED_SCHEMA["assistant_messages"] | {"native_context_json"}
+DASHBOARD_SCHEMA = {
+    "dashboard_cards": {"id", "name", "position", "definition_json", "created_at", "updated_at"},
+    "model_usage": {"id", "purpose", "model", "provider", "status", "elapsed_ms", "usage_json", "created_at"},
+}
+EXPECTED_SCHEMA.update(DASHBOARD_SCHEMA)
 
 SCHEMA_REVISIONS = {
     "0001_initial": {"tasks", "extractions"},
@@ -416,7 +430,15 @@ SCHEMA_REVISIONS.update(
 SCHEMA_REVISIONS["0031_template_restorations"] = SCHEMA_REVISIONS["0030_row_input_scope"] | {"template_restorations"}
 SCHEMA_REVISIONS["0032_task_diagnostics"] = SCHEMA_REVISIONS["0031_template_restorations"]
 SCHEMA_REVISIONS["0033_row_review_pending"] = SCHEMA_REVISIONS["0032_task_diagnostics"]
+SCHEMA_REVISIONS["0034_assistant"] = SCHEMA_REVISIONS["0033_row_review_pending"] | ASSISTANT_SCHEMA.keys()
+SCHEMA_REVISIONS["0035_assistant_native_context"] = SCHEMA_REVISIONS["0034_assistant"]
+SCHEMA_REVISIONS["0036_dashboard_usage"] = SCHEMA_REVISIONS["0035_assistant_native_context"] | DASHBOARD_SCHEMA.keys()
+SCHEMA_REVISIONS["0037_model_context_policy"] = SCHEMA_REVISIONS["0036_dashboard_usage"]
 COLUMNS_INTRODUCED_BY_REVISION = {
+    "0037_model_context_policy": {"model_profile_versions": {"context_policy"}},
+    "0036_dashboard_usage": DASHBOARD_SCHEMA,
+    "0035_assistant_native_context": {"assistant_messages": {"native_context_json"}},
+    "0034_assistant": ASSISTANT_SCHEMA,
     "0033_row_review_pending": {"data_rows": {"review_pending"}},
     "0032_task_diagnostics": {"tasks": {"failure_detail"}},
     "0030_row_input_scope": {"data_rows": {"input_scope_json"}},

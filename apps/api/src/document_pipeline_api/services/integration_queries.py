@@ -4,11 +4,13 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.models import DataRowRecord, DataTableRecord
 from document_pipeline_api.services.data_tables import get_data_table, table_columns, _csv_safe
+from document_pipeline_api.services.assistant_analysis import AnalysisRequest, Metric, analyze
+from document_pipeline_api.services.export_scope import REVIEW_KEY, REVIEW_LABEL, table_has_pending_reviews
 from document_pipeline_api.services.export_scope import SCOPE_LABEL, csv_scope_value, export_row_values, table_has_input_scopes
 
 
@@ -31,61 +33,27 @@ def aggregate_data_table(
                 status_code=422,
                 detail=f"字段不在数据表列契约中：{field}",
             )
-    filters = [DataRowRecord.table_id == table_id]
-    if search:
-        filters.append(DataRowRecord.row_json.ilike(f"%{search}%"))
-    if group_by is None:
-        count = int(
-            session.scalar(select(func.count(DataRowRecord.id)).where(*filters)) or 0
-        )
-        total = None
-        if value_field:
-            value_expr = func.json_extract(
-                DataRowRecord.row_json,
-                f'$."{value_field}"',
-            )
-            total = float(
-                session.scalar(
-                    select(func.coalesce(func.sum(value_expr), 0)).where(*filters)
-                )
-                or 0
-            )
-        return {"count": count, "sum": total, "groups": []}
-    group_expr = func.json_extract(
-        DataRowRecord.row_json,
-        f'$."{group_by}"',
-    )
-    columns = [group_expr.label("group_value"), func.count(DataRowRecord.id)]
+    metrics = [Metric(op="count")]
     if value_field:
-        columns.append(
-            func.coalesce(
-                func.sum(
-                    func.json_extract(
-                        DataRowRecord.row_json,
-                        f'$."{value_field}"',
-                    )
-                ),
-                0,
-            )
-        )
-    rows = session.execute(
-        select(*columns)
-        .where(*filters)
-        .group_by(group_expr)
-        .order_by(func.count(DataRowRecord.id).desc())
-        .limit(100)
-    ).all()
+        metrics.append(Metric(op="sum", field=value_field))
+    result = analyze(session, AnalysisRequest(table_id=table_id, metrics=metrics,
+        dimensions=[group_by] if group_by else [], search=search or "", limit=100, grain="auto"))
+    amount = f"sum:{value_field}"
     return {
-        "count": sum(int(row[1]) for row in rows),
-        "sum": sum(float(row[2] or 0) for row in rows) if value_field else None,
+        "count": result["totals"]["count:*"],
+        "sum": result["totals"].get(amount) if value_field else None,
         "groups": [
             {
-                "value": row[0],
-                "count": int(row[1]),
-                "sum": float(row[2] or 0) if value_field else None,
+                "value": row.get(group_by),
+                "count": row["count:*"],
+                "sum": row.get(amount) if value_field else None,
             }
-            for row in rows
-        ],
+            for row in result["data"]
+        ] if group_by else [],
+        "group_count": result["group_count"] if group_by else 0,
+        "truncated": result["truncated"],
+        "warnings": result["warnings"],
+        "source": result["source"],
     }
 
 
@@ -99,14 +67,17 @@ def export_data_table_file(
     detail = get_data_table(session, table_id, page=1, page_size=1)
     columns = [column.key for column in detail.columns]
     scoped = table_has_input_scopes(session, table_id)
+    pending = table_has_pending_reviews(session, table_id)
+    if pending and REVIEW_LABEL in [column.label for column in detail.columns]:
+        raise ValueError("业务列名与知意来源状态说明列冲突，请重命名后导出。")
     if scoped and SCOPE_LABEL in [column.label for column in detail.columns]:
         raise ValueError("业务列名与知意范围说明列冲突，请重命名后导出。")
     if output_format == "csv":
         with path.open("w", encoding="utf-8-sig", newline="") as stream:
             writer = csv.writer(stream)
-            writer.writerow([column.label for column in detail.columns] + ([SCOPE_LABEL] if scoped else []))
+            writer.writerow([_csv_safe(column.label) for column in detail.columns] + ([SCOPE_LABEL] if scoped else []) + ([REVIEW_LABEL] if pending else []))
             for values in _iter_table_values(session, table_id):
-                writer.writerow([_csv_safe(values.get(column)) for column in columns] + ([csv_scope_value(values)] if scoped else []))
+                writer.writerow([_csv_safe(values.get(column)) for column in columns] + ([csv_scope_value(values)] if scoped else []) + (["待核对" if values.get(REVIEW_KEY) else ""] if pending else []))
     else:
         with path.open("w", encoding="utf-8") as stream:
             stream.write("[")

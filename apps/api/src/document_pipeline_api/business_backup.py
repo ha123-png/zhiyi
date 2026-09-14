@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 
 
 BACKUP_FORMAT = "document-pipeline-backup-v1"
-MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_BACKUP_FILES = 100_000
+MAX_MANIFEST_BYTES = MAX_BACKUP_FILES * 512 + 4096
 MAX_BACKUP_CONTENT_BYTES = 100 * 1024 * 1024 * 1024
 
 
@@ -89,6 +90,8 @@ def inspect_business_backup(archive_path: Path) -> dict[str, Any]:
         with zipfile.ZipFile(archive_path) as archive:
             infos = archive.infolist()
             names = [info.filename for info in infos]
+            if len(names) > MAX_BACKUP_FILES + 2:
+                raise BusinessBackupError("备份超过十万份原件的容量上限，请分批整理后重试。")
             if len(names) != len(set(names)):
                 raise BusinessBackupError("备份包含重复成员。")
             for info in infos:
@@ -313,6 +316,8 @@ def _prepare_staged_database(
                 state.error_code = "backup_restored"
                 state.error_message = "已恢复备份；请重新选择并确认外部副本目标，不会自动写入旧路径。"
                 connection.execute("UPDATE tasks SET export_state_json = ? WHERE id = ?", (state.model_dump_json(), task_id))
+        connection.execute("UPDATE assistant_runs SET status='interrupted', error='已恢复备份；历史内容保留，请重新提问。' WHERE status IN ('running','waiting','cancelling')")
+        connection.execute("UPDATE assistant_tool_calls SET status='expired' WHERE status='pending'")
         connection.commit()
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         journal_mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
@@ -430,8 +435,10 @@ def _build_manifest(
         internal_column = "internal_storage_json" if "internal_storage_json" in columns else "NULL AS internal_storage_json"
         tasks = connection.execute(
             f"SELECT id, content_type, size_bytes, sha256, storage_path, {internal_column} "
-            "FROM tasks ORDER BY id"
+            f"FROM tasks ORDER BY id LIMIT {MAX_BACKUP_FILES + 1}"
         ).fetchall()
+        if len(tasks) > MAX_BACKUP_FILES:
+            raise BusinessBackupError("备份超过十万份原件的容量上限，请分批整理后重试。")
         for task in tasks:
             task_id = task["id"]
             content_type = task["content_type"]

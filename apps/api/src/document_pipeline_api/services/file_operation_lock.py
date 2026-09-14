@@ -8,11 +8,11 @@ from fastapi import HTTPException
 
 
 @contextmanager
-def file_operation_lock(storage_dir: Path):
+def file_operation_lock(storage_dir: Path, *, lock_name: str = ".file-actions.lock"):
     storage_dir.mkdir(parents=True, exist_ok=True)
     # Keep the lock outside uploads so backup restoration can swap that
     # directory while holding the same lock (Windows forbids moving open files).
-    path = storage_dir.parent / ".file-actions.lock"
+    path = storage_dir.parent / lock_name
     if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
         raise HTTPException(409, "文件操作锁路径异常，请检查知意数据目录。")
     with path.open("a+b") as handle:

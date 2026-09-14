@@ -18,10 +18,12 @@ import {
   getIntegrationSettings,
   getIntegrationStatus,
   getMcpRuntimeConfig,
+  getTables,
   revokeIntegrationKey,
   saveIntegrationPermissions,
 } from "../api";
 import type { IntegrationSettings, McpRuntimeConfig } from "../api";
+import type { DataTableRead } from "../types";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { Icon } from "./Icon";
 
@@ -129,7 +131,7 @@ function CollapsibleCard({
           size={17}
         />
       </button>
-      <div className="card-body">
+      <div className="card-body" inert={collapsed} aria-hidden={collapsed}>
         <div className="card-body-inner">{children}</div>
       </div>
     </div>
@@ -172,6 +174,17 @@ export function ConnectionsPage() {
     fileRoots: "",
   });
   const [savingPerms, setSavingPerms] = useState(false);
+  const [tables, setTables] = useState<DataTableRead[]>([]);
+  const [tableError, setTableError] = useState<string | null>(null);
+  const [dataScope, setDataScope] = useState<"all" | "selected">("all");
+  const [tableIds, setTableIds] = useState<string[]>([]);
+  useEffect(() => {
+    if (!permDraft.dataRead && !permDraft.writeEnabled) return;
+    let current = true;
+    getTables().then(items => { if (current) { setTables(items); setTableError(null); } })
+      .catch(() => { if (current) setTableError("暂时无法读取数据表列表，请重新打开接口页面重试。"); });
+    return () => { current = false; };
+  }, [permDraft.dataRead, permDraft.writeEnabled]);
 
   const refreshSettings = useCallback(() => {
     getIntegrationSettings()
@@ -190,6 +203,8 @@ export function ConnectionsPage() {
   // 权限草稿与当前配置同步
   useEffect(() => {
     if (!settings) return;
+    setDataScope(settings.data_scope ?? "all");
+    setTableIds(settings.table_ids ?? []);
     setPermDraft({
       taskRead: settings.task_read,
       templateRead: settings.template_read,
@@ -198,7 +213,7 @@ export function ConnectionsPage() {
       taskControl: settings.task_control,
       writeEnabled: settings.write_enabled,
       fileAccess: settings.file_access,
-      fileRoots: settings.file_roots.join("; "),
+      fileRoots: settings.file_roots.join("\n"),
     });
   }, [settings]);
 
@@ -252,10 +267,12 @@ export function ConnectionsPage() {
     setMcpNotice(null);
     try {
       const fileRoots = permDraft.fileRoots
-        .split(/[;,，]/)
+        .split(/\r?\n|;/)
         .map((item) => item.trim())
         .filter(Boolean);
       await saveIntegrationPermissions({
+        data_scope: dataScope,
+        table_ids: tableIds,
         task_read: permDraft.taskRead,
         template_read: permDraft.templateRead,
         result_read: permDraft.resultRead,
@@ -265,7 +282,7 @@ export function ConnectionsPage() {
         file_access: permDraft.fileAccess,
         file_roots: fileRoots,
       });
-      setMcpNotice("MCP 权限已保存；无需重启知意，请在 MCP 客户端重新连接以刷新工具列表。");
+      setMcpNotice("MCP 权限已保存；旧连接将拒绝继续操作，请在客户端重新连接以使用最新权限。");
       await refreshSettings();
     } catch (err) {
       setMcpError(err instanceof Error ? err.message : "保存权限失败");
@@ -529,6 +546,23 @@ export function ConnectionsPage() {
                   <span />
                 </button>
               </div>
+              {(permDraft.dataRead || permDraft.writeEnabled) && <div className="setting-row align-top">
+                <div style={{ width: "100%" }}>
+                  <label className="settings-name" htmlFor="mcp-data-scope">允许访问的数据表</label>
+                  <select id="mcp-data-scope" value={dataScope} onChange={e => setDataScope(e.target.value as "all" | "selected")}>
+                    <option value="all">全部数据表（包括以后新建的表）</option>
+                    <option value="selected">只允许选中的表</option>
+                  </select>
+                  {dataScope === "selected" && <div className="mcp-table-scope">
+                    {tableError ? <p role="alert">{tableError}</p> : tables.map(table => <label key={table.id}>
+                      <input type="checkbox" checked={tableIds.includes(table.id)} onChange={e => setTableIds(ids => e.target.checked ? [...ids, table.id] : ids.filter(id => id !== table.id))} />{table.name}
+                    </label>)}
+                    {!tableError && !tables.length && <p className="small muted">还没有可选的数据表。</p>}
+                    <p className="small muted">已选 {tableIds.length} 张表。未选择时不允许访问任何数据表。</p>
+                  </div>}
+                  <p className="small muted">同时约束读取、聚合、修改和导出。任务与原提取结果由上方独立开关控制。</p>
+                </div>
+              </div>}
               <div className="setting-row">
                 <div>
                   <div className="settings-name">文件访问</div>

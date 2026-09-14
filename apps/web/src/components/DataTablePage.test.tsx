@@ -18,6 +18,22 @@ const columns = [
 ];
 
 describe("DataTablePage", () => {
+  it("refreshes visible facts after an assistant approval without reloading the page", async () => {
+    let amount = 3200;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/tables")) return response([table]);
+      if (url.endsWith("/views") || url.includes("/templates")) return response([]);
+      return response({ ...table, columns, page: 1, page_size: 10, rows: [{ id: 1, task_id: null, item_index: 1, version: 1,
+        values: { seller_name: "合成供应方", total_amount: amount }, created_at: "", updated_at: "" }] });
+    }));
+    render(<DataTablePage />);
+    await screen.findByText("3200");
+    amount = 3600;
+    fireEvent(window, new CustomEvent("zhiyi:assistant-changed", { detail: { table_id: "invoice-v1" } }));
+    expect(await screen.findByText("3600")).toBeInTheDocument();
+    expect(screen.queryByText("3200")).not.toBeInTheDocument();
+  });
   it("keeps pending source information visible in both presentations", async () => {
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
       const url = String(input);

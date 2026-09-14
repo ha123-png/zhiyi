@@ -10,7 +10,7 @@ export function TemplateNameSettings({ value, disabled, onChange }: { value?: Te
   const behavior = value ?? defaultBehavior();
   return <div className="form-field template-feature">
     <label className="form-label"><input type="checkbox" checked={behavior.suggest_filename} disabled={disabled} onChange={(event) => onChange({ ...behavior, suggest_filename: event.target.checked })} /> 有意义的文件名</label>
-    <p className="support">AI 在提取时判断原名是否有意义：已有意义就保留，否则建议新名称。确认时可修改，原名始终可追溯；新副本使用最终名称。</p>
+    <p className="support">提取时自动填写内容名称，已有意义的原名可保留。可直接编辑，无需单独采纳；原名始终可追溯，新副本使用最终名称。</p>
   </div>;
 }
 

@@ -1,7 +1,7 @@
 import os
 import mimetypes
 from functools import wraps
-from inspect import iscoroutinefunction
+from inspect import iscoroutinefunction, signature
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -49,6 +49,7 @@ def create_mcp_server(
     template_read_enabled: bool = False,
     result_read_enabled: bool = False,
     data_read_enabled: bool = False,
+    allowed_table_ids: tuple[str, ...] | None = None,
 ) -> FastMCP:
     resolved_roots = tuple(root.resolve() for root in allowed_file_roots)
     if file_access_enabled and not resolved_roots:
@@ -78,21 +79,46 @@ def create_mcp_server(
 
     initial_generation = generation()
 
+    from document_pipeline_api.services.integration_config import read_integration_config
+
+    def permission_snapshot():
+        # HTTP key rotation is independent of MCP. A changed MCP policy invalidates
+        # the connection, so its old registered closures can never retain access.
+        config = read_integration_config(settings.storage_dir.parent)
+        return {key: value for key, value in config.items() if key.startswith("mcp_")}
+
+    initial_permissions = permission_snapshot()
+    permissions_invalidated = False
+
+    def check_access():
+        nonlocal permissions_invalidated
+        if clear_journal_path(settings).exists() or generation() != initial_generation:
+            raise ValueError("本地数据已清除或正在清除，请重新连接 MCP 并确认权限。")
+        permissions_invalidated = permissions_invalidated or permission_snapshot() != initial_permissions
+        if permissions_invalidated:
+            raise ValueError("MCP 权限已变更，本次操作未执行。请重新连接 MCP 使用最新权限。")
+
     def guarded_tool(*, name):
         def register(function):
+            def check_table(args, kwargs):
+                if allowed_table_ids is None:
+                    return
+                table_id = signature(function).bind(*args, **kwargs).arguments.get("table_id")
+                if table_id is not None and table_id not in allowed_table_ids:
+                    raise ValueError("该数据表不在 MCP 授权范围内。")
             if iscoroutinefunction(function):
                 @wraps(function)
                 async def guarded_async(*args, **kwargs):
                     with file_operation_lock(settings.storage_dir):
-                        if clear_journal_path(settings).exists() or generation() != initial_generation:
-                            raise ValueError("本地数据已清除或正在清除，请重新连接 MCP 并确认权限。")
+                        check_access()
+                        check_table(args, kwargs)
                         return await function(*args, **kwargs)
                 return server.tool(name=name)(guarded_async)
             @wraps(function)
             def guarded(*args, **kwargs):
                 with file_operation_lock(settings.storage_dir):
-                    if clear_journal_path(settings).exists() or generation() != initial_generation:
-                        raise ValueError("本地数据已清除或正在清除，请重新连接 MCP 并确认权限。")
+                    check_access()
+                    check_table(args, kwargs)
                     return function(*args, **kwargs)
             return server.tool(name=name)(guarded)
         return register
@@ -121,6 +147,8 @@ def create_mcp_server(
             "template_read": template_read_enabled,
             "raw_file_read": False,
             "allowed_file_roots": [str(root) for root in resolved_roots],
+            "data_scope": "all" if allowed_table_ids is None else "selected",
+            "allowed_table_ids": None if allowed_table_ids is None else list(allowed_table_ids),
         }
 
     if task_read_enabled:
@@ -193,7 +221,8 @@ def create_mcp_server(
         def mcp_list_data_tables() -> list[dict[str, object]]:
             """列出原始数据表及其行数，不返回全部行。"""
             with session_factory() as session:
-                return [table.model_dump(mode="json") for table in list_data_tables(session)]
+                return [table.model_dump(mode="json") for table in list_data_tables(session)
+                        if allowed_table_ids is None or table.id in allowed_table_ids]
 
         @guarded_tool(name="get_data_table")
         def mcp_get_data_table(
@@ -409,6 +438,8 @@ def main() -> None:
         template_read_enabled=template_read_enabled,
         result_read_enabled=result_read_enabled,
         data_read_enabled=data_read_enabled,
+        allowed_table_ids=(tuple(item for item in os.getenv("DOCUMENT_PIPELINE_MCP_TABLE_IDS", "").split(os.pathsep) if item)
+                           if os.getenv("DOCUMENT_PIPELINE_MCP_DATA_SCOPE") == "selected" else None),
     )
     server.run(transport="stdio")
 

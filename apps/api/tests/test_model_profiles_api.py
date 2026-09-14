@@ -312,7 +312,8 @@ def test_default_profile_uses_default_context_and_no_temperature(
         created = client.post("/api/v1/models/profiles", json=_profile_body())
         assert created.status_code == 201
         profile = created.json()
-        assert profile["context_length"] == 8192
+        assert profile["context_length"] == 32768
+        assert profile["context_policy"] == "auto"
         assert profile["temperature"] is None
 
 

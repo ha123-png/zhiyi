@@ -42,8 +42,13 @@ def require_integration_read(
 ) -> IntegrationPrincipal:
     settings: Settings = request.app.state.settings
     config = read_integration_config(settings.storage_dir.parent)
-    read_token = config.get("read_token", settings.integration_read_token)
-    write_token = config.get("write_token", settings.integration_write_token)
+    from document_pipeline_api.services.integration_config import integration_config_path
+    managed = getattr(request.app.state, "integration_config_managed", False) or integration_config_path(settings.storage_dir.parent).exists()
+    request.app.state.integration_config_managed = managed
+    # Environment credentials are supported only for never-managed headless use.
+    # Once managed, a missing/revoked credential must never revive a startup copy.
+    read_token = config.get("read_token", "" if managed else settings.integration_read_token)
+    write_token = config.get("write_token", "" if managed else settings.integration_write_token)
     if not read_token and not write_token:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

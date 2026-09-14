@@ -1,4 +1,6 @@
+import { taskDisplayName } from "../taskNames";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useAssistantPageContext } from "../assistant/AssistantProvider";
 import {
   CheckCircle2,
   ChevronDown,
@@ -368,7 +370,7 @@ function mapValidationIssues(extraction: Extraction): ValidationIssue[] {
     return {
       id: issue.code || `v${idx}`,
       row: 0,
-      field: issue.field,
+      field: issue.field.replace(/^header\./, ""),
       msg: issue.message,
       index: idx,
       ignored: issue.ignored === true,
@@ -486,6 +488,7 @@ export function ExtractPage({
   const [tables, setTables] = useState<DataTableRead[]>([]);
   const [targetTableId, setTargetTableId] = useState<string>("");
   const [task, setTask] = useState<Task | null>(null);
+  useAssistantPageContext("extract", { task_id: task?.id ?? null, template_id: task?.template_id ?? null, template_version: task?.template_version ?? null });
   const [extraction, setExtraction] = useState<Extraction | null>(null);
   const [nameChoices, setNameChoices] = useState<Record<string, string>>({});
   const [draftResult, setDraftResult] = useState<ExtractionResult | null>(null);
@@ -716,7 +719,7 @@ export function ExtractPage({
   }, [initialTask, extraction]);
 
   const hasExtractData = extraction !== null && task !== null;
-  const extractedSourceName = task?.filename ?? "";
+  const extractedSourceName = task ? taskDisplayName(task) : "";
   const batchActive = batch.some((b) => BATCH_ACTIVE_STATUSES.has(b.task.status));
   // 批量处理中保留最近完成的结果，下一份完成后再平滑替换；不能因为队列仍活动
   // 就把用户正在核对的结果隐藏掉。
@@ -983,7 +986,7 @@ export function ExtractPage({
     <div className="view">
       <div className="page-header">
         <div className="eyebrow">提取</div>
-        <h1>上传文档</h1>
+        <h1>文件提取</h1>
         <div className="support">
           拖拽或选择文件，AI
           会自动识别内容并提取结构化数据，下方实时显示校验结果。
@@ -1084,7 +1087,7 @@ export function ExtractPage({
           <div className="batch-items">
             {pendingBatch.slice(0, 3).map((b) => (
               <span key={b.task.id} className={`batch-item ${b.task.status}`}>
-                <span className="batch-item-name">{b.task.filename}</span>
+                <span className="batch-item-name">{taskDisplayName(b.task)}</span>
                 <span className="batch-item-status">
                   {b.task.status === "failed" ? "失败" : BATCH_STATUS_LABEL[b.task.status]}
                 </span>
@@ -1395,6 +1398,8 @@ export function ExtractPage({
               >
                 <button
                   className="validation-panel-head"
+                  aria-expanded={validationPanelOpen}
+                  aria-controls="extract-validation-content"
                   onClick={() => setValidationPanelOpen(!validationPanelOpen)}
                 >
                   <Icon
@@ -1419,8 +1424,8 @@ export function ExtractPage({
                     className="validation-caret"
                   />
                 </button>
-                {validationPanelOpen && (
-                  <div className="validation-panel-body">
+                <div className={`collapse${validationPanelOpen ? " open" : ""}`} id="extract-validation-content" inert={!validationPanelOpen} aria-hidden={!validationPanelOpen}>
+                  <div className="collapse-content"><div className="validation-panel-body">
                     {extractValidationIssues.length === 0 ? (
                       <div className="validation-empty">
                         <Icon
@@ -1444,7 +1449,7 @@ export function ExtractPage({
                         <span className="validation-field">
                           {extractedColumns.find(
                             (c) => c.key === issue.field,
-                          )?.label || issue.field}
+                          )?.label || extraction?.template?.fields.find(field => field.key === issue.field)?.label || issue.field}
                         </span>
                         <span className="validation-msg">{issue.msg}</span>
                         {issue.ignored && (
@@ -1477,8 +1482,8 @@ export function ExtractPage({
                         </button>
                       </div>
                     ))}
-                  </div>
-                )}
+                  </div></div>
+                </div>
               </div>
             </div>
           )}

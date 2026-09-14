@@ -1,6 +1,7 @@
 """Validate same-call model naming advice, preserving original file identity."""
 from pathlib import Path
 from datetime import datetime, timezone
+import re
 from typing import Annotated
 from pydantic import BaseModel, ConfigDict, WrapValidator
 
@@ -55,7 +56,7 @@ def confirm_file_name(task: TaskRecord, filename: str | None = None) -> None:
         if filename is not None:
             raise HTTPException(422, "此任务未开启名称建议。")
         return
-    chosen = filename if filename is not None else state.confirmed_filename or task.filename
+    chosen = filename if filename is not None else state.confirmed_filename or state.suggested_filename or task.filename
     try:
         validate_copy_name(chosen)
     except CopyExportError as error:
@@ -71,3 +72,55 @@ def confirm_file_name(task: TaskRecord, filename: str | None = None) -> None:
     if export is not None and export.status not in {"completed", "skipped"}:
         export.confirmed_name = chosen
         task.export_state_json = export.model_dump_json()
+
+
+def automatic_file_name(original: str, decision: object, values: dict) -> FileNameRead:
+    state = model_file_name(original, decision)
+    stem = Path(original).stem
+    opaque = bool(re.search(r"[a-f0-9]{16,}", stem, re.I) or re.fullmatch(r"(?:IMG|DSC|SCAN|PDF|FILE)?[_ -]?\d{4,}", stem, re.I))
+    if opaque and state.suggested_filename == original:
+        header = values.get("header") if isinstance(values.get("header"), dict) else values
+        candidates = [(key, value.strip()) for key, value in header.items()
+                      if isinstance(value, str) and 2 <= len(value.strip()) <= 80
+                      and not re.fullmatch(r"[\d\W_]+", value.strip())
+                      and not re.search(r"[a-f0-9]{16,}", value, re.I)]
+        if candidates:
+            selected = candidates[:2]
+            name = " · ".join(re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value) for _, value in selected)[:100].strip(" .")
+            try:
+                validate_copy_name(name + Path(original).suffix)
+                state.suggested_filename = name + Path(original).suffix
+                state.source_fields = [key for key, _ in selected]
+                state.explanation = "根据已提取内容生成名称，上传原名始终保留。"
+            except CopyExportError:
+                pass
+    state.confirmed_filename = state.suggested_filename
+    state.status = "confirmed"
+    if state.confirmed_filename != original:
+        state.decisions.append(FileNameDecision(before=original, after=state.confirmed_filename, confirmed_at=datetime.now(timezone.utc).isoformat()))
+        state.explanation = "已自动采用内容名称，可直接修改；上传原名始终保留。"
+    return state
+
+
+def adopt_pending_file_names(session) -> int:
+    """Upgrade unaccepted name advice, preserving reviewed names and file bytes."""
+    import json
+    from sqlalchemy import func, select
+    from document_pipeline_api.models import ExtractionRecord
+
+    query = select(TaskRecord, ExtractionRecord.result_json).join(
+        ExtractionRecord, ExtractionRecord.task_id == TaskRecord.id
+    ).where(func.json_extract(TaskRecord.file_name_json, "$.status") == "pending")
+    count = 0
+    for task, saved_result in session.execute(query.execution_options(yield_per=500)):
+        old = task.file_name
+        state = automatic_file_name(task.filename, {
+            "rename": old.suggested_filename != task.filename,
+            "name": old.suggested_filename,
+        }, json.loads(saved_result))
+        task.file_name_json = state.model_dump_json()
+        confirm_file_name(task)
+        count += 1
+    if count:
+        session.commit()
+    return count

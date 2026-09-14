@@ -1,4 +1,6 @@
 import { Disclosure } from "./Disclosure";
+import { useUnsavedChanges } from "../useUnsavedChanges";
+import { useAssistantPageContext } from "../assistant/AssistantProvider";
 import { useEffect, useRef, useState } from "react";
 import {
   Archive,
@@ -73,12 +75,15 @@ const fieldTypeOptions: { value: TemplateField["value_type"]; label: string }[] 
   { value: "boolean", label: "是非" },
 ];
 
-export function TemplatesPage() {
+export function TemplatesPage({ initialTemplateId = null, initialVersion = null, initialDraft = null, onDraftConsumed }: { initialTemplateId?: string | null; initialVersion?: number | null; initialDraft?: TemplateDraft | null; onDraftConsumed?: () => void } = {}) {
+  const appliedReference = useRef("");
+  const handedDraft = useRef(false);
   const [templates, setTemplates] = useState<ExtractionTemplate[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [draft, setDraft] = useState<TemplateDraft>(emptyDraft);
   const [version, setVersion] = useState(0);
-  const savedDraft = useRef<string>("");
+  useAssistantPageContext("templates", { template_id: selectedId || null, template_version: version || null });
+  const savedDraft = useRef<string>(JSON.stringify(emptyDraft));
   const exportSettings = useRef<TemplateExportHandle>(null);
   const [isSystem, setIsSystem] = useState(false);
   const [isActive, setIsActive] = useState(true);
@@ -91,6 +96,7 @@ export function TemplatesPage() {
   const importInput = useRef<HTMLInputElement>(null);
   const [fieldAnnouncement, setFieldAnnouncement] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
+  const unsaved = useUnsavedChanges(() => !saving && ((!isSystem && JSON.stringify(draft) !== savedDraft.current) || Boolean(exportSettings.current?.isDirty())));
 
   const fieldSort = useFieldSort(draft.fields.map(f => `${f.section}:${f.key}`).join("|"), moveField);
 
@@ -127,8 +133,20 @@ export function TemplatesPage() {
   }, [aiOpen, aiProfilesLoaded]);
 
   useEffect(() => {
-    void refreshTemplates();
+    void refreshTemplates(initialTemplateId ?? undefined);
   }, []);
+
+  useEffect(() => {
+    if (initialDraft) {
+      handedDraft.current = true;
+      setSelectedId(""); setVersion(0); setIsSystem(false); setIsActive(true); setIsNew(true);
+      setDraft(initialDraft); savedDraft.current = JSON.stringify({ ...emptyDraft, fields: [] }); setMessage("来自问知意的草稿，尚未保存。请核对字段、规则及文件命名设置。");
+      onDraftConsumed?.();
+    } else if (initialTemplateId && appliedReference.current !== `${initialTemplateId}:${initialVersion}`) {
+      const selected = templates.find(t => t.id === initialTemplateId);
+      if (selected) { selectTemplate(selected); appliedReference.current = `${initialTemplateId}:${initialVersion}`; if (initialVersion) setHistoryOpen(true); }
+    }
+  }, [initialTemplateId, initialVersion, initialDraft, templates]);
 
   // AI 生成中的等待计时（每秒跳动）
   useEffect(() => {
@@ -148,16 +166,18 @@ export function TemplatesPage() {
         next.find((template) => template.id === preferredId)
         ?? next.find((template) => template.id === selectedId)
         ?? next[0];
-      if (selected) {
-        selectTemplate(selected);
+      if (selected && !initialDraft && (!handedDraft.current || preferredId)) {
+        handedDraft.current = false;
+        selectTemplate(selected, saving);
       }
-      setMessage("");
+      if (!handedDraft.current) setMessage("");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "模板读取失败。");
     }
   }
 
-  function selectTemplate(template: ExtractionTemplate) {
+  function selectTemplate(template: ExtractionTemplate, force = false) {
+    if (!force) { unsaved.protect(() => selectTemplate(template, true)); return; }
     setSelectedId(template.id);
     setVersion(template.version);
     setIsSystem(template.is_system);
@@ -169,17 +189,20 @@ export function TemplatesPage() {
     setMessage("");
   }
 
-  function startNew() {
+  function startNew(force = false) {
+    if (!force) { unsaved.protect(() => startNew(true)); return; }
     setSelectedId("");
     setVersion(0);
     setIsSystem(false);
     setIsActive(true);
     setIsNew(true);
-    setDraft({
+    const next = {
       ...emptyDraft,
       fields: [{ ...emptyField, key: `field_${crypto.randomUUID().replaceAll("-", "")}` }],
       output_mapping: {},
-    });
+    };
+    savedDraft.current = JSON.stringify(next);
+    setDraft(next);
     setExpandedField(null);
     setMessage("给模板起个名字，再写下你想从每份文件中得到什么。");
   }
@@ -217,7 +240,7 @@ export function TemplatesPage() {
     try {
       const copied = await copyTemplate(id);
       await refreshTemplates(copied.id);
-      notify("已创建可编辑副本，内置模板保持不变。", "success");
+      notify("已创建可编辑副本。副本默认不参与智能匹配，可在提取页的匹配范围中勾选。", "success");
     } catch (error) {
       notify(error instanceof Error ? error.message : "复制模板失败。", "error");
     } finally {
@@ -355,7 +378,7 @@ export function TemplatesPage() {
   /** 内置模板占用"发票/送货单"等常用名：AI 生成名撞名时自动追加后缀，保证保存总能成功。 */
   function uniqueTemplateName(base: string): string {
     const names = new Set(
-      templates.filter((t) => t.is_active !== false).map((t) => t.name),
+      templates.map((t) => t.name),
     );
     if (!names.has(base)) return base;
     let candidate = `${base}（AI 生成）`;
@@ -418,6 +441,10 @@ export function TemplatesPage() {
   }
 
   async function handleSave() {
+    if (isNew && templates.some(t => t.name.trim() === draft.name.trim())) {
+      notify("已有同名模板，请修改名称后创建。原模板不会被覆盖。", "error");
+      return;
+    }
     setSaving(true);
     try {
       let savedId = selectedId;
@@ -530,6 +557,7 @@ export function TemplatesPage() {
 
   return (
     <section className="templates-view">
+      {unsaved.dialog}
       <header className="page-header">
         <span className="eyebrow">配置</span>
         <h1>模板管理</h1>
@@ -566,7 +594,7 @@ export function TemplatesPage() {
             <button
               className="btn secondary sm"
               disabled={saving}
-              onClick={startNew}
+              onClick={() => startNew()}
               type="button"
             >
               <Icon icon={Plus} size={13} />
@@ -755,6 +783,9 @@ export function TemplatesPage() {
               placeholder="例如：门店送货单"
               value={draft.name}
             />
+            {isNew && templates.some(t => t.name.trim() === draft.name.trim()) && <p className="field-hint" role="status">
+              已有同名模板。<button type="button" onClick={() => setDraft(current => ({ ...current, name: uniqueTemplateName(current.name.trim()) }))}>使用名称“{uniqueTemplateName(draft.name.trim())}”</button>
+            </p>}
           </div>
 
           <div className="form-field tpl-desc-field">
@@ -844,6 +875,8 @@ export function TemplatesPage() {
                     <div style={{ display: "flex", gap: 2, justifyContent: "flex-end" }}>
                       <button
                         aria-label={expanded ? "收起示例" : "展开示例"}
+                        aria-expanded={expanded}
+                        aria-controls={`template-field-detail-${index}`}
                         className="tpl-act-btn"
                         onClick={() => setExpandedField(expanded ? null : index)}
                         title={expanded ? "收起" : "示例与说明"}
@@ -854,7 +887,7 @@ export function TemplatesPage() {
                           size={14}
                           style={{
                             transform: expanded ? "rotate(90deg)" : "none",
-                            transition: "transform var(--dur-fast) var(--ease-out)",
+                            transition: "transform var(--dur-fold) var(--ease-fold)",
                           }}
                         />
                       </button>
@@ -871,8 +904,8 @@ export function TemplatesPage() {
                       ) : null}
                     </div>
                   </div>
-                  {expanded ? (
-                    <div className="field-row-sub">
+                  <div className={`collapse${expanded ? " open" : ""}`} id={`template-field-detail-${index}`} inert={!expanded} aria-hidden={!expanded}>
+                    <div className="collapse-content"><div className="field-row-sub">
                       <div className="form-field">
                         <label className="form-label" htmlFor={`field-example-${index}`}>示例（可选）</label>
                         <input
@@ -899,8 +932,8 @@ export function TemplatesPage() {
                           value={field.instructions}
                         />
                       </div>
-                    </div>
-                  ) : null}
+                    </div></div>
+                  </div>
                 </div>
               );
             })}
@@ -1314,7 +1347,7 @@ export function TemplatesPage() {
         </div>
       ) : null}
       <Toast toast={toast} onDismiss={clear} />
-      {historyOpen && templates.find(t => t.id === selectedId) && <TemplateHistory current={templates.find(t => t.id === selectedId)!}
+      {historyOpen && templates.find(t => t.id === selectedId) && <TemplateHistory current={templates.find(t => t.id === selectedId)!} initialVersion={selectedId === initialTemplateId ? initialVersion : null}
         dirty={JSON.stringify(draft) !== savedDraft.current} onClose={() => setHistoryOpen(false)}
         onRestored={restored => { setHistoryOpen(false); setTemplates(items => items.map(t => t.id === restored.id ? restored : t)); selectTemplate(restored); notify(`已将第 ${restored.version} 版设为当前版本。`, "success"); }} />}
     </section>

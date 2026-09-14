@@ -434,6 +434,8 @@ def test_smart_match_uses_custom_template_schema_and_version(tmp_path: Path) -> 
 
     with Session(engine) as session:
         template = create_template(session, _custom_template())
+        from document_pipeline_api.services.templates import set_smart_pool
+        set_smart_pool(session, template.id, True)
         task = _add_task(session, image, "smart-custom")
 
         extraction = process_task(
@@ -496,6 +498,8 @@ def test_ambiguous_match_persists_versioned_candidates(tmp_path: Path) -> None:
 
     with Session(engine) as session:
         custom = create_template(session, _custom_template())
+        from document_pipeline_api.services.templates import set_smart_pool
+        set_smart_pool(session, custom.id, True)
         task = _add_task(session, image, "smart-ambiguous")
 
         result = process_task(

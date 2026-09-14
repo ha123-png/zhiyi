@@ -13,7 +13,7 @@ class ModelProfileBody(BaseModel):
     model_name: str = Field(min_length=1, max_length=128)
     reasoning_effort: str | None = Field(default=None, max_length=32)
     timeout_seconds: float = Field(default=180, ge=1, le=3600)
-    context_length: int = Field(default=8192, ge=1024, le=262144)
+    context_length: int | None = Field(default=None, ge=1024, le=2_000_000)
     temperature: float | None = Field(default=None, ge=0, le=2)
     # None=未验证；True=支持图片；False=仅文本。仅文本方案处理图片输入时任务直接失败。
     multimodal: bool | None = Field(default=None)
@@ -55,6 +55,7 @@ class ModelProfileRead(BaseModel):
     reasoning_effort: str | None
     timeout_seconds: float
     context_length: int
+    context_policy: Literal["auto", "fixed"] = "fixed"
     temperature: float | None
     multimodal: bool | None
     has_api_key: bool

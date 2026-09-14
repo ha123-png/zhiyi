@@ -49,6 +49,7 @@ class ModelProfileVersionRecord(Base):
     reasoning_effort: Mapped[str | None] = mapped_column(String(32), nullable=True)
     timeout_seconds: Mapped[float] = mapped_column(Float)
     context_length: Mapped[int] = mapped_column(Integer, default=8192)
+    context_policy: Mapped[str] = mapped_column(String(16), default="fixed", server_default="fixed")
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
     secret_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
     is_remote: Mapped[bool] = mapped_column(Boolean, default=False)

@@ -80,7 +80,7 @@
 .presentation-card .datastore-split .data-table-scroll { flex:1; min-height:250px; height:auto; overflow:auto; }
 .presentation-card .table-footer { flex:none; }
 .disclosure-trigger { display:flex; align-items:center; justify-content:space-between; gap:12px; width:100%; border:0; background:none; color:var(--color-text); padding:12px 0; text-align:left; font:inherit; font-size:var(--text-label); font-weight:500; cursor:pointer; }
-.disclosure-arrow { flex:none; transition:transform 200ms var(--ease-out); }
+.disclosure-arrow { flex:none; transition:transform var(--dur-fold, 180ms) var(--ease-fold, ease); }
 .disclosure-arrow.open { transform:rotate(180deg); }
 .disclosure-body { padding:8px 0 4px; }
 .processing-details > .collapse > .collapse-content > .disclosure-body { padding:4px 0 4px 16px; }

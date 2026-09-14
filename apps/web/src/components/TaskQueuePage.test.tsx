@@ -142,7 +142,7 @@ describe("TaskQueuePage", () => {
     render(<TaskQueuePage />);
 
     expect(await screen.findByText("f1.png")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "全部重试" }));
+    fireEvent.click(screen.getByRole("button", { name: "重试本页" }));
 
     await waitFor(() => {
       expect(

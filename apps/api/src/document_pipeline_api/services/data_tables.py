@@ -550,7 +550,7 @@ def export_data_table(session: Session, table_id: str) -> StreamingResponse:
         raise HTTPException(status_code=404, detail="没有找到这个数据表。")
     workbook = Workbook()
     sheet = workbook.active
-    sheet.title = table.name[:31]
+    sheet.title = _unique_sheet_name(table.name, set())
     keys, labels = _export_columns(session, table)
     from document_pipeline_api.services.export_scope import WorkbookInputScopes
     scopes = WorkbookInputScopes()
@@ -559,6 +559,7 @@ def export_data_table(session: Session, table_id: str) -> StreamingResponse:
     header_fill = PatternFill("solid", fgColor="F0FDF4")
     for index, key in enumerate(keys, start=1):
         cell = sheet.cell(row=1, column=index, value=labels[key])
+        cell.data_type = "s"
         cell.font = Font(bold=True, color="065F46")
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
@@ -692,6 +693,7 @@ def _populate_export_sheet(sheet, rows, keys, labels, column_defs, scopes) -> No
     header_fill = PatternFill("solid", fgColor="F0FDF4")
     for index, key in enumerate(keys, start=1):
         cell = sheet.cell(row=1, column=index, value=labels[key])
+        cell.data_type = "s"
         cell.font = Font(bold=True, color="065F46")
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
@@ -1301,7 +1303,7 @@ def export_data_table_csv(session: Session, table_id: str) -> StreamingResponse:
         output.write(line.getvalue().encode("utf-8"))
 
     output.write(b"\xef\xbb\xbf")
-    write_csv_row([labels[key] for key in keys] + ([SCOPE_LABEL] if scoped else []) + ([REVIEW_LABEL] if pending else []))
+    write_csv_row([_csv_safe(labels[key]) for key in keys] + ([SCOPE_LABEL] if scoped else []) + ([REVIEW_LABEL] if pending else []))
     row_jsons = session.scalars(
         select(DataRowRecord)
         .where(DataRowRecord.table_id == table_id)

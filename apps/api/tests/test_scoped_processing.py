@@ -158,6 +158,8 @@ def test_global_scope_policy_snapshot_review_and_original_survive(client):
 def test_smart_ambiguity_records_match_range_without_formal_extraction(client):
     first = template(client, complete=False, name="报告概览")
     second = template(client, complete=False, name="笔记概览")
+    for candidate in (first, second):
+        assert client.put(f"/api/v1/templates/{candidate['id']}/smart-pool", json={"in_smart_pool": True}).status_code == 200
     limited(client)
     task = client.post("/api/v1/tasks", files={"file": ("smart.txt", LONG_TEXT, "text/plain")}).json()
     model = TextModel([first["id"], second["id"]])

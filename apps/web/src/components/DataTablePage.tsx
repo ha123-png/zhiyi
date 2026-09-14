@@ -1,3 +1,5 @@
+import { useAssistantPageContext } from "../assistant/AssistantProvider";
+import { assistantApi } from "../assistant/api";
 import {
   useEffect,
   useMemo,
@@ -97,6 +99,7 @@ function getCellValue(row: DataRowRead, colKey: string): string {
 }
 
 interface DataTablePageProps {
+  initialRowId?: number | null;
   initialTemplateId?: string | null;
   initialTableId?: string | null;
   jumpNotice?: string | null;
@@ -105,6 +108,7 @@ interface DataTablePageProps {
 }
 
 export function DataTablePage({
+  initialRowId = null,
   initialTemplateId = null,
   initialTableId = null,
   jumpNotice = null,
@@ -142,6 +146,16 @@ export function DataTablePage({
   const [jumpPageInput, setJumpPageInput] = useState("");
   const [searchText, setSearchText] = useState("");
   const [reloadTrigger, setReloadTrigger] = useState(0);
+  useEffect(() => {
+    const changed = (event: Event) => {
+      if ((event as CustomEvent<{ table_id?: string }>).detail?.table_id === currentTableId) {
+        setReloadTrigger(n => n + 1);
+        setTableNotice("问知意已执行确认的修改，当前数据已刷新；历史分析仍保留原快照。");
+      }
+    };
+    window.addEventListener("zhiyi:assistant-changed", changed);
+    return () => window.removeEventListener("zhiyi:assistant-changed", changed);
+  }, [currentTableId]);
   const [views, setViews] = useState<DataViewRead[]>([]);
   const [currentViewId, setCurrentViewId] = useState<string | null>(null);
   const [splitFieldKey, setSplitFieldKey] = useState("");
@@ -150,6 +164,7 @@ export function DataTablePage({
 
   const [hiddenCols, setHiddenCols] = useState<string[]>([]);
   const [selectedRows, setSelectedRows] = useState<number[]>([]);
+  useAssistantPageContext("tables", { table_id: currentTableId, table_name: tableDetail?.name, row_ids: selectedRows.length ? selectedRows : null, view_id: currentViewId, search: searchText });
   const [editingCell, setEditingCell] = useState<string | null>(null);
   const [mergeSelection, setMergeSelection] = useState<string[]>([]);
   const [mergeName, setMergeName] = useState("");
@@ -210,6 +225,14 @@ export function DataTablePage({
   const [cardCapacity, setCardCapacity] = useState(2);
   const cardCapacityRef = useRef(2);
   const pageSize = presentationMode === "card" ? cardCapacity : TABLE_PAGE_SIZE;
+  useEffect(() => {
+    if (!initialRowId || !currentTableId || currentTableId !== initialTableId) return;
+    let cancelled = false;
+    void assistantApi<{ page: number }>(`/references/tables/${encodeURIComponent(currentTableId)}/rows/${initialRowId}?page_size=${pageSize}`).then(result => {
+      if (!cancelled) { setCurrentViewId(null); setSearchText(""); setPage(result.page); setSelectedRows([initialRowId]); }
+    }).catch(error => { if (!cancelled) setTableNotice(error.message); });
+    return () => { cancelled = true; };
+  }, [initialRowId, currentTableId, initialTableId, pageSize]);
   useEffect(() => {
     const area = cardArea.current;
     if (presentationMode !== "card" || !area || typeof ResizeObserver === "undefined") return;
@@ -944,7 +967,7 @@ export function DataTablePage({
                     <Icon icon={ChevronDown} size={16} />
                     <span className="sheet-tree-group-label">原始记录</span>
                   </button>
-                  <div className={`sheet-tree-group-body${treeGroupsOpen.records ? " open" : ""}`}>
+                  <div className={`sheet-tree-group-body${treeGroupsOpen.records ? " open" : ""}`} inert={!treeGroupsOpen.records} aria-hidden={!treeGroupsOpen.records}>
                     <div className="sheet-tree-group-inner">
                   {tables.length === 0 && (
                     <div className="sheet-tree-empty">暂无数据表，先处理文件或新建表</div>
@@ -973,7 +996,7 @@ export function DataTablePage({
                     <Icon icon={ChevronDown} size={16} />
                     <span className="sheet-tree-group-label">{presentationMode === "card" ? "内容分组" : "分 Sheet 视图"}</span>
                   </button>
-                  <div className={`sheet-tree-group-body${treeGroupsOpen.views ? " open" : ""}`}>
+                  <div className={`sheet-tree-group-body${treeGroupsOpen.views ? " open" : ""}`} inert={!treeGroupsOpen.views} aria-hidden={!treeGroupsOpen.views}>
                     <div className="sheet-tree-group-inner">
                   {currentTableId && views.length > 0 ? (
                     views.map((view) => (
@@ -1116,7 +1139,7 @@ export function DataTablePage({
                 </div>
               </div>
               {rows.some((row) => row.review_pending) && (
-                <details className="support" style={{ padding: "8px 16px", color: "var(--warning-text)", overflowWrap: "anywhere" }}>
+                <details className="support data-source-details" style={{ padding: "8px 16px", color: "var(--warning-text)", overflowWrap: "anywhere" }}>
                   <summary>本页有 {rows.filter((row) => row.review_pending).length} 条来源待核对的数据</summary>
                   <p>请在文件历史中处理来源任务的校验提示。直接编辑表格不会重新执行提取校验；导出会保留待核对标记。</p>
                   {rows.filter((row, index) => row.review_pending && !rows.slice(0, index).some((previous) => previous.review_pending &&
@@ -1125,7 +1148,7 @@ export function DataTablePage({
                 </details>
               )}
               {presentationMode === "table" && rows.some((row) => row.input_scope?.coverage === "partial") && (
-                <details className="support" style={{ padding: "8px 16px", overflowWrap: "anywhere" }}>
+                <details className="support data-source-details" style={{ padding: "8px 16px", overflowWrap: "anywhere" }}>
                   <summary>本页有局部读取的数据 · 查看来源范围</summary>
                   <p>这些结果只基于文件的部分内容，不能代表全文或全部明细。修改表中数据不会改变当时的读取范围。</p>
                   {rows.filter((row, index) => row.input_scope?.coverage === "partial" && !rows.slice(0, index).some((previous) =>

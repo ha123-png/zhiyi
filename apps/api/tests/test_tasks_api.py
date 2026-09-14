@@ -1322,11 +1322,11 @@ def test_tasks_summary_counts_by_status(client: TestClient) -> None:
         session.commit()
 
     summary = client.get("/api/v1/tasks/summary").json()
-    assert summary == {"total": 5, "completed": 2, "needs_review": 1, "failed": 1, "active": 2, "waiting_for_action": 0, "pending_exports": 0}
+    assert summary == {"total": 5, "completed": 2, "needs_review": 1, "failed": 1, "active": 2, "waiting_for_action": 0, "pending_exports": 0, "cancelled": 0}
 
     # 带文件名筛选：只统计命中子集（c1/c2 文件名含 "c"）
     filtered = client.get("/api/v1/tasks/summary", params={"search": "c"}).json()
-    assert filtered == {"total": 2, "completed": 2, "needs_review": 0, "failed": 0, "active": 0, "waiting_for_action": 0, "pending_exports": 0}
+    assert filtered == {"total": 2, "completed": 2, "needs_review": 0, "failed": 0, "active": 0, "waiting_for_action": 0, "pending_exports": 0, "cancelled": 0}
 
 
 def test_summary_counts_copy_actions_beyond_list_limit_and_excludes_model_failures(client: TestClient) -> None:

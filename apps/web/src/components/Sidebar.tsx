@@ -1,5 +1,6 @@
 import {
   Activity,
+  MessageCircle,
   Braces,
   Database,
   DatabaseBackup,
@@ -29,14 +30,14 @@ interface NavItem {
   caption: string;
 }
 
-// 与设计稿一致（已删除「分析」「AI 助手」）
 const navigation: NavItem[] = [
   { key: "workspace", label: "状态监控", icon: Activity, caption: "任务" },
   { key: "dashboard", label: "仪表盘", icon: LayoutGrid, caption: "概览" },
-  { key: "extract", label: "提取", ariaLabel: "提取工作台", icon: Upload, caption: "上传" },
+  { key: "extract", label: "文件提取", icon: Upload, caption: "上传" },
   { key: "tables", label: "数据仓库", icon: Database, caption: "" },
   { key: "history", label: "文件历史", icon: History, caption: "" },
   { key: "templates", label: "模板", icon: FileText, caption: "" },
+  { key: "assistant", label: "问知意", icon: MessageCircle, caption: "对话" },
   { key: "backups", label: "备份", caption: "数据安全", icon: DatabaseBackup },
   { key: "connections", label: "接口", icon: Braces, caption: "API" },
   { key: "guide", label: "使用说明", icon: CircleHelp, caption: "帮助" },

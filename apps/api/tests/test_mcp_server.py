@@ -5,6 +5,61 @@ import pytest
 
 from document_pipeline_api.config import Settings
 from document_pipeline_api.mcp_server import create_mcp_server
+from document_pipeline_api.services.integration_config import write_integration_config
+
+
+@pytest.mark.parametrize("change", [
+    {"mcp_data_read": False},
+    {"mcp_file_roots": ["D:/narrow"]},
+])
+def test_connected_mcp_rejects_permission_changes(tmp_path: Path, change) -> None:
+    write_integration_config(tmp_path, {"mcp_data_read": True, "mcp_file_roots": ["D:/wide"]})
+    server = create_mcp_server(_settings(tmp_path), data_read_enabled=True)
+    asyncio.run(server.call_tool("list_data_tables", {}))
+    write_integration_config(tmp_path, change)
+    with pytest.raises(Exception, match="权限已变更"):
+        asyncio.run(server.call_tool("list_data_tables", {}))
+    # Once invalidated, restoring the old settings does not revive old closures.
+    write_integration_config(tmp_path, {"mcp_data_read": True, "mcp_file_roots": ["D:/wide"]})
+    with pytest.raises(Exception, match="权限已变更"):
+        asyncio.run(server.call_tool("list_data_tables", {}))
+
+
+def test_http_key_rotation_does_not_invalidate_mcp(tmp_path: Path) -> None:
+    server = create_mcp_server(_settings(tmp_path), data_read_enabled=True)
+    write_integration_config(tmp_path, {"read_token": "synthetic-rotated-token"})
+    asyncio.run(server.call_tool("list_data_tables", {}))
+
+
+@pytest.mark.parametrize("name,arguments", [
+    ("get_data_table", {"table_id": "private"}),
+    ("aggregate_data_table", {"table_id": "private"}),
+    ("list_data_views", {"table_id": "private"}),
+    ("get_data_view", {"table_id": "private", "view_id": "v"}),
+    ("update_data_row", {"table_id": "private", "row_id": 1, "expected_version": 1, "changes": {"amount": 9}}),
+    ("export_data_table", {"table_id": "private", "output_path": "unused.csv"}),
+])
+def test_mcp_table_scope_covers_every_data_path(tmp_path: Path, name: str, arguments: dict) -> None:
+    server = create_mcp_server(_settings(tmp_path), data_read_enabled=True, write_enabled=True,
+        file_access_enabled=True, allowed_file_roots=(tmp_path,), allowed_table_ids=("allowed",))
+    with pytest.raises(Exception, match="授权范围"):
+        asyncio.run(server.call_tool(name, arguments))
+    assert not (tmp_path / "unused.csv").exists()
+
+
+def test_empty_selected_scope_does_not_mean_all_tables(tmp_path: Path) -> None:
+    from sqlalchemy.orm import Session
+    from document_pipeline_api.db import build_engine
+    from document_pipeline_api.models.data_table import DataTableRecord
+    settings = _settings(tmp_path)
+    server = create_mcp_server(settings, data_read_enabled=True, allowed_table_ids=())
+    with Session(build_engine(settings.database_url)) as session:
+        session.add(DataTableRecord(id="private", name="private", template_key="private", template_version="1", document_kind="manual"))
+        session.commit()
+    result = asyncio.run(server.call_tool("list_data_tables", {}))
+    assert "private" not in str(result)
+    with pytest.raises(Exception, match="授权范围"):
+        asyncio.run(server.call_tool("get_data_table", {"table_id": "private"}))
 
 
 def _settings(tmp_path: Path) -> Settings:

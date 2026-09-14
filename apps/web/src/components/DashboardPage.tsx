@@ -1,498 +1,119 @@
-import { useEffect, useRef, useState } from "react";
-import {
-  ArrowRight,
-  CircleX,
-  Database,
-  FileText,
-  Info,
-  Loader2,
-  Timer,
-} from "lucide-react";
-import { getDashboardSummary, getDashboardTrend, getTables, getTaskSummary } from "../api";
-import { parseServerTime, serverDate } from "../time";
-import type { DashboardSummary, DataTableRead, TaskSummary, TrendPoint } from "../types";
+import { useEffect, useMemo, useState } from "react";
+import { ArrowRight, Check, Database, FileText, Layers, Loader2, Plus, RotateCw, TrendingUp } from "lucide-react";
+import { getDashboardSummary, getDashboardTrend, getTables, getTaskSummary, subscribeTaskEvents } from "../api";
+import type { DashboardRange, DashboardSummary, DataTableRead, TaskSummary, TrendPoint } from "../types";
+import { Fold } from "../assistant/Interaction";
+import { dashboardApi } from "../dashboard/api";
+import { AnimatedNumber, DashboardChart, formatNumber } from "../dashboard/DashboardChart";
+import { StatisticCard } from "../dashboard/StatisticCard";
+import { StatisticDialog } from "../dashboard/StatisticDialog";
+import type { DashboardOverview, Statistic } from "../dashboard/types";
 import { Icon } from "./Icon";
+import "./dashboard.css";
 
-function formatDateLocal(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
+type Destination = "tables" | "workspace" | "history" | "templates" | "backups" | "extract";
+const ranges: Record<DashboardRange, string> = { 1: "今日", 7: "近 7 天", 30: "近 30 天", 90: "近 90 天", all: "全部" };
+const rangeDescription = (range: DashboardRange) => range === "all" ? "全部保留历史" : ranges[range];
+const bucketDescription = (bucket = "day", interval = 1) => bucket === "year" && interval > 1 ? `每 ${interval} 年` : ({ day: "按日", month: "按月", year: "按年" }[bucket] ?? "按日");
+const purposeNames: Record<string, string> = { extraction: "文件提取", matching: "智能匹配", template_generation: "模板生成", assistant: "问知意" };
 
-function formatRelativeTime(iso: string): string {
-  const then = parseServerTime(iso);
-  if (Number.isNaN(then)) return "—";
-  const diffMs = Date.now() - then;
-  if (diffMs < 0) return "刚刚";
-  const diffMin = Math.floor(diffMs / 60000);
-  if (diffMin < 1) return "刚刚";
-  if (diffMin < 60) return `${diffMin} 分钟前`;
-  const diffHr = Math.floor(diffMin / 60);
-  if (diffHr < 24) return `${diffHr} 小时前`;
-  const diffDay = Math.floor(diffHr / 24);
-  return `${diffDay} 天前`;
-}
-
-const WEEKDAY_LABELS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
-
-/** 数字平滑过渡：目标值变化时从当前值 easeOut 缓动到新值（rAF 驱动）。 */
-function useAnimatedNumber(target: number, duration = 450): number {
-  const [display, setDisplay] = useState(target);
-  const valueRef = useRef(target);
-  const rafRef = useRef(0);
-
-  useEffect(() => {
-    const from = valueRef.current;
-    if (from === target) return;
-    const start = performance.now();
-    const tick = (now: number) => {
-      const t = Math.min(1, (now - start) / duration);
-      const eased = 1 - Math.pow(1 - t, 3); // easeOutCubic
-      const value = from + (target - from) * eased;
-      valueRef.current = value;
-      setDisplay(value);
-      if (t < 1) rafRef.current = requestAnimationFrame(tick);
-    };
-    rafRef.current = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [target, duration]);
-
-  return display;
-}
-
-function AnimatedNumber({
-  value,
-  format,
-}: {
-  value: number;
-  format?: (n: number) => string;
-}) {
-  const display = useAnimatedNumber(value);
-  return <>{format ? format(display) : Math.round(display)}</>;
-}
-
-export function DashboardPage({ onNavigate }: { onNavigate?: (page: "tables") => void } = {}) {
-  const [dashRange, setDashRange] = useState("week");
-  const [kpiTipOpen, setKpiTipOpen] = useState(false);
-  // 任务统计走聚合接口（ISSUE-067）：不拉全量任务表到前端内存
-  const [taskSummary, setTaskSummary] = useState<TaskSummary | null>(null);
-  const [trend, setTrend] = useState<TrendPoint[]>([]);
-  const [tables, setTables] = useState<DataTableRead[]>([]);
-  const [summary, setSummary] = useState<DashboardSummary | null>(null);
+export function DashboardPage({ onNavigate, onOpenTable, onReview }: { onNavigate?: (page: Destination) => void; onOpenTable?: (id: string) => void; onReview?: () => void } = {}) {
+  const [days, setDays] = useState<DashboardRange>(7);
+  const [reload, setReload] = useState(0);
+  const [data, setData] = useState<{ tasks: TaskSummary; tables: DataTableRead[]; stats: DashboardSummary; trend: TrendPoint[]; days: DashboardRange } | null>(null);
+  const [overview, setOverview] = useState<{ data: DashboardOverview; days: DashboardRange } | null>(null);
+  const [overviewError, setOverviewError] = useState("");
+  const [cards, setCards] = useState<Statistic[]>([]);
+  const [limit, setLimit] = useState(4);
+  const [cardsError, setCardsError] = useState("");
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const rangeDays =
-    dashRange === "today" ? 1 :
-    dashRange === "month" ? 30 :
-    dashRange === "quarter" ? 90 : 7;
-  const rangeLabel =
-    dashRange === "today" ? "今日" :
-    dashRange === "month" ? "近 30 天" :
-    dashRange === "quarter" ? "近 90 天" : "近 7 天";
-
+  const [error, setError] = useState("");
+  const [editing, setEditing] = useState<Statistic | "new" | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
+  const [mutating, setMutating] = useState(false);
+  const [chartView, setChartView] = useState<"files" | "rows">("files");
+  const [notice, setNotice] = useState("");
   useEffect(() => {
-    setLoading(true);
-    Promise.all([
-      getTaskSummary(),
-      getTables(),
-      getDashboardSummary(),
-      getDashboardTrend(rangeDays),
-    ])
-      .then(([summaryAll, tableList, stats, trendData]) => {
-        setTaskSummary(summaryAll);
-        setTables(tableList);
-        setSummary(stats);
-        setTrend(trendData);
-      })
-      .catch((err) =>
-        setError(err instanceof Error ? err.message : "加载失败"),
-      )
-      .finally(() => setLoading(false));
-  }, [rangeDays]);
-
-  const totalFiles = taskSummary?.total ?? 0;
-  const extractedRows = tables.reduce((sum, t) => sum + t.row_count, 0);
-  // 切换时间范围时保留旧内容直接做动画，不闪整页加载圈（仅首次加载显示）
-  const hasData = summary !== null || taskSummary !== null;
-
-  const rangeStart = new Date();
-  rangeStart.setDate(rangeStart.getDate() - (rangeDays - 1));
-  const inRange = (iso: string) => serverDate(iso) >= rangeStart;
-  // 范围统计直接来自按天聚合，不再内存过滤全量任务
-  const rangeProcessed = trend.reduce((sum, p) => sum + p.total, 0);
-  const rangeSuccess = trend.reduce((sum, p) => sum + p.completed, 0);
-  const rangeFailed = trend.reduce((sum, p) => sum + p.failed, 0);
-  const rangeNewRecords = tables
-    .filter((t) => inRange(t.created_at))
-    .reduce((sum, t) => sum + t.row_count, 0);
-
-  // 趋势图数据：后端已按服务器本地时区切天（与前端展示一致）
-  const trendDays: Date[] = trend.map((p) => serverDate(p.date));
-  const trendCounts = trend.map((p) => p.total);
-  const trendTotal = trendCounts.reduce((sum, c) => sum + c, 0);
-  const maxCount = Math.max(...trendCounts, 1);
-  const trendPoints = trendCounts
-    .map((count, i) => {
-      const x =
-        trendDays.length === 1
-          ? 0
-          : Math.round((i * 700) / (trendDays.length - 1));
-      const y = Math.round(160 - (count / maxCount) * 120);
-      return `${x},${y}`;
-    })
-    .join(" ");
-  const trendPolygonPoints = `${trendPoints} 700,200 0,200`;
-
-  return (
-    <div className="view">
-      <div className="page-header">
-        <div className="eyebrow">概览</div>
-        <h1>数据仪表盘</h1>
-        <div className="support">文件处理、提取质量与数据仓库的全局视图。</div>
-        <div className="dash-filter-bar">
-          <span className="dash-filter-label">时间范围</span>
-          <select
-            aria-label="时间范围"
-            className="dash-filter-select"
-            value={dashRange}
-            onChange={(e) => setDashRange(e.target.value)}
-          >
-            <option value="today">今日</option>
-            <option value="week">本周</option>
-            <option value="month">本月</option>
-            <option value="quarter">本季</option>
-          </select>
-        </div>
+    let current = true;
+    setLoading(true); setError("");
+    Promise.all([getTaskSummary(), getTables(), getDashboardSummary(days), getDashboardTrend(days)])
+      .then(([tasks, tables, stats, trend]) => { if (current) setData({ tasks, tables, stats, trend, days }); })
+      .catch(cause => { if (current) setError(cause instanceof Error ? cause.message : "统计加载失败，请重试。"); })
+      .finally(() => { if (current) setLoading(false); });
+    setOverviewError("");
+    dashboardApi.overview(days).then(value => { if (current) setOverview({ data: value, days }); }).catch(cause => { if (current) setOverviewError(cause.message); });
+    return () => { current = false; };
+  }, [days, reload]);
+  useEffect(() => {
+    let current = true;
+    dashboardApi.cards().then(value => { if (current) { setCards(value.items); setLimit(value.limit); setCardsError(""); } }).catch(cause => { if (current) setCardsError(cause.message); });
+    return () => { current = false; };
+  }, [reload]);
+  useEffect(() => {
+    let timer = 0;
+    const refresh = () => {
+      window.clearTimeout(timer);
+      if (!document.hidden) timer = window.setTimeout(() => setReload(value => value + 1), 350);
+    };
+    const unsubscribe = subscribeTaskEvents(refresh);
+    window.addEventListener("zhiyi:assistant-changed", refresh);
+    window.addEventListener("zhiyi:statistics-changed", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    const interval = window.setInterval(refresh, 30000);
+    return () => { unsubscribe(); window.clearTimeout(timer); window.clearInterval(interval); window.removeEventListener("zhiyi:assistant-changed", refresh); window.removeEventListener("zhiyi:statistics-changed", refresh); document.removeEventListener("visibilitychange", refresh); };
+  }, []);
+  const stats = data?.stats;
+  const tasks = data?.tasks;
+  const fileData = useMemo(() => (data?.trend ?? []).map(point => ({ label: point.label || point.date, value: point.total })), [data?.trend]);
+  const rowData = useMemo(() => (overview?.data.rows_trend ?? []).map(point => ({ label: point.label || point.date, value: point.count })), [overview?.data.rows_trend]);
+  const composition = useMemo(() => {
+    const sorted = [...(data?.tables ?? [])].filter(table => table.row_count > 0).sort((a, b) => b.row_count - a.row_count);
+    return [...sorted.slice(0, 4).map(table => ({ label: table.name, value: table.row_count })), ...(sorted.length > 4 ? [{ label: "其他数据表", value: sorted.slice(4).reduce((sum, table) => sum + table.row_count, 0) }] : [])];
+  }, [data?.tables]);
+  const received = fileData.reduce((sum, item) => sum + item.value, 0);
+  const usage = overview?.data.model_usage;
+  async function removeCard(id: string) {
+    setMutating(true); setCardsError("");
+    try { await dashboardApi.remove(id); setDeleting(null); setNotice("已删除统计，原表数据保留。"); setReload(value => value + 1); }
+    catch (cause) { setCardsError(cause instanceof Error ? cause.message : "删除失败，请重试。"); }
+    finally { setMutating(false); }
+  }
+  async function moveCard(index: number, direction: number) {
+    if (mutating || index + direction < 0 || index + direction >= cards.length) return;
+    const reordered = cards.map(card => card.id);
+    [reordered[index], reordered[index + direction]] = [reordered[index + direction], reordered[index]];
+    setMutating(true); setCardsError("");
+    try { await dashboardApi.order(reordered); setReload(value => value + 1); }
+    catch (cause) { setCardsError(cause instanceof Error ? cause.message : "排序失败，请重试。"); }
+    finally { setMutating(false); }
+  }
+  return <div className="view dashboard-page">
+    <div className="page-header"><div className="eyebrow">概览</div><h1>数据仪表盘</h1><div className="support">从文件到数据，看见每一次积累。</div></div>
+    <div className="dashboard-toolbar"><div className="dashboard-range-control"><label htmlFor="dashboard-range">时间范围</label><select id="dashboard-range" className="form-select" value={days} onChange={event => setDays(event.target.value === "all" ? "all" : Number(event.target.value))}>{Object.entries(ranges).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></div><button className="btn secondary xs" disabled={loading} onClick={() => setReload(value => value + 1)}><RotateCw size={13} className={loading ? "spin" : ""} />刷新</button></div>
+    {error && <div className="callout danger" role="alert">{error}<button className="btn secondary xs" onClick={() => setReload(value => value + 1)}>重新加载</button></div>}
+    {!data && loading ? <div className="dashboard-panel dashboard-loading"><Loader2 size={20} className="spin" />正在读取统计</div> : data && <>
+      <section className="dashboard-metrics" aria-label="数据概览" aria-busy={loading}>
+        {[
+          { label: "文件任务", value: tasks?.total, hint: "当前保留", icon: FileText, page: "history" as const },
+          { label: "数据记录", value: stats?.row_count, hint: `当前 · ${formatNumber(stats?.table_count)} 张表`, icon: Database, page: "tables" as const },
+          { label: "可用模板", value: stats?.template_count, hint: "当前启用", icon: Layers, page: "templates" as const },
+          { label: "新增记录", value: stats?.new_rows, hint: rangeDescription(data.days), icon: TrendingUp, page: "tables" as const },
+        ].map((item, index) => <button key={item.label} className="dashboard-metric" style={{ animationDelay: `${index * 40}ms` }} onClick={() => onNavigate?.(item.page)}><span className="dashboard-metric-top"><span className="dashboard-metric-icon"><Icon icon={item.icon} size={17} /></span><span>{item.label}</span><ArrowRight size={13} /></span><strong><AnimatedNumber value={item.value} /></strong><small>{item.hint}</small></button>)}
+      </section>
+      {Boolean(tasks?.needs_review || tasks?.failed || tasks?.waiting_for_action || tasks?.pending_exports) && <div className="dashboard-attention-strip"><span>需要关注</span>{!!tasks?.needs_review && <button onClick={() => onReview ? onReview() : onNavigate?.("history")}>{tasks.needs_review} 份文件待复核<ArrowRight size={12} /></button>}{!!tasks?.failed && <button onClick={() => onNavigate?.("workspace")}>{tasks.failed} 个任务失败<ArrowRight size={12} /></button>}{!!tasks?.waiting_for_action && <button onClick={() => onNavigate?.("workspace")}>{tasks.waiting_for_action} 个任务待处理<ArrowRight size={12} /></button>}{!!tasks?.pending_exports && <button onClick={() => onNavigate?.("workspace")}>{tasks.pending_exports} 份文件待整理<ArrowRight size={12} /></button>}</div>}
+      <div className="dashboard-charts-grid">
+        <section className="dashboard-panel dashboard-main-trend" aria-label="期间趋势"><div className="dashboard-panel-heading"><div><h2>{chartView === "files" ? "文件接收趋势" : "数据新增趋势"}</h2><p>{rangeDescription(chartView === "files" ? data.days : overview?.days ?? data.days)} · {chartView === "files" ? bucketDescription(data.trend[0]?.bucket, data.trend[0]?.interval) : bucketDescription(overview?.data.trend_bucket, overview?.data.trend_interval)}</p></div><div className="dashboard-chart-switch" role="group" aria-label="趋势内容"><button aria-pressed={chartView === "files"} onClick={() => setChartView("files")}>文件</button><button aria-pressed={chartView === "rows"} onClick={() => setChartView("rows")}>数据</button></div></div><div className="dashboard-trend-summary"><strong><AnimatedNumber value={chartView === "files" ? received : rowData.reduce((sum, row) => sum + row.value, 0)} /></strong><span>{chartView === "files" ? "份文件接收" : "条记录新增"}</span></div>{chartView === "rows" && overviewError ? <div className="dashboard-card-error" role="alert">{overviewError}<button className="btn secondary xs" onClick={() => setReload(value => value + 1)}>重新加载趋势</button></div> : <DashboardChart data={chartView === "files" ? fileData : rowData} label={chartView === "files" ? "接收文件" : "新增记录"} unit={chartView === "files" ? "份" : "条"} />}</section>
+        <section className="dashboard-panel" aria-label="数据分布"><div className="dashboard-panel-heading"><div><h2>数据分布</h2><p>当前各表记录数</p></div><button className="dashboard-text-action" onClick={() => onNavigate?.("tables")}>数据仓库<ArrowRight size={13} /></button></div><DashboardChart data={composition} type="donut" label="数据记录" unit="条" height={174} /></section>
       </div>
-
-      {error && (
-        <div className="callout danger" style={{ marginBottom: 16 }}>
-          {error}
-        </div>
-      )}
-
-      {loading && !hasData && (
-        <div className="card flush" style={{ padding: 48, textAlign: "center" }}>
-          <Icon icon={Loader2} size={24} className="spin" />
-        </div>
-      )}
-      <>
-          {/* KPI 卡片 */}
-          <div className="dash-kpi-row">
-            <div className="dash-kpi-card" data-kpi="files">
-              <div className="dash-kpi-icon">
-                <Icon icon={FileText} size={24} />
-              </div>
-              <div className="dash-kpi-body">
-                <div className="dash-kpi-value">
-                  <AnimatedNumber value={totalFiles} />
-                  <span className="dash-kpi-unit">个</span>
-                </div>
-                <div className="dash-kpi-label">累计处理文件</div>
-                <div className="dash-kpi-sub">按当前任务实时统计</div>
-              </div>
-            </div>
-            <div className="dash-kpi-card" data-kpi="time">
-              <div className="dash-kpi-icon">
-                <Icon icon={Timer} size={24} />
-              </div>
-              <div className="dash-kpi-body">
-                <div className="dash-kpi-value">
-                  {summary?.average_elapsed_seconds != null ? (
-                    <AnimatedNumber
-                      value={summary.average_elapsed_seconds}
-                      format={(n) => String(Math.round(n * 10) / 10)}
-                    />
-                  ) : (
-                    "—"
-                  )}
-                  <span className="dash-kpi-unit">
-                    {summary?.average_elapsed_seconds != null ? "秒" : ""}
-                  </span>
-                </div>
-                <div className="dash-kpi-label">平均处理耗时</div>
-                <div className="dash-kpi-sub">
-                  {summary?.processed_count
-                    ? `按 ${summary.processed_count} 个已处理文件统计`
-                    : "暂无处理记录"}
-                </div>
-              </div>
-            </div>
-            <div className="dash-kpi-card" data-kpi="replace">
-              <div
-                className="dash-kpi-icon"
-                style={{ position: "relative" }}
-                onMouseEnter={() => setKpiTipOpen(true)}
-                onMouseLeave={() => setKpiTipOpen(false)}
-              >
-                <Icon icon={Database} size={24} />
-                <Icon
-                  icon={Info}
-                  className="kpi-tip-trigger"
-                  size={11}
-                  style={{
-                    color: "var(--color-text-muted)",
-                    cursor: "help",
-                    position: "absolute",
-                    bottom: "-2px",
-                    right: "-2px",
-                    background: "var(--card)",
-                    borderRadius: "50%",
-                    padding: "1px",
-                  }}
-                />
-                {kpiTipOpen && (
-                  <div
-                    className="kpi-tip-popover"
-                    style={{
-                      position: "absolute",
-                      top: "calc(100% + 6px)",
-                      left: 0,
-                      right: 0,
-                      zIndex: 50,
-                    }}
-                  >
-                    <div className="kpi-tip-title">统计规则</div>
-                    <div className="kpi-tip-text">
-                      无明细字段的文档按表头计 1 条；含明细的按明细行数累计
-                    </div>
-                  </div>
-                )}
-              </div>
-              <div className="dash-kpi-body">
-                <div className="dash-kpi-value">
-                  <AnimatedNumber value={extractedRows} />
-                  <span className="dash-kpi-unit">条</span>
-                </div>
-                <div className="dash-kpi-label">提取数据条数</div>
-                <div className="dash-kpi-sub">按事实表实时统计</div>
-              </div>
-            </div>
-            <div className="dash-kpi-card" data-kpi="error">
-              <div className="dash-kpi-icon">
-                <Icon icon={CircleX} size={24} />
-              </div>
-              <div className="dash-kpi-body">
-                <div className="dash-kpi-value">
-                  {summary?.success_rate != null ? (
-                    <AnimatedNumber value={Math.round((1 - summary.success_rate) * 100)} />
-                  ) : (
-                    "—"
-                  )}
-                  <span className="dash-kpi-unit">
-                    {summary?.success_rate != null ? "%" : ""}
-                  </span>
-                </div>
-                <div className="dash-kpi-label">报错率</div>
-                <div className="dash-kpi-sub">
-                  {summary?.processed_count
-                    ? `${summary.failed_count} 失败 / ${summary.processed_count} 处理`
-                    : "暂无处理记录"}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* 图表 + 今日概览 */}
-          <div className="dash-charts-row">
-            <div className="dash-card dash-card--chart">
-              <div className="dash-card-header">
-                <div className="dash-card-title">每日处理趋势</div>
-                <div className="dash-card-hint">
-                  {rangeLabel} · <strong><AnimatedNumber value={trendTotal} /></strong> 个文件
-                </div>
-              </div>
-              <div className="dash-card-body">
-                <div className="dash-chart-wrap">
-                  <svg
-                    className="dash-svg"
-                    viewBox="0 0 700 200"
-                    preserveAspectRatio="none"
-                  >
-                    <defs>
-                      <linearGradient id="dashGrad" x1="0" y1="0" x2="0" y2="1">
-                        <stop
-                          offset="0%"
-                          stopColor="var(--color-primary)"
-                          stopOpacity="0.25"
-                        />
-                        <stop
-                          offset="100%"
-                          stopColor="var(--color-primary)"
-                          stopOpacity="0"
-                        />
-                      </linearGradient>
-                    </defs>
-                    <g className="dash-grid">
-                      <line
-                        x1="0"
-                        y1="40"
-                        x2="700"
-                        y2="40"
-                        stroke="var(--color-border)"
-                        strokeDasharray="3,4"
-                      />
-                      <line
-                        x1="0"
-                        y1="100"
-                        x2="700"
-                        y2="100"
-                        stroke="var(--color-border)"
-                        strokeDasharray="3,4"
-                      />
-                      <line
-                        x1="0"
-                        y1="160"
-                        x2="700"
-                        y2="160"
-                        stroke="var(--color-border)"
-                        strokeDasharray="3,4"
-                      />
-                    </g>
-                    {/* key 随范围变化强制重挂载，让折线绘制/淡入动画在切换范围时重播 */}
-                    <g key={rangeDays}>
-                      <polygon
-                        className="dash-polygon"
-                        fill="url(#dashGrad)"
-                        points={trendPolygonPoints}
-                      />
-                      <polyline
-                        className="dash-line"
-                        pathLength={1}
-                        fill="none"
-                        stroke="var(--color-primary)"
-                        strokeWidth="2.5"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        points={trendPoints}
-                      />
-                      <g className="dash-dots">
-                        {trendCounts.map((count, i) => {
-                          const x =
-                            trendDays.length === 1
-                              ? 0
-                              : Math.round((i * 700) / (trendDays.length - 1));
-                          const y = Math.round(160 - (count / maxCount) * 120);
-                          return (
-                            <circle
-                              key={i}
-                              cx={x}
-                              cy={y}
-                              r="3.5"
-                              fill="var(--color-primary)"
-                            />
-                          );
-                        })}
-                      </g>
-                    </g>
-                  </svg>
-                  <div className="dash-chart-xaxis">
-                    {rangeDays <= 7
-                      ? trendDays.map((d, i) => (
-                          <span key={i}>{WEEKDAY_LABELS[d.getDay()]}</span>
-                        ))
-                      : (
-                        <>
-                          <span>{formatDateLocal(trendDays[0])}</span>
-                          <span>{formatDateLocal(trendDays[trendDays.length - 1])}</span>
-                        </>
-                      )}
-                  </div>
-                </div>
-              </div>
-            </div>
-            <div className="dash-card dash-card--today">
-              <div className="dash-card-header">
-                <div className="dash-card-title">{rangeLabel}概览</div>
-                <div className="dash-card-hint">实时</div>
-              </div>
-              <div className="dash-card-body">
-                <div className="dash-today-list">
-                  <div className="dash-today-item">
-                    <span className="dash-today-lbl">已处理</span>
-                    <span className="dash-today-val">
-                      <AnimatedNumber value={rangeProcessed} />
-                      <small>个</small>
-                    </span>
-                  </div>
-                  <div className="dash-today-item">
-                    <span className="dash-today-lbl">成功</span>
-                    <span
-                      className="dash-today-val"
-                      style={{ color: "var(--color-success)" }}
-                    >
-                      <AnimatedNumber value={rangeSuccess} />
-                      <small>个</small>
-                    </span>
-                  </div>
-                  <div className="dash-today-item">
-                    <span className="dash-today-lbl">失败</span>
-                    <span
-                      className="dash-today-val"
-                      style={{ color: "var(--color-danger)" }}
-                    >
-                      <AnimatedNumber value={rangeFailed} />
-                      <small>个</small>
-                    </span>
-                  </div>
-                  <div className="dash-today-item">
-                    <span className="dash-today-lbl">新增记录</span>
-                    <span className="dash-today-val">
-                      <AnimatedNumber value={rangeNewRecords} />
-                      <small>条</small>
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* 数据仓库概览 */}
-          <div className="dash-card" style={{ marginTop: 20 }}>
-            <div className="dash-card-header">
-              <div className="dash-card-title">数据仓库概览</div>
-              <button
-                className="btn secondary xs"
-                onClick={() => onNavigate?.("tables")}
-              >
-                查看全部 <Icon icon={ArrowRight} size={13} />
-              </button>
-            </div>
-            <div className="dash-card-body" style={{ padding: 0 }}>
-              <div
-                className="data-table-wrap"
-                style={{ border: 0, borderRadius: 0 }}
-              >
-                <div className="data-table-scroll">
-                  <table className="data-table">
-                    <thead>
-                      <tr>
-                        <th>表名</th>
-                        <th>行数</th>
-                        <th>最近更新</th>
-                        <th>状态</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {tables.slice(0, 5).map((t) => (
-                        <tr key={t.id}>
-                          <td>{t.name}</td>
-                          <td className="numeric">{t.row_count + " 行"}</td>
-                          <td>{formatRelativeTime(t.created_at)}</td>
-                          <td>
-                            <span className="badge live">活跃</span>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </div>
-          </div>
-      </>
-    </div>
-  );
+    </>}
+    <section className="dashboard-statistics" aria-label="我的统计"><div className="dashboard-section-heading"><div><h2>我的统计</h2><span>{cards.length ? `${cards.length} / ${limit}` : "把常看的数据留在这里"}</span></div><button className="btn secondary" disabled={cards.length >= limit || mutating || Boolean(cardsError && !cards.length)} onClick={() => { setNotice(""); setEditing("new"); }}><Plus size={14} />添加统计</button></div>
+      {cardsError && <div className="callout danger" role="alert">{cardsError}<button className="btn secondary xs" onClick={() => setReload(value => value + 1)}>重新读取统计</button></div>}
+      {notice && <div className="dashboard-notice" role="status"><Check size={13} />{notice}</div>}
+      {!!cards.length && <div className="dashboard-statistic-grid">{cards.map((card, index) => <div key={card.id} className="dashboard-statistic-slot"><StatisticCard card={card} days={days} refresh={reload} first={index === 0} last={index === cards.length - 1} onEdit={() => setEditing(card)} onDelete={() => setDeleting(card.id)} onMove={direction => { void moveCard(index, direction); }} onOpenTable={onOpenTable} />{deleting === card.id && <div className="statistic-delete-prompt" role="alert"><span>删除这张统计？原表数据会保留。</span><div><button className="btn secondary xs" disabled={mutating} onClick={() => setDeleting(null)}>取消</button><button className="btn danger xs" disabled={mutating} onClick={() => { void removeCard(card.id); }}>删除统计</button></div></div>}</div>)}</div>}
+      {cards.length >= limit && <p className="dashboard-limit-note">已添加 {limit} 张统计，可修改或替换已有统计。</p>}
+    </section>
+    <section className="dashboard-panel dashboard-model-panel" aria-label="模型使用"><div className="dashboard-panel-heading"><div><h2>模型使用</h2><p>{rangeDescription(overview?.days ?? days)} · 按实际调用记录</p></div></div>{overviewError ? <div className="dashboard-card-error" role="alert">{overviewError}<button className="btn secondary xs" onClick={() => setReload(value => value + 1)}>重新加载模型统计</button></div> : usage ? <><div className="dashboard-usage-metrics"><div><span>模型调用</span><strong><AnimatedNumber value={usage.calls} /><small>次</small></strong></div><div><span>平均调用耗时</span><strong>{usage.average_elapsed_ms == null ? "—" : formatNumber(usage.average_elapsed_ms / 1000)}<small>秒</small></strong></div><div><span>已上报 Token</span><strong>{formatNumber(usage.total_tokens)}</strong></div><div><span>失败调用</span><strong>{formatNumber(usage.failed)}<small>次</small></strong></div></div><Fold className="dashboard-data-details" title="使用明细与统计口径">{usage.by_purpose.length ? <div className="dashboard-data-scroll"><table><thead><tr><th>用途 / 模型</th><th>调用</th><th>失败</th><th>平均耗时</th><th>Token</th></tr></thead><tbody>{usage.by_purpose.map((item, index) => <tr key={`${item.purpose}-${item.model}-${index}`}><td>{purposeNames[item.purpose] ?? item.purpose}<small>{item.model}</small></td><td>{item.calls}</td><td>{item.failed}</td><td>{item.average_elapsed_ms == null ? "—" : formatNumber(item.average_elapsed_ms / 1000)} 秒</td><td>{formatNumber(item.total_tokens)}</td></tr>)}</tbody></table></div> : <p>这个时间范围内还没有模型调用记录。</p>}<p>耗时统计覆盖 {usage.elapsed_sample_count} / {usage.calls} 次调用。Token 上报覆盖 {usage.calls_with_usage} / {usage.calls} 次调用；未上报显示“—”。缓存读入占比 {usage.cache_hit_ratio == null ? "—" : `${formatNumber(usage.cache_hit_ratio * 100)}%`}，覆盖 {usage.calls_with_cache_usage} 次调用。失败次数不代表内容准确率。</p><p>{usage.history_note}</p></Fold></> : <div className="dashboard-loading"><Loader2 size={16} className="spin" />正在读取模型使用</div>}</section>
+    {data && <Fold className="dashboard-definitions" title="仪表盘统计说明"><p>“当前”统计只包含现在保留的任务、数据与启用模板。数据记录包含提取、导入、手工新增及合并副本；期间新增按记录创建时间统计。</p><p>文件趋势按任务接收日期统计，不等于当天完成量。日期范围按本机日期从当天零点起计算，近 7 天包含今天和之前 6 天。“全部”覆盖当前保留的完整历史，跨度较长时自动按月或年汇总；已删除的数据不计入。</p><p>我的统计读取原表当前数据；涉及文件公共字段时沿用文件级去重规则。删除统计不影响原表。模型调用耗时包括请求等待，不包含任务排队，也不是内容准确率。</p></Fold>}
+    {editing && <StatisticDialog existing={editing === "new" ? undefined : editing} days={days} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); setNotice("统计已保存，会随当前数据更新。"); setReload(value => value + 1); }} />}
+  </div>;
 }

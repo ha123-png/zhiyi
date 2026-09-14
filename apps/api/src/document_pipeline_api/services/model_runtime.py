@@ -1,4 +1,5 @@
 from dataclasses import replace
+from document_pipeline_api.services.model_context import profile_context_budget
 
 from sqlalchemy.orm import Session
 
@@ -36,7 +37,7 @@ def model_snapshot_values(
             "model_name": active_version.model_name,
             "model_reasoning_effort": active_version.reasoning_effort,
             "model_timeout_seconds": active_version.timeout_seconds,
-            "model_context_length": active_version.context_length,
+            "model_context_length": profile_context_budget(active_version),
             "model_temperature": active_version.temperature,
             "model_secret_ref": active_version.secret_ref,
         }
@@ -142,7 +143,7 @@ def settings_for_active_profile_metadata(
         model_name=version.model_name,
         model_reasoning_effort=version.reasoning_effort,
         model_timeout_seconds=version.timeout_seconds,
-        model_context_length=version.context_length,
+        model_context_length=profile_context_budget(version),
         model_temperature=version.temperature,
         model_api_key="",
     )
@@ -165,7 +166,7 @@ def _task_snapshot_for_version(version: ModelProfileVersionRecord) -> TaskRecord
         model_name=version.model_name,
         model_reasoning_effort=version.reasoning_effort,
         model_timeout_seconds=version.timeout_seconds,
-        model_context_length=version.context_length,
+        model_context_length=profile_context_budget(version),
         model_temperature=version.temperature,
         model_secret_ref=version.secret_ref,
     )

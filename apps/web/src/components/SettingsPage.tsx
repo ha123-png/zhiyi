@@ -62,7 +62,7 @@ function SettingsCard({ id, title, icon, support, collapsed, onToggle, children 
           className={`settings-card-caret${open ? "" : " collapsed"}`}
         />
       </button>
-      <div className={`collapse${open ? " open" : ""}`}>
+      <div className={`collapse${open ? " open" : ""}`} inert={!open} aria-hidden={!open}>
         <div className="collapse-content">
           <div className="settings-card-body">
             {support ? <div className="support settings-card-support">{support}</div> : null}

@@ -244,6 +244,8 @@ def tasks_summary(
             summary.needs_review = count
         elif status_value == TaskStatus.FAILED.value:
             summary.failed = count
+        elif status_value == TaskStatus.CANCELLED.value:
+            summary.cancelled = count
     export_count = select(func.count()).select_from(TaskRecord).where(
         TaskRecord.status == TaskStatus.COMPLETED.value,
         func.json_extract(TaskRecord.export_state_json, "$.status").in_(["failed", "needs_rebind"]),

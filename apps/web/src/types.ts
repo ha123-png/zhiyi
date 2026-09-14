@@ -1,4 +1,5 @@
 export type NavigationKey =
+  | "assistant"
   | "workspace"
   | "extract"
   | "tables"
@@ -111,6 +112,7 @@ export interface Task {
 
 /** 历史页统计：各状态任务计数（SQL 聚合，不加载任务全表）。 */
 export interface TaskSummary {
+  cancelled?: number;
   active?: number;
   waiting_for_action?: number;
   pending_exports?: number;
@@ -121,8 +123,13 @@ export interface TaskSummary {
 }
 
 /** 仪表盘按天聚合：趋势图与范围统计（SQL 聚合，不加载任务全表）。 */
+export type DashboardRange = number | "all";
+
 export interface TrendPoint {
   date: string;
+  label?: string;
+  bucket?: "day" | "month" | "year";
+  interval?: number;
   total: number;
   completed: number;
   failed: number;
@@ -174,6 +181,7 @@ export interface ModelProfile {
   reasoning_effort: string | null;
   timeout_seconds: number;
   context_length: number;
+  context_policy?: "auto" | "fixed";
   temperature: number | null;
   multimodal: boolean | null;
   has_api_key: boolean;
@@ -193,7 +201,7 @@ export interface ModelProfileDraft {
   model_name: string;
   reasoning_effort: string | null;
   timeout_seconds: number;
-  context_length: number;
+  context_length: number | null;
   temperature: number | null;
   multimodal: boolean | null;
   api_key?: string;
@@ -219,6 +227,11 @@ export interface LocalModelStatus {
 }
 
 export interface DashboardSummary {
+  elapsed_sample_count?: number;
+  new_rows?: number;
+  table_count?: number;
+  row_count?: number;
+  template_count?: number;
   average_elapsed_seconds: number | null;
   processed_count: number;
   failed_count: number;

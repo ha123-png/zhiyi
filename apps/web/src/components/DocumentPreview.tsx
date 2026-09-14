@@ -64,7 +64,8 @@ interface DocxPreviewResponse {
 }
 
 export function DocumentPreview(props: DocumentPreviewProps) {
-  return <><DocumentContent {...props} />{props.showDownload !== false && <a className="original-download" href={props.url} download={props.filename}>下载完整原件</a>}</>;
+  if (props.showDownload === false) return <DocumentContent {...props} />;
+  return <div className="document-preview-with-download"><DocumentContent {...props} /><a className="original-download btn secondary sm" href={props.url} download={props.filename}>下载完整原件</a></div>;
 }
 
 function DocumentContent({

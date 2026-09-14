@@ -20,7 +20,7 @@ class TextModel:
         return result_type.model_validate({"header": {"title": "光合作用实验", "date": "2026-09-08"}, "items": [], "file_name_advice": {"rename": True, "name": "光合作用实验.txt"}})
 
 
-def test_name_confirmation_exports_copy_without_extra_model_call(tmp_path: Path):
+def test_automatic_name_exports_copy_without_extra_model_call(tmp_path: Path):
     settings = Settings(database_url=f"sqlite:///{tmp_path / 'data.db'}", storage_dir=tmp_path / "uploads", queue_enabled=False)
     external = tmp_path / "external"
     external.mkdir()
@@ -39,13 +39,15 @@ def test_name_confirmation_exports_copy_without_extra_model_call(tmp_path: Path)
         with client.app.state.session_factory() as session:
             result = process_task(session, settings, task_id, client=model)
             task = session.get(TaskRecord, task_id)
-            assert task.status == "needs_review"
-            assert task.file_name.status == "pending"
+            assert task.status == "completed"
+            assert task.file_name.status == "confirmed"
             suggested = task.file_name.suggested_filename
             assert "光合作用实验" in suggested
             assert result.file_name.source_fields == []
             assert "file_name_advice" not in result.result.model_dump()
-        assert list(external.iterdir()) == []
+            from document_pipeline_api.services.task_exports import process_task_export
+            process_task_export(session, settings, task_id)
+        assert (external / "实验记录" / suggested).read_bytes() == raw
         response = client.put(f"/api/v1/tasks/{task_id}/review", json={"expected_version": 0, "result": result.result.model_dump(), "filename": suggested})
         assert response.status_code == 200, response.text
         assert response.json()["file_name"]["confirmed_filename"] == suggested

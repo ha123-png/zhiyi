@@ -57,6 +57,8 @@ jobs:
         run: npx playwright install --only-shell chromium
       - name: Isolated browser journeys without model calls
         run: npm run test:browser
+      - name: Offline extraction, review, export and restore journey
+        run: uv run --project apps/api --no-sync python scripts/verify-offline-journey.py
       - name: Bounded format and queue integrity checks
         run: uv run --project apps/api --no-sync python scripts/verify-release-pressure.py
       - name: Keep browser evidence

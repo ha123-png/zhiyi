@@ -11,6 +11,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from document_pipeline_api.api.admin import router as admin_router
+from document_pipeline_api.api.assistant import router as assistant_router
 from document_pipeline_api.api.backups import router as backups_router
 from document_pipeline_api.api.data_tables import router as data_tables_router
 from document_pipeline_api.api.events import router as events_router
@@ -100,9 +101,15 @@ def create_app(
         )
 
         with application.state.session_factory() as session:
+            from sqlalchemy import update
+            from document_pipeline_api.models import AssistantRun
+            session.execute(update(AssistantRun).where(AssistantRun.status.in_(["running", "waiting", "cancelling"])).values(status="interrupted", error="应用已重启；已保存生成内容，请重新提问。"))
+            session.commit()
             ensure_builtin_templates(session)
             leave_experimental_one_click_profile(session)
             ensure_default_local_profile(session)
+            from document_pipeline_api.services.file_names import adopt_pending_file_names
+            adopt_pending_file_names(session)
         from document_pipeline_api.services.clear_data import clear_journal_path
         if active_settings.queue_enabled and not clear_journal_path(active_settings).exists():
             from document_pipeline_api.services.queueing import recover_missing_queued_tasks
@@ -122,6 +129,11 @@ def create_app(
         try:
             yield
         finally:
+            from document_pipeline_api.api.assistant import stop_conversations
+            stop_conversations(application)
+            for state in list(application.state.assistant_active.values()):
+                if state.get("thread"):
+                    state["thread"].join(timeout=5)
             engine.dispose()
             if active_settings.queue_enabled:
                 from document_pipeline_api.queue import huey
@@ -135,8 +147,12 @@ def create_app(
         lifespan=lifespan,
     )
     application.state.settings = active_settings
+    from document_pipeline_api.services.integration_config import integration_config_path
+    application.state.integration_config_managed = integration_config_path(active_settings.storage_dir.parent).exists()
     application.state.model_secret_store = model_secret_store
     application.state.session_factory = sessionmaker(engine, expire_on_commit=False)
+    application.state.assistant_active = {}
+    application.include_router(assistant_router, prefix="/api/v1")
     import threading
     application.state.maintenance_condition = threading.Condition()
     application.state.maintenance_active = False

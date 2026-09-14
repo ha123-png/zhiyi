@@ -38,6 +38,8 @@ class PermissionRequest(BaseModel):
     write_enabled: bool = False
     file_access: bool = False
     file_roots: list[str] = Field(default_factory=list)
+    data_scope: Literal["all", "selected"] = "all"
+    table_ids: list[str] = Field(default_factory=list, max_length=1000)
 
 
 @router.get("")
@@ -87,6 +89,7 @@ def create_key(request: Request, body: KeyRequest) -> dict[str, str]:
     token = generate_token()
     field = "read_token" if body.kind == "read" else "write_token"
     write_integration_config(data_dir, {field: token})
+    request.app.state.integration_config_managed = True
     return {"kind": body.kind, "token": token}
 
 
@@ -95,18 +98,21 @@ def revoke_key(request: Request, body: KeyRequest) -> dict[str, bool]:
     """撤销（清空）指定密钥：API 鉴权立即读取文件并生效。"""
     field = "read_token" if body.kind == "read" else "write_token"
     write_integration_config(_data_dir(request), {field: None})
+    request.app.state.integration_config_managed = True
     return {"revoked": True}
 
 
 @router.post("/permissions")
 def save_permissions(request: Request, body: PermissionRequest) -> dict[str, bool]:
-    """保存 MCP 权限开关与文件允许目录；下次 MCP 连接立即采用。"""
+    """保存权限与资源范围；已有 MCP 连接在后续调用拒绝旧权限。"""
     data_dir = _data_dir(request)
     updates: dict[str, object] = {
         "mcp_task_read": body.task_read,
         "mcp_template_read": body.template_read,
         "mcp_result_read": body.result_read,
         "mcp_data_read": body.data_read,
+        "mcp_data_scope": body.data_scope,
+        "mcp_table_ids": sorted(set(body.table_ids)) if body.data_scope == "selected" else [],
         "mcp_task_control": body.task_control,
         "mcp_write_enabled": body.write_enabled,
         "mcp_file_access": body.file_access,
@@ -115,4 +121,5 @@ def save_permissions(request: Request, body: PermissionRequest) -> dict[str, boo
         ),
     }
     write_integration_config(data_dir, updates)
+    request.app.state.integration_config_managed = True
     return {"saved": True}

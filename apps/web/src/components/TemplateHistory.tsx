@@ -5,14 +5,15 @@ import type { ExtractionTemplate } from "../types";
 import { templateDifferences } from "../templateHistory";
 import { Icon } from "./Icon";
 
-export function TemplateHistory({ current, dirty, onClose, onRestored }: {
+export function TemplateHistory({ current, dirty, onClose, onRestored, initialVersion }: {
+  initialVersion?: number | null;
   current: ExtractionTemplate; dirty: boolean; onClose: () => void; onRestored: (template: ExtractionTemplate) => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [versions, setVersions] = useState<TemplateVersionSummary[]>([]);
   const [restorations, setRestorations] = useState<TemplateRestoration[]>([]);
   const [restorationError, setRestorationError] = useState("");
-  const [selected, setSelected] = useState(current.version);
+  const [selected, setSelected] = useState(initialVersion ?? current.version);
   const [target, setTarget] = useState<ExtractionTemplate | null>(current);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);

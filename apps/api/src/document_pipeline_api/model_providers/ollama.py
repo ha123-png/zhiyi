@@ -60,6 +60,7 @@ class OllamaProvider:
         *,
         system_prompt: str | None = None,
     ) -> SchemaModel:
+        self.last_usage = {}
         payload = {
             "model": self.model_name,
             "stream": False,
@@ -83,6 +84,7 @@ class OllamaProvider:
             response = self._client.post(f"{self.base_url}/api/chat", json=payload, headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})
             response.raise_for_status()
             body = response.json()
+            self.last_usage = _ollama_usage(body)
             if body.get("done_reason") == "length":
                 raise ModelResponseError("模型输出达到长度上限，结果未完成。原件仍保留，请调整模型设置后重试。")
             content = body["message"]["content"]
@@ -181,6 +183,7 @@ class OllamaProvider:
         *,
         system_prompt: str | None = None,
     ) -> SchemaModel:
+        self.last_usage = {}
         if not image_paths:
             raise ValueError("至少需要一张图片。")
         for image_path in image_paths:
@@ -219,6 +222,7 @@ class OllamaProvider:
             response = self._client.post(f"{self.base_url}/api/chat", json=payload, headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})
             response.raise_for_status()
             body = response.json()
+            self.last_usage = _ollama_usage(body)
             if body.get("done_reason") == "length":
                 raise ModelResponseError("模型输出达到长度上限，结果未完成。原件仍保留，请调整模型设置后重试。")
             content = body["message"]["content"]
@@ -256,3 +260,13 @@ class OllamaProvider:
             raise ModelResponseError(
                 "Ollama 返回内容不符合字段结构，可以重试或更换模型。"
             ) from error
+
+
+def _ollama_usage(body):
+    usage = {}
+    for source, key in (("prompt_eval_count", "prompt_tokens"), ("eval_count", "completion_tokens")):
+        if type(body.get(source)) is int and body[source] >= 0:
+            usage[key] = body[source]
+    if "prompt_tokens" in usage and "completion_tokens" in usage:
+        usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    return usage
