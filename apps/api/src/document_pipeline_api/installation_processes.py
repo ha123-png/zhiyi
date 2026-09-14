@@ -6,6 +6,28 @@ from pathlib import Path
 import sys
 
 
+def _open_live_process(kernel, pid):
+    process = kernel.OpenProcess(0x1000 | 0x100000 | 0x1, False, pid)
+    if process:
+        return process
+    error = ctypes.get_last_error()
+    if error == 87:
+        return None
+    if error == 5:
+        # A terminated child can remain in the snapshot while its parent or
+        # WebView releases handles. Windows denies TERMINATE on that object.
+        observer = kernel.OpenProcess(0x1000 | 0x100000, False, pid)
+        if observer:
+            try:
+                if kernel.WaitForSingleObject(observer, 0) == 0:
+                    return None
+            finally:
+                kernel.CloseHandle(observer)
+        elif ctypes.get_last_error() == 87:
+            return None
+    raise ctypes.WinError(error)
+
+
 def stop_installation(directory: Path) -> int:
     if sys.platform != "win32":
         raise RuntimeError("This operation is only available on Windows.")
@@ -51,19 +73,20 @@ def stop_installation(directory: Path) -> int:
             if entry.name.casefold() == "zhiyi.exe":
                 # Validate and terminate through the same handle, so PID reuse
                 # cannot redirect the operation to a different process.
-                process = kernel.OpenProcess(0x1000 | 0x100000 | 0x1, False, entry.pid)
-                if not process:
-                    if ctypes.get_last_error() != 87:  # Process already exited.
-                        raise ctypes.WinError(ctypes.get_last_error())
-                else:
+                process = _open_live_process(kernel, entry.pid)
+                if process:
                     try:
                         buffer = ctypes.create_unicode_buffer(32768)
                         length = wintypes.DWORD(len(buffer))
                         if not kernel.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(length)):
-                            raise ctypes.WinError(ctypes.get_last_error())
-                        if Path(buffer.value).resolve() == target:
+                            error = ctypes.get_last_error()
+                            if kernel.WaitForSingleObject(process, 0) != 0:
+                                raise ctypes.WinError(error)
+                        if buffer.value and Path(buffer.value).resolve() == target:
                             if not kernel.TerminateProcess(process, 0):
-                                raise ctypes.WinError(ctypes.get_last_error())
+                                error = ctypes.get_last_error()
+                                if kernel.WaitForSingleObject(process, 0) != 0:
+                                    raise ctypes.WinError(error)
                             if kernel.WaitForSingleObject(process, 10000) != 0:
                                 raise RuntimeError("知意进程未能退出，请关闭该安装目录中的知意后重试。")
                             stopped += 1
