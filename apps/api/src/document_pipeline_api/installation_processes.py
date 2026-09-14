@@ -19,7 +19,7 @@ def _open_live_process(kernel, pid):
         observer = kernel.OpenProcess(0x1000 | 0x100000, False, pid)
         if observer:
             try:
-                if kernel.WaitForSingleObject(observer, 0) == 0:
+                if kernel.WaitForSingleObject(observer, 1000) == 0:
                     return None
             finally:
                 kernel.CloseHandle(observer)
@@ -80,12 +80,12 @@ def stop_installation(directory: Path) -> int:
                         length = wintypes.DWORD(len(buffer))
                         if not kernel.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(length)):
                             error = ctypes.get_last_error()
-                            if kernel.WaitForSingleObject(process, 0) != 0:
+                            if kernel.WaitForSingleObject(process, 1000) != 0:
                                 raise ctypes.WinError(error)
                         if buffer.value and Path(buffer.value).resolve() == target:
                             if not kernel.TerminateProcess(process, 0):
                                 error = ctypes.get_last_error()
-                                if kernel.WaitForSingleObject(process, 0) != 0:
+                                if kernel.WaitForSingleObject(process, 1000) != 0:
                                     raise ctypes.WinError(error)
                             if kernel.WaitForSingleObject(process, 10000) != 0:
                                 raise RuntimeError("知意进程未能退出，请关闭该安装目录中的知意后重试。")
