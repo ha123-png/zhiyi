@@ -11,7 +11,6 @@ import {
   useRef,
   useState,
   type ComponentProps,
-  type ReactNode,
 } from "react";
 import {
   ComposerPrimitive,
@@ -130,11 +129,8 @@ function ToolCardContent({
         spec={result.chart}
         analysis={result.analysis}
         navigate={navigateAssistant}
-        refresh={() =>
-          ask.runtime.thread.composer.setText(
-            `请按最新数据重新分析，沿用此统计口径：${JSON.stringify(result.analysis!.source.request)}`,
-          )
-        }
+        updated={!!result.refreshed_from}
+        refresh={() => ask.refreshAnalysis(tool.id)}
       />
     );
   if (result.source && (result.analysis_id || result.rows)) {
@@ -142,11 +138,8 @@ function ToolCardContent({
       <AnalysisCard
         analysis={result as Analysis}
         navigate={navigateAssistant}
-        refresh={() =>
-          ask.runtime.thread.composer.setText(
-            `请按最新数据重新分析，沿用此统计口径：${JSON.stringify(result.source!.request)}`,
-          )
-        }
+        updated={!!result.refreshed_from}
+        refresh={() => ask.refreshAnalysis(tool.id)}
       />
     );
     // The process group already supplies the disclosure. Keep its single
@@ -358,9 +351,6 @@ function ToolCardContent({
     </section>
   );
 }
-function ResultNarrative({ folded, children }: { folded: boolean; children: ReactNode }) {
-  return folded ? <Fold title="文字说明" className="ask-result-narrative">{children}</Fold> : <>{children}</>;
-}
 function MessageView() {
   const message = useAuiState((s) => s.message);
   const ask = useAssistant();
@@ -388,8 +378,6 @@ function MessageView() {
           return final !== r && final.source && !final.rows && (other.chart || final.data) && sameScope(r.source!, final.source);
         })));
   });
-  const hasResultCard = message.content.some(part => part.type === "tool-call" && !intermediate.includes(part) &&
-    ((part.result as ToolRecord)?.result?.chart || (part.result as ToolRecord)?.result?.analysis_id));
   return (
     <MessagePrimitive.Root
       className={`ask-message ask-message-${message.role}`}
@@ -410,8 +398,6 @@ function MessageView() {
         </Fold>}
         {message.content.map((part, index) =>
           intermediate.includes(part) ? null : part.type === "text" ? (
-            <ResultNarrative key={index} folded={hasResultCard && !(ask.busy && ask.detail?.messages.at(-1)?.id === message.id) &&
-              (part.text.length > 240 || /(?:^|\n)\s*(?:\d+[.)]|[-*+])\s+/.test(part.text))}>
             <ReactMarkdown
               key={index}
               remarkPlugins={[remarkGfm]}
@@ -420,7 +406,7 @@ function MessageView() {
                   const table = <div className="ask-data-scroll" tabIndex={0} aria-label="回答中的表格，可横向滚动">
                     <table>{children}</table>
                   </div>;
-                  return hasResultCard ? <Fold title="补充表格">{table}</Fold> : table;
+                  return table;
                 },
                 img: ({ alt }) => (
                   <span>[图片：{alt || "未加载外部图片"}]</span>
@@ -443,7 +429,6 @@ function MessageView() {
             >
               {part.text}
             </ReactMarkdown>
-            </ResultNarrative>
           ) : part.type === "tool-call" ? (
             <ToolCard
               key={part.toolCallId}
@@ -482,7 +467,7 @@ function MessageView() {
               修改后再问
             </button>
           )}
-          {message.role === "assistant" && (
+          {message.role === "assistant" && !results.some(result => result.refreshed_from) && (
             <button
               type="button"
               disabled={ask.busy}

@@ -65,6 +65,9 @@ function useController() {
   const announced = useRef(new Set<string>());
   const pageOwner = useRef("");
   const defaultId = useRef("");
+  const selectionRevision = useRef(0);
+  const analysisSubmission = useRef<{ signature: string; id: string } | null>(null);
+  const lastModelRun = detail?.last_model_run ?? detail?.runs.find(run => run.execution_kind !== "analysis_refresh");
   const profile = profiles.find((p) => p.id === profileId);
   const grantKey = (thread = activeId.current || draftThread.current) => profile ? consentKey(thread, profile, context) : "";
   const remoteConsent = grants.includes(grantKey());
@@ -80,6 +83,7 @@ function useController() {
     setContext(currentContext(next));
   }, []);
   const selectProfile = useCallback((id: string) => {
+    selectionRevision.current++;
     setProfileId(id);
   }, []);
   const registerPage = useCallback(
@@ -112,9 +116,10 @@ function useController() {
   }, []);
   useEffect(() => {
     let mounted = true;
+    const revision = selectionRevision.current;
     void loadModels()
       .then((id) => {
-        if (mounted) setProfileId(id);
+        if (mounted && !activeId.current && revision === selectionRevision.current) setProfileId(id);
       })
       .catch((e) => {
         if (mounted) setError(e.message);
@@ -256,6 +261,7 @@ function useController() {
   const switchThread = useCallback(
     async (id: string) => {
       if (submitting.current) return;
+      selectionRevision.current++;
       observer.current?.close();
       streamCleanup.current?.();
       activeId.current = id;
@@ -266,7 +272,8 @@ function useController() {
       try {
         const next = await refresh(id);
         if (activeId.current !== id) return;
-        setProfileId(next.profile_id || defaultId.current);
+        const last = next.last_model_run ?? next.runs.find(run => run.execution_kind !== "analysis_refresh");
+        setProfileId(last?.profile_id || next.profile_id || "");
         const restored = next.messages.at(-1)?.context ?? {};
         setContext({
           ...currentContext(restored),
@@ -284,6 +291,7 @@ function useController() {
   );
   const newThread = useCallback(() => {
     if (submitting.current) return;
+    selectionRevision.current++;
     observer.current?.close();
     streamCleanup.current?.();
     activeId.current = null;
@@ -498,6 +506,31 @@ function useController() {
       },
     },
   });
+  async function refreshAnalysis(toolId: string) {
+    const threadId = activeId.current;
+    if (!threadId || submitting.current || busy) return;
+    submitting.current = true;
+    setBusy(true);
+    setError("");
+    setStatus("正在按原统计口径刷新…");
+    const signature = JSON.stringify({ threadId, toolId, context: currentContext(context) });
+    if (analysisSubmission.current?.signature !== signature)
+      analysisSubmission.current = { signature, id: crypto.randomUUID() };
+    try {
+      await assistantApi(`/tools/${encodeURIComponent(toolId)}/refresh-analysis`, "POST", {
+        request_id: analysisSubmission.current.id, thread_id: threadId, context: currentContext(context),
+      });
+      await refresh(threadId);
+      await reloadThreads();
+      analysisSubmission.current = null;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "刷新失败");
+    } finally {
+      submitting.current = false;
+      setBusy(false);
+      setStatus("");
+    }
+  }
   return {
     runtime,
     drawerOpen,
@@ -507,6 +540,8 @@ function useController() {
     profiles,
     profile,
     profileId,
+    lastModelRun,
+    refreshAnalysis,
     selectProfile,
     remoteConsent,
     setRemoteConsent,

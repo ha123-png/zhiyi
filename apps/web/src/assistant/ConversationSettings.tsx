@@ -186,10 +186,10 @@ export function ConversationSettings() {
         <button
           className="ask-settings-trigger"
           aria-label="对话设置"
-          title={`${ask.profile?.name || "选择模型"} · ${scopeText(ctx)}`}
+          title={`${ask.profile?.model_name || "选择模型"} · ${scopeText(ctx)}`}
         >
           <span>对话设置</span>
-          <small>{ask.profile?.name || "选择模型"}</small>
+          <small>{ask.profile?.model_name || "选择模型"}</small>
           <Settings2 size={15} />
         </button>
       </Popover.Trigger>
@@ -209,19 +209,21 @@ export function ConversationSettings() {
         </header>
         <section className="ask-setting-section" aria-label="聊天模型设置">
         <label className="ask-setting-label">
-          聊天模型 <span>独立于文件提取</span>
+          聊天模型 <span>{ask.busy ? "本轮使用" : "下一条使用"}</span>
         </label>
         <div className="ask-model-row">
           <select
             aria-label="问知意模型方案"
             value={ask.profileId}
-            disabled={ask.busy}
+            disabled={ask.busy || ask.loading}
             onChange={(e) => ask.selectProfile(e.target.value)}
             onFocus={() =>
               void ask.loadModels().catch((e) => ask.setError(e.message))
             }
           >
             <option value="">选择问知意模型方案</option>
+            {ask.profileId && !ask.profiles.some(p => p.id === ask.profileId) &&
+              <option value={ask.profileId}>上次方案已不可用，请重新选择</option>}
             {ask.profiles.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.name} · {p.is_remote ? "远程" : "本地"} · {p.model_name}
@@ -236,6 +238,9 @@ export function ConversationSettings() {
             设为默认
           </button>
         </div>
+        {ask.lastModelRun && (ask.lastModelRun.profile_id !== ask.profileId ||
+          ask.lastModelRun.model !== ask.profile?.model_name || ask.lastModelRun.profile_version !== ask.profile?.version) &&
+          <p className="ask-notice">上次回答使用：{ask.lastModelRun.model}</p>}
         {ask.profile?.is_remote && <p className="ask-consent-setting">
           {ask.remoteConsent ? "已允许这段对话发送所选资料" : "发送前会确认云端资料范围"}
           {ask.remoteConsent && <button disabled={ask.busy} onClick={() => ask.setRemoteConsent(false)}>撤销授权</button>}

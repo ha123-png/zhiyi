@@ -102,6 +102,7 @@ export interface Message {
   created_at: string;
 }
 export interface Run {
+  execution_kind?: "model" | "analysis_refresh";
   id: string;
   message_id?: string;
   stream_cursor?: number;
@@ -119,6 +120,7 @@ export interface Thread {
   updated_at: string;
 }
 export interface ThreadDetail extends Thread {
+  last_model_run?: Run | null;
   partial?: boolean;
   has_more?: boolean;
   oldest_position?: number;

@@ -1084,6 +1084,15 @@
   gap: 16px;
 }
 .ask-chart-dialog header button { flex-shrink: 0; }
+.ask-chart-axis-labels {
+  display: flex;
+  justify-content: space-between;
+  min-height: 22px;
+  padding: 0 12px 0 2px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  line-height: 18px;
+}
 .ask-chart-dialog h2 {
   font-size: 18px;
   font-weight: 550;

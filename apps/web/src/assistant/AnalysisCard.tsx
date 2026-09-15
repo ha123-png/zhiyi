@@ -60,11 +60,13 @@ function AnalysisCardView({
   spec,
   navigate,
   refresh,
+  updated = false,
 }: {
   analysis: Analysis;
   spec?: ChartSpec;
   navigate: (r: Reference) => void;
-  refresh?: () => void;
+  refresh?: () => void | Promise<void>;
+  updated?: boolean;
 }) {
   const data = analysis.data ?? [];
   const reduced = useReducedMotion();
@@ -86,6 +88,7 @@ function AnalysisCardView({
   const dialog = useRef<HTMLDialogElement>(null);
   const [expanded, setExpanded] = useState(false);
   const [changedChart, setChangedChart] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   useEffect(() => {
     if (expanded) dialog.current?.showModal();
   }, [expanded]);
@@ -241,7 +244,7 @@ function AnalysisCardView({
       );
     }
     const height = expanded
-      ? "clamp(240px, calc(90dvh - 290px), 460px)"
+      ? "clamp(240px, calc(90dvh - 312px), 460px)"
       : actualType === "horizontal_bar"
         ? Math.min(520, Math.max(260, data.length * 30))
         : 280;
@@ -379,7 +382,6 @@ function AnalysisCardView({
           />
           <YAxis
             type={actualType === "horizontal_bar" ? "category" : "number"}
-            label={mixedCounts ? { value: "数值", position: "insideTopLeft", fill: "var(--muted-foreground)", fontSize: 10 } : undefined}
             dataKey={actualType === "horizontal_bar" ? x : undefined}
             axisLine={false}
             tickLine={false}
@@ -397,7 +399,7 @@ function AnalysisCardView({
 
           {mixedCounts && <YAxis yAxisId="count" orientation="right" allowDecimals={false} width={45}
             axisLine={false} tickLine={false} tick={{fill: "var(--muted-foreground)", fontSize: 11}}
-            label={{value: "记录数", position: "insideTopRight", fill: "var(--muted-foreground)", fontSize: 10}} />}
+          />}
           {series.map((s, i) =>
             actualType === "line" || (actualType === "composed" && (mixedCounts ? s.startsWith("count:") : i > 0)) ? (
               <Line
@@ -455,6 +457,7 @@ function AnalysisCardView({
         {actualType !== "donut" && <div className="ask-chart-readout" ref={expanded ? setExpandedTooltipHost : setTooltipHost}>
           <span className="ask-chart-readout-hint">移至图形或使用方向键查看数值</span>
         </div>}
+        {mixedCounts && <div className="ask-chart-axis-labels" aria-hidden="true"><span>数值</span><span>记录数</span></div>}
         <div style={{ height }}>
           <ResponsiveContainer width="100%" height="100%">
             {chart}
@@ -548,6 +551,7 @@ function AnalysisCardView({
         {analysis.source.row_count} 条记录 · {analysis.source.document_count}{" "}
         份来源
         {mixedCounts && actualType === "composed" && " · 左轴：数值；右轴：记录数"}
+        {updated && <time dateTime={analysis.source.generated_at}> · 更新于 {new Date(analysis.source.generated_at).toLocaleString("zh-CN")}</time>}
       </p>
       <motion.div key={actualType} initial={fresh || changedChart ? { opacity: .65 } : false}
         animate={{ opacity: 1 }} transition={{ duration: reduced ? 0 : .18 }}>
@@ -609,7 +613,10 @@ function AnalysisCardView({
           {statisticFromAnalysis(analysis, spec) && <button type="button" className="ask-resource-link" onClick={() =>
             window.dispatchEvent(new CustomEvent("zhiyi:pin-analysis", { detail: { analysis, spec } }))
           }>添加到仪表盘</button>}
-          {refresh && <button type="button" className="ask-resource-link" onClick={refresh}>按最新数据重新分析</button>}
+          {refresh && <button type="button" className="ask-resource-link" disabled={refreshing} onClick={async () => {
+            setRefreshing(true);
+            try { await refresh(); } finally { setRefreshing(false); }
+          }}>{refreshing ? "正在刷新…" : "按最新数据重新分析"}</button>}
         </div>}
       </div>
       </Fold>
@@ -638,7 +645,9 @@ function AnalysisCardView({
                 <X size={18} />
               </button>
             </header>
-            <p className="ask-chart-description">{analysis.source.row_count} 条记录 · {analysis.source.document_count} 份来源</p>
+            <p className="ask-chart-description">{analysis.source.row_count} 条记录 · {analysis.source.document_count} 份来源
+              {updated && <time dateTime={analysis.source.generated_at}> · 更新于 {new Date(analysis.source.generated_at).toLocaleString("zh-CN")}</time>}
+            </p>
             {analysis.truncated && <p className="ask-quality-summary">{analysis.rows ? `共 ${analysis.source.row_count} 条记录，预览 ${analysis.rows.length} 条。` : `共 ${analysis.group_count ?? "多"} 组，展示前 ${data.length} 组；统计总计包含完整查询范围。`}</p>}
             {graphic(true)}
             {legend}

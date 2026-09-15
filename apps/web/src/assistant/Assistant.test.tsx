@@ -144,6 +144,72 @@ beforeEach(() => {
 });
 
 describe("问知意", () => {
+  it("restores the last actual model and scope despite a late default response", async () => {
+    const modelRun = { id: "old-cloud", status: "completed", error: null, model: "cloud-original", profile_id: "cloud", profile_version: 1 };
+    stored = { id: "thread", title: "云端历史", profile_id: "local", archived: false, updated_at: "2026-09-13T00:00:00Z",
+      last_model_run: modelRun, runs: [{ ...modelRun, id: "refresh", model: "知意统计", execution_kind: "analysis_refresh" }], tools: [],
+      messages: [{ id: "answer", role: "assistant", parts: [{ type: "text", text: "已保存的云端回答" }],
+        context: { workspace: true, mode: "read" }, created_at: "2026-09-13T00:00:00Z" }] };
+    const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+    let resolveDefault!: (value: Response) => void;
+    const delayed = new Promise<Response>(resolve => { resolveDefault = resolve; });
+    vi.stubGlobal("fetch", vi.fn((input, init) => String(input).endsWith("/assistant/settings")
+      ? delayed : originalFetch(input, init)));
+    render(<Shell />);
+    fireEvent.click(await screen.findByRole("button", { name: /云端历史.*2026/ }));
+    await screen.findByText("已保存的云端回答");
+    await act(async () => resolveDefault(Response.json({ profile_id: "local" })));
+    fireEvent.click(screen.getByRole("button", { name: "对话设置" }));
+    await screen.findByRole("option", { name: /提取云模型/ });
+    expect(screen.getByRole("combobox", { name: "问知意模型方案" })).toHaveValue("cloud");
+    expect(screen.getByRole("checkbox", { name: "允许查找知意资料" })).toBeChecked();
+    expect(screen.getByRole("button", { name: "只读分析" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("下一条使用")).toBeVisible();
+    fireEvent.change(screen.getByRole("combobox", { name: "问知意模型方案" }), { target: { value: "local" } });
+    expect(screen.getByText(/上次回答使用：cloud-original/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "关闭对话设置" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "向问知意提问" }), { target: { value: "继续" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送问题" }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0].profile_id).toBe("local");
+  });
+  it("keeps explanation visible and refreshes saved analysis without a prompt or model consent", async () => {
+    const result = { analysis_id: "snapshot", source: { table_id: "t", table_name: "历史汇总", row_count: 10000,
+      document_count: 10000, grain: "auto", generated_at: "2026-09-13T00:00:00Z", request: { table_id: "t", row_ids: null } },
+      data: [{ label: "全部", "sum:total": 50005000 }], metric_keys: ["sum:total"], warnings: [], truncated: false };
+    const tool = { id: "stat", name: "analyze_data_table", status: "completed", result };
+    const prose = "这是完整数据的解释，有助于理解业务变化。".repeat(20);
+    stored = { id: "thread", title: "刷新验收", profile_id: "cloud", archived: false, updated_at: "2026-09-13T00:00:00Z", runs: [], tools: [tool],
+      messages: [{ id: "a", role: "assistant", context: { workspace: true }, created_at: "2026-09-13T00:00:00Z",
+        parts: [{ type: "tool", ...tool }, { type: "text", text: prose }] }] };
+    const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+    const refreshBodies: Record<string, unknown>[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+      if (String(input).endsWith("/tools/stat/refresh-analysis")) {
+        refreshBodies.push(JSON.parse(String(init?.body)));
+        const updated = { ...tool, id: "stat2", result: { ...result, analysis_id: "new", refreshed_from: "stat",
+          source: { ...result.source, generated_at: "2026-09-15T00:00:00Z" } } };
+        stored!.tools.push(updated);
+        stored!.messages.push({ id: "a2", role: "assistant", context: { workspace: true }, created_at: "2026-09-15T00:00:00Z", parts: [{ type: "tool", ...updated }] });
+        return Response.json({ thread_id: "thread", run_id: "local-refresh" });
+      }
+      return originalFetch(input, init);
+    }));
+    render(<Shell />);
+    fireEvent.click(await screen.findByRole("button", { name: /刷新验收.*2026/ }));
+    expect(await screen.findByText(prose)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "文字说明" })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "向问知意提问" }), { target: { value: "未发送的草稿" } });
+    fireEvent.click(screen.getByRole("button", { name: "数据与来源" }));
+    fireEvent.click(screen.getByRole("button", { name: "按最新数据重新分析" }));
+    expect(await screen.findByText(/更新于/)).toBeVisible();
+    expect(refreshBodies).toHaveLength(1);
+    expect(refreshBodies[0]).toEqual({ thread_id: "thread", request_id: expect.any(String), context: { workspace: true } });
+    expect(posted).toHaveLength(0);
+    expect(screen.getByRole("textbox", { name: "向问知意提问" })).toHaveValue("未发送的草稿");
+    expect(screen.getAllByText("50,005,000").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByRole("button", { name: "重新回答" })).toHaveLength(1);
+  });
   it("renders incremental Unicode text without polling and reconciles final saved content", async () => {
     stored = { id: "thread", title: "真实增量通路", profile_id: "local", archived: false, updated_at: "2026-09-13T00:00:00Z",
       messages: [{ id: "a", role: "assistant", parts: [], context: {}, created_at: "2026-09-13T00:00:00Z" }], tools: [],

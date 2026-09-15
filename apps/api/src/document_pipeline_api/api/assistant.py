@@ -51,6 +51,7 @@ from document_pipeline_api.services.assistant_operations import (
     validate_guards,
 )
 from document_pipeline_api.services.assistant_memory import (
+    current_result_notices,
     summarize_result,
     model_result,
     compact_history,
@@ -108,6 +109,12 @@ class Decision(Strict):
     approve: bool
 
 
+class AnalysisRefresh(Strict):
+    request_id: UUID
+    thread_id: str
+    context: Context
+
+
 def budget_content(messages):
     values = []
     for message in messages:
@@ -155,12 +162,13 @@ def run_read(r):
         "usage": json.loads(r.usage_json),
         "message_id": r.message_id,
         "stream_cursor": r.snapshot_sequence,
+        "execution_kind": "analysis_refresh" if r.provider == "zhiyi_internal" else "model",
     }
 
 
 def tool_view(call, session):
     """Read current preview validity without changing business data or history."""
-    result = json.loads(call.result_json)
+    result = current_result_notices(json.loads(call.result_json))
     if isinstance(result.get("error"), str) and ("validation error" in result["error"] or "input_value=" in result["error"]):
         result = {**result, "error": "此前操作参数格式不正确，未能完成。请重新读取所需资料。"}
     status = call.status
@@ -345,11 +353,15 @@ def get_thread(thread_id: str, run_id: str | None = None, before: int | None = Q
     ).all()
     views = {call.id: tool_view(call, session) for call in calls}
     runs_by_message = {r.message_id: r for r in runs}
+    last_model_run = session.scalar(select(AssistantRun).where(
+        AssistantRun.thread_id == thread_id, AssistantRun.provider != "zhiyi_internal"
+    ).order_by(AssistantRun.created_at.desc()).limit(1))
     return {
         **thread_read(t),
         "partial": bool(run_id),
         "has_more": bool(messages and not run_id and messages[0].position > 0),
         "oldest_position": messages[0].position if messages else None,
+        "last_model_run": run_read(last_model_run) if last_model_run else None,
         "messages": [
             {
                 "id": m.id,
@@ -367,6 +379,61 @@ def get_thread(thread_id: str, run_id: str | None = None, before: int | None = Q
         "runs": [run_read(r) for r in runs],
         "tools": list(views.values()),
     }
+
+
+@router.post("/tools/{tool_id}/refresh-analysis")
+def refresh_analysis(tool_id: str, body: AnalysisRefresh, session=Depends(get_session)):
+    from document_pipeline_api.services.assistant_refresh import refreshed_result
+
+    session.execute(text("BEGIN IMMEDIATE"))
+    call = session.get(AssistantToolCall, tool_id)
+    source_run = session.get(AssistantRun, call.run_id) if call else None
+    if not source_run or source_run.thread_id != body.thread_id:
+        raise HTTPException(404, "这段对话中没有该分析结果。")
+    thread = session.get(AssistantThread, body.thread_id)
+    if thread.archived_at:
+        raise HTTPException(409, "请恢复归档对话后继续。")
+    existing = session.get(AssistantRun, str(body.request_id))
+    if existing:
+        previous = session.scalar(select(AssistantToolCall).where(AssistantToolCall.run_id == existing.id))
+        previous_message = session.get(AssistantMessage, existing.message_id)
+        if (existing.thread_id != body.thread_id or existing.provider != "zhiyi_internal" or not previous
+                or json.loads(previous.result_json).get("refreshed_from") != tool_id
+                or not previous_message or json.loads(previous_message.context_json) != body.context.model_dump()):
+            raise HTTPException(409, "本次请求标识已用于其他内容。")
+        return {"thread_id": thread.id, "run_id": existing.id}
+    if session.scalar(select(AssistantRun.id).where(
+        AssistantRun.thread_id == thread.id, AssistantRun.status.in_(ACTIVE_STATES)
+    )):
+        raise HTTPException(409, "这段对话仍在生成，请先停止或等待。")
+    result = refreshed_result(session, call, body.context)
+    analysis = result.get("analysis", result)
+    position = session.scalar(select(func.max(AssistantMessage.position)).where(AssistantMessage.thread_id == thread.id))
+    position = (position + 1) if position is not None else 0
+    context_json = encoded(body.context.model_dump())
+    tool_name = "render_chart" if result.get("chart") else "analyze_data_table"
+    fresh_call = AssistantToolCall(id=str(uuid4()), run_id=str(body.request_id), name=tool_name,
+        arguments_json=encoded(result.get("chart") or analysis["source"]["request"]),
+        result_json=encoded(result), status="completed")
+    title = result.get("chart", {}).get("title") or analysis["source"]["table_name"]
+    question = AssistantMessage(id=str(uuid4()), thread_id=thread.id, role="user", position=position,
+        context_json=context_json, parts_json=encoded([{"type": "text", "text": f"按最新数据刷新：{title}"}]))
+    reply = AssistantMessage(id=str(uuid4()), thread_id=thread.id, role="assistant", position=position + 1,
+        context_json=context_json, parts_json=encoded([
+            {"type": "text", "text": "已按原统计口径更新，旧结果仍然保留。"},
+            {"type": "tool", "id": fresh_call.id, "name": tool_name},
+        ]))
+    run = AssistantRun(id=str(body.request_id), thread_id=thread.id, message_id=reply.id,
+        profile_id=source_run.profile_id, profile_version=source_run.profile_version,
+        provider="zhiyi_internal", model="知意统计", status="completed")
+    session.add_all([question, reply])
+    session.flush()
+    session.add(run)
+    session.flush()
+    session.add(fresh_call)
+    thread.updated_at = now()
+    session.commit()
+    return {"thread_id": thread.id, "run_id": run.id}
 
 
 def active(app):

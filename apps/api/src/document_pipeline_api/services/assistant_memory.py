@@ -141,7 +141,18 @@ def preview_values(value):
     return value
 
 
+def current_result_notices(result):
+    result = dict(result)
+    if isinstance(result.get("analysis"), dict):
+        result["analysis"] = current_result_notices(result["analysis"])
+    if isinstance(result.get("warnings"), list):
+        result["warnings"] = [warning for warning in result["warnings"]
+                              if not (isinstance(warning, str) and "未记录币种，仅显示数值汇总；不能作为统一币种总额。" in warning)]
+    return result
+
+
 def summarize_result(result, *, history=False, status=None):
+    result = current_result_notices(result)
     if result.get("chart") and result.get("analysis"):
         return {
             "chart": result["chart"],

@@ -130,8 +130,6 @@ def validate_measure_units(columns, rows, metrics):
         ) or (
             quantity and (c.label.strip() in {"单位", "计量单位"} or c.key.rsplit(".", 1)[-1].casefold() in {"unit", "measurement_unit"})
         )]
-        if rows and currency and not candidates and not re.search(r"[（(](?:元|万元|人民币|美元|欧元|CNY|USD|EUR)[）)]", column.label, re.I):
-            warnings.append(f"「{column.label}」未记录币种，仅显示数值汇总；不能作为统一币种总额。")
         if rows and quantity and not candidates and not re.search(r"[（(][^）)]+[）)]", column.label):
             warnings.append(f"「{column.label}」未记录计量单位，仅显示数值汇总；请核对是否属于同一单位。")
         for unit in candidates:
