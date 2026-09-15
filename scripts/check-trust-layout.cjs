@@ -107,6 +107,12 @@ const assert = require('node:assert/strict');
     await page.setViewportSize({width:1366,height:900});
     report.scenarios.push('server-rule-preview-fullmatch-narrow');
     await page.getByRole('button',{name:'设置',exact:true}).click();
+    // The reordered fields are still unsaved. Navigation must stop at the
+    // product's draft guard before the user explicitly discards this test edit.
+    await page.getByRole('heading',{name:'修改尚未保存',exact:true}).waitFor();
+    await page.getByRole('button',{name:'放弃修改并继续',exact:true}).click();
+    await page.getByRole('heading',{name:'系统设置',exact:true}).waitFor();
+    report.scenarios.push('navigation-protects-unsaved-template');
     const headingStyle = await page.locator('.page-header h1').evaluate(e=>({size:getComputedStyle(e).fontSize,font:getComputedStyle(e).fontFamily}));
     await page.getByRole('button',{name:'使用说明',exact:false}).click();
     await page.getByRole('heading',{name:'使用说明',exact:true}).waitFor();
