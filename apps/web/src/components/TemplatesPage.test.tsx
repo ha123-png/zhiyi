@@ -62,9 +62,9 @@ describe("TemplatesPage", () => {
     render(<TemplatesPage />);
     await screen.findByRole("heading", { name: "发票" });
     fireEvent.click(screen.getByText("高级设置"));
-    const toggle = screen.getByRole("checkbox", { name: "自动导出原件副本" });
+    const toggle = screen.getByRole("combobox", { name: "原文件处理" });
     await waitFor(() => expect(toggle).toBeEnabled());
-    fireEvent.click(toggle);
+    fireEvent.change(toggle, { target: { value: "move" } });
     fireEvent.click(screen.getByRole("button", { name: "设置服务端目录" }));
     fireEvent.change(screen.getByLabelText("知意服务所在电脑的绝对路径"), { target: { value: "D:\\副本" } });
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
@@ -72,7 +72,7 @@ describe("TemplatesPage", () => {
     const writes = fetchMock.mock.calls.filter(([, init]) => init?.method === "PUT");
     expect(writes).toHaveLength(1);
     expect(String(writes[0][0])).toMatch(/\/local-export$/);
-    expect(JSON.parse(writes[0][1]!.body as string)).toEqual({ expected_revision: 0, enabled: true, parent_path: "D:\\副本" });
+    expect(JSON.parse(writes[0][1]!.body as string)).toEqual({ expected_revision: 0, enabled: true, mode: "move", parent_path: "D:\\副本" });
   });
 
   beforeEach(() => {

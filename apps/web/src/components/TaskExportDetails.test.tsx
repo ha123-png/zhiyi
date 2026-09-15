@@ -65,3 +65,23 @@ it("preserves actionable controls after an API failure", async () => {
   expect(await screen.findByRole("alert")).toHaveTextContent("请稍后重试");
   expect(screen.getByRole("button", { name: "重试副本导出" })).toBeEnabled();
 });
+
+it("resolves archive conflicts without a second confirmation", async () => {
+  const moving: Task = { ...task, archive_pending: true, file_export: { ...task.file_export!, mode: "move" } };
+  vi.mocked(actOnTaskExport).mockResolvedValue({ ...moving, archive_pending: false, file_export: { ...moving.file_export!, status: "completed" } });
+  render(<TaskExportAction task={moving} />);
+  fireEvent.click(screen.getByRole("button", { name: "处理" }));
+  expect(screen.getByRole("dialog", { name: "处理原文件归档" })).toBeVisible();
+  fireEvent.change(screen.getByLabelText("归档名称（保留扩展名）"), { target: { value: "归档新名.png" } });
+  expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "重试归档" }));
+  await waitFor(() => expect(actOnTaskExport).toHaveBeenCalledExactlyOnceWith(task.id, { action: "retry", filename: "归档新名.png", parent_path: "D:\\资料", acknowledge_uncertain: false }));
+});
+
+it("retries the recorded target after publication without offering another copy", async () => {
+  render(<TaskExportDetails task={{ ...task, file_export: { ...task.file_export!, mode: "move", attempted_path: "D:\\资料\\数学\\原名.png", source_removal_started: true, error_code: "archive_failed" } }} expanded />);
+  expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+  expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "重试归档" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "跳过此次归档" })).toBeEnabled();
+});

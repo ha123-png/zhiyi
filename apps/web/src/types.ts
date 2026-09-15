@@ -58,6 +58,9 @@ export interface InputScope {
 }
 
 export interface FileExportState {
+  mode?: "copy" | "move";
+  attempted_path?: string | null;
+  source_removal_started?: boolean;
   status: "disabled" | "awaiting_confirmation" | "pending" | "exporting" | "completed" | "failed" | "skipped" | "needs_rebind";
   parent_path: string | null;
   destination: string | null;
@@ -85,6 +88,7 @@ export interface Task {
   planned_scope?: InputScope | null;
   match_scope?: InputScope | null;
   pending_reason?: string | null;
+  archive_pending?: boolean;
   file_export?: FileExportState | null;
   file_name?: FileNameState | null;
   internal_storage?: { status: "moving" | "classified" | "failed"; folder?: string; absolute_path?: string; relative_path?: string; error?: string } | null;

@@ -68,6 +68,7 @@ async def create_task_from_upload(
     template_id: str | None = None,
     *,
     target_table_id: str | None = None,
+    source_file: dict | None = None,
 ) -> TaskRecord:
     if upload.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
@@ -155,6 +156,7 @@ async def create_task_from_upload(
             target_table_id=target_table_id,
         )
         task = session.get(TaskRecord, task_id)
+        task.source_file_json = json.dumps(source_file, ensure_ascii=False) if source_file else None
         task.input_policy_json = policy.model_dump_json()
         task.input_plan_json = prepared.scope.model_dump_json()
         if selected_template is not None:
@@ -379,13 +381,13 @@ def list_tasks(
         statement = statement.where(
             TaskRecord.status.in_(ACTIVE_TASK_STATUSES)
         )
+    from document_pipeline_api.services.task_exports import archive_pending_expression, pending_export_expression
     if export_pending:
-        statement = statement.where(
-            TaskRecord.status == TaskStatus.COMPLETED.value,
-            func.json_extract(TaskRecord.export_state_json, "$.status").in_(["failed", "needs_rebind"]),
-        )
+        statement = statement.where(pending_export_expression())
     if status is not None:
         statement = statement.where(TaskRecord.status.in_(status.split(",")))
+        if not export_pending and "completed" in status.split(","):
+            statement = statement.where(~func.coalesce(archive_pending_expression(), False))
     if search:
         statement = statement.where(
             task_name_matches(search)

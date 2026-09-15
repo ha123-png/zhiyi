@@ -6,12 +6,14 @@ from pydantic import BaseModel, ConfigDict, Field
 class LocalExportUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_revision: int = Field(ge=0)
+    mode: Literal["copy", "move"] = "copy"
     enabled: bool = False
     parent_path: str | None = Field(default=None, max_length=2048)
 
 
 class LocalExportRead(BaseModel):
     revision: int = 0
+    mode: Literal["copy", "move"] = "copy"
     enabled: bool = False
     parent_path: str | None = None
     destination: str | None = None
@@ -19,6 +21,9 @@ class LocalExportRead(BaseModel):
 
 class TaskExportState(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    mode: Literal["copy", "move"] = "copy"
+    source_removal_started: bool = False
+    staging_path: str | None = None
     version: int = 1
     status: Literal["disabled", "awaiting_confirmation", "pending", "exporting", "completed", "failed", "skipped", "needs_rebind"] = "disabled"
     binding_revision: int = 0

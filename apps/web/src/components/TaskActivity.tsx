@@ -90,7 +90,7 @@ export function GlobalTaskCard({
     ?? nextQueuedTask
     ?? tasks.find((task) => activeStatuses.includes(task.status));
   const waitingForTemplate = tasks.filter(
-    (task) => task.status === "waiting_for_template" || (task.status === "completed" && ["failed", "needs_rebind"].includes(task.file_export?.status ?? "")),
+    (task) => task.status === "waiting_for_template" || (task.status === "completed" && (task.archive_pending || ["failed", "needs_rebind"].includes(task.file_export?.status ?? ""))),
   );
   const waitingForReview = tasks.filter((task) => task.status === "needs_review");
 

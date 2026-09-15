@@ -36,6 +36,7 @@ const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
 
 export interface LocalExportBinding {
+  mode?: "copy" | "move";
   revision: number;
   enabled: boolean;
   parent_path: string | null;
@@ -46,7 +47,7 @@ export async function getLocalExportBinding(templateId: string): Promise<LocalEx
   return readResponse(await fetch(`${API_BASE_URL}/templates/${encodeURIComponent(templateId)}/local-export`));
 }
 
-export async function saveLocalExportBinding(templateId: string, body: { expected_revision: number; enabled: boolean; parent_path: string | null }): Promise<LocalExportBinding> {
+export async function saveLocalExportBinding(templateId: string, body: { expected_revision: number; enabled: boolean; parent_path: string | null; mode?: "copy" | "move" }): Promise<LocalExportBinding> {
   return readResponse(await fetch(`${API_BASE_URL}/templates/${encodeURIComponent(templateId)}/local-export`, {
     method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   }));
@@ -322,10 +323,17 @@ export async function unloadLocalModel(modelName: string): Promise<LocalModelAct
 }
 
 export async function uploadTask(
-  file: File,
+  file: File | import("./desktop").NativeImportFile,
   templateSelection: string,
   targetTableId?: string,
 ): Promise<Task> {
+  if ("token" in file) {
+    return readResponse<Task>(await apiFetch(`${API_BASE_URL}/tasks/native-import`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: file.token, template_mode: templateSelection === "smart" ? "smart" : "manual",
+        template_id: templateSelection === "smart" ? null : templateSelection, target_table_id: targetTableId ?? null }),
+    }));
+  }
   const body = new FormData();
   body.append("file", file);
   body.append("template_mode", templateSelection === "smart" ? "smart" : "manual");
@@ -374,6 +382,7 @@ export interface TaskEvent {
   filename: string;
   failure_message?: string | null;
   export_status?: string | null;
+  export_mode?: "copy" | "move" | null;
 }
 
 const taskEventListeners = new Set<(events: TaskEvent[]) => void>();

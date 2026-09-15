@@ -133,6 +133,29 @@ describe("ExtractPage", () => {
     expect(container.querySelector("#extract-validation-content")).not.toHaveAttribute("inert");
   });
 
+  it("uses the native picker ticket without another confirmation or raw source path", async () => {
+    const picked = { token: "a".repeat(64), name: "invoice.png", size: 1024, type: "image/png" };
+    const pick = vi.fn().mockResolvedValue([picked]);
+    window.pywebview = { api: { choose_import_files: pick } as unknown as NonNullable<NonNullable<Window["pywebview"]>["api"]> };
+    const fetchMock = vi.fn().mockImplementation(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/templates")) return response([]);
+      if (url.endsWith("/tasks/native-import") && init?.method === "POST") return response({ ...task, status: "queued" });
+      if (url.includes("/tasks?")) return response([{ ...task, status: "queued" }]);
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      render(<ExtractPage />);
+      fireEvent.click(screen.getByRole("button", { name: "选择文件" }));
+      await waitFor(() => expect(pick).toHaveBeenCalledOnce());
+      await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/tasks/native-import"))).toBe(true));
+      const request = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/tasks/native-import"));
+      expect(JSON.parse(String(request?.[1]?.body))).toEqual({ token: picked.token, template_mode: "smart", template_id: null, target_table_id: null });
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    } finally { delete window.pywebview; }
+  });
+
   it("shows honest page-only evidence and saves the edited draft", async () => {
     const scroll = vi.fn();
     HTMLElement.prototype.scrollIntoView = scroll;

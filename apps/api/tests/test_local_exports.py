@@ -15,7 +15,7 @@ def test_local_binding_is_independent_versioned_and_snapshotted(tmp_path: Path):
     with TestClient(create_app(settings)) as client:
         template = client.get("/api/v1/templates").json()[0]
         url = f"/api/v1/templates/{template['id']}/local-export"
-        assert client.get(url).json() == {"revision": 0, "enabled": False, "parent_path": None, "destination": None}
+        assert client.get(url).json() == {"revision": 0, "enabled": False, "mode": "copy", "parent_path": None, "destination": None}
         changed = client.put(url, json={"expected_revision": 0, "enabled": True, "parent_path": str(external)})
         assert changed.status_code == 200
         assert changed.json()["destination"] == str(external / template["name"])

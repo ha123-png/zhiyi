@@ -300,7 +300,7 @@ def _prepare_staged_database(
             ):
                 raise BusinessBackupError("恢复文件与数据库记录不一致。")
             connection.execute(
-                "UPDATE tasks SET storage_path = ?, internal_storage_json = NULL WHERE id = ?",
+                "UPDATE tasks SET storage_path = ?, internal_storage_json = NULL, source_file_json = NULL WHERE id = ?",
                 (name, task_id),
             )
         # A portable restore must never resume writes into another machine's
@@ -314,7 +314,7 @@ def _prepare_staged_database(
             if state.status not in {"disabled", "completed", "skipped"}:
                 state.status = "needs_rebind"
                 state.error_code = "backup_restored"
-                state.error_message = "已恢复备份；请重新选择并确认外部副本目标，不会自动写入旧路径。"
+                state.error_message = ("已恢复备份，原文件移动权限已清除；请跳过此次归档后重新选择文件导入。" if state.mode == "move" else "已恢复备份；请重新选择并确认外部副本目标，不会自动写入旧路径。")
                 connection.execute("UPDATE tasks SET export_state_json = ? WHERE id = ?", (state.model_dump_json(), task_id))
         connection.execute("UPDATE assistant_runs SET status='interrupted', error='已恢复备份；历史内容保留，请重新提问。' WHERE status IN ('running','waiting','cancelling')")
         connection.execute("UPDATE assistant_tool_calls SET status='expired' WHERE status='pending'")

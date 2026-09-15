@@ -74,6 +74,18 @@ class _DesktopApi:
         selected = Path(result[0] if isinstance(result, (list, tuple)) else result).resolve()
         return str(selected)
 
+    def choose_import_files(self) -> list[dict]:
+        """The native file selection grants access; no second approval dialog."""
+        if self._window is None:
+            return []
+        import webview
+        from document_pipeline_api.services.native_files import issue_import_ticket
+        result = self._window.create_file_dialog(webview.OPEN_DIALOG, allow_multiple=True,
+            file_types=("支持的文件 (*.pdf;*.jpg;*.jpeg;*.png;*.bmp;*.webp;*.tif;*.tiff;*.gif;*.docx;*.xlsx;*.txt;*.md)",))
+        if not result:
+            return []
+        return [issue_import_ticket(self._data_dir, Path(path)) for path in result]
+
     def open_export_folder(self, task_id: str) -> str:
         """Open a recorded copy's parent, without granting file-management rights."""
         if not isinstance(task_id, str) or not task_id or len(task_id) > 128:
@@ -84,18 +96,18 @@ class _DesktopApi:
                 row = connection.execute("SELECT export_state_json FROM tasks WHERE id = ?", (task_id,)).fetchone()
             state = json.loads(row[0]) if row and row[0] else {}
         except (sqlite3.Error, ValueError, TypeError):
-            raise ValueError("无法读取副本位置，请刷新知意后重试。") from None
+            raise ValueError("无法读取文件位置，请刷新知意后重试。") from None
         if not isinstance(state, dict) or state.get("status") != "completed" or not isinstance(state.get("actual_path"), str) or not state["actual_path"]:
-            raise ValueError("这份文件没有已完成的副本导出记录。")
+            raise ValueError("这份文件没有已完成的归档或副本记录。")
         path = Path(state["actual_path"])
         if not path.is_absolute():
-            raise ValueError("记录的副本位置无效。")
+            raise ValueError("记录的文件位置无效。")
         try:
             if not path.is_file():
-                raise ValueError("原副本位置已不可用，文件可能已移动、改名或删除。知意内部原件预览不受影响；不会自动重建副本。")
+                raise ValueError("外部文件位置已不可用，文件可能已移动、改名或删除。知意内部原件预览不受影响；不会自动重建文件。")
             os.startfile(str(path.parent), "explore")
         except OSError:
-            raise ValueError("无法打开副本文件夹，请检查磁盘连接、目录权限或资源管理器。内部原件预览不受影响。") from None
+            raise ValueError("无法打开文件夹，请检查磁盘连接、目录权限或资源管理器。内部原件预览不受影响。") from None
         return str(path.parent)
 
     def _export_target(self, filename: str) -> Path:

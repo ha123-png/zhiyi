@@ -218,7 +218,7 @@ def test_desktop_bridge_does_not_expose_native_window(tmp_path: Path) -> None:
     # pywebview recursively exposes public object methods (including Path.unlink/rename).
     assert all(name.startswith("_") for name in vars(api))
     public = {name for name in dir(api) if not name.startswith("_")}
-    assert public == {"get_export_directory", "choose_export_directory", "choose_folder",
+    assert public == {"get_export_directory", "choose_export_directory", "choose_folder", "choose_import_files",
                       "open_export_folder", "export_template", "download_task_file", "export_table"}
 
 

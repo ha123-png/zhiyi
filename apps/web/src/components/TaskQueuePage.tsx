@@ -135,7 +135,7 @@ export function TaskQueuePage({
         getTasks({ limit: pendingPageSize, offset: failedPage * pendingPageSize, status: "failed,cancelled" }),
       ]);
       if (currentRequest !== requestNumber.current) return;
-      const exportItems = exports.filter((task) => task.status === "completed" && ["failed", "needs_rebind"].includes(task.file_export?.status ?? ""));
+      const exportItems = exports.filter((task) => task.status === "completed" && (task.archive_pending || ["failed", "needs_rebind"].includes(task.file_export?.status ?? "")));
       const waitingItems = waiting.filter((task) => task.status === "waiting_for_template");
       setExportPendingTasks(exportItems);
       setMatchFailedTasks(waitingItems);
@@ -354,7 +354,7 @@ export function TaskQueuePage({
   todayStart.setHours(0, 0, 0, 0);
   const completedTasks = tasks.filter(
     (t) =>
-      t.status === "completed"
+      t.status === "completed" && !t.archive_pending
       && parseServerTime(t.updated_at) >= todayStart.getTime(),
   );
   // 失败
@@ -498,7 +498,7 @@ export function TaskQueuePage({
                   </div>}
                   {pendingTotals.failed > 0 && <button className="btn secondary sm" onClick={() => { setCollapsed(previous => ({ ...previous, failed: false })); document.getElementById("queue-failed")?.scrollIntoView({ block: "start" }); }}>{pendingTotals.failed} 个失败或取消任务待处理 · 查看</button>}
                   {exportPendingTasks.map((task) => <div className="task-item" key={`export-${task.id}`}>
-                    <div className="task-row-top"><span className="task-name" title={taskDisplayName(task)}>{taskDisplayName(task)}</span><span className="badge warn">副本待处理</span></div>
+                    <div className="task-row-top"><span className="task-name" title={taskDisplayName(task)}>{taskDisplayName(task)}</span><span className="badge warn">{task.file_export?.mode === "move" ? "归档待处理" : "副本待处理"}</span></div>
                     <TaskExportAction task={task} onUpdated={() => void load()} />
                   </div>)}
                   {pendingTotals.exports > pendingPageSize && <div className="row" aria-label="副本事项翻页">

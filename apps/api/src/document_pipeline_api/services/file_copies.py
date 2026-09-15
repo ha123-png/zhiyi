@@ -62,6 +62,7 @@ def publish_original_copy(
     expected_sha256: str,
     expected_size: int,
     before_publish: Callable[[Path, tuple[int, int]], None] | None = None,
+    on_staged: Callable[[Path, tuple[int, int]], None] | None = None,
 ) -> PublishedCopy:
     """Stage, verify and atomically publish, with exclusive destination creation.
 
@@ -91,6 +92,8 @@ than falling back to a potentially destructive rename. No model is involved.
         with os.fdopen(descriptor, "wb") as output:
             stat = os.fstat(output.fileno())
             identity = (stat.st_dev, stat.st_ino)
+            if on_staged is not None:
+                on_staged(temporary, identity)
             with source.open("rb") as original:
                 while chunk := original.read(1024 * 1024):
                     size += len(chunk)

@@ -25,6 +25,7 @@ class TaskRecord(Base):
     input_plan_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     match_scope_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     pending_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source_file_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     export_state_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_name_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     internal_storage_json: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -109,6 +110,12 @@ class TaskRecord(Base):
     def match_scope(self):
         from document_pipeline_api.schemas.input_scope import InputScope
         return InputScope.model_validate_json(self.match_scope_json) if self.match_scope_json else None
+
+    @property
+    def archive_pending(self) -> bool:
+        state = self.file_export
+        return bool(self.status == "completed" and state and state.mode == "move"
+                    and state.status not in {"disabled", "completed", "skipped"})
 
     @property
     def file_export(self):

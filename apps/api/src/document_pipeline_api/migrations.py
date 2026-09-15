@@ -27,6 +27,7 @@ EXPECTED_SCHEMA = {
         "input_plan_json",
         "match_scope_json",
         "pending_reason",
+        "source_file_json",
         "export_state_json",
         "file_name_json",
         "internal_storage_json",
@@ -200,7 +201,7 @@ EXPECTED_SCHEMA = {
         "updated_at",
     },
 }
-EXPECTED_SCHEMA["template_local_bindings"] = {"template_id", "revision", "enabled", "parent_path", "internal_folder"}
+EXPECTED_SCHEMA["template_local_bindings"] = {"template_id", "revision", "enabled", "parent_path", "internal_folder", "mode"}
 EXPECTED_SCHEMA["data_rows"].add("review_pending")
 ASSISTANT_SCHEMA = {
     "assistant_threads": {"id", "title", "profile_id", "created_at", "updated_at", "archived_at"},
@@ -438,7 +439,9 @@ GROWTH_SCHEMA = {"file_name_sequences": {"template_id", "day", "value"}, "assist
 EXPECTED_SCHEMA.update(GROWTH_SCHEMA)
 EXPECTED_SCHEMA["assistant_runs"] = EXPECTED_SCHEMA["assistant_runs"] | {"stream_version", "snapshot_sequence"}
 SCHEMA_REVISIONS["0038_growth_and_streaming"] = SCHEMA_REVISIONS["0037_model_context_policy"] | GROWTH_SCHEMA.keys()
+SCHEMA_REVISIONS["0039_original_archive"] = SCHEMA_REVISIONS["0038_growth_and_streaming"]
 COLUMNS_INTRODUCED_BY_REVISION = {
+    "0039_original_archive": {"tasks": {"source_file_json"}, "template_local_bindings": {"mode"}},
     "0038_growth_and_streaming": {**GROWTH_SCHEMA, "assistant_runs": {"stream_version", "snapshot_sequence"}},
     "0037_model_context_policy": {"model_profile_versions": {"context_policy"}},
     "0036_dashboard_usage": DASHBOARD_SCHEMA,

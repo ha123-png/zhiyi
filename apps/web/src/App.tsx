@@ -147,16 +147,16 @@ function AppContent() {
       case "completed":
         switch (event.export_status) {
           case "completed":
-            return `「${event.filename}」提取已完成；副本已导出`;
+            return `「${event.filename}」提取已完成；${event.export_mode === "move" ? "原文件已归档" : "副本已导出"}`;
           case "failed":
           case "needs_rebind":
-            return `「${event.filename}」提取已完成；副本导出需要处理，请查看待处理事项`;
+            return `「${event.filename}」提取已完成；${event.export_mode === "move" ? "原文件归档" : "副本导出"}需要处理，请查看待处理事项`;
           case "pending":
           case "awaiting_confirmation":
           case "exporting":
-            return `「${event.filename}」提取已完成；副本等待导出`;
+            return `「${event.filename}」提取已完成；${event.export_mode === "move" ? "原文件等待归档" : "副本等待导出"}`;
           case "skipped":
-            return `「${event.filename}」提取已完成；已跳过副本导出`;
+            return `「${event.filename}」提取已完成；已跳过${event.export_mode === "move" ? "原文件归档" : "副本导出"}`;
           default:
             return `「${event.filename}」提取已完成`;
         }

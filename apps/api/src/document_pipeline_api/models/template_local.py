@@ -9,6 +9,7 @@ class TemplateLocalBindingRecord(Base):
     __tablename__ = "template_local_bindings"
 
     template_id: Mapped[str] = mapped_column(ForeignKey("templates.id", ondelete="CASCADE"), primary_key=True)
+    mode: Mapped[str] = mapped_column(String(8), default="copy", server_default="copy")
     revision: Mapped[int] = mapped_column(Integer, default=1)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     parent_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)

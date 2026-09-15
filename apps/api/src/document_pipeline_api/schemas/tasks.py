@@ -44,6 +44,7 @@ class TaskRead(BaseModel):
     planned_scope: InputScope | None = None
     match_scope: InputScope | None = None
     pending_reason: str | None = None
+    archive_pending: bool = False
     file_export: TaskExportState | None = None
     file_name: FileNameRead | None = None
     internal_storage: dict | None = None

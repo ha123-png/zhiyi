@@ -3,7 +3,7 @@ import hashlib
 from pathlib import Path
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.config import Settings
@@ -12,6 +12,17 @@ from document_pipeline_api.schemas.file_export import ExportAction, TaskExportSt
 from document_pipeline_api.services.file_copies import CopyExportError, publish_original_copy, validate_copy_name
 from document_pipeline_api.services.file_operation_lock import file_operation_lock
 from document_pipeline_api.storage_paths import resolve_task_storage_path
+
+
+def archive_pending_expression():
+    return and_(TaskRecord.status == "completed",
+        func.json_extract(TaskRecord.export_state_json, "$.mode") == "move",
+        func.json_extract(TaskRecord.export_state_json, "$.status").not_in(["disabled", "completed", "skipped"]))
+
+
+def pending_export_expression():
+    return and_(TaskRecord.status == "completed", or_(archive_pending_expression(),
+        func.json_extract(TaskRecord.export_state_json, "$.status").in_(["failed", "needs_rebind"])))
 
 
 def _save(session: Session, task: TaskRecord, state: TaskExportState) -> None:
@@ -58,6 +69,10 @@ def _process_task_export(session: Session, settings: Settings, task_id: str) -> 
         return
     state = task.file_export
     if state.status not in {"awaiting_confirmation", "pending", "exporting"}:
+        return
+    if state.mode == "move":
+        from document_pipeline_api.services.original_archive import archive_original
+        archive_original(session, settings, task, state)
         return
     try:
         if state.attempted_path:
@@ -118,14 +133,36 @@ def act_on_task_export(session: Session, settings: Settings, task_id: str, actio
             raise HTTPException(404, "没有找到这个任务。")
         state = task.file_export
         if task.status != "completed" or state is None or state.status not in {"failed", "needs_rebind", "pending", "awaiting_confirmation"}:
-            raise HTTPException(409, "这个任务当前没有可操作的副本导出事项。")
+            raise HTTPException(409, "这个任务当前没有可操作的文件归档或副本事项。")
         if action.action == "skip":
             state.status = "skipped"
             state.error_code = state.error_message = None
         else:
+            if state.mode == "move" and not task.source_file_json:
+                raise HTTPException(422, "没有可核实的原文件位置，请跳过此次归档后，通过桌面版重新选择文件导入。")
+            if state.mode == "move" and state.staging_path:
+                from document_pipeline_api.services.original_archive import cleanup_staging
+                try:
+                    cleanup_staging(state)
+                except (ValueError, OSError) as error:
+                    raise HTTPException(409, "上次归档的暂存文件暂时无法核实，请检查原目标目录后重试或跳过。") from error
+            if state.mode == "move" and state.attempted_path:
+                target = Path(state.attempted_path)
+                try:
+                    target.lstat()
+                    missing = False
+                except FileNotFoundError:
+                    missing = True
+                except OSError as error:
+                    raise HTTPException(409, "无法访问上次归档位置，请检查目录权限后重试。") from error
+                if missing and not state.source_removal_started:
+                    state.attempted_path = None
+                    state.published_device = state.published_inode = None
+                elif (action.filename is not None and action.filename != state.confirmed_name) or (action.parent_path is not None and Path(action.parent_path) != Path(state.parent_path)):
+                    raise HTTPException(409, "已有归档写入记录，请先重试完成原文件归档，或跳过；不会生成另一份文件。")
             if state.status == "needs_rebind" and not action.parent_path:
                 raise HTTPException(422, "恢复备份后，请重新选择并确认导出文件夹。")
-            if state.error_code == "publication_uncertain" and not action.acknowledge_uncertain:
+            if state.mode == "copy" and state.error_code == "publication_uncertain" and not action.acknowledge_uncertain:
                 raise HTTPException(422, "请先检查上次导出位置，并明确确认是否重新导出。")
             if action.filename is not None:
                 try:
@@ -137,6 +174,12 @@ def act_on_task_export(session: Session, settings: Settings, task_id: str, actio
                 state.confirmed_name = action.filename
             if action.parent_path is not None:
                 parent = Path(action.parent_path)
+                if state.mode == "move":
+                    from document_pipeline_api.services.native_files import validate_local_path
+                    try:
+                        validate_local_path(parent)
+                    except (ValueError, OSError) as error:
+                        raise HTTPException(422, str(error)) from error
                 if not parent.is_absolute() or not parent.is_dir():
                     raise HTTPException(422, "请选择存在且可访问的绝对文件夹路径。")
                 if not state.folder_name:
@@ -145,8 +188,9 @@ def act_on_task_export(session: Session, settings: Settings, task_id: str, actio
                 state.destination = str(parent.resolve() / state.folder_name)
             state.status = "pending"
             state.error_code = state.error_message = None
-            state.attempted_path = None
-            state.published_device = state.published_inode = None
+            if state.mode == "copy":
+                state.attempted_path = None
+                state.published_device = state.published_inode = None
         _save(session, task, state)
     if action.action == "retry":
         process_task_export(session, settings, task_id)

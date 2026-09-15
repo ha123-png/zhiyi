@@ -246,10 +246,12 @@ def tasks_summary(
             summary.failed = count
         elif status_value == TaskStatus.CANCELLED.value:
             summary.cancelled = count
-    export_count = select(func.count()).select_from(TaskRecord).where(
-        TaskRecord.status == TaskStatus.COMPLETED.value,
-        func.json_extract(TaskRecord.export_state_json, "$.status").in_(["failed", "needs_rebind"]),
-    )
+    from document_pipeline_api.services.task_exports import archive_pending_expression, pending_export_expression
+    export_count = select(func.count()).select_from(TaskRecord).where(pending_export_expression())
+    archive_count = select(func.count()).select_from(TaskRecord).where(archive_pending_expression())
+    if statement.whereclause is not None:
+        archive_count = archive_count.where(statement.whereclause)
+    summary.completed -= session.scalar(archive_count) or 0
     if statement.whereclause is not None:
         export_count = export_count.where(statement.whereclause)
     summary.pending_exports = session.scalar(export_count) or 0
@@ -280,6 +282,40 @@ async def create_task(
     if settings.queue_enabled and not frozen:
         from document_pipeline_api.services.queueing import enqueue_task
 
+        enqueue_task(task.id)
+    return TaskRead.model_validate(task)
+
+
+class NativeImportRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    token: str = Field(pattern=r"^[a-f0-9]{64}$")
+    template_mode: str = "smart"
+    template_id: str | None = None
+    target_table_id: str | None = None
+
+
+@router.post("/native-import", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
+async def native_import(request: Request, session: SessionDependency, body: NativeImportRequest) -> TaskRead:
+    import mimetypes
+    from starlette.datastructures import Headers
+    from document_pipeline_api.services.native_files import consume_import_ticket
+    from document_pipeline_api.services.file_copies import CopyExportError
+    settings = request.app.state.settings
+    try:
+        with consume_import_ticket(settings.storage_dir.parent, body.token) as (source, origin):
+            name = Path(origin["path"]).name
+            content_type = "text/markdown" if Path(name).suffix.lower() == ".md" else mimetypes.guess_type(name)[0] or "application/octet-stream"
+            task = await create_task_from_upload(session, settings,
+                UploadFile(source, filename=name, headers=Headers({"content-type": content_type})),
+                body.template_mode, body.template_id, target_table_id=body.target_table_id,
+                source_file={key: value for key, value in origin.items() if key != "expires"})
+    except (CopyExportError, OSError) as error:
+        raise HTTPException(422, str(error) if isinstance(error, CopyExportError) else "无法读取所选文件，请关闭占用程序或重新选择文件。") from error
+    from document_pipeline_api.services.internal_storage import classify_task_original
+    classify_task_original(session, settings, task.id)
+    frozen = freeze_new_task_if_paused(session, task.id)
+    if settings.queue_enabled and not frozen:
+        from document_pipeline_api.services.queueing import enqueue_task
         enqueue_task(task.id)
     return TaskRead.model_validate(task)
 

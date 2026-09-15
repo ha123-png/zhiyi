@@ -19,7 +19,7 @@ def read_local_export(session: Session, template_id: str) -> LocalExportRead:
     if record is None:
         return LocalExportRead()
     return LocalExportRead(
-        revision=record.revision, enabled=record.enabled, parent_path=record.parent_path,
+        revision=record.revision, enabled=record.enabled, mode=record.mode, parent_path=record.parent_path,
         destination=str(Path(record.parent_path) / suggest_safe_stem(template.name)) if record.parent_path else None,
     )
 
@@ -31,6 +31,12 @@ def update_local_export(session: Session, settings: Settings, template_id: str, 
         path = Path(body.parent_path)
         if not path.is_absolute():
             raise HTTPException(422, "请选择本机的绝对文件夹路径。")
+        if body.enabled and body.mode == "move":
+            from document_pipeline_api.services.native_files import validate_local_path
+            try:
+                validate_local_path(path)
+            except (ValueError, OSError) as error:
+                raise HTTPException(422, str(error)) from error
         parent = str(path.resolve())
     if body.enabled:
         if parent is None or not Path(parent).is_dir():
@@ -39,7 +45,7 @@ def update_local_export(session: Session, settings: Settings, template_id: str, 
         managed = settings.storage_dir.resolve()
         if destination.is_relative_to(managed) or managed.is_relative_to(destination):
             raise HTTPException(422, "外部副本目标不能与知意内部原件目录重叠。")
-    values = dict(template_id=template_id, revision=body.expected_revision + 1, enabled=body.enabled, parent_path=parent)
+    values = dict(mode=body.mode, template_id=template_id, revision=body.expected_revision + 1, enabled=body.enabled, parent_path=parent)
     # SQLite performs revision comparison and update in one write transaction.
     existing = session.get(TemplateLocalBindingRecord, template_id)
     if existing is None and body.expected_revision != 0:
@@ -63,6 +69,7 @@ def build_export_snapshot(session: Session, template: TemplateRead) -> str:
     binding = session.get(TemplateLocalBindingRecord, template.id)
     state = TaskExportState()
     if binding is not None:
+        state.mode = binding.mode
         state.binding_revision = binding.revision
         if binding.enabled and binding.parent_path:
             state.status = "awaiting_confirmation"

@@ -75,6 +75,7 @@ def poll_task_changes(
             TaskRecord.failure_message,
             TaskRecord.updated_at,
             func.json_extract(TaskRecord.export_state_json, "$.status").label("export_status"),
+            func.json_extract(TaskRecord.export_state_json, "$.mode").label("export_mode"),
         )
         .where(after)
         .order_by(TaskRecord.updated_at, TaskRecord.id)
@@ -89,6 +90,7 @@ def poll_task_changes(
             "filename": row.filename,
             "failure_message": row.failure_message,
             "export_status": row.export_status,
+            "export_mode": row.export_mode,
         }
         for row in rows
     ]

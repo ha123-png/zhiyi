@@ -1,3 +1,4 @@
+import { desktopApi, type NativeImportFile } from "../desktop";
 import { taskDisplayName } from "../taskNames";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAssistantPageContext } from "../assistant/AssistantProvider";
@@ -795,7 +796,7 @@ export function ExtractPage({
   }, []);
 
   /** 批量上传：每个文件入队为一个任务，全部进入队列后由后端串行处理。 */
-  async function handleFiles(files: File[]) {
+  async function handleFiles(files: (File | NativeImportFile)[]) {
     if (files.length === 0) return;
     setError(null);
     setLoading(true);
@@ -844,6 +845,13 @@ export function ExtractPage({
     });
     // 立即同步全局任务条：上传成功即刻显示"正在识别"，不等下一次轮询
     onTasksChange?.();
+  }
+
+  async function chooseFiles() {
+    const pick = desktopApi()?.choose_import_files;
+    if (!pick) { fileInputRef.current?.click(); return; }
+    try { await handleFiles(await pick()); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "文件选择未能完成，请重试。"); }
   }
 
   function handleDrop(e: React.DragEvent<HTMLDivElement>) {
@@ -1089,7 +1097,7 @@ export function ExtractPage({
               <span key={b.task.id} className={`batch-item ${b.task.status}`}>
                 <span className="batch-item-name">{taskDisplayName(b.task)}</span>
                 <span className="batch-item-status">
-                  {b.task.status === "failed" ? "失败" : BATCH_STATUS_LABEL[b.task.status]}
+                  {b.task.archive_pending ? "归档待处理" : b.task.status === "failed" ? "失败" : BATCH_STATUS_LABEL[b.task.status]}
                 </span>
               </span>
             ))}
@@ -1111,12 +1119,12 @@ export function ExtractPage({
           aria-label="上传文件区域，按回车选择文件"
           className={`drop-zone ${dragOver ? "drag-over" : ""}`}
           onClick={() => {
-            if (!loading) fileInputRef.current?.click();
+            if (!loading) void chooseFiles();
           }}
           onKeyDown={(e) => {
             if ((e.key === "Enter" || e.key === " ") && !loading) {
               e.preventDefault();
-              fileInputRef.current?.click();
+              void chooseFiles();
             }
           }}
           role="button"
@@ -1145,12 +1153,13 @@ export function ExtractPage({
           </div>
           <h3>点击或拖拽文件到此处</h3>
           <p>支持 PDF、Word、Excel、图片、文本，可多选批量上传。单文件不超过 50 MB。</p>
+          {desktopApi()?.choose_import_files && <p className="support">需要原文件归档时，请使用“选择文件”导入。</p>}
           <button
             className="btn secondary sm"
             style={{ marginTop: "calc(var(--space-4) * 3)" }}
             onClick={(e) => {
               e.stopPropagation();
-              if (!loading) fileInputRef.current?.click();
+              if (!loading) void chooseFiles();
             }}
             disabled={loading}
           >
