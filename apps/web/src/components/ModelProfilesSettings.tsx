@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Check, ChevronDown, Eye, EyeOff, Loader2, Pencil, Plus, Zap } from "lucide-react";
+import { Archive, Check, ChevronDown, Eye, EyeOff, Loader2, Pencil, Plus, Zap } from "lucide-react";
 import {
   activateModelProfile,
   archiveModelProfile,
@@ -11,6 +11,7 @@ import {
 import type { ModelProfile, ModelProfileDraft, ModelProbeResult, ModelProviderName } from "../types";
 import { Icon } from "./Icon";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { Toast, useToast } from "./Toast";
 
 const EMPTY_DRAFT: ModelProfileDraft = {
   name: "",
@@ -53,6 +54,8 @@ function inferPreset(draft: Pick<ModelProfileDraft, "provider" | "base_url">): S
 
 export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProfileChanged?: () => void } = {}) {
   const [profiles, setProfiles] = useState<ModelProfile[]>([]);
+  const [archiveTarget, setArchiveTarget] = useState<ModelProfile | null>(null);
+  const { toast, notify, clear } = useToast();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draft, setDraft] = useState<ModelProfileDraft>(EXAMPLE_DRAFT);
   const [showApiKey, setShowApiKey] = useState(false);
@@ -198,10 +201,13 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
     setMessage(null);
     try {
       await archiveModelProfile(profile.id);
+      setArchiveTarget(null);
       await reload();
       setMessage("方案已停用；停用后不能再激活，但历史任务快照不受影响。");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "停用失败。");
+      const message = reason instanceof Error ? reason.message : "停用失败。";
+      setError(message);
+      notify(message, "error");
     } finally {
       setSaving(false);
     }
@@ -373,7 +379,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
           <button className="btn secondary sm" type="button" disabled={saving} onClick={() => requestActivate(selected)}><Icon icon={Check} size={13} /> 激活方案</button>
         )}
         {selected && !selected.is_archived && !selected.is_active && (
-          <button className="btn danger-soft sm" type="button" disabled={saving} onClick={() => void archive(selected)}><Icon icon={Pencil} size={13} /> 删除方案</button>
+          <button className="btn danger-soft sm" type="button" disabled={saving} onClick={() => setArchiveTarget(selected)}><Icon icon={Archive} size={13} /> 停用方案</button>
         )}
       </div>
 
@@ -393,6 +399,15 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
       </div>
 
       <ConfirmDialog
+        open={archiveTarget !== null}
+        title={`停用“${archiveTarget?.name ?? ""}”？`}
+        description="停用后将从可选方案中移除，不能再次激活。已完成任务的模型快照保留，不删除模型软件或模型文件。"
+        buttonLabel="确认停用"
+        busy={saving}
+        onConfirm={() => { if (archiveTarget) void archive(archiveTarget); }}
+        onClose={() => setArchiveTarget(null)}
+      />
+      <ConfirmDialog
         open={confirmActivate !== null}
         title="确认使用云端模型？"
         description={`此方案的服务地址不在本机（${confirmActivate?.base_url ?? ""}）。激活后，新上传的文件内容会被发送到该服务进行处理。每次切换到这个方案都会再次确认，防止误切到云端。`}
@@ -403,6 +418,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
         }}
         onClose={() => setConfirmActivate(null)}
       />
+      <Toast toast={toast} onDismiss={clear} />
     </>
   );
 }

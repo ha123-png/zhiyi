@@ -98,6 +98,9 @@ class FieldEvidence(BaseModel):
 
 
 class ExtractionRead(BaseModel):
+    current_schema: list[dict] = Field(default_factory=list)
+    detail_ids: list[int] = Field(default_factory=list)
+    has_current_data: bool = True
     file_name: FileNameRead | None = None
     task_id: str
     document_kind: DocumentKind
@@ -116,6 +119,8 @@ class ExtractionRead(BaseModel):
 
 
 class ReviewUpdate(BaseModel):
+    # Stable identities survive deletion/reordering; null entries mean new details.
+    detail_ids: list[int | None] | None = None
     filename: str | None = Field(default=None, max_length=512)
     model_config = ConfigDict(extra="forbid")
 

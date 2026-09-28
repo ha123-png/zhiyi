@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from pydantic import Field
 from sqlalchemy import select
 
+from document_pipeline_api.services.current_data import row_values
 from document_pipeline_api.models import (
     DataRowRecord,
     DataTableRecord,
@@ -113,7 +114,7 @@ def guard(session, kind, identifier):
         return digest(scope_rows(session, Context.model_validate(selection["context"]), selection["table_id"]))
     if kind == "row":
         row = session.get(DataRowRecord, int(identifier))
-        return None if not row else digest([row.table_id, row.row_version, row.row_json])
+        return None if not row else digest([row.table_id, row.row_version, row_values(row)])
     if kind == "table":
         table = session.get(DataTableRecord, identifier)
         return (
@@ -128,7 +129,7 @@ def guard(session, kind, identifier):
     if kind == "membership":
         return digest(
             [
-                (r.id, r.row_version, r.row_json)
+                (r.id, r.row_version, row_values(r))
                 for r in session.scalars(
                     select(DataRowRecord)
                     .where(DataRowRecord.table_id == identifier)
@@ -148,7 +149,7 @@ def guard(session, kind, identifier):
 
 def entire_table(context, table_id):
     if context.table_id == table_id and (
-        context.row_ids is not None or context.search or context.view_id or context.task_id
+        context.row_ids is not None or context.source_keys is not None or context.search or context.view_id or context.task_id
     ):
         raise HTTPException(403, "此操作影响整张表；请在资料选择器中明确选择整张表后再提出。")
 
@@ -197,6 +198,10 @@ def preview_plan(session, context, body: Plan):
 
     for op in body.operations:
         require_capability(context, CAPABILITY[op.kind])
+        if context.task_id and not context.workspace and op.kind in {
+            "add_rows", "split_table", "add_column", "rename_table", "create_table",
+        }:
+            raise HTTPException(403, "当前只授权所选文件，整表操作请到数据仓库另行授权。")
         item = {
             "operation": op.model_dump(mode="json"),
             "label": LABELS[op.kind],
@@ -241,7 +246,7 @@ def preview_plan(session, context, body: Plan):
                     changes = op.changes
                     if op.kind == "increment_rows":
                         ensure_row_scope(session, context, op.table_id, row_id)
-                        current = json.loads(session.get(DataRowRecord, row_id).row_json)
+                        current = row_values(session.get(DataRowRecord, row_id))
                         changes = {}
                         for key, delta in op.changes.items():
                             if key not in columns or columns[key].value_type != "number":
@@ -274,9 +279,9 @@ def preview_plan(session, context, body: Plan):
                     row = session.get(DataRowRecord, row_id)
                     watch("row", row_id)
                     item["affected"].append(
-                        {"row_id": row.id, "before": json.loads(row.row_json), "after": None}
+                        {"row_id": row.id, "before": row_values(row), "after": None}
                     )
-                item["note"] = "删除记录及该行修订，不提供一键撤销；原件和任务仍保留。"
+                item["note"] = "删除当前数据，修订历史保留删除前内容；原文件和文件历史保留。"
             else:
                 entire_table(context, op.table_id)
                 if op.kind == "add_rows":
@@ -348,7 +353,7 @@ def preview_plan(session, context, body: Plan):
         if op.kind in {"update_rows", "increment_rows", "delete_rows"} and columns:
             first_key = next(iter(columns))
             for affected in item["affected"]:
-                original = json.loads(session.get(DataRowRecord, affected["row_id"]).row_json)
+                original = row_values(session.get(DataRowRecord, affected["row_id"]))
                 identifier = original.get(first_key)
                 if identifier is not None and str(identifier).strip():
                     affected["name"] = f"{columns[first_key].label}：{identifier}"[:160]
@@ -420,6 +425,8 @@ def apply_plan(session, context, plan, settings):
         raise HTTPException(409, "实际影响范围已变化，请重新生成预览。")
     result, undo, queue = [], [], []
     can_undo = True
+    from document_pipeline_api.services.current_data import create_edit_session, seal_edit_session
+    editing = create_edit_session(session, owner="assistant", editor="问知意 / 用户授权")
     for item in plan["items"]:
         op = Operation.model_validate(item["operation"])
         require_capability(context, CAPABILITY[op.kind])
@@ -439,6 +446,7 @@ def apply_plan(session, context, plan, settings):
                         expected_version=current.row_version,
                         changes=row["after"],
                         editor="问知意 / 用户授权",
+                        edit_session_id=editing.id,
                     ),
                 )
             # One reversal per root. Shared fields continue to use the existing propagation service.
@@ -462,7 +470,7 @@ def apply_plan(session, context, plan, settings):
             can_undo = False
         elif op.kind == "delete_rows":
             root_ids = item.get("root_ids", op.row_ids)
-            data_tables.delete_rows(session, op.table_id, root_ids)
+            data_tables.delete_rows(session, op.table_id, root_ids, edit_session_id=editing.id)
             result.append({"table_id": op.table_id, "deleted_rows": root_ids})
             can_undo = False
         elif op.kind == "tasks":
@@ -520,6 +528,7 @@ def apply_plan(session, context, plan, settings):
     # after changing its matching values can be empty (or select other rows).
     # Keep the row/table guards; the original scope guard was checked before
     # execution and must not invalidate the edit that intentionally changed it.
+    seal_edit_session(session, editing.id)
     undo_guards = {
         key: guard(session, *key.split(":", 1))
         for key in plan["guards"] if not key.startswith("scope:")

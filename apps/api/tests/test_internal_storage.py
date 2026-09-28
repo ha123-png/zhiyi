@@ -93,7 +93,10 @@ def test_deleting_legacy_external_reference_does_not_delete_external_file(client
         task.storage_path = str(target)
         task.status = "completed"
         session.commit()
-        assert resolve_task_storage_path(settings.storage_dir, task) == target
+        with pytest.raises(ValueError, match="相对引用"):
+            resolve_task_storage_path(settings.storage_dir, task)
+        assert client.get(f"/api/v1/tasks/{task_id}/file").status_code == 410
+        assert client.get(f"/api/v1/tasks/{task_id}/preview").status_code == 410
         delete_task(session, settings, task_id)
     assert target.read_bytes() == PNG_BYTES
 

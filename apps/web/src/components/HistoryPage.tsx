@@ -1,3 +1,9 @@
+import { deletionNotice } from "../deletionNotice";
+import { FileRevisionHistory } from "./FileRevisionHistory";
+import { DetailPagination, useDetailPage } from "./DetailPagination";
+import { DetailRowAction } from "./DetailRowAction";
+import { FileHistoryActions } from "./FileHistoryActions";
+import { History } from "lucide-react";
 import { taskDisplayName } from "../taskNames";
 import { FileLocation } from "./FileLocation";
 import { Disclosure } from "./Disclosure";
@@ -18,22 +24,17 @@ import {
   Search,
   ShieldAlert,
   Table2,
-  Trash2,
-  Wrench,
 } from "lucide-react";
 import {
-  confirmTask,
   deleteTask,
   getExtraction,
   getOriginalFileUrl,
-  getTables,
   getTemplates,
   getTasks,
   getTaskSummary,
   updateReview,
 } from "../api";
 import type {
-  DataTableRead,
   Extraction,
   ExtractionResult,
   Task,
@@ -112,8 +113,6 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
   const [extraction, setExtraction] = useState<Extraction | null>(null);
   const [extractionLoading, setExtractionLoading] = useState(false);
   const [templateNameMap, setTemplateNameMap] = useState<Record<string, string>>({});
-  const [tables, setTables] = useState<DataTableRead[]>([]);
-  const [targetTableId, setTargetTableId] = useState<string>("");
   const [columnWidths, setColumnWidths] = useState<Record<number, number>>({});
   const [detailWidths, setDetailWidths] = useState<Record<string, number>>({});
 
@@ -125,13 +124,16 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
   const [problemsPage, setProblemsPage] = useState(1);
   const [jumpPageInput, setJumpPageInput] = useState("");
 
-  // 原文件 tab 内编辑：草稿模式，点“保存到表”才触发校验并保存
+  // 原文件 tab 内编辑：草稿模式，点“修订到表”才触发校验并保存
   const [editingCell, setEditingCell] = useState<string | null>(null);
+  const [fileHistoryOpen, setFileHistoryOpen] = useState(false);
+  const [draftDetailIds, setDraftDetailIds] = useState<number[] | undefined>();
+  useEffect(() => { setDraftDetailIds(extraction?.detail_ids); }, [extraction]);
   const [draft, setDraft] = useState<ExtractionResult | null>(null);
   const [saving, setSaving] = useState(false);
   // 原文件加载竞态守卫：快速切换文件时只让最新一次请求写入结果
   const originalSeqRef = useRef(0);
-  // 用户忽略的校验问题下标：被忽略的问题仍记录，但不再阻断保存到表
+  // 用户忽略的校验问题下标：被忽略的问题仍记录，但不再阻断修订到表
   const [ignoredIssueIndices, setIgnoredIssueIndices] = useState<number[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
@@ -140,7 +142,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     status: "downloading" | "success" | "error";
     message: string;
   } | null>(null);
-  // 删除确认：文件历史删除=删除任务记录，不删除数据表中的数据；需输入文件名确认
+  // 删除整个文件前确认：原件、当前数据及修订历史一起删除
   const [deleteTarget, setDeleteTarget] = useState<Task | null>(null);
 
   async function downloadOriginalFile(task: Task) {
@@ -169,9 +171,6 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
         ),
       )
       .catch(() => setTemplateNameMap({}));
-    getTables()
-      .then(setTables)
-      .catch(() => setTables([]));
   }, []);
 
   const HISTORY_PAGE_SIZE = 10;
@@ -334,6 +333,8 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
         extraction.review_version,
         draft,
         ignoredIssueIndices,
+        undefined,
+        draftDetailIds,
       );
       setExtraction(updated);
       setDraft(structuredClone(updated.result));
@@ -343,10 +344,6 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
           .map((issue, index) => (issue.ignored ? index : -1))
           .filter((index) => index >= 0),
       );
-      // 用户显式选择了目标表：确认入表（保存到表 = 镜像同步）
-      if (targetTableId) {
-        await confirmTask(selectedTask.id, updated.review_version, targetTableId);
-      }
       // 保存后刷新列表：任务可能从"校验问题"变"已完成"，列表状态不滞后
       await load();
     } catch (err) {
@@ -388,7 +385,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     }
   }
 
-  // 文件历史删除：删除任务记录与提取结果，不删除数据表中已确认的数据
+  // 删除整个文件及其唯一当前数据与历史
   async function handleDeleteTask() {
     if (!deleteTarget) return;
     setBusyTaskId(deleteTarget.id);
@@ -397,9 +394,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
       const result = await deleteTask(deleteTarget.id);
       setDeleteTarget(null);
       setNotice(
-        result.kept_rows > 0
-          ? `已删除记录：${deleteTarget.filename}。数据表中保留 ${result.kept_rows} 行数据（不再追溯此文件）。`
-          : `已删除记录：${deleteTarget.filename}。`,
+        deletionNotice(result, `已删除文件及关联数据：${deleteTarget.filename}。`),
       );
       await load();
     } catch (err) {
@@ -454,14 +449,14 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
   const colWidths = useMemo<Record<number, number>>(
     () => ({
       0: columnWidths[0] ?? 48,
-      1: columnWidths[1] ?? 260,
-      2: columnWidths[2] ?? 120,
-      3: columnWidths[3] ?? 180,
-      4: columnWidths[4] ?? 140,
-      5: columnWidths[5] ?? 140,
-      6: columnWidths[6] ?? 190,
+      1: columnWidths[1] ?? 240,
+      2: columnWidths[2] ?? 100,
+      3: columnWidths[3] ?? 140,
+      4: columnWidths[4] ?? (historyTab === "problems" ? 180 : 70),
+      5: columnWidths[5] ?? (historyTab === "problems" ? 165 : 85),
+      6: columnWidths[6] ?? 165,
     }),
-    [columnWidths],
+    [columnWidths, historyTab],
   );
 
   const renderColumnResizer = (index: number) => (
@@ -478,21 +473,23 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
   // 抬头/明细字段一律以提取所用模板字段为准（与数据表、提取页同源）：
   // 模板缺失（旧记录/模板已删）时不显示字段，也不回退发票全集，避免送货单冒出税字段。
   const extractionHeaderKeys = useMemo(() => {
-    if (!extraction?.template) return [];
-    return extraction.template.fields
+    if (!extraction) return [];
+    return (extraction.current_schema ?? extraction.template?.fields ?? [])
       .filter((field) => field.section === "header" && field.key)
       .map((field) => field.key as string);
   }, [extraction]);
 
   const extractionItemKeys = useMemo(() => {
-    if (!extraction?.template) return [];
-    return extraction.template.fields
+    if (!extraction) return [];
+    return (extraction.current_schema ?? extraction.template?.fields ?? [])
       .filter((field) => field.section === "item" && field.key)
       .map((field) => field.key as string);
   }, [extraction]);
+  const detailColumnWidth = extractionItemKeys.reduce((width, key) => width + (detailWidths[key] ?? 132), 0);
 
   function labelFor(key: string): string {
     key = key.replace(/^(?:header\.|items\[\d+\]\.)/, "");
+    if (extraction?.current_schema?.length) return extraction.current_schema.find(field => field.key === key)?.label ?? key;
     if (extraction?.template) {
       const field = extraction.template.fields.find((f) => f.key === key);
       if (field) {
@@ -515,6 +512,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     : extraction
       ? (extraction.result as { items?: Array<Record<string, unknown>> }).items ?? []
       : [];
+  const detailPage = useDetailPage(displayItems.length, selectedTask?.id);
 
   const renderTable = (
     headers: string[],
@@ -528,9 +526,9 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
         <thead>
           <tr>
             {headers.map((header, index) => (
-              <th key={index} style={{ width: `${colWidths[index]}px` }}>
+              <th key={index} aria-label={header || "文件操作"} className={header ? undefined : "history-actions-gutter"} style={header ? { width: `${colWidths[index]}px` } : {width: "48px"}}>
                 <span>{header}</span>
-                {renderColumnResizer(index)}
+                {header && renderColumnResizer(index)}
               </th>
             ))}
           </tr>
@@ -602,6 +600,8 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
 
   return (
     <div className="view">
+      {fileHistoryOpen && selectedTask && <FileRevisionHistory taskId={selectedTask.id} filename={taskDisplayName(selectedTask)} onClose={() => setFileHistoryOpen(false)} />}
+      {extraction?.has_current_data === false && <p className="callout">当前数据已清空。原文件和历史版本仍可查看。</p>}
       <div className="page-header">
         <div className="eyebrow">追溯</div>
         <h1>文件历史</h1>
@@ -717,7 +717,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
           {historyTab === "completed" && (
             <div className="card flush history-table-card" aria-busy={loading}>
               {renderTable(
-                ["#", "文件名", "模板", "处理方式", "记录数", "提取耗时", "完成时间", "操作"],
+                ["#", "文件名", "模板", "处理方式", "记录数", "提取耗时", "完成时间", ""],
                 (
                   <colgroup>
                     <col style={{ width: `${colWidths[0]}px` }} />
@@ -726,8 +726,8 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                     <col style={{ width: `${colWidths[3]}px` }} />
                     <col style={{ width: `${colWidths[4]}px` }} />
                     <col style={{ width: `${colWidths[5]}px` }} />
-                    <col style={{ width: "200px" }} />
-                    <col style={{ width: "190px" }} />
+                    <col style={{ width: `${colWidths[6]}px` }} />
+                    <col style={{ width: "48px" }} />
                   </colgroup>
                 ),
                 pageTasks.length === 0
@@ -754,20 +754,8 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                         <td className="numeric">{t.record_count ?? 0}</td>
                         <td>{formatElapsed(t.processing_elapsed_seconds)}</td>
                         <td>{t.completed_at ? formatDateTime(t.completed_at) : "—"}</td>
-                        <td>
-                          <div className="hist-actions">
-                            <button className="btn ghost xs" onClick={() => openOriginal(t)}>
-                              <Icon icon={FileText} style={{ width: "12px", height: "12px" }} /> 查看原文件
-                            </button>
-                            <button
-                              className="btn ghost xs danger-btn"
-                              title="删除该文件的任务记录（数据表中的数据保留）"
-                              onClick={() => setDeleteTarget(t)}
-                            >
-                              <Icon icon={Trash2} style={{ width: "12px", height: "12px" }} /> 删除
-                            </button>
-                          </div>
-                        </td>
+                        <td className="history-actions-gutter"><FileHistoryActions filename={taskDisplayName(t)} onOpen={() => openOriginal(t)}
+                          onDelete={() => setDeleteTarget(t)} /></td>
                       </tr>
                     )),
               )}
@@ -778,7 +766,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
           {historyTab === "problems" && (
             <div className="card flush history-table-card" aria-busy={loading}>
               {renderTable(
-                ["#", "文件名", "模板", "处理方式", "问题", "处理时间", "操作"],
+                ["#", "文件名", "模板", "处理方式", "问题", "处理时间", ""],
                 (
                   <colgroup>
                     <col style={{ width: `${colWidths[0]}px` }} />
@@ -787,7 +775,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                     <col style={{ width: `${colWidths[3]}px` }} />
                     <col style={{ width: `${colWidths[4]}px` }} />
                     <col style={{ width: `${colWidths[5]}px` }} />
-                    <col style={{ width: "200px" }} />
+                    <col style={{ width: "48px" }} />
                   </colgroup>
                 ),
                 pageTasks.length === 0
@@ -818,33 +806,8 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                           </div>
                         </td>
                         <td>{formatDateTime(p.updated_at)}</td>
-                        <td>
-                          <div className="hist-actions">
-                            <button
-                              className="btn primary xs"
-                              onClick={() => openOriginal(p)}
-                              title="打开原文件修正提取结果"
-                            >
-                              <Icon icon={Wrench} style={{ width: "12px", height: "12px" }} /> 修正
-                            </button>
-                            <button
-                              className="btn ghost xs hist-ignore"
-                              disabled={busyTaskId === p.id}
-                              onClick={() => void handleIgnoreAll(p)}
-                              title="忽略该校验问题并直接完成任务（变为已完成）"
-                            >
-                              <Icon icon={EyeOff} style={{ width: "12px", height: "12px" }} />
-                              {busyTaskId === p.id ? "处理中" : "忽略"}
-                            </button>
-                            <button
-                              className="btn ghost xs danger-btn"
-                              title="删除该文件的任务记录（数据表中的数据保留）"
-                              onClick={() => setDeleteTarget(p)}
-                            >
-                              <Icon icon={Trash2} style={{ width: "12px", height: "12px" }} /> 删除
-                            </button>
-                          </div>
-                        </td>
+                        <td className="history-actions-gutter"><FileHistoryActions filename={taskDisplayName(p)} onOpen={() => openOriginal(p)}
+                          onDelete={() => setDeleteTarget(p)} busy={busyTaskId === p.id} onIgnore={() => void handleIgnoreAll(p)} /></td>
                       </tr>
                     )),
                 "problems",
@@ -875,28 +838,15 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                   <div className="history-action-bar">
                     {extraction ? (
                       <>
-                        <select
-                          aria-label="选择保存到的数据表"
-                          className="form-select"
-                          value={targetTableId}
-                          onChange={(e) => setTargetTableId(e.target.value)}
-                          title="选择保存到的数据表；默认使用模板唯一表"
-                        >
-                          <option value="">默认表（按模板）</option>
-                          {tables.map((t) => (
-                            <option key={t.id} value={t.id}>
-                              {t.name}（{t.row_count} 行）
-                            </option>
-                          ))}
-                        </select>
+                        <button className="btn secondary sm" onClick={() => setFileHistoryOpen(true)}><Icon icon={History} size={14} /> 历史版本</button>
                         <button
                           className="btn primary sm"
-                          disabled={saving}
+                          disabled={saving || extraction.has_current_data === false}
                           onClick={() => void handleSaveToTable()}
-                          title="保存修改并通过规则校验后写入数据表"
+                          title="提交本轮修改，形成一个文件修订版本"
                         >
                           <Icon icon={saving ? Loader2 : Save} size={14} className={saving ? "spin" : undefined} />{" "}
-                          保存到表
+                          修订到表
                         </button>
                       </>
                     ) : null}
@@ -949,7 +899,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                       <div className="extract-data-block">
                         <div className="extract-header-card">
                           <div className="extract-header-title">
-                            <Icon icon={FileText} size={18} /> 提取数据（抬头）
+                            <Icon icon={FileText} size={18} /> 文件级信息
                           </div>
                           <div className="extract-header-grid">
                             {extractionHeaderKeys.map((key) => (
@@ -978,17 +928,18 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                                 <Icon icon={List} size={18} /> 明细
                               </span>
                               <span className="extract-item-count">
-                                {((extraction.result as { items?: unknown[] }).items ?? []).length + " 行"}
+                                {displayItems.length + " 行"}
                               </span>
                             </div>
                             <div className="data-table-scroll">
-                              <table className="data-table" style={{ tableLayout: "fixed" }}>
+                              <table className="data-table" style={{ tableLayout: "fixed", minWidth: detailColumnWidth + 52 }}>
                                 <thead>
                                   <tr>
+                                    <th className="detail-row-gutter" scope="col" aria-label="明细序号">#</th>
                                     {extractionItemKeys.map((key) => (
                                       <th
                                         key={key}
-                                        style={{ width: `${detailWidths[key] ?? 132}px` }}
+                                        style={{ width: `calc(${100 * (detailWidths[key] ?? 132) / detailColumnWidth}% - ${52 * (detailWidths[key] ?? 132) / detailColumnWidth}px)` }}
                                       >
                                         <span>{labelFor(key)}</span>
                                         <span
@@ -1006,8 +957,15 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                                   </tr>
                                 </thead>
                                 <tbody>
-                                  {displayItems.map((item, idx) => (
+                                  {displayItems.slice(detailPage.start, detailPage.end).map((item, offset) => {
+                                    const idx = detailPage.start + offset;
+                                    return (
                                     <tr key={idx}>
+                                      <td className="detail-row-gutter"><DetailRowAction index={idx + 1} disabled={saving} onDelete={() => {
+                                        setDraft(current => current ? {...current, items: current.items.filter((_, index) => index !== idx)} as ExtractionResult : current);
+                                        setDraftDetailIds(current => current?.filter((_, index) => index !== idx));
+                                        setEditingCell(null);
+                                      }} /></td>
                                       {extractionItemKeys.map((key) => (
                                         <td
                                           aria-label={`编辑 ${labelFor(key)}，当前值 ${String(item[key] ?? "") || "空"}`}
@@ -1031,13 +989,14 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                                         </td>
                                       ))}
                                     </tr>
-                                  ))}
+                                  ); })}
                                   {displayItems.length === 0 ? (
-                                    <tr><td colSpan={extractionItemKeys.length} className="hist-empty">无明细</td></tr>
+                                    <tr><td colSpan={extractionItemKeys.length + 1} className="hist-empty">无明细</td></tr>
                                   ) : null}
                                 </tbody>
                               </table>
                             </div>
+                            <DetailPagination paging={detailPage} count={displayItems.length} disabled={saving} />
                           </div>
                         ) : null}
                       </div>
@@ -1090,7 +1049,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                                 )}
                                 <button
                                   className="btn ghost sm"
-                                  title={ignoredIssueIndices.includes(idx) ? "恢复这条校验" : "忽略这条校验，保存到表时不再阻断"}
+                                  title={ignoredIssueIndices.includes(idx) ? "恢复这条校验" : "忽略这条校验，修订到表时不再阻断"}
                                   onClick={() => toggleIssueIgnored(idx)}
                                   type="button"
                                 >
@@ -1183,7 +1142,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
       <ConfirmDialog
         open={deleteTarget !== null}
         title="删除文件记录"
-        description={`将删除「${deleteTarget?.filename ?? ""}」的处理记录、提取结果和原文件。数据表中已确认的数据不会删除，会保留在表里，只是不再追溯到这个文件。此操作不可恢复。`}
+        description={`将删除「${deleteTarget?.filename ?? ""}」的处理记录、提取结果和原文件。关联的当前数据和全部文件修订历史也会一起删除。独立合并结果和外部归档文件不受影响。此操作不可恢复。`}
         confirmText={deleteTarget?.filename ?? ""}
         buttonLabel="确认删除"
         busy={busyTaskId === deleteTarget?.id}

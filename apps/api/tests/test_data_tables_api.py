@@ -10,7 +10,7 @@ from document_pipeline_api.config import Settings
 from document_pipeline_api.main import create_app
 from document_pipeline_api.models import ExtractionRecord, TaskRecord
 from document_pipeline_api.schemas.extraction import DocumentExtraction, TemplateExtraction
-from document_pipeline_api.services.data_tables import confirm_task
+from document_pipeline_api.services.data_tables import confirm_task, materialize_task_result
 from document_pipeline_api.services.task_leases import TaskLeaseLostError
 
 
@@ -57,6 +57,7 @@ def _seed_task(
     task_id: str,
     *,
     item_name: str = "服务",
+    initialize: bool = True,
 ) -> None:
     with client.app.state.session_factory() as session:
         session.add(
@@ -83,6 +84,9 @@ def _seed_task(
                 validation_json="[]",
             )
         )
+        if initialize:
+            session.flush()
+            materialize_task_result(session, task_id)
         session.commit()
 
 
@@ -112,6 +116,8 @@ def _seed_two_item_task(client: TestClient, task_id: str) -> None:
                 validation_json="[]",
             )
         )
+        session.flush()
+        materialize_task_result(session, task_id)
         session.commit()
 
 
@@ -122,12 +128,13 @@ def test_confirm_with_empty_items_inserts_header_only_row(tmp_path: Path) -> Non
         storage_dir=tmp_path / "uploads",
     )
     with TestClient(create_app(settings)) as client:
-        _seed_task(client, "empty-items")
+        _seed_task(client, "empty-items", initialize=False)
         with client.app.state.session_factory() as session:
             extraction = session.get(ExtractionRecord, "empty-items")
             result = DocumentExtraction.model_validate_json(extraction.result_json)
             result.items = []
             extraction.result_json = result.model_dump_json()
+            materialize_task_result(session, "empty-items")
             session.commit()
 
         response = client.post(
@@ -187,7 +194,7 @@ def test_custom_columns_are_table_only_and_header_column_merges_on_export(tmp_pa
         storage_dir=tmp_path / "uploads",
     )
     with TestClient(create_app(settings)) as client:
-        _seed_task(client, "custom-columns", item_name="第一项")
+        _seed_task(client, "custom-columns", item_name="第一项", initialize=False)
         with client.app.state.session_factory() as session:
             extraction = session.get(ExtractionRecord, "custom-columns")
             assert extraction is not None
@@ -197,6 +204,7 @@ def test_custom_columns_are_table_only_and_header_column_merges_on_export(tmp_pa
                     _result(item_name="第二项").items[0],
                 ]}
             ).model_dump_json()
+            materialize_task_result(session, "custom-columns")
             session.commit()
         confirmation = client.post(
             "/api/v1/tasks/custom-columns/confirm",
@@ -244,8 +252,8 @@ def test_custom_columns_are_table_only_and_header_column_merges_on_export(tmp_pa
 
         assert client.delete(
             f"/api/v1/tables/{table_id}/columns/{column['key']}"
-        ).status_code == 204
-        assert all(item["label"] != "内部备注" for item in client.get(
+        ).status_code == 409
+        assert any(item["label"] == "内部备注" for item in client.get(
             f"/api/v1/tables/{table_id}"
         ).json()["columns"])
 
@@ -253,7 +261,7 @@ def test_custom_columns_are_table_only_and_header_column_merges_on_export(tmp_pa
         assert client.delete(
             f"/api/v1/tables/{table_id}/columns/seller_name"
         ).status_code == 409
-        assert template_key == "invoice"
+        assert template_key == "builtin-invoice"
 
 
 def test_manual_confirm_cannot_bypass_active_worker_lease(tmp_path: Path) -> None:
@@ -276,7 +284,7 @@ def test_manual_confirm_cannot_bypass_active_worker_lease(tmp_path: Path) -> Non
         )
 
         assert response.status_code == 409
-        assert response.json()["detail"] == "只有待确认或已完成任务可以手动保存到表。"
+        assert response.json()["detail"] == "这份文件当前不能确认。"
         with client.app.state.session_factory() as session:
             task = session.get(TaskRecord, "active-worker")
             assert task is not None
@@ -399,7 +407,12 @@ def test_valid_review_updates_rows_and_completes_without_extra_confirmation(
         storage_dir=tmp_path / "uploads",
     )
     with TestClient(create_app(settings)) as client:
-        _seed_task(client, "stale")
+        _seed_task(client, "stale", initialize=False)
+        # Normal extraction publishes the current data before review begins.
+        with client.app.state.session_factory() as session:
+            from document_pipeline_api.services.data_tables import materialize_task_result
+            materialize_task_result(session, "stale")
+            session.commit()
         review = _result(item_name="人工修正")
         assert client.put(
             "/api/v1/tasks/stale/review",
@@ -414,7 +427,7 @@ def test_valid_review_updates_rows_and_completes_without_extra_confirmation(
             json={"expected_review_version": 0},
         )
 
-        assert response.status_code == 200
+        assert response.status_code == 409
         table = client.get("/api/v1/tables").json()[0]
         detail = client.get(f"/api/v1/tables/{table['id']}").json()
         assert detail["rows"][0]["values"]["name"] == "人工修正"
@@ -486,6 +499,9 @@ def test_custom_template_flattens_fields_and_uses_output_mapping(
             )
             session.commit()
 
+        with client.app.state.session_factory() as session:
+            materialize_task_result(session, "custom-result")
+            session.commit()
         confirmation = client.post(
             "/api/v1/tasks/custom-result/confirm",
             json={"expected_review_version": 0},
@@ -537,15 +553,12 @@ def test_review_sync_keeps_row_identity_and_records_revision(tmp_path: Path) -> 
         assert current["id"] == original["id"]
         assert current["version"] == original["version"] + 1
         revisions = client.get(
-            f"/api/v1/tables/{confirmation['table_id']}"
-            f"/rows/{original['id']}/revisions"
-        ).json()
-        assert [revision["operation"] for revision in revisions] == [
-            "materialize_create",
-            "materialize_update",
-        ]
-        assert revisions[-1]["before"]["name"] == "服务"
-        assert revisions[-1]["after"]["name"] == "审核修正"
+            "/api/v1/tasks/stable/revisions"
+        ).json()["revisions"]
+        assert len(revisions) == 2
+        detail = client.get(f"/api/v1/tasks/stable/revisions/{revisions[0]['id']}").json()
+        assert detail["items"][0]["before"]["values"]["name"] == "服务"
+        assert detail["items"][0]["after"]["values"]["name"] == "审核修正"
 
 
 def test_row_edit_uses_optimistic_concurrency(tmp_path: Path) -> None:
@@ -643,13 +656,11 @@ def test_header_edit_propagates_to_all_rows_of_same_document(tmp_path: Path) -> 
             "统一后的销售方",
         ]
         assert [row["version"] for row in current] == [2, 2]
-        for row in current:
-            revisions = client.get(
-                f"/api/v1/tables/{table_id}/rows/{row['id']}/revisions"
-            ).json()
-            assert revisions[-1]["operation"] == "table_edit"
-            assert revisions[-1]["before"]["seller_name"] != "统一后的销售方"
-            assert revisions[-1]["after"]["seller_name"] == "统一后的销售方"
+        revisions = client.get("/api/v1/tasks/header-propagation/revisions").json()["revisions"]
+        detail = client.get(f"/api/v1/tasks/header-propagation/revisions/{revisions[0]['id']}").json()
+        assert detail["modified_fields"] == 1
+        assert detail["items"] == []
+        assert detail["header"]["seller_name"]["after"] == "统一后的销售方"
 
 
 def test_custom_template_rule_does_not_block_downstream_table_edits(tmp_path: Path) -> None:
@@ -718,6 +729,9 @@ def test_custom_template_rule_does_not_block_downstream_table_edits(tmp_path: Pa
                 )
             )
             session.commit()
+        with client.app.state.session_factory() as session:
+            materialize_task_result(session, "custom-row-rule")
+            session.commit()
         table_id = client.post(
             "/api/v1/tasks/custom-row-rule/confirm",
             json={"expected_review_version": 0},
@@ -739,10 +753,12 @@ def test_custom_template_rule_does_not_block_downstream_table_edits(tmp_path: Pa
             assert extraction is not None
             assert json.loads(extraction.result_json)["items"][0]["score"] is None
         revisions = client.get(
-            f"/api/v1/tables/{table_id}/rows/{row['id']}/revisions"
-        ).json()
-        assert revisions[-1]["before"]["score"] is None
-        assert revisions[-1]["after"]["score"] == 120
+            "/api/v1/tasks/custom-row-rule/revisions"
+        ).json()["revisions"]
+        detail = client.get(f"/api/v1/tasks/custom-row-rule/revisions/{revisions[0]['id']}").json()
+        assert detail["items"][0]["before"]["values"]["score"] is None
+        assert detail["items"][0]["after"]["values"]["score"] == 120
+        assert client.get("/api/v1/tasks/custom-row-rule/result").json()["result"]["items"][0]["score"] == 120
 
 
 def test_split_view_reuses_source_rows_and_edits_same_fact(tmp_path: Path) -> None:
@@ -805,7 +821,7 @@ def test_split_view_reuses_source_rows_and_edits_same_fact(tmp_path: Path) -> No
         assert workbook["company-a.png"].max_row == 2
 
 
-def test_review_sync_does_not_overwrite_a_user_edited_table_row(
+def test_stale_file_draft_cannot_overwrite_the_same_fact_edited_in_warehouse(
     tmp_path: Path,
 ) -> None:
     settings = Settings(
@@ -834,7 +850,7 @@ def test_review_sync_does_not_overwrite_a_user_edited_table_row(
                 "expected_version": 0,
                 "result": review_result.model_dump(mode="json"),
             },
-        ).status_code == 200
+        ).status_code == 409
 
         current = client.get(f"/api/v1/tables/{table_id}").json()["rows"][0]
         assert current["id"] == row["id"]

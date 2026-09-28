@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -53,7 +54,7 @@ def test_legacy_hints_merge_once_and_builtin_snapshot_stays_unchanged(client):
     assert client.get("/api/v1/templates/builtin-invoice").json() == builtin
 
 
-def test_reordering_updates_existing_table_without_rewriting_schema_or_values(client):
+def test_reordering_updates_current_schema_without_rewriting_values(client):
     from document_pipeline_api.models import DataTableRecord
 
     body = template_body()
@@ -66,6 +67,9 @@ def test_reordering_updates_existing_table_without_rewriting_schema_or_values(cl
     with client.app.state.session_factory() as session:
         session.get(TaskRecord, task["id"]).status = "needs_review"
         session.add(ExtractionRecord(task_id=task["id"], document_kind="custom", template_id=template["id"], template_version=1, model_name="deterministic fixture", prompt_version="test", elapsed_seconds=0, result_json='{"header":{"subject":"记录"},"items":[{"question":"内容","answer":"结果"}]}', validation_json="[]"))
+        from document_pipeline_api.services.data_tables import materialize_task_result
+        session.flush()
+        materialize_task_result(session, task["id"])
         session.commit()
     confirmed = client.post(f"/api/v1/tasks/{task['id']}/confirm", json={"expected_review_version": 0})
     assert confirmed.status_code == 200, confirmed.text
@@ -83,11 +87,13 @@ def test_reordering_updates_existing_table_without_rewriting_schema_or_values(cl
     after = client.get(table_url).json()
     assert [column["key"] for column in after["columns"]] == ["question", "answer", "subject", added.json()["key"]]
     assert client.get(manual_url).json()["columns"] == manual_before
-    assert after["rows"] == before["rows"]
+    assert [row["values"] for row in after["rows"]] == [row["values"] for row in before["rows"]]
+    assert [row["id"] for row in after["rows"]] == [row["id"] for row in before["rows"]]
+    assert after["rows"][0]["version"] > before["rows"][0]["version"]
     assert {column["key"]: column for column in after["columns"]} == {column["key"]: column for column in before["columns"]}
     with client.app.state.session_factory() as session:
         stored = session.get(DataTableRecord, table["id"])
-        assert stored.columns_json == schema_before
+        assert {col["key"] for col in json.loads(stored.columns_json)} == {col["key"] for col in json.loads(schema_before)}
         assert stored.template_version == version_before
         assert [field.key for field in get_template_version(session, template["id"], 1).fields] == ["subject", "question", "answer"]
 

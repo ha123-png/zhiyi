@@ -5,6 +5,7 @@ import re
 from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Font
 
+from document_pipeline_api.services.current_data import row_values
 from document_pipeline_api.schemas.input_scope import InputScope
 
 SCOPE_KEY = "__zhiyi_input_scope"
@@ -13,10 +14,10 @@ REVIEW_KEY = "__zhiyi_review_pending"
 REVIEW_LABEL = "知意来源状态（非业务字段）"
 
 
-def table_has_pending_reviews(session, table_id):
+def table_has_pending_reviews(session, table_id, *, predicates=()):
     from sqlalchemy import select
     from document_pipeline_api.models import DataRowRecord
-    return session.scalar(select(DataRowRecord.id).where(DataRowRecord.table_id == table_id, DataRowRecord.review_pending.is_(True)).limit(1)) is not None
+    return session.scalar(select(DataRowRecord.id).where(DataRowRecord.table_id == table_id, DataRowRecord.review_pending.is_(True), *predicates).limit(1)) is not None
 
 
 def imported_pending_review(value):
@@ -27,14 +28,14 @@ def imported_pending_review(value):
     raise ValueError("知意来源状态标记损坏，未导入。")
 
 
-def table_has_input_scopes(session, table_id):
+def table_has_input_scopes(session, table_id, *, predicates=()):
     from sqlalchemy import select
     from document_pipeline_api.models import DataRowRecord
-    return session.scalar(select(DataRowRecord.id).where(DataRowRecord.table_id == table_id, DataRowRecord.input_scope_json.is_not(None)).limit(1)) is not None
+    return session.scalar(select(DataRowRecord.id).where(DataRowRecord.table_id == table_id, DataRowRecord.input_scope_json.is_not(None), *predicates).limit(1)) is not None
 
 
 def export_row_values(record):
-    values = json.loads(record.row_json)
+    values = row_values(record)
     if record.review_pending:
         if REVIEW_KEY in values:
             raise ValueError("业务字段与知意来源状态保留字段冲突，未导出。")
@@ -64,11 +65,11 @@ class WorkbookInputScopes:
             sheet.cell(1, column, REVIEW_LABEL)
             sheet.column_dimensions[sheet.cell(1, column).column_letter].width = 28
             cell = sheet.cell(row_number, column, "待核对")
-            cell.comment = Comment("来源任务仍有待处理事项。编辑数据不等于重新执行校验；来源已移除或本表由导入/合并生成时，这是保留的来源状态。其他行没有此标记也不代表经过人工核验。", "知意")
+            cell.comment = Comment("来源任务仍有待处理事项。关联原文件的数据在修改后按提取时的规则重新执行校验；本表由导入或合并生成时，仅保留当时的来源状态。其他行没有此标记也不代表经过人工核验。", "知意")
         if not record.input_scope_json:
             return
         scope = InputScope.model_validate_json(record.input_scope_json)
-        values = json.loads(record.row_json)
+        values = row_values(record)
         source_key = (record.task_id or values.get("__row_group") or record.id, record.input_scope_json)
         if source_key not in self.sources:
             self.sources[source_key] = (len(self.sources) + 1, str(values.get("source_filename") or "未记录原文件名"), scope)
@@ -88,6 +89,7 @@ class WorkbookInputScopes:
             index += 1
         sheet = workbook.create_sheet(title)
         sheet.append(["来源编号", "原上传文件名", "输入覆盖", "类别", "原始范围或说明", "原因"])
+        sheet.cell(1, 1).comment = Comment("zhiyi:input-scope-v1", "知意")
         sheet.append([None, None, None, "使用说明", "业务表单元格批注中的来源编号对应本页。范围记录模型当时收到什么，不代表提取正确率；局部读取不能代表全文或全部记录。没有批注的旧行未记录范围，不代表完整读取。", None])
         reasons = {"input_budget": "达到当时设置的读取上限", "images_disabled": "未开启图片读取", "unsupported_image": "暂不支持的图片", "unsupported_structure": "暂不支持的文档部分"}
         for source_id, filename, scope in self.sources.values():
@@ -122,6 +124,31 @@ class WorkbookInputScopes:
 
 def _safe_text(value):
     return "'" + value if value.startswith(("=", "+", "-", "@")) else value
+
+
+def workbook_business_sheets(workbook):
+    """Only exclude positively identified metadata, never a user's sheet by name."""
+    signature = ["来源编号", "原上传文件名", "输入覆盖", "类别", "原始范围或说明", "原因"]
+    candidates = {sheet.title for sheet in workbook if sheet.max_column >= 6 and [sheet.cell(1, index).value for index in range(1, 7)] == signature}
+    referenced = set()
+    if candidates:
+        for sheet in workbook:
+            if sheet.title in candidates:
+                continue
+            for row in sheet.iter_rows():
+                for cell in row:
+                    if cell.comment and cell.comment.author == "知意":
+                        match = re.search(r"来源编号 (\d+)，实际提供和遗漏的范围见「(.+)」工作表。", cell.comment.text)
+                        if match:
+                            referenced.add(match[2])
+    business = []
+    for sheet in workbook:
+        marker = sheet.cell(1, 1).comment
+        metadata = sheet.title in candidates and (sheet.title in referenced or (
+            marker and marker.author == "知意" and marker.text == "zhiyi:input-scope-v1"))
+        if not metadata and any(cell.value is not None for row in sheet.iter_rows() for cell in row):
+            business.append(sheet.title)
+    return business
 
 
 def read_workbook_scopes(workbook, business_sheet):

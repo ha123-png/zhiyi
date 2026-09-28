@@ -94,20 +94,23 @@ def test_restore_name_conflict_archive_and_delete_log(client: TestClient):
     assert client.delete(url).status_code == 204
     from document_pipeline_api.models import TemplateRestorationRecord
     with client.app.state.session_factory() as session:
-        assert session.scalars(select(TemplateRestorationRecord)).all() == []
+        events = session.scalars(select(TemplateRestorationRecord)).all()
+        assert len(events) == 1  # Removing a rule does not erase its provenance.
+        assert events[0].template_id == created["id"]
 
 
-def test_builtin_templates_are_seeded_and_read_only(client: TestClient) -> None:
+def test_starter_templates_are_seeded_as_editable_rules(client: TestClient) -> None:
     response = client.get("/api/v1/templates")
 
     assert response.status_code == 200
-    templates = response.json()
+    templates = [item for item in response.json() if item["engine_kind"] != "autonomous"]
     assert [(item["builtin_key"], item["name"]) for item in templates] == [
         ("invoice", "发票"),
         ("delivery", "送货单"),
     ]
     invoice = templates[0]
-    assert invoice["is_system"] is True
+    assert invoice["is_system"] is False
+    assert invoice["engine_kind"] == "template"
     assert invoice["in_smart_pool"] is True  # 内置模板默认在智能匹配预选池内
     assert invoice["fields"][0]["key"] == "seller_name"
     labels = [field["label"] for field in invoice["fields"]]
@@ -123,8 +126,9 @@ def test_builtin_templates_are_seeded_and_read_only(client: TestClient) -> None:
             "expected_version": 1,
         },
     )
-    assert update.status_code == 409
-    assert update.json()["detail"] == "内置模板不能直接修改，请先复制。"
+    assert update.status_code == 200
+    assert update.json()["version"] == 2
+    assert len({field["key"] for field in invoice["fields"]}) == len(invoice["fields"])
 
 
 def test_smart_pool_toggle_updates_membership(client: TestClient) -> None:
@@ -220,7 +224,7 @@ def test_create_rejects_duplicate_field_keys(client: TestClient) -> None:
     )
 
     assert response.status_code == 422
-    assert response.json()["detail"] == "字段“字段二”重复。"
+    assert "相同标识" in response.json()["detail"]
 
 
 def test_deterministic_rules_are_versioned_and_cannot_reference_unknown_fields(
@@ -342,10 +346,10 @@ def test_user_template_archive_is_recoverable_and_preserves_versions(
     }
 
 
-def test_builtin_template_cannot_be_archived(client: TestClient) -> None:
+def test_starter_template_can_be_archived(client: TestClient) -> None:
     response = client.post("/api/v1/templates/builtin-invoice/archive")
-    assert response.status_code == 409
-    assert response.json()["detail"] == "内置模板不能停用。"
+    assert response.status_code == 200
+    assert response.json()["is_active"] is False
 
 
 def _editable_body(template: dict) -> dict:
@@ -468,10 +472,12 @@ def test_delete_unreferenced_user_template(client: TestClient) -> None:
                 TemplateVersionRecord.template_id == copied["id"],
             )
         ).all()
-        assert versions == []
+        assert len(versions) == 1
+    assert client.get(f"/api/v1/templates/{copied['id']}").status_code == 404
+    assert client.get(f"/api/v1/templates/{copied['id']}/versions/1").status_code == 200
 
 
-def test_delete_template_detaches_copied_descendants(client: TestClient) -> None:
+def test_delete_template_preserves_copy_provenance(client: TestClient) -> None:
     created = client.post(
         "/api/v1/templates",
         json=_user_template_body("溯源源模板"),
@@ -482,10 +488,10 @@ def test_delete_template_detaches_copied_descendants(client: TestClient) -> None
     deleted = client.delete(f"/api/v1/templates/{created['id']}")
     assert deleted.status_code == 204
     detached = client.get(f"/api/v1/templates/{copied['id']}").json()
-    assert detached["source_template_id"] is None
+    assert detached["source_template_id"] == created["id"]
 
 
-def test_delete_referenced_template_is_rejected(client: TestClient) -> None:
+def test_delete_referenced_template_keeps_frozen_rules(client: TestClient) -> None:
     from document_pipeline_api.models import TaskRecord
 
     created = client.post(
@@ -509,14 +515,86 @@ def test_delete_referenced_template_is_rejected(client: TestClient) -> None:
         session.commit()
 
     deleted = client.delete(f"/api/v1/templates/{created['id']}")
-    assert deleted.status_code == 409
-    assert "已被任务或数据表引用" in deleted.json()["detail"]
-    # 停用仍然可用
-    archived = client.post(f"/api/v1/templates/{created['id']}/archive")
-    assert archived.status_code == 200
+    assert deleted.status_code == 204
+    assert client.get(f"/api/v1/templates/{created['id']}").status_code == 404
+    assert client.get(f"/api/v1/templates/{created['id']}/versions/1").status_code == 200
+    with client.app.state.session_factory() as session:
+        assert session.get(TaskRecord, "referencing-task").template_id == created["id"]
 
 
-def test_delete_builtin_template_is_rejected(client: TestClient) -> None:
+def test_deleted_starter_is_not_recreated(client: TestClient) -> None:
     deleted = client.delete("/api/v1/templates/builtin-invoice")
-    assert deleted.status_code == 409
-    assert "内置模板不能删除" in deleted.json()["detail"]
+    assert deleted.status_code == 204
+    from document_pipeline_api.services.templates import ensure_builtin_templates
+    with client.app.state.session_factory() as session:
+        ensure_builtin_templates(session)
+    assert client.get("/api/v1/templates/builtin-invoice").status_code == 404
+    assert all(item["id"] != "builtin-invoice" for item in client.get("/api/v1/templates?include_inactive=true").json())
+
+
+def test_restore_archived_template_rejects_reused_name_without_changing_state(client: TestClient):
+    first = client.post("/api/v1/templates", json=_user_template_body("恢复冲突")).json()
+    url = f"/api/v1/templates/{first['id']}"
+    client.post(f"{url}/archive")
+    archived = client.get(url).json()
+    second = client.post("/api/v1/templates", json=_user_template_body("恢复冲突")).json()
+    rejected = client.post(f"{url}/restore")
+    assert rejected.status_code == 422
+    assert "已存在同名模板" in rejected.json()["detail"]
+    unchanged = client.get(url).json()
+    assert unchanged["is_active"] is False
+    assert unchanged["updated_at"] == archived["updated_at"]
+    assert unchanged["version"] == first["version"]
+    assert len([item for item in client.get("/api/v1/templates").json() if item["name"] == "恢复冲突"]) == 1
+    client.delete(f"/api/v1/templates/{second['id']}")
+    assert client.post(f"{url}/restore").json()["is_active"] is True
+
+
+@pytest.mark.parametrize("mapping", [
+    {"customer": "业务值", "amount": "业务值"},
+    {"customer": "  Total  Amount ", "amount": "total amount"},
+    {"customer": "金额"},
+])
+def test_final_output_names_are_unique_on_create_and_update(client: TestClient, mapping):
+    body = {"name": "映射列名", "fields": [
+        {"key": "customer", "label": "客户", "section": "header"},
+        {"key": "amount", "label": "金额", "section": "item", "value_type": "number"},
+    ]}
+    rejected = client.post("/api/v1/templates", json={**body, "output_mapping": mapping})
+    assert rejected.status_code == 422
+    assert "输出列名" in rejected.json()["detail"]
+    created = client.post("/api/v1/templates", json=body).json()
+    url = f"/api/v1/templates/{created['id']}"
+    rejected = client.put(url, json={**body, "output_mapping": mapping, "expected_version": 1})
+    assert rejected.status_code == 422
+    assert client.get(url).json()["version"] == 1
+    assert len(client.get(f"{url}/versions").json()) == 1
+
+
+def test_output_mapping_preserves_valid_aliases_and_rejects_legacy_conflicting_restore(client: TestClient):
+    import json
+
+    body = {"name": "映射历史", "fields": [
+        {"key": "customer", "label": "客户"}, {"key": "amount", "label": "金额"},
+    ], "output_mapping": {"customer": "收货方", "amount": "  ", "removed_field": "收货方"}}
+    created = client.post("/api/v1/templates", json=body).json()
+    assert created["output_mapping"] == {"customer": "收货方"}
+    url = f"/api/v1/templates/{created['id']}"
+    updated = client.put(url, json={**body, "description": "新版本", "expected_version": 1}).json()
+    # Simulate a stored pre-fix snapshot without rewriting any current facts.
+    with client.app.state.session_factory() as session:
+        old = session.scalar(select(TemplateVersionRecord).where(
+            TemplateVersionRecord.template_id == created["id"], TemplateVersionRecord.version == 1,
+        ))
+        old.output_mapping_json = json.dumps({"customer": "金额"}, ensure_ascii=False)
+        session.commit()
+    rejected = client.post(f"{url}/versions/1/restore", json={"expected_version": 2})
+    assert rejected.status_code == 422
+    assert "输出列名" in rejected.json()["detail"]
+    assert client.get(url).json()["version"] == updated["version"]
+    assert client.get(f"{url}/restorations").json() == []
+    # Legacy snapshot remains readable, and correcting it produces a valid new revision.
+    old = client.get(f"{url}/versions/1").json()
+    repaired = client.put(url, json={**_editable_body(old), "output_mapping": {"customer": "收货方"}, "expected_version": 2})
+    assert repaired.status_code == 200
+    assert repaired.json()["version"] == 3

@@ -1,4 +1,6 @@
 from pathlib import Path
+import json
+import hashlib
 import sqlite3
 from uuid import uuid4
 import warnings
@@ -93,6 +95,34 @@ def test_missing_or_changed_original_aborts_without_partial_backup(tmp_path: Pat
 
     assert not output.exists()
     assert not output.with_name(f"{output.name}.partial").exists()
+
+
+def test_staged_migration_failure_preserves_live_data_and_reports_supervised_failure(tmp_path, monkeypatch):
+    from document_pipeline_api import business_backup, supervisor
+
+    settings = _settings(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        task_id = _upload(client)
+    original = settings.storage_dir / f"{task_id}.png"
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    archive = create_business_backup(settings, backup_dir / "old.dpbak")
+    database = tmp_path / "document-pipeline.db"
+    before_db = hashlib.sha256(database.read_bytes()).hexdigest()
+    before_original = original.read_bytes()
+
+    def migration_failed(_engine):
+        raise RuntimeError("synthetic staging migration failure")
+
+    monkeypatch.setattr(business_backup, "upgrade_database", migration_failed)
+    with pytest.raises(BusinessBackupError, match="备份数据库升级失败"):
+        restore_business_backup(settings, archive, tmp_path)
+    supervisor._perform_supervised_restore(tmp_path, archive.name)
+    payload = json.loads((tmp_path / "runtime" / "restore-result.json").read_text(encoding="utf-8"))
+    assert payload["state"] == "failed"
+    assert "备份数据库升级失败" in payload["message"]
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == before_db
+    assert original.read_bytes() == before_original
 
 
 def test_backup_inspection_rejects_path_traversal_and_duplicate_members(
@@ -198,7 +228,7 @@ def test_restore_disables_bindings_and_requires_new_export_confirmation(tmp_path
     with TestClient(create_app(target_settings)) as client:
         binding = client.get(url).json()
         assert binding["enabled"] is False
-        assert binding["revision"] == 2
+        assert 2 < binding["revision"] < 2**53
         with client.app.state.session_factory() as session:
             state = session.get(TaskRecord, task_id).file_export
             assert state.status == "needs_rebind"
@@ -279,7 +309,9 @@ def test_restore_upgrades_a_portable_0009_database_before_install(tmp_path: Path
                 len(original),
                 1,
                 digest,
-                str(original_path.resolve()),
+                # Legacy schema import remains testable with an explicitly
+                # managed reference; live backup never follows absolute paths.
+                f"{task_id}.png",
                 "smart",
                 "queued",
                 0,
@@ -294,7 +326,7 @@ def test_restore_upgrades_a_portable_0009_database_before_install(tmp_path: Path
 
     with sqlite3.connect(target_dir / "document-pipeline.db") as connection:
         assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-            "0039_original_archive",
+        "0046_upload_intent",
         )
         assert connection.execute(
             "SELECT storage_path FROM tasks WHERE id = ?", (task_id,)

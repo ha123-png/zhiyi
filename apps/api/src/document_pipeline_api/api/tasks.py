@@ -1,10 +1,13 @@
+import asyncio
 import json
 from document_pipeline_api.schemas.file_export import ExportAction
 import mimetypes
 import zipfile
+from io import BytesIO
+from threading import Event
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import (
     APIRouter,
@@ -20,6 +23,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
+from PIL import Image
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -53,9 +57,9 @@ from document_pipeline_api.services.tasks import (
 )
 from document_pipeline_api.services.file_formats import (
     UnsupportedTextFileError,
-    extract_docx_blocks,
-    extract_text,
-    extract_xlsx_sheets,
+)
+from document_pipeline_api.services.document_preview import (
+    docx_window, image_thumbnail, text_window, xlsx_window,
 )
 from document_pipeline_api.services.queue_pause import (
     freeze_new_task_if_paused,
@@ -75,7 +79,6 @@ _TEXT_PREVIEW_TYPES = {
 }
 _DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-_MAX_PREVIEW_CHARS = 200_000
 _MAX_DOCX_PREVIEW_IMAGES = 50
 _MAX_DOCX_PREVIEW_IMAGE_BYTES = 20 * 1024 * 1024
 
@@ -85,6 +88,9 @@ class TextPreviewRead(BaseModel):
     text: str
     truncated: bool = False
     image_count: int = 0
+    offset: int = 0
+    next_offset: int | None = None
+    total_bytes: int | None = None
 
 
 class XlsxSheetRead(BaseModel):
@@ -95,6 +101,14 @@ class XlsxSheetRead(BaseModel):
 
 class XlsxPreviewRead(BaseModel):
     sheets: list[XlsxSheetRead]
+    sheet_names: list[str] = Field(default_factory=list)
+    sheet_index: int = 0
+    offset: int = 0
+    column_offset: int = 0
+    next_offset: int | None = None
+    next_column_offset: int | None = None
+    total_rows: int | None = None
+    clipped_cells: bool = False
 
 
 class DocxBlockRead(BaseModel):
@@ -108,6 +122,9 @@ class DocxBlockRead(BaseModel):
 
 class DocxPreviewRead(BaseModel):
     blocks: list[DocxBlockRead]
+    offset: int = 0
+    next_offset: int | None = None
+    clipped_cells: bool = False
 
 
 @router.get("", response_model=list[TaskRead])
@@ -125,7 +142,7 @@ def get_tasks(
 ) -> list[TaskRead]:
     """任务列表。limit/offset 用于历史页分页；active_only 供全局任务条与状态监控轮询
     （只拉还在动的任务，避免万级历史任务每次全量加载）；status/search/template_id/since
-    供历史页服务端筛选。历史记录数 = 提取快照（当时提取出多少条明细就是多少条），不依赖数据表。
+    供历史页服务端筛选。记录数来自唯一当前数据，清空后为零；原始提取快照仍保留。
     """
     # 1.0 前把旧的“省略 limit 即全表返回”收紧为默认 100 条。继续全量返回会让
     # 一个长期运行的本地实例最终耗尽 API/浏览器内存；集成方应显式翻页。
@@ -148,21 +165,19 @@ def get_tasks(
     processing_engines: dict[str, str] = {}
     processing_models: dict[str, str] = {}
     if not active_only:
-        # 只对本页任务做快照计数（子查询，不遍历全部 extraction 记录）
+        # Count current records without loading whole extraction JSON documents.
+        from document_pipeline_api.models import DataRowRecord
+        record_counts = dict(session.execute(select(DataRowRecord.task_id, func.count(DataRowRecord.id))
+                            .where(DataRowRecord.task_id.in_(task_ids)).group_by(DataRowRecord.task_id)).all())
         pairs = session.execute(
             select(
                 ExtractionRecord.task_id,
                 ExtractionRecord.document_kind,
-                ExtractionRecord.result_json,
                 ExtractionRecord.elapsed_seconds,
                 ExtractionRecord.model_name,
             ).where(ExtractionRecord.task_id.in_(task_ids))
         ).all()
-        for task_id, document_kind, result_json, elapsed, model_name in pairs:
-            record_counts[task_id] = _extraction_snapshot_rows(
-                document_kind,
-                result_json,
-            )
+        for task_id, document_kind, elapsed, model_name in pairs:
             elapsed_seconds[task_id] = round(float(elapsed), 1)
             processing_engines[task_id] = "multimodal_model"
             processing_models[task_id] = model_name
@@ -266,6 +281,7 @@ async def create_task(
     template_mode: Annotated[str, Form()] = "smart",
     template_id: Annotated[str | None, Form()] = None,
     target_table_id: Annotated[str | None, Form()] = None,
+    duplicate_policy: Annotated[Literal["reject", "allow"], Form()] = "reject",
 ) -> TaskRead:
     settings: Settings = request.app.state.settings
     task = await create_task_from_upload(
@@ -275,6 +291,7 @@ async def create_task(
         template_mode,
         template_id,
         target_table_id=target_table_id,
+        duplicate_policy=duplicate_policy,
     )
     from document_pipeline_api.services.internal_storage import classify_task_original
     classify_task_original(session, settings, task.id)
@@ -292,23 +309,33 @@ class NativeImportRequest(BaseModel):
     template_mode: str = "smart"
     template_id: str | None = None
     target_table_id: str | None = None
+    duplicate_policy: Literal["reject", "allow"] = "reject"
 
 
 @router.post("/native-import", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
 async def native_import(request: Request, session: SessionDependency, body: NativeImportRequest) -> TaskRead:
     import mimetypes
     from starlette.datastructures import Headers
-    from document_pipeline_api.services.native_files import consume_import_ticket
+    from document_pipeline_api.services.native_files import consume_import_ticket, renew_import_ticket
     from document_pipeline_api.services.file_copies import CopyExportError
     settings = request.app.state.settings
     try:
         with consume_import_ticket(settings.storage_dir.parent, body.token) as (source, origin):
             name = Path(origin["path"]).name
             content_type = "text/markdown" if Path(name).suffix.lower() == ".md" else mimetypes.guess_type(name)[0] or "application/octet-stream"
-            task = await create_task_from_upload(session, settings,
-                UploadFile(source, filename=name, headers=Headers({"content-type": content_type})),
-                body.template_mode, body.template_id, target_table_id=body.target_table_id,
-                source_file={key: value for key, value in origin.items() if key != "expires"})
+            try:
+                task = await create_task_from_upload(session, settings,
+                    UploadFile(source, filename=name, headers=Headers({"content-type": content_type})),
+                    body.template_mode, body.template_id, target_table_id=body.target_table_id,
+                    duplicate_policy=body.duplicate_policy,
+                    source_file={key: value for key, value in origin.items() if key != "expires"})
+            except HTTPException as error:
+                if (error.status_code == 409 and isinstance(error.detail, dict)
+                        and error.detail.get("code") == "duplicate_upload"):
+                    # Old token remains consumed. Only the already validated
+                    # capability can issue a successor, with the same expiry.
+                    error.detail["retry_token"] = renew_import_ticket(settings.storage_dir.parent, origin)
+                raise
     except (CopyExportError, OSError) as error:
         raise HTTPException(422, str(error) if isinstance(error, CopyExportError) else "无法读取所选文件，请关闭占用程序或重新选择文件。") from error
     from document_pipeline_api.services.internal_storage import classify_task_original
@@ -380,10 +407,13 @@ def delete_batch(
 ) -> dict[str, object]:
     settings: Settings = request.app.state.settings
     deleted, kept_rows = delete_tasks_batch(session, settings, body.task_ids)
+    from document_pipeline_api.services.original_cleanup import pending_cleanup_count
+    pending = pending_cleanup_count(session, body.task_ids)
     return {
         "deleted": deleted,
         "skipped": len(body.task_ids) - deleted,
         "kept_rows": kept_rows,
+        **({"pending_cleanup": pending} if pending else {}),
     }
 
 
@@ -415,7 +445,9 @@ def resume(request: Request, task_id: str, session: SessionDependency) -> TaskRe
 def delete(request: Request, task_id: str, session: SessionDependency) -> dict[str, object]:
     settings: Settings = request.app.state.settings
     kept_rows = delete_task(session, settings, task_id)
-    return {"task_id": task_id, "kept_rows": kept_rows}
+    from document_pipeline_api.services.original_cleanup import pending_cleanup_count
+    pending = pending_cleanup_count(session, [task_id])
+    return {"task_id": task_id, "kept_rows": kept_rows, **({"pending_cleanup": pending} if pending else {})}
 
 
 @router.post("/{task_id}/template", response_model=TaskRead)
@@ -548,91 +580,87 @@ def original_file(
 
 
 @router.get("/{task_id}/preview", response_model=TextPreviewRead)
-def text_preview(
+async def text_preview(
     task_id: str,
     request: Request,
     session: SessionDependency,
+    offset: Annotated[int, Query(ge=0, le=1_000_000_000)] = 0,
 ) -> TextPreviewRead:
-    """为不能由浏览器直接显示的文本/Office 原文件提供只读可读预览。"""
     task, path = _preview_task_path(task_id, request, session)
     if task.content_type not in _TEXT_PREVIEW_TYPES:
         raise HTTPException(status_code=415, detail="这个文件类型不使用文本预览。")
     try:
-        text = extract_text(
-            path,
-            task.content_type,
-            max_uncompressed_bytes=request.app.state.settings.max_import_uncompressed_bytes,
-            max_rows=request.app.state.settings.max_import_rows,
-            max_columns=request.app.state.settings.max_import_columns,
-        )
-        image_count = len(_docx_preview_image_names(path, request)) if task.content_type == _DOCX_TYPE else 0
-    except (UnsupportedTextFileError, zipfile.BadZipFile, OSError) as error:
-        raise HTTPException(
-            status_code=422,
-            detail=public_error_message(error, "原文件预览失败，请确认文件未损坏。"),
-        ) from error
-    truncated = len(text) > _MAX_PREVIEW_CHARS
-    return TextPreviewRead(
-        kind="markdown" if task.content_type == "text/markdown" else "text",
-        text=text[:_MAX_PREVIEW_CHARS],
-        truncated=truncated,
-        image_count=image_count,
-    )
+        if task.content_type == _DOCX_TYPE:
+            result = await _read_preview(request, lambda cancelled: docx_window(path, offset,
+                max_uncompressed_bytes=request.app.state.settings.max_import_uncompressed_bytes,
+                cancelled=cancelled))
+            return TextPreviewRead(text="\n".join(str(block.get("text", "")) for block in result["blocks"]),
+                                   kind="text", truncated=result["next_offset"] is not None,
+                                   offset=offset, next_offset=result["next_offset"],
+                                   image_count=len(_docx_preview_image_names(path, request)))
+        if task.content_type == _XLSX_TYPE:
+            raise HTTPException(status_code=415, detail="请使用工作表预览。")
+        result = await _read_preview(request, lambda cancelled: text_window(path, offset, cancelled=cancelled))
+        return TextPreviewRead(kind="markdown" if task.content_type == "text/markdown" else "text", **result)
+    except (UnsupportedTextFileError, zipfile.BadZipFile, OSError, ValueError, KeyError) as error:
+        raise HTTPException(status_code=422, detail=public_error_message(error, "原文件预览失败，请确认文件未损坏。")) from error
 
 
 @router.get("/{task_id}/preview/xlsx", response_model=XlsxPreviewRead)
-def xlsx_preview(
+async def xlsx_preview(
     task_id: str,
     request: Request,
     session: SessionDependency,
+    sheet: Annotated[int, Query(ge=0, le=10_000)] = 0,
+    offset: Annotated[int, Query(ge=0, le=1_048_575)] = 0,
+    column_offset: Annotated[int, Query(ge=0, le=16_383)] = 0,
 ) -> XlsxPreviewRead:
-    """把 xlsx 原文件以结构化表格（工作表/列/单元格）返回，供只读表格预览。"""
     task, path = _preview_task_path(task_id, request, session)
     if task.content_type != _XLSX_TYPE:
         raise HTTPException(status_code=415, detail="这个文件类型不是 Excel 表格。")
     try:
-        sheets = extract_xlsx_sheets(
-            path,
+        result = await _read_preview(request, lambda cancelled: xlsx_window(path, sheet, offset, column_offset,
             max_uncompressed_bytes=request.app.state.settings.max_import_uncompressed_bytes,
-            max_rows=request.app.state.settings.max_import_rows,
-            max_columns=request.app.state.settings.max_import_columns,
-        )
-    except UnsupportedTextFileError as error:
-        raise HTTPException(
-            status_code=422,
-            detail=public_error_message(error, "原文件预览失败，请确认文件未损坏。"),
-        ) from error
-    return XlsxPreviewRead(sheets=sheets)
+            cancelled=cancelled))
+        return XlsxPreviewRead(**result)
+    except (UnsupportedTextFileError, zipfile.BadZipFile, OSError, ValueError, KeyError) as error:
+        raise HTTPException(status_code=422, detail=public_error_message(error, "原文件预览失败，请确认文件未损坏。")) from error
 
 
 @router.get("/{task_id}/preview/docx", response_model=DocxPreviewRead)
-def docx_preview(
+async def docx_preview(
     task_id: str,
     request: Request,
     session: SessionDependency,
+    offset: Annotated[int, Query(ge=0, le=10_000_000)] = 0,
 ) -> DocxPreviewRead:
-    """把 docx 原文件按结构（标题/段落/列表/表格/按位图片）返回，供只读预览。"""
     task, path = _preview_task_path(task_id, request, session)
     if task.content_type != _DOCX_TYPE:
         raise HTTPException(status_code=415, detail="这个文件不是 Word 文档。")
     try:
-        blocks = extract_docx_blocks(
-            path,
+        result = await _read_preview(request, lambda cancelled: docx_window(path, offset,
             max_uncompressed_bytes=request.app.state.settings.max_import_uncompressed_bytes,
-            max_images=_MAX_DOCX_PREVIEW_IMAGES,
-            max_rows=request.app.state.settings.max_import_rows,
-            max_columns=request.app.state.settings.max_import_columns,
-        )
-    except UnsupportedTextFileError as error:
-        raise HTTPException(
-            status_code=422,
-            detail=public_error_message(error, "原文件预览失败，请确认文件未损坏。"),
-        ) from error
-    return DocxPreviewRead(blocks=blocks)
+            cancelled=cancelled))
+        return DocxPreviewRead(**result)
+    except (UnsupportedTextFileError, zipfile.BadZipFile, OSError, ValueError, KeyError) as error:
+        raise HTTPException(status_code=422, detail=public_error_message(error, "原文件预览失败，请确认文件未损坏。")) from error
+
+
+@router.get("/{task_id}/preview/image")
+async def image_preview(task_id: str, request: Request, session: SessionDependency) -> Response:
+    task, path = _preview_task_path(task_id, request, session)
+    if not task.content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail="这个文件不是图片。")
+    try:
+        content = await _read_preview(request, lambda cancelled: image_thumbnail(path,
+            max_pixels=request.app.state.settings.max_image_total_pixels, cancelled=cancelled))
+    except (UnsupportedTextFileError, OSError, ValueError, Image.DecompressionBombError) as error:
+        raise HTTPException(status_code=422, detail=public_error_message(error, "图片预览失败。")) from error
+    return Response(content, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
 
 
 @router.get("/{task_id}/preview/images/{image_index}")
-def docx_preview_image(
+async def docx_preview_image(
     task_id: str,
     image_index: Annotated[int, ApiPath(ge=1, le=_MAX_DOCX_PREVIEW_IMAGES)],
     request: Request,
@@ -656,7 +684,31 @@ def docx_preview_image(
     media_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
     if not media_type.startswith("image/"):
         raise HTTPException(status_code=415, detail="内嵌对象不是可预览图片。")
-    return Response(content, media_type=media_type)
+    try:
+        thumbnail = await _read_preview(request, lambda cancelled: image_thumbnail(BytesIO(content),
+            max_pixels=request.app.state.settings.max_image_total_pixels, cancelled=cancelled))
+    except (UnsupportedTextFileError, OSError, ValueError, Image.DecompressionBombError) as error:
+        raise HTTPException(status_code=422, detail=public_error_message(error, "内嵌图片预览失败。")) from error
+    return Response(thumbnail, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
+
+
+async def _read_preview(request: Request, operation):
+    """Disconnect cancels incremental work; returned payloads never outlive a request."""
+    cancelled = Event()
+    worker = asyncio.create_task(asyncio.to_thread(operation, cancelled))
+    try:
+        while True:
+            done, _ = await asyncio.wait({worker}, timeout=0.1)
+            if done:
+                return worker.result()
+            if await request.is_disconnected():
+                raise HTTPException(status_code=499, detail="原件预览已关闭。")
+    finally:
+        cancelled.set()
+        # Do not strand a thread exception after client cancellation. Parsers
+        # observe the event on their next bounded read; they never write data.
+        if not worker.done():
+            worker.add_done_callback(lambda task: None if task.cancelled() else task.exception())
 
 
 def _preview_task_path(

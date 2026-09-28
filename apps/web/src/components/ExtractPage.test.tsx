@@ -100,6 +100,63 @@ function triggerTaskEvent() {
 }
 
 describe("ExtractPage", () => {
+  it("focuses the related value from a validation issue instead of clearing editing on the parent", async () => {
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/templates")) return response([]);
+      if (url.endsWith(`/tasks/${task.id}/result`)) return response({ ...extraction,
+        validation_issues: [{ code: "amount_mismatch", field: "total_amount", message: "合计不一致", severity: "warning" }],
+      });
+      throw new Error(url);
+    }));
+    render(<ExtractPage initialTask={task} />);
+    fireEvent.click(await screen.findByRole("button", { name: "编辑相关字段" }));
+    const value = screen.getByRole("button", { name: "编辑字段 价税合计" }).querySelector('[contenteditable="true"]');
+    expect(value).toHaveFocus();
+  });
+
+  it("independent audit: old save response cannot attach old values to a newly uploaded source", async () => {
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    let release: ((value: Response) => void) | undefined;
+    const savedResponse = new Promise<Response>(resolve => { release = resolve; });
+    const nextTask = {...task, id:"new-source",filename:"new-source.png",status:"paused"};
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/templates")) return response([]);
+      if (url.endsWith(`/tasks/${task.id}/result`)) return response(extraction);
+      if (url.endsWith(`/tasks/${task.id}/review`)) return savedResponse;
+      if (url.endsWith("/tasks") && init?.method === "POST") return response(nextTask);
+      if (url.includes("/tasks?")) return response([nextTask]);
+      throw new Error(url);
+    }));
+    const {container} = render(<ExtractPage initialTask={task} />);
+    await screen.findByText("372", {selector:".extract-header-value"});
+    fireEvent.click(screen.getByRole("button",{name:"修订到表"}));
+    fireEvent.change(container.querySelector('input[type="file"]')!, {target:{files:[new File(["new"],"new-source.png")]}});
+    await waitFor(() => expect(screen.queryByText("372",{selector:".extract-header-value"})).not.toBeInTheDocument());
+    await act(async()=> {release!(response({...extraction,review_version:3}));});
+    expect(screen.queryByText("372",{selector:".extract-header-value"})).not.toBeInTheDocument();
+    expect(screen.queryByRole("button",{name:"修订到表"})).not.toBeInTheDocument();
+  });
+
+  it("independent audit: switching history task cannot retain old file values while new result is pending", async () => {
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    const pendingResponse = new Promise<Response>(() => {});
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/templates")) return response([]);
+      if (url.endsWith(`/tasks/${task.id}/result`)) return response(extraction);
+      if (url.endsWith("/tasks/new-history/result")) return pendingResponse;
+      throw new Error(url);
+    }));
+    const {rerender} = render(<ExtractPage initialTask={task} />);
+    await screen.findByText("372",{selector:".extract-header-value"});
+    rerender(<ExtractPage initialTask={{...task,id:"new-history",filename:"new-history.png"}} />);
+    expect(screen.queryByText("372",{selector:".extract-header-value"})).not.toBeInTheDocument();
+  });
+
+
   beforeEach(() => {
     window.localStorage.clear();
     taskListeners = [];
@@ -119,6 +176,54 @@ describe("ExtractPage", () => {
     );
   });
 
+  it("reloads remembered current data instead of trusting stale browser values", async () => {
+    localStorage.setItem("last-extraction-record-v1", JSON.stringify({ task, extraction }));
+    let release: ((response: Response) => void) | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/templates")) return response([]);
+      if (url.endsWith(`/tasks/${task.id}/result`)) return new Promise<Response>(resolve => { release = resolve; });
+      throw new Error(url);
+    }));
+    render(<ExtractPage />);
+    expect(screen.queryByText("372", { selector: ".extract-header-value" })).not.toBeInTheDocument();
+    await act(async () => { release!(response({ ...extraction, result: result(401), review_version: 3 })); });
+    expect(await screen.findByText("401", { selector: ".extract-header-value" })).toBeInTheDocument();
+    expect(screen.queryByText("372", { selector: ".extract-header-value" })).not.toBeInTheDocument();
+  });
+
+  it("does not resurrect a remembered file deleted from the service", async () => {
+    localStorage.setItem("last-extraction-record-v1", JSON.stringify({ task, extraction }));
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/templates")) return response([]);
+      if (url.endsWith(`/tasks/${task.id}/result`)) return new Response(JSON.stringify({ detail: "没有找到任务" }), { status: 404 });
+      throw new Error(url);
+    }));
+    render(<ExtractPage />);
+    await screen.findByText("没有找到任务");
+    expect(localStorage.getItem("last-extraction-record-v1")).toBeNull();
+    expect(screen.queryByText("372", { selector: ".extract-header-value" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the onboarding example read-only and opens its original without a fictitious task request", async () => {
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    const { container } = render(<ExtractPage demo="rule" />);
+    const field = await screen.findByRole("button", { name: "查看字段 价税合计" });
+    fireEvent.click(field);
+    expect(container.querySelector('[contenteditable="true"]')).toBeNull();
+    expect(screen.queryByRole("button", { name: "忽略" })).not.toBeInTheDocument();
+    const opener = screen.getByRole("button", { name: "打开原文件全屏预览" });
+    opener.focus();
+    fireEvent.click(opener);
+    const dialog = screen.getByRole("dialog", { name: "原文件全屏预览" });
+    expect(dialog.textContent).toContain("服务费：1000.00 元");
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes("onboarding-demo"))).toBe(false);
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(opener).toHaveFocus();
+  });
+
   it("keeps validation content mounted through collapse while removing hidden controls from navigation", async () => {
     HTMLElement.prototype.scrollIntoView = vi.fn();
     const { container } = render(<ExtractPage initialTask={task} />);
@@ -131,6 +236,44 @@ describe("ExtractPage", () => {
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(container.querySelector("#extract-validation-content")).not.toHaveAttribute("inert");
+  });
+
+  it("paginates the real extraction editor and submits edits from multiple pages as one draft", async () => {
+    const many = {...extraction, detail_ids: Array.from({length: 1000}, (_, index) => index + 500),
+      result: {...result(372), items: Array.from({length: 1000}, (_, index) => ({name: `项目-${index + 1}`, quantity: 1, amount: 1}))}};
+    let saved: {result: {items: {name: string}[]}; detail_ids: number[]} | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/templates")) return response([]);
+      if (url.endsWith(`/tasks/${task.id}/result`)) return response(many);
+      if (url.endsWith(`/tasks/${task.id}/review`) && init?.method === "PUT") {
+        saved = JSON.parse(String(init.body));
+        return response({...many, ...saved, review_version: 3});
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    render(<ExtractPage initialTask={task} />);
+    const first = await screen.findByText("项目-1");
+    expect(screen.getAllByRole("button", {name: /^明细 \d+ 操作$/})).toHaveLength(20);
+    expect(screen.queryByText("项目-21")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", {name: /删除明细/})).not.toBeInTheDocument();
+    fireEvent.click(first); first.textContent = "第一页修改"; fireEvent.blur(first);
+    fireEvent.click(screen.getByRole("button", {name: "下一页明细"}));
+    const next = await screen.findByText("项目-21");
+    fireEvent.click(next); next.textContent = "第二页修改"; fireEvent.blur(next);
+    const menu = screen.getByRole("button", {name: "明细 22 操作"});
+    fireEvent.keyDown(menu, {key: "Enter"});
+    fireEvent.click(await screen.findByRole("menuitem", {name: "删除此明细"}));
+    expect(screen.queryByText("项目-22")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", {name: "上一页明细"}));
+    expect(await screen.findByText("第一页修改")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", {name: "修订到表"}));
+    await waitFor(() => expect(saved).toBeDefined());
+    expect(saved?.result.items).toHaveLength(999);
+    expect(saved?.result.items[0].name).toBe("第一页修改");
+    expect(saved?.result.items[20].name).toBe("第二页修改");
+    expect(saved?.detail_ids).not.toContain(521);
+    expect(saved?.detail_ids).toHaveLength(999);
   });
 
   it("uses the native picker ticket without another confirmation or raw source path", async () => {
@@ -151,8 +294,61 @@ describe("ExtractPage", () => {
       await waitFor(() => expect(pick).toHaveBeenCalledOnce());
       await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/tasks/native-import"))).toBe(true));
       const request = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/tasks/native-import"));
-      expect(JSON.parse(String(request?.[1]?.body))).toEqual({ token: picked.token, template_mode: "smart", template_id: null, target_table_id: null });
+      expect(JSON.parse(String(request?.[1]?.body))).toEqual({ token: picked.token, template_mode: "smart", template_id: null, target_table_id: null, duplicate_policy: "reject" });
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    } finally { delete window.pywebview; }
+  });
+
+  it("skips an accidental duplicate without retrying and keeps the other batch file", async () => {
+    const policies: string[] = [];
+    const uploaded = { ...task, id: "new-batch-file", filename: "new.png", status: "queued" };
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/templates")) return response([]);
+      if (url.includes("/tasks?")) return response([uploaded]);
+      if (url.endsWith("/tasks") && init?.method === "POST") {
+        const data = init.body as FormData;
+        policies.push(String(data.get("duplicate_policy")));
+        return (data.get("file") as File).name === "existing.png"
+          ? new Response(JSON.stringify({ detail: { code: "duplicate_upload", message: "再次提取会重复生成数据", duplicate_task_id: task.id, duplicate_status: "completed" } }), { status: 409 })
+          : response(uploaded);
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    render(<ExtractPage />);
+    fireEvent.change(document.querySelector('input[type="file"]')!, { target: { files: [new File(["old"], "existing.png"), new File(["new"], "new.png")] } });
+    expect(await screen.findByRole("dialog", { name: "这份文件已经导入" })).toHaveTextContent("existing.png");
+    await waitFor(() => expect(screen.getByRole("button", { name: "跳过此文件" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "跳过此文件" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(policies).toEqual(["reject", "reject"]);
+    expect(await screen.findByText("队列中 1 个任务")).toBeInTheDocument();
+  });
+
+  it("confirms a native duplicate only with its replacement single-use ticket", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const original = "a".repeat(64), replacement = "b".repeat(64);
+    window.pywebview = { api: { choose_import_files: vi.fn().mockResolvedValue([{ token: original, name: "invoice.png", size: 1024, type: "image/png" }]) } as unknown as NonNullable<NonNullable<Window["pywebview"]>["api"]> };
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/templates")) return response([]);
+      if (url.includes("/tasks?")) return response([{ ...task, status: "queued" }]);
+      if (url.endsWith("/tasks/native-import")) {
+        bodies.push(JSON.parse(String(init?.body)));
+        if (bodies.length === 1) return new Response(JSON.stringify({ detail: { code: "duplicate_upload", message: "再次提取会重复生成数据", duplicate_task_id: task.id, duplicate_status: "completed", retry_token: replacement } }), { status: 409 });
+        return response({ ...task, status: "queued" });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    try {
+      render(<ExtractPage />);
+      fireEvent.click(screen.getByRole("button", { name: "选择文件" }));
+      await screen.findByRole("dialog", { name: "这份文件已经导入" });
+      await waitFor(() => expect(screen.getByRole("button", { name: "再次提取" })).toBeEnabled());
+      expect(bodies).toHaveLength(1);
+      fireEvent.click(screen.getByRole("button", { name: "再次提取" }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+      expect(bodies.map(body => [body.token, body.duplicate_policy])).toEqual([[original, "reject"], [replacement, "allow"]]);
     } finally { delete window.pywebview; }
   });
 
@@ -164,14 +360,14 @@ describe("ExtractPage", () => {
     const amount = await screen.findByText("372", { selector: ".extract-header-value" });
     expect(screen.getByText("手动 · 发票")).toBeInTheDocument();
     await waitFor(() => expect(scroll).toHaveBeenCalledOnce());
-    fireEvent.click(screen.getByRole("radio", { name: "智能匹配" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "提取模板" }), { target: { value: "smart" } });
     expect(screen.getByText("手动 · 发票")).toBeInTheDocument();
     fireEvent.click(amount);
     expect(screen.getByText("仅确认来自第 1 页，暂无可靠区域")).toBeInTheDocument();
 
     amount.textContent = "373";
     fireEvent.blur(amount);
-    fireEvent.click(screen.getByRole("button", { name: "保存到表" }));
+    fireEvent.click(screen.getByRole("button", { name: "修订到表" }));
 
     await waitFor(() => {
       const fetchMock = vi.mocked(fetch);
@@ -289,6 +485,97 @@ describe("ExtractPage", () => {
     await waitFor(() => {
       expect(onTasksChange).toHaveBeenCalled();
     });
+  });
+
+  it("never shows the previous file values under a newly uploaded source", async () => {
+    const next = { ...task, id: "next-upload", filename: "next.png", status: "queued" };
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/templates")) return response([]);
+      if (url.endsWith(`/tasks/${task.id}/result`)) return response(extraction);
+      if (url.includes("/tasks?")) return response([next]);
+      if (url.endsWith("/tasks") && init?.method === "POST") return response(next);
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    render(<ExtractPage initialTask={task} />);
+    expect(await screen.findByText("372", { selector: ".extract-header-value" })).toBeInTheDocument();
+    fireEvent.change(document.querySelector('input[type="file"]')!, { target: { files: [new File(["new"], "next.png")] } });
+    await waitFor(() => expect(screen.queryByText("372", { selector: ".extract-header-value" })).not.toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "修订到表" })).not.toBeInTheDocument();
+    expect(screen.getByText("队列中 1 个任务")).toBeInTheDocument();
+  });
+
+  it.each(["failed", "completed"] as const)("keeps a consecutive upload's %s outcome from being replaced by the previous success", async (outcome) => {
+    const first = { ...task, id: "previous-success", filename: "previous.txt", status: "queued" as const };
+    const next = { ...task, id: "latest-upload", filename: "latest.png", status: "queued" as const };
+    let uploadIndex = 0;
+    let pollIndex = 0;
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/templates")) return response([]);
+      if (url.endsWith("/tasks") && init?.method === "POST") return response(uploadIndex++ === 0 ? first : next);
+      if (url.includes("/tasks?")) {
+        pollIndex += 1;
+        const completedFirst = { ...first, status: "completed", updated_at: "2026-08-01T00:00:01Z" };
+        return response(pollIndex === 1 ? [completedFirst] : [completedFirst, {
+          ...next, status: outcome, updated_at: "2026-08-01T00:00:02Z",
+          failure_message: outcome === "failed" ? "模型返回内容无效，请重试。" : null,
+        }]);
+      }
+      if (url.endsWith("/tasks/previous-success/result")) return response({ ...extraction, task_id: first.id, result: result(371) });
+      if (url.endsWith("/tasks/latest-upload/result")) return response({ ...extraction, task_id: next.id, result: result(372) });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const history = vi.fn();
+    render(<ExtractPage onNavigateHistory={history} />);
+    const input = document.querySelector('input[type="file"]')!;
+    fireEvent.change(input, { target: { files: [new File(["first"], "previous.txt")] } });
+    await screen.findByText("队列中 1 个任务");
+    act(() => triggerTaskEvent());
+    await screen.findByText("371", { selector: ".extract-header-value" });
+    fireEvent.change(input, { target: { files: [new File(["next"], "latest.png")] } });
+    await waitFor(() => expect(screen.queryByText("371", { selector: ".extract-header-value" })).not.toBeInTheDocument());
+    await screen.findByText("队列中 1 个任务");
+    act(() => triggerTaskEvent());
+    if (outcome === "failed") {
+      const alert = await screen.findByRole("alert");
+      expect(alert).toHaveTextContent("latest.png · 提取失败");
+      expect(alert).toHaveTextContent("模型返回内容无效，请重试。");
+      expect(screen.queryByRole("button", { name: "修订到表" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "查看文件历史并重试" }));
+      expect(history).toHaveBeenCalledOnce();
+    } else {
+      expect(await screen.findByText("372", { selector: ".extract-header-value" })).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    }
+    expect(screen.queryByText("371", { selector: ".extract-header-value" })).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/tasks/previous-success/result"))).toHaveLength(1);
+  });
+
+  it("keeps a successful result and a sibling failure visible in the same upload batch", async () => {
+    const good = { ...task, id: "mixed-good", filename: "good.txt", status: "queued" as const };
+    const bad = { ...task, id: "mixed-bad", filename: "bad.png", status: "queued" as const };
+    let index = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/templates")) return response([]);
+      if (url.endsWith("/tasks") && init?.method === "POST") return response(index++ === 0 ? good : bad);
+      if (url.includes("/tasks?")) return response([
+        { ...good, status: "completed", updated_at: "2026-08-01T00:00:01Z" },
+        { ...bad, status: "failed", updated_at: "2026-08-01T00:00:02Z", failure_message: "图片理解失败。" },
+      ]);
+      if (url.endsWith("/tasks/mixed-good/result")) return response({ ...extraction, task_id: good.id });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    render(<ExtractPage />);
+    fireEvent.change(document.querySelector('input[type="file"]')!, { target: { files: [new File(["good"], "good.txt"), new File(["bad"], "bad.png")] } });
+    await screen.findByText("队列中 2 个任务");
+    act(() => triggerTaskEvent());
+    expect(await screen.findByText("372", { selector: ".extract-header-value" })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("bad.png · 提取失败");
+    expect(screen.getByRole("alert")).toHaveTextContent("图片理解失败。");
+    expect(screen.getByText("good.txt")).toBeInTheDocument();
   });
 
   it("keeps the latest completed batch result visible and replaces it when the next finishes", async () => {

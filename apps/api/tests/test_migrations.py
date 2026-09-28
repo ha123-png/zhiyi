@@ -54,7 +54,7 @@ def test_upgrade_database_creates_schema_from_empty_database(tmp_path) -> None:
     with engine.connect() as connection:
         assert connection.execute(
             select(_version_table(engine))
-        ).scalar_one() == "0039_original_archive"
+        ).scalar_one() == "0046_upload_intent"
     assert "rule_engine_version" in {
         column["name"] for column in inspect(engine).get_columns("extractions")
     }
@@ -137,7 +137,7 @@ def test_unversioned_0005_database_is_not_mistaken_for_0006(tmp_path) -> None:
     with engine.connect() as connection:
         assert connection.execute(
             select(_version_table(engine))
-        ).scalar_one() == "0039_original_archive"
+        ).scalar_one() == "0046_upload_intent"
 
 
 def test_unversioned_0006_database_is_upgraded_to_row_versions(tmp_path) -> None:
@@ -160,7 +160,7 @@ def test_unversioned_0006_database_is_upgraded_to_row_versions(tmp_path) -> None
     with engine.connect() as connection:
         assert connection.execute(
             select(_version_table(engine))
-        ).scalar_one() == "0039_original_archive"
+        ).scalar_one() == "0046_upload_intent"
 
 
 def test_unversioned_current_database_is_adopted_without_replaying_migrations(tmp_path) -> None:
@@ -178,7 +178,7 @@ def test_unversioned_current_database_is_adopted_without_replaying_migrations(tm
 
     with engine.connect() as connection:
         assert connection.execute(select(_version_table(engine))).scalar_one() == (
-            "0039_original_archive"
+            "0046_upload_intent"
         )
         assert connection.exec_driver_sql(
             "SELECT value FROM system_settings WHERE key = 'image_convert'"
@@ -219,7 +219,7 @@ def test_0010_backfills_rules_for_existing_builtin_template_versions(tmp_path) -
     with engine.connect() as connection:
         stored = connection.exec_driver_sql(
             "SELECT deterministic_rules_json FROM template_versions "
-            "WHERE template_id = 'builtin-invoice'"
+            "WHERE template_id = 'builtin-invoice' AND version = 1"
         ).scalar_one()
     rules = json.loads(stored)
     assert any(rule["kind"] == "required" for rule in rules)
@@ -249,7 +249,7 @@ def test_0010_recovers_when_column_was_added_before_revision_was_recorded(
 
     with engine.connect() as connection:
         assert connection.execute(select(_version_table(engine))).scalar_one() == (
-            "0039_original_archive"
+            "0046_upload_intent"
         )
     assert [
         column["name"]
@@ -363,7 +363,9 @@ def test_0014_upgrade_keeps_tasks_referenced_by_child_rows(tmp_path) -> None:
             """
         )
 
-    upgrade_database(engine)
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0039_original_archive")
 
     with engine.connect() as connection:
         assert connection.execute(select(_version_table(engine))).scalar_one() == (
@@ -451,12 +453,12 @@ def test_0031_preserves_existing_template_versions(tmp_path):
     with engine.begin() as connection:
         config.attributes["connection"] = connection
         command.upgrade(config, "0030_row_input_scope")
-    from document_pipeline_api.services.templates import ensure_builtin_templates
-    with Session(engine) as session:
-        ensure_builtin_templates(session)
-    with engine.connect() as connection:
+    with engine.begin() as connection:
+        connection.exec_driver_sql("INSERT INTO templates (id, builtin_key, is_system, is_active, in_smart_pool, current_version, created_at, updated_at) VALUES ('example', NULL, 0, 1, 0, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+        connection.exec_driver_sql("INSERT INTO template_versions (template_id, version, name, description, extra_instructions, fields_json, validation_rules_json, deterministic_rules_json, output_mapping_json, behavior_json, created_at) VALUES ('example', 1, '样例', '', '', '[]', '[]', '[]', '{}', '{}', CURRENT_TIMESTAMP)")
         before = connection.exec_driver_sql("SELECT * FROM template_versions ORDER BY id").fetchall()
-    upgrade_database(engine)
-    with engine.connect() as connection:
+        config.attributes['connection'] = connection
+        command.upgrade(config, '0031_template_restorations')
         assert connection.exec_driver_sql("SELECT * FROM template_versions ORDER BY id").fetchall() == before
         assert connection.exec_driver_sql("SELECT count(*) FROM template_restorations").scalar_one() == 0
+    engine.dispose()

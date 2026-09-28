@@ -10,6 +10,7 @@ from document_pipeline_api.models import (
     DataTableRecord,
     ExtractionRecord,
 )
+from document_pipeline_api.services.current_data import row_values, get_current, revise_current
 from document_pipeline_api.models.task import utc_now
 from document_pipeline_api.schemas.data_tables import (
     DataRowRead,
@@ -53,16 +54,27 @@ BUILTIN_ITEM_KEYS = {
 
 def data_row_read(row: DataRowRecord) -> DataRowRead:
     return DataRowRead(
+        is_header_only=row.is_header_only,
         review_pending=row.review_pending,
         input_scope=InputScope.model_validate_json(row.input_scope_json) if row.input_scope_json else None,
         id=row.id,
         task_id=row.task_id,
         item_index=row.item_index,
         version=row.row_version,
-        values=json.loads(row.row_json),
+        values=row_values(row),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
+
+
+def data_rows_read(session, table, rows):
+    from document_pipeline_api.services.data_groups import row_source_key, shared_header_values
+    from document_pipeline_api.services.data_tables import table_columns
+    columns = table_columns(session, table)
+    shared = shared_header_values(session, table.id, [row_source_key(row) for row in rows if not row.task_id], columns)
+    file_keys = [column.key for column in columns if column.section == 'header']
+    return [data_row_read(row).model_copy(update={'shared_header_keys': file_keys if row.task_id
+            else list(shared.get(row_source_key(row), {}))}) for row in rows]
 
 
 def update_data_row(
@@ -71,6 +83,8 @@ def update_data_row(
     row_id: int,
     request: DataRowUpdate,
 ) -> DataRowRead:
+    from document_pipeline_api.services.read_snapshot import begin_write_snapshot
+    begin_write_snapshot(session)
     row = session.scalar(
         select(DataRowRecord).where(
             DataRowRecord.id == row_id,
@@ -89,18 +103,24 @@ def update_data_row(
     # 新增的空行或原本缺失字段的行，在编辑缺失字段时不应被误判为"表里没有该字段"。
     from document_pipeline_api.services.data_tables import table_columns
 
-    table_column_defs = table_columns(session, table)
+    if table.collection_kind == "files" and row.task_id:
+        from document_pipeline_api.schemas.data_tables import ColumnDef
+        table_column_defs = [ColumnDef(**column) for column in json.loads(get_current(session, row.task_id).schema_json)]
+    else:
+        table_column_defs = table_columns(session, table)
     valid_keys = {column.key for column in table_column_defs}
     before = json.loads(row.row_json)
     _validate_row_changes(valid_keys, before, request.changes)
+    from document_pipeline_api.services.current_data import check_column_values
+    check_column_values(request.changes, [column.model_dump() for column in table_column_defs])
 
-    # 合并表没有 task_id，但用 __row_group 表示同一份原文件。表头在界面上是
-    # 跨明细合并单元格，因此编辑时也必须同步到同组所有行并分别留下修订；
-    # 否则选择同组第二条明细查看历史时，会误以为表头从未修改。
+    # Independent groups retain shared fields only while all typed values agree.
+    # A historically varied field is a per-row value, never a first-row override.
     if row.task_id is None:
-        header_keys = {
-            column.key for column in table_column_defs if column.section == "header"
-        }
+        from document_pipeline_api.services.data_groups import effective_header_keys
+        header_keys = effective_header_keys(session, row, table_column_defs)
+        if request.expected_shared_header_keys is not None and (set(request.expected_shared_header_keys) & request.changes.keys()) != (header_keys & request.changes.keys()):
+            raise HTTPException(409, "共享字段的范围已经变化，请刷新后再修改。")
         row_group = before.get("__row_group")
         propagated = header_keys & request.changes.keys()
         related_rows = [row]
@@ -164,79 +184,18 @@ def update_data_row(
             raise RuntimeError("更新后的数据行不存在。")
         return data_row_read(updated_row)
 
-    task_rows = session.scalars(
-        select(DataRowRecord)
-        .where(DataRowRecord.task_id == row.task_id)
-        .order_by(DataRowRecord.item_index)
-    ).all()
-    custom_header_keys = {
-        column.key
-        for column in table_column_defs
-        if column.user_defined and column.section == "header"
-    }
-    header_keys = _header_keys_for_task(session, row.task_id) | custom_header_keys
-    propagated = header_keys & request.changes.keys()
-    prospective: dict[int, dict[str, object | None]] = {
-        current.id: json.loads(current.row_json) for current in task_rows
-    }
-    prospective[row.id].update(request.changes)
-    for current in task_rows:
-        if current.id == row.id:
-            continue
-        prospective[current.id].update(
-            {key: request.changes[key] for key in propagated}
-        )
-
-    # 数据仓库是确认结果的下游副本。这里的编辑只改变数据表，不回写提取结果、
-    # 文件历史或任务校验；否则用户整理已入库数据会被旧模板规则反向阻断。
-
-    changed_at = utc_now()
-    for current in task_rows:
-        after_json = _canonical_json(prospective[current.id])
-        if after_json == current.row_json:
-            continue
-        before_json = current.row_json
-        expected_version = (
-            request.expected_version if current.id == row.id else current.row_version
-        )
-        next_version = expected_version + 1
-        result = session.execute(
-            update(DataRowRecord)
-            .where(
-                DataRowRecord.id == current.id,
-                DataRowRecord.table_id == current.table_id,
-                DataRowRecord.row_version == expected_version,
-            )
-            .values(
-                row_json=after_json,
-                row_version=next_version,
-                updated_at=changed_at,
-            )
-        )
-        if result.rowcount != 1:
-            session.rollback()
-            raise HTTPException(
-                status_code=409,
-                detail="相关数据已经更新，请刷新后再修改。",
-            )
-        session.add(
-            DataRowRevisionRecord(
-                row_id=current.id,
-                table_id=current.table_id,
-                task_id=current.task_id,
-                version=next_version,
-                operation="table_edit",
-                before_json=before_json,
-                after_json=after_json,
-                editor=request.editor,
-                created_at=changed_at,
-            )
-        )
+    current = get_current(session, row.task_id)
+    header_keys = {column["key"] for column in json.loads(current.schema_json) if column.get("section") == "header"}
+    item_changes = {key: value for key, value in request.changes.items() if key not in header_keys}
+    revise_current(
+        session, row.task_id, expected_version=current.current_version,
+        header_changes={key: value for key, value in request.changes.items() if key in header_keys},
+        detail_changes={row.id: item_changes} if item_changes else {},
+        editor=request.editor, edit_session_id=request.edit_session_id,
+    )
     session.commit()
-    updated_row = session.get(DataRowRecord, row_id)
-    if updated_row is None:
-        raise RuntimeError("更新后的数据行不存在。")
-    return data_row_read(updated_row)
+    session.refresh(row)
+    return data_row_read(row)
 
 
 def _header_keys_for_task(session: Session, task_id: str) -> set[str]:
@@ -257,44 +216,60 @@ def list_row_revisions(
     session: Session,
     table_id: str,
     row_id: int,
+    *, page: int = 1, page_size: int = 50,
 ) -> list[DataRowRevisionRead]:
-    row = session.scalar(
-        select(DataRowRecord.id).where(
-            DataRowRecord.id == row_id,
-            DataRowRecord.table_id == table_id,
-        )
-    )
-    if row is None:
+    from document_pipeline_api.services.read_snapshot import begin_read_snapshot
+    begin_read_snapshot(session)
+    exists = session.scalar(select(DataRowRecord.id).where(DataRowRecord.id == row_id, DataRowRecord.table_id == table_id))
+    past = session.scalar(select(DataRowRevisionRecord.id).where(DataRowRevisionRecord.row_id == row_id,
+                           DataRowRevisionRecord.table_id == table_id,
+                           DataRowRevisionRecord.task_id.is_(None)).limit(1))
+    if session.get(DataTableRecord, table_id) is None or exists is None and past is None:
         raise HTTPException(status_code=404, detail="没有找到这行数据。")
     revisions = session.scalars(
         select(DataRowRevisionRecord)
         .where(
             DataRowRevisionRecord.row_id == row_id,
             DataRowRevisionRecord.table_id == table_id,
+            # File-linked rows use the file revision contract. Pre-baseline
+            # row copies must not reappear through this independent-row API.
+            DataRowRevisionRecord.task_id.is_(None),
         )
-        .order_by(DataRowRevisionRecord.version)
+        .order_by(DataRowRevisionRecord.version, DataRowRevisionRecord.id)
+        .offset((page - 1) * page_size).limit(page_size)
     ).all()
-    return [
-        DataRowRevisionRead(
+    return [_read_revision(revision) for revision in revisions]
+
+
+def _read_revision(revision):
+    def values(raw):
+        return {key: value for key, value in json.loads(raw).items() if not key.startswith('__')} if raw is not None else None
+    return DataRowRevisionRead(
             id=revision.id,
             row_id=revision.row_id,
             version=revision.version,
             operation=revision.operation,
-            before=(
-                json.loads(revision.before_json)
-                if revision.before_json is not None
-                else None
-            ),
-            after=(
-                json.loads(revision.after_json)
-                if revision.after_json is not None
-                else None
-            ),
+            before=values(revision.before_json),
+            after=values(revision.after_json),
             editor=revision.editor,
             created_at=revision.created_at,
         )
-        for revision in revisions
-    ]
+
+
+def independent_history(session, table_id, *, row_id=None, page=1, page_size=20):
+    from document_pipeline_api.services.read_snapshot import begin_read_snapshot
+    begin_read_snapshot(session)
+    if session.get(DataTableRecord, table_id) is None:
+        raise HTTPException(404, '没有找到这个数据表。')
+    predicates = [DataRowRevisionRecord.table_id == table_id, DataRowRevisionRecord.task_id.is_(None)]
+    if row_id is not None:
+        predicates.append(DataRowRevisionRecord.row_id == row_id)
+    total = session.scalar(select(func.count()).select_from(DataRowRevisionRecord).where(*predicates)) or 0
+    revisions = session.scalars(select(DataRowRevisionRecord).where(*predicates).order_by(
+        DataRowRevisionRecord.created_at.desc(), DataRowRevisionRecord.id.desc(),
+    ).offset((page - 1) * page_size).limit(page_size))
+    return {'page': page, 'page_size': page_size, 'total': total,
+            'revisions': [_read_revision(revision).model_dump(mode='json') for revision in revisions]}
 
 
 def _validate_row_changes(

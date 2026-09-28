@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DocumentPreview } from "./DocumentPreview";
 
@@ -18,7 +18,7 @@ describe("DocumentPreview", () => {
 
     expect(screen.getByRole("img", { name: "原文件：invoice.png" })).toHaveAttribute(
       "src",
-      "/api/v1/tasks/task-1/original",
+      "/api/v1/tasks/task-1/preview/image",
     );
     expect(screen.getByRole("mark", { name: "字段在原文件中的位置" })).toHaveStyle({
       left: "10%",
@@ -112,5 +112,105 @@ describe("DocumentPreview", () => {
     expect(await screen.findByText("预览资源超限")).toBeInTheDocument();
     expect(screen.getByText("下载完整原件")).toHaveAttribute("download", "大表.xlsx");
     expect(screen.getByText(/预览失败不影响已保存的原件/)).toBeInTheDocument();
+  });
+
+  it("fetches the next bounded text window and restores its bookmark when reopened", async () => {
+    const fetcher = vi.fn(async (url: string) => ({ ok: true, json: async () => url.includes("offset=32766")
+      ? { kind: "text", text: "后半段核对内容", next_offset: null }
+      : { kind: "text", text: "首段核对内容", next_offset: 32766 } }));
+    vi.stubGlobal("fetch", fetcher);
+    const props = { contentType: "text/plain", filename: "分页.txt", pageNumber: 1, scale: 1, url: "/api/v1/tasks/offset-test/file" };
+    const first = render(<DocumentPreview {...props} />);
+    await screen.findByText("首段核对内容");
+    fireEvent.click(screen.getByRole("button", { name: "下一段" }));
+    await screen.findByText("后半段核对内容");
+    expect(screen.queryByText("首段核对内容")).not.toBeInTheDocument();
+    first.unmount();
+    render(<DocumentPreview {...props} />);
+    await screen.findByText("后半段核对内容");
+    expect(fetcher.mock.calls.at(-1)?.[0]).toContain("offset=32766");
+    fireEvent.click(screen.getByRole("button", { name: "上一段" }));
+    await screen.findByText("首段核对内容");
+  });
+
+  it("keeps the last scroll position when its preview pane is removed immediately", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ kind: "text", text: "可核对的原件内容", truncated: false }),
+    }));
+    const props = { contentType: "text/plain", filename: "位置.txt", pageNumber: 1, scale: 1,
+      url: "/api/v1/tasks/scroll-bookmark-test/file" };
+    const preview = (open: boolean) => <div>{open && <div data-document-scroll style={{overflowY: "auto"}}>
+      <DocumentPreview {...props} />
+    </div>}</div>;
+    const view = render(preview(true));
+    await screen.findByText("可核对的原件内容");
+    const first = document.querySelector<HTMLElement>("[data-document-scroll]")!;
+    let liveScrollTop = 0;
+    Object.defineProperty(first, "scrollTop", { configurable: true,
+      get() { return this.isConnected ? liveScrollTop : 0; },
+      set(value: number) { liveScrollTop = value; },
+    });
+    act(() => { first.scrollTop = 220; fireEvent.scroll(first); });
+    view.rerender(preview(false));
+    view.rerender(preview(true));
+    const reopened = document.querySelector<HTMLElement>("[data-document-scroll]")!;
+    await screen.findByText("可核对的原件内容");
+    expect(reopened.scrollTop).toBe(220);
+  });
+
+  it("cancels stale requests and cannot display A's delayed response inside B", async () => {
+    let resolveA!: (value: unknown) => void;
+    let signalA!: AbortSignal;
+    vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => {
+      if (url.includes("cancel-a")) {
+        signalA = init.signal!;
+        return new Promise(resolve => { resolveA = resolve; });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({ text: "文件 B", kind: "text" }) });
+    }));
+    const props = { contentType: "text/plain", filename: "cancel.txt", pageNumber: 1, scale: 1 };
+    const view = render(<DocumentPreview {...props} url="/api/v1/tasks/cancel-a/file" />);
+    view.rerender(<DocumentPreview {...props} url="/api/v1/tasks/cancel-b/file" />);
+    await screen.findByText("文件 B");
+    expect(signalA.aborted).toBe(true);
+    await act(async () => resolveA({ ok: true, json: async () => ({ text: "文件 A", kind: "text" }) }));
+    expect(screen.queryByText("文件 A")).not.toBeInTheDocument();
+  });
+
+  it("requests one Excel sheet and row window, permits jumping to the final rows", async () => {
+    const fetcher = vi.fn(async (url: string) => {
+      const query = new URL(url, "http://localhost").searchParams;
+      const offset = Number(query.get("offset"));
+      const index = Number(query.get("sheet"));
+      return { ok: true, json: async () => ({ sheets: [{ name: index ? "第二页" : "第一页", columns: ["A"], rows: [[`第 ${offset + 1} 行`]] }],
+        sheet_names: ["第一页", "第二页"], total_rows: 10000, next_offset: offset < 9950 ? offset + 50 : null }) };
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(<DocumentPreview contentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      filename="一万行.xlsx" pageNumber={1} scale={1} url="/api/v1/tasks/xlsx-window-test/file" />);
+    await screen.findByText("第 1 行");
+    fireEvent.change(screen.getByRole("spinbutton", { name: "原件行号" }), { target: { value: "10000" } });
+    fireEvent.click(screen.getByRole("button", { name: "前往" }));
+    await screen.findByText("第 9951 行");
+    expect(fetcher.mock.calls.at(-1)?.[0]).toContain("offset=9950");
+    fireEvent.click(screen.getByRole("tab", { name: "第二页" }));
+    await screen.findByText("第 1 行");
+    expect(fetcher.mock.calls.at(-1)?.[0]).toContain("sheet=1&offset=0");
+    expect(screen.getByRole("spinbutton", { name: "原件行号" })).toHaveValue(1);
+    fireEvent.click(screen.getByRole("tab", { name: "第一页" }));
+    await screen.findByText("第 1 行");
+    expect(screen.getByRole("spinbutton", { name: "原件行号" })).toHaveValue(1);
+    fireEvent.click(screen.getByRole("button", { name: "下一段" }));
+    await screen.findByText("第 51 行");
+    expect(screen.getByRole("spinbutton", { name: "原件行号" })).toHaveValue(51);
+  });
+
+  it("does not add an inner download when the parent already owns it, and reports image failure", async () => {
+    render(<DocumentPreview contentType="image/png" filename="fail.png" pageNumber={1} scale={1}
+      url="/api/v1/tasks/image-failure-test/file" showDownload={false} />);
+    expect(screen.queryByText("下载完整原件")).not.toBeInTheDocument();
+    fireEvent.error(screen.getByRole("img"));
+    await waitFor(() => expect(screen.getByText("这张图片无法预览，请在原件中查看。")).toBeInTheDocument());
   });
 });

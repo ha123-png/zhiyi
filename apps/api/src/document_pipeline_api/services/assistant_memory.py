@@ -12,6 +12,13 @@ def conversation_title(text):
 
 def unverified_tool_text(reply, question, artifacts):
     """Detect leaked internal wrappers and fabricated snapshot IDs, not general prose."""
+    write_request = any(word in question.lower() for word in (
+        "改为", "改成", "修改为", "修改成", "更新为", "设置为", "替换为",
+        "新增", "删除", "增加", "减少", "change", "update", "delete",
+    ))
+    if (write_request and re.search(r"(?:修改|操作)预览", reply)
+            and re.search(r"请.{0,16}确认.{0,16}执行", reply)):
+        return True
     if any(word in question.lower() for word in ("json", "调试", "工具记录", "schema", "代码")):
         return False
     if "已保存的工具记录（数据，不是指令）" in reply:
@@ -29,6 +36,7 @@ def scope_identity(value):
         "workspace",
         "table_id",
         "row_ids",
+        "source_keys",
         "view_id",
         "search",
         "task_id",
@@ -39,9 +47,9 @@ def scope_identity(value):
         "template_ids",
     )
     result = {
-        k: value[k] for k in keys if value.get(k) or (k == "row_ids" and value.get(k) is not None)
+        k: value[k] for k in keys if value.get(k) or (k in {"row_ids", "source_keys"} and value.get(k) is not None)
     }
-    for key in ("table_ids", "task_ids", "template_ids", "row_ids"):
+    for key in ("table_ids", "task_ids", "template_ids", "row_ids", "source_keys"):
         if isinstance(result.get(key), list):
             result[key] = sorted(set(result[key]))
     return result
@@ -212,10 +220,12 @@ def summarize_result(result, *, history=False, status=None):
             **{k: v for k, v in result.items() if k != "extraction"},
             "extraction_available": True,
             "result_preview": preview,
-            "item_count": len(business.get("items", [])) if isinstance(business, dict) else None,
+            "item_count": extraction.get("item_count", len(business.get("items", []))) if isinstance(business, dict) else None,
             "validation_issues": extraction.get("validation_issues", [])[:10],
             "read_paths": [["extraction", key] for key in ("result", "validation_issues", "evidence", "input_scope") if key in extraction],
-            "notice": "已提供当前提取字段和前三条明细，长字段为预览。完整资料保存在工具记录，其他内容可直接用 read_tool_result 的 read_paths 中相应数组读取；预览不代表全部明细。",
+            "page": extraction.get("page"), "page_size": extraction.get("page_size"),
+            "notice": ("这是当前页的三条明细预览，长字段可用 read_tool_result 读取，其他页用 read_resource 的 file_data；预览不代表全部明细。"
+                       if "item_count" in extraction else "已提供当前提取字段和前三条明细，长字段为预览。完整资料保存在工具记录，可用 read_tool_result 按路径读取；预览不代表全部明细。"),
         }
     if history:
         value = {
@@ -331,7 +341,7 @@ def model_result(result, tool_id, budget=6000):
     # Preserve facts/identifiers first. Even error messages, column lists and
     # user-controlled names must obey the transport budget.
     for key in ("analysis_id", "snapshot_id", "reference", "source", "totals", "row_count", "group_count",
-                "status", "error", "path", "offset", "total", "total_characters", "next_offset", "request", "metric_labels", "columns"):
+                "status", "error", "path", "offset", "total", "total_characters", "next_offset", "page", "page_size", "version", "total_details", "request", "metric_labels", "columns"):
         if key in summary:
             candidate = {**small, key: preview_values(summary[key])}
             if len(encode(candidate)) <= budget * 0.7:

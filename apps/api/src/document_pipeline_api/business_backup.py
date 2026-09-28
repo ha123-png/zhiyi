@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
@@ -155,6 +156,7 @@ def _restore_business_backup(
     *,
     before_install: Callable[[], None] | None = None,
 ) -> Path:
+    _recover_interrupted_restore(data_dir.resolve())
     manifest = inspect_business_backup(archive_path)
     active_data_dir = data_dir.resolve()
     current_database = _database_path(settings)
@@ -276,7 +278,10 @@ def _prepare_staged_database(
 ) -> None:
     engine = build_engine(f"sqlite:///{database_path.resolve()}")
     try:
-        upgrade_database(engine)
+        try:
+            upgrade_database(engine)
+        except Exception as error:
+            raise BusinessBackupError("备份数据库升级失败，当前数据没有改变。") from error
     finally:
         engine.dispose()
     expected = {item["task_id"]: item for item in manifest["files"]}
@@ -342,8 +347,8 @@ def _install_staged_restore(
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     rollback = data_dir / "backups" / f"before-restore-{timestamp}"
     rollback.mkdir(parents=True, exist_ok=False)
-    moved: list[tuple[Path, Path]] = []
-    installed: list[Path] = []
+    from document_pipeline_api.services.clear_data import _write_json
+    from document_pipeline_api.services.dataset_identity import advance_dataset
     current_items = [
         current_database,
         Path(f"{current_database}-wal"),
@@ -355,18 +360,26 @@ def _install_staged_restore(
         data_dir / "queue.db-shm",
         data_dir / "queue.db-journal",
     ]
+    for path in [data_dir, rollback, *current_items]:
+        if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+            raise BusinessBackupError("恢复路径包含外部链接，未替换当前数据。")
+    journal = restore_journal_path(data_dir)
+    state = {"version": 1, "rollback": rollback.name, "phase": "installing",
+             "originals": [path.name for path in current_items if path.exists()]}
+    # Write intent before any move. Recovery uses the journal plus atomic path
+    # existence; it does not depend on a post-move update having reached disk.
+    _write_json(journal, state)
     try:
+        epoch = advance_dataset(data_dir)
+        _fence_restored_versions(stage_database, epoch)
         for source in current_items:
             if source.exists():
                 destination = rollback / source.name
                 _move_path(source, destination)
-                moved.append((source, destination))
         current_database.parent.mkdir(parents=True, exist_ok=True)
         current_uploads.parent.mkdir(parents=True, exist_ok=True)
         _move_path(stage_database, current_database)
-        installed.append(current_database)
         _move_path(stage_uploads, current_uploads)
-        installed.append(current_uploads)
         connection = sqlite3.connect(current_database)
         try:
             result = connection.execute("PRAGMA integrity_check").fetchone()
@@ -374,19 +387,111 @@ def _install_staged_restore(
                 raise BusinessBackupError("安装恢复数据后的数据库完整性检查失败。")
         finally:
             connection.close()
+        _write_json(journal, {**state, "phase": "committed"})
     except Exception as error:
         logger.exception("恢复替换失败，回滚中：%s", type(error).__name__)
-        for path in reversed(installed):
-            _remove_installed_path(path)
-        for original, saved in reversed(moved):
-            if saved.exists():
-                _move_path(saved, original)
-        if isinstance(error, BusinessBackupError):
-            raise
+        try:
+            _recover_interrupted_restore(data_dir)
+        except Exception as recovery_error:
+            raise BusinessBackupError("恢复中断且回滚尚未完成，已阻止继续使用。请重启知意重试恢复；原数据保留在恢复前备份目录。") from recovery_error
         raise BusinessBackupError(
-            f"恢复替换失败，当前数据已回滚。{type(error).__name__}: {error}"
+            "恢复替换失败，当前数据已回滚，请检查文件占用和磁盘空间。"
         ) from error
+    journal.unlink()
     return rollback
+
+
+def restore_journal_path(data_dir: Path) -> Path:
+    return data_dir / "runtime" / "restore-pending.json"
+
+
+def recover_interrupted_restore(data_dir: Path) -> None:
+    """Run before opening any database. Never start against a half-installed set."""
+    if restore_journal_path(data_dir).exists():
+        from document_pipeline_api.services.file_operation_lock import file_operation_lock
+        with file_operation_lock(data_dir / "uploads"):
+            _recover_interrupted_restore(data_dir.resolve())
+
+
+def _recover_interrupted_restore(data_dir: Path) -> None:
+    journal = restore_journal_path(data_dir)
+    if not journal.exists():
+        return
+    from document_pipeline_api.services.clear_data import _checked
+    _checked(data_dir, journal)
+    if journal.is_symlink():
+        raise BusinessBackupError("恢复记录路径异常，已停止启动。")
+    try:
+        state = json.loads(journal.read_text(encoding="utf-8"))
+        name = state["rollback"]
+        allowed = {"document-pipeline.db", "uploads", "queue.db"}
+        allowed |= {base + suffix for base in ("document-pipeline.db", "queue.db") for suffix in ("-wal", "-shm", "-journal")}
+        if (state.get("version") != 1 or not isinstance(name, str) or Path(name).name != name
+                or not name.startswith("before-restore-") or state.get("phase") not in {"installing", "committed"}
+                or not isinstance(state.get("originals"), list) or not set(state["originals"]) <= allowed):
+            raise ValueError
+        rollback = _checked(data_dir, data_dir / "backups" / name)
+        if not rollback.is_dir() or rollback.is_symlink() or (hasattr(rollback, "is_junction") and rollback.is_junction()):
+            raise ValueError
+        if state["phase"] == "committed":
+            if not (data_dir / "document-pipeline.db").is_file() or not (data_dir / "uploads").is_dir():
+                raise ValueError
+            journal.unlink()
+            return
+        discarded = _checked(data_dir, rollback / "interrupted-install")
+        if discarded.is_symlink() or (hasattr(discarded, "is_junction") and discarded.is_junction()):
+            raise ValueError
+        for name in sorted(allowed):
+            active, saved = data_dir / name, rollback / name
+            _checked(data_dir, active)
+            _checked(data_dir, saved)
+            for path in (active, saved):
+                if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+                    raise ValueError
+            if saved.exists():
+                if active.exists():
+                    discarded.mkdir(exist_ok=True)
+                    _move_path(active, discarded / name)
+                _move_path(saved, active)
+            elif name in state["originals"]:
+                if not active.exists():
+                    raise ValueError
+            elif active.exists():
+                discarded.mkdir(exist_ok=True)
+                _move_path(active, discarded / name)
+        journal.unlink()
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise BusinessBackupError("上次恢复尚未完成，已停止启动以保护数据。请检查恢复前备份与数据目录权限后重试。") from error
+
+
+def _fence_restored_versions(database: Path, epoch: int) -> None:
+    # The backup contains old optimistic-lock tokens. A fresh epoch makes every
+    # pre-restore file/row draft stale, even when its numeric ID is unchanged.
+    with closing(sqlite3.connect(database)) as connection, connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "data_rows" in tables:
+            connection.execute("UPDATE data_rows SET row_version = ?", (epoch,))
+        if "file_current_data" in tables:
+            connection.execute("UPDATE file_current_data SET current_version = ?", (epoch,))
+        if "templates" in tables:
+            # Version numbers identify immutable rule snapshots and cannot be
+            # renumbered. Fence their mutable current pointer with a fresh UTC
+            # timestamp, using the monotonic microsecond restore epoch.
+            restored_at = (datetime(1970, 1, 1) + timedelta(microseconds=epoch)).isoformat(" ", timespec="microseconds")
+            connection.execute("UPDATE templates SET updated_at = ?", (restored_at,))
+            connection.execute(
+                "INSERT INTO system_settings (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                ("restored_template_write_fence", str(epoch), restored_at),
+            )
+            # Templates without a prior local binding also need a fence: the
+            # implicit revision 0 must not authorize an old enable-export draft.
+            connection.execute(
+                "INSERT INTO template_local_bindings (template_id, revision, enabled, mode) "
+                "SELECT id, ?, 0, 'copy' FROM templates WHERE id NOT IN "
+                "(SELECT template_id FROM template_local_bindings)", (epoch,),
+            )
+            connection.execute("UPDATE template_local_bindings SET revision = ?, enabled = 0", (epoch,))
 
 
 def _move_path(source: Path, destination: Path) -> None:

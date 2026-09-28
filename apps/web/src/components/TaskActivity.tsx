@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, FileSearch, Pause, Play, Trash2 } from "lucide-react";
 import { Icon } from "./Icon";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { parseServerTime } from "../time";
 import type { Task, TaskStatus } from "../types";
 
@@ -63,12 +64,14 @@ export function GlobalTaskCard({
   /** 恢复暂停的当前任务，放回队列继续处理 */
   onResume?: (taskId: string) => void;
   /** 删除任务（含原文件）：仅对可删除状态（如已暂停）显示 */
-  onDelete?: (taskId: string) => void;
+  onDelete?: (taskId: string) => void | Promise<void>;
   onOpenPending?: () => void;
   pendingCount?: number;
   reviewCount?: number;
 }) {
   const [now, setNow] = useState(() => Date.now());
+  const [deleteTarget, setDeleteTarget] = useState<Task | null>(null);
+  const [deleting, setDeleting] = useState(false);
   // 计时锚点 = 任务真正开始处理的时刻：任务进入处理中/校验中时从 0 清零重新计，
   // 排队等待时间不计入；批量处理时每个任务独立计时。
   const anchorRef = useRef<Map<string, number>>(new Map());
@@ -97,6 +100,17 @@ export function GlobalTaskCard({
   // 任务条只展示一个任务：正在处理 > 已暂停 > 最早排队 > 其他活动任务；
   // 文案与计时由 activeVisual 决定（排队中不计时，处理中从 0 计时）。
   const visual = activeTask ? activeVisual(activeTask.status) : null;
+
+  const confirmDelete = async () => {
+    if (!deleteTarget || !onDelete || deleting) return;
+    setDeleting(true);
+    try {
+      await onDelete(deleteTarget.id);
+      setDeleteTarget(null);
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   // 渲染期同步各任务状态，维护计时锚点（ref 读写无渲染副作用）。
   // 计时是每个任务独立的：任务真正开始处理（processing/validating）那一刻
@@ -139,6 +153,7 @@ export function GlobalTaskCard({
   // 处理中/排队/暂停：完整任务条（文件名 + 状态 + 计时 + 暂停/恢复 + 取消）
   if (activeTask && visual) {
     return (
+      <>
       <section className={`gtb-card ${visual.className}`} aria-label="当前任务状态" aria-live="polite">
         <div className="gtb-status">
           <span className={`gtb-dot ${visual.className}`} aria-hidden="true" />
@@ -171,8 +186,8 @@ export function GlobalTaskCard({
             <button
               className="btn ghost sm danger"
               type="button"
-              title="删除此任务（处理未完成，直接删除不确认）"
-              onClick={() => onDelete(activeTask.id)}
+              title="删除此任务（将确认删除范围）"
+              onClick={() => setDeleteTarget(activeTask)}
             >
               <Icon icon={Trash2} size={13} /> 删除
             </button>
@@ -184,6 +199,18 @@ export function GlobalTaskCard({
           )}
         </div>
       </section>
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        title="删除暂停任务"
+        description={deleteTarget
+          ? `将永久删除“${deleteTarget.filename}”的任务记录、平台内部原件、当前数据和该文件的修订历史（如有）。外部归档/副本文件及独立导入/合并表不受影响。取消任务可停止处理并保留原件和历史。此删除无法从应用恢复。`
+          : "将删除所选任务及其关联内容。此删除无法从应用恢复。"}
+        buttonLabel="确认删除"
+        busy={deleting}
+        onConfirm={() => void confirmDelete()}
+        onClose={() => setDeleteTarget(null)}
+      />
+      </>
     );
   }
 

@@ -121,6 +121,56 @@ def test_invalid_profile_request_never_echoes_api_key(tmp_path: Path) -> None:
     assert backend.values == {}
 
 
+def test_profile_list_reports_missing_restored_credentials_without_mutating_refs(tmp_path: Path) -> None:
+    """A restored reference cannot claim that a deleted Windows key is saved."""
+    backend = MemoryCredentialBackend()
+    store = ModelSecretStore(backend)
+    settings = _settings(tmp_path)
+    with TestClient(create_app(settings, model_secret_store=store)) as client:
+        profile = client.post("/api/v1/models/profiles", json=_profile_body()).json()
+        def listed():
+            return next(item for item in client.get("/api/v1/models/profiles").json() if item["id"] == profile["id"])
+        assert listed()["has_api_key"] is True
+        with sqlite3.connect(tmp_path / "profiles.db") as db:
+            ref = db.execute("SELECT secret_ref FROM model_profile_versions WHERE profile_id = ?", (profile["id"],)).fetchone()[0]
+        store.delete(ref)
+        missing = listed()
+        assert missing["has_api_key"] is False
+        assert "secret_ref" not in missing and "api_key" not in missing
+        with sqlite3.connect(tmp_path / "profiles.db") as db:
+            assert db.execute("SELECT secret_ref FROM model_profile_versions WHERE profile_id = ?", (profile["id"],)).fetchone()[0] == ref
+
+        repaired = client.put(f"/api/v1/models/profiles/{profile['id']}", json={**_profile_body(key="replacement-test-key"), "expected_version":1})
+        assert repaired.status_code == 200
+        assert listed()["has_api_key"] is True
+
+
+def test_profile_list_does_not_claim_unreadable_credentials_are_available(tmp_path: Path, monkeypatch) -> None:
+    backend = MemoryCredentialBackend()
+    store = ModelSecretStore(backend)
+    with TestClient(create_app(_settings(tmp_path), model_secret_store=store)) as client:
+        profile = client.post("/api/v1/models/profiles", json=_profile_body()).json()
+        def deny_read(target):
+            raise PermissionError("credential backend denied access")
+        monkeypatch.setattr(backend, "read", deny_read)
+        response = client.get("/api/v1/models/profiles")
+        assert response.status_code == 200
+        assert next(item for item in response.json() if item["id"] == profile["id"])["has_api_key"] is False
+        assert "cloud-secret-one" not in response.text
+        assert "denied access" not in response.text
+
+
+def test_profile_list_checks_existing_credentials_after_restart(tmp_path: Path, monkeypatch) -> None:
+    store = ModelSecretStore(MemoryCredentialBackend())
+    settings = _settings(tmp_path)
+    with TestClient(create_app(settings, model_secret_store=store)) as client:
+        profile = client.post("/api/v1/models/profiles", json=_profile_body()).json()
+    monkeypatch.setattr("document_pipeline_api.api.models.create_model_secret_store", lambda: store)
+    with TestClient(create_app(settings)) as restarted:
+        items = restarted.get("/api/v1/models/profiles").json()
+        assert next(item for item in items if item["id"] == profile["id"])["has_api_key"] is True
+
+
 def test_profile_versions_activation_and_tasks_keep_exact_secret(tmp_path: Path) -> None:
     backend = MemoryCredentialBackend()
     store = ModelSecretStore(backend)
@@ -175,6 +225,15 @@ def test_profile_versions_activation_and_tasks_keep_exact_secret(tmp_path: Path)
         second_task_response = client.post(
             "/api/v1/tasks",
             data={"template_mode": "smart"},
+            files={"file": ("second.png", PNG_BYTES, "image/png")},
+        )
+        # Switching model versions alone does not authorize paying to extract
+        # identical input again. Explicit repeat still snapshots the new model.
+        assert second_task_response.status_code == 409
+        assert second_task_response.json()["detail"]["duplicate_task_id"] == first_task_id
+        second_task_response = client.post(
+            "/api/v1/tasks",
+            data={"template_mode": "smart", "duplicate_policy": "allow"},
             files={"file": ("second.png", PNG_BYTES, "image/png")},
         )
         assert second_task_response.status_code == 201

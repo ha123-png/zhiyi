@@ -1,25 +1,32 @@
+import { deletionNotice } from "../deletionNotice";
 import { taskDisplayName } from "../taskNames";
 import { TaskFailureDetails } from "./TaskFailureDetails";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
+  Ban,
   CheckCircle2,
   ChevronDown,
   HelpCircle,
   Loader2,
+  Pause,
   Play,
   Trash2,
 } from "lucide-react";
 import {
+  cancelTask,
   deleteTask,
   deleteTasksBatch,
+  getQueuePaused,
   getTasks,
   getTaskSummary,
   getTables,
   getTemplates,
+  pauseTask,
   retryTask,
   retryTasksBatch,
+  resumeTask,
   selectTaskTemplate,
   subscribeTaskEvents,
   taskEventsConnected,
@@ -98,13 +105,15 @@ export function TaskQueuePage({
   const [templates, setTemplates] = useState<ExtractionTemplate[]>([]);
   const [templateNames, setTemplateNames] = useState<Record<string, string>>({});
   const [tables, setTables] = useState<DataTableRead[]>([]);
-  // 待选模板删除确认（单删）：无数据、不输入文件名
-  const [deleteMatchTarget, setDeleteMatchTarget] = useState<Task | null>(null);
+  // 所有单项删除都确认；删除范围包括平台内部原件及该文件的当前事实/修订。
+  const [deleteTarget, setDeleteTarget] = useState<Task | null>(null);
   // 待选模板批量删除确认：一次弹窗
   const [batchDeleteMatchOpen, setBatchDeleteMatchOpen] = useState(false);
   // 暂停任务批量删除确认：一次弹窗（防止误删整个队列）
   const [batchDeletePausedOpen, setBatchDeletePausedOpen] = useState(false);
+  const [batchDeleteFailedOpen, setBatchDeleteFailedOpen] = useState(false);
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
+  const [queuePaused, setQueuePaused] = useState<boolean | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [retryingAll, setRetryingAll] = useState(false);
   const [exportPage, setExportPage] = useState(0);
@@ -125,7 +134,7 @@ export function TaskQueuePage({
       setError(null);
       // 活动任务必须按状态查询，不能假设它们一定处于最近 N 条；否则大量新历史
       // 会把旧的待选模板/暂停任务挤出列表。近期终态仅用于本页摘要。
-      const [active, recent, exports, waiting, summary, reviews, failures] = await Promise.all([
+      const [active, recent, exports, waiting, summary, reviews, failures, queuePausedState] = await Promise.all([
         getTasks({ limit: 1000, activeOnly: true }),
         getTasks({ limit: 500 }),
         getTasks({ limit: pendingPageSize, offset: exportPage * pendingPageSize, exportPending: true }),
@@ -133,8 +142,10 @@ export function TaskQueuePage({
         getTaskSummary(),
         getTasks({ limit: pendingPageSize, offset: reviewPage * pendingPageSize, status: "needs_review" }),
         getTasks({ limit: pendingPageSize, offset: failedPage * pendingPageSize, status: "failed,cancelled" }),
+        getQueuePaused().catch(() => null),
       ]);
       if (currentRequest !== requestNumber.current) return;
+      setQueuePaused(queuePausedState);
       const exportItems = exports.filter((task) => task.status === "completed" && (task.archive_pending || ["failed", "needs_rebind"].includes(task.file_export?.status ?? "")));
       const waitingItems = waiting.filter((task) => task.status === "waiting_for_template");
       setExportPendingTasks(exportItems);
@@ -201,11 +212,17 @@ export function TaskQueuePage({
   const isCardCollapsed = (key: string) => !!collapsed[key];
 
   const handleRetry = async (taskId: string, useCurrentSettings = false) => {
+    if (busyTaskId !== null) return;
+    setBusyTaskId(taskId);
+    setError(null);
+    setNotice(null);
     try {
       await retryTask(taskId, useCurrentSettings);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "重试任务失败");
+    } finally {
+      setBusyTaskId(null);
     }
   };
 
@@ -233,16 +250,14 @@ export function TaskQueuePage({
   };
 
   const handleDelete = async () => {
-    if (!deleteMatchTarget) return;
-    setBusyTaskId(deleteMatchTarget.id);
+    if (!deleteTarget) return;
+    setBusyTaskId(deleteTarget.id);
     try {
-      const result = await deleteTask(deleteMatchTarget.id);
-      setDeleteMatchTarget(null);
+      const result = await deleteTask(deleteTarget.id);
+      setDeleteTarget(null);
       await load();
       setNotice(
-        result.kept_rows > 0
-          ? `任务已删除，数据表中保留 ${result.kept_rows} 行数据（与原文件追溯已断开）。`
-          : "任务已删除。",
+        deletionNotice(result, "文件及关联数据已删除。"),
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : "删除任务失败");
@@ -251,15 +266,50 @@ export function TaskQueuePage({
     }
   };
 
-  /** 失败任务 / 暂停任务：没有产生数据，删除无需确认，直接删 */
-  const handleDeleteImmediate = async (taskId: string) => {
-    setBusyTaskId(taskId);
+  const handleCancelTask = async (task: Task) => {
+    setBusyTaskId(task.id);
+    setError(null);
+    setNotice(null);
     try {
-      await deleteTask(taskId);
+      await cancelTask(task.id);
       await load();
-      setNotice("任务已删除。");
+      setNotice(taskDisplayName(task) + " 已取消。任务记录、原件、已有数据和修订历史均保留。");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "删除任务失败");
+      setError(err instanceof Error ? err.message : "取消任务失败");
+    } finally {
+      setBusyTaskId(null);
+    }
+  };
+
+  const handlePauseTask = async (task: Task) => {
+    setBusyTaskId(task.id);
+    setError(null);
+    setNotice(null);
+    try {
+      await pauseTask(task.id);
+      await load();
+      setNotice(taskDisplayName(task) + " 已单独暂停；其他任务继续排队。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "暂停任务失败");
+    } finally {
+      setBusyTaskId(null);
+    }
+  };
+
+  const handleResumeTask = async (task: Task) => {
+    if (queuePaused === true) {
+      setError("整个队列已暂停。请先用顶部“启动队列”恢复全部任务。");
+      return;
+    }
+    setBusyTaskId(task.id);
+    setError(null);
+    setNotice(null);
+    try {
+      await resumeTask(task.id);
+      await load();
+      setNotice(taskDisplayName(task) + " 已继续处理。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "继续任务失败");
     } finally {
       setBusyTaskId(null);
     }
@@ -275,9 +325,7 @@ export function TaskQueuePage({
       setBatchDeleteMatchOpen(false);
       await load();
       setNotice(
-        result.kept_rows > 0
-          ? `已删除 ${result.deleted} 个任务，数据表中保留 ${result.kept_rows} 行数据。`
-          : `已删除 ${result.deleted} 个任务。`,
+        deletionNotice(result, `已删除 ${result.deleted} 个文件及关联数据。`),
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : "批量删除失败");
@@ -294,10 +342,10 @@ export function TaskQueuePage({
     if (ids.length === 0) return;
     setBusyTaskId("batch");
     try {
-      await deleteTasksBatch(ids);
+      const result = await deleteTasksBatch(ids);
       setBatchDeletePausedOpen(false);
       await load();
-      setNotice(`已删除 ${ids.length} 个暂停任务。`);
+      setNotice(deletionNotice(result, `已删除 ${result.deleted} 个暂停任务。`));
     } catch (err) {
       setError(err instanceof Error ? err.message : "批量删除失败");
     } finally {
@@ -305,7 +353,7 @@ export function TaskQueuePage({
     }
   };
 
-  /** 失败任务批量删除：没有产生数据，直接删，不弹确认 */
+  /** 失败/取消任务批量删除：确认本页范围和实际删除内容后执行。 */
   const handleBatchDeleteFailed = async () => {
     const ids = failedTasks
       .filter((t) => t.status === "failed" || t.status === "cancelled")
@@ -313,9 +361,10 @@ export function TaskQueuePage({
     if (ids.length === 0) return;
     setBusyTaskId("batch");
     try {
-      await deleteTasksBatch(ids);
+      const result = await deleteTasksBatch(ids);
+      setBatchDeleteFailedOpen(false);
       await load();
-      setNotice(`已删除 ${ids.length} 个失败任务。`);
+      setNotice(deletionNotice(result, `已删除 ${result.deleted} 个失败/已取消任务。`));
     } catch (err) {
       setError(err instanceof Error ? err.message : "批量删除失败");
     } finally {
@@ -433,14 +482,48 @@ export function TaskQueuePage({
                           <span>{STAGE_TEXT[t.status]}</span>
                         </div>
                         <div className="task-actions">
+                          {["queued", "processing"].includes(t.status) && (
+                            <button
+                              className="btn ghost sm"
+                              aria-label={"暂停 " + taskDisplayName(t)}
+                              title="仅暂停此任务；其他任务继续处理"
+                              disabled={busyTaskId === t.id}
+                              onClick={() => void handlePauseTask(t)}
+                            >
+                              <Icon icon={Pause} size={12} /> 暂停
+                            </button>
+                          )}
+                          {["created", "queued", "processing", "paused"].includes(t.status) && (
+                            <button
+                              className="btn ghost sm"
+                              aria-label={"取消 " + taskDisplayName(t)}
+                              title="取消任务会保留任务记录、原件和已有数据；不会删除文件"
+                              disabled={busyTaskId === t.id}
+                              onClick={() => void handleCancelTask(t)}
+                            >
+                              <Icon icon={Ban} size={12} /> 取消
+                            </button>
+                          )}
+                          {t.status === "paused" && (
+                            <button
+                              className="btn ghost sm"
+                              aria-label={"继续 " + taskDisplayName(t)}
+                              title={queuePaused === true ? "整个队列已暂停；请用顶部“启动队列”恢复全部任务" : "仅继续此任务"}
+                              disabled={busyTaskId === t.id || queuePaused === true}
+                              onClick={() => void handleResumeTask(t)}
+                            >
+                              <Icon icon={Play} size={12} /> 继续
+                            </button>
+                          )}
                           {t.status === "paused" && (
                             <button
                               className="btn ghost sm danger-btn"
-                              title="删除此任务（防止上传错文件，直接删除不确认）"
+                              aria-label={"删除任务 " + taskDisplayName(t)}
+                              title="删除任务记录、内部原件、当前数据和该文件修订历史"
                               disabled={busyTaskId === t.id}
-                              onClick={() => void handleDeleteImmediate(t.id)}
+                              onClick={() => setDeleteTarget(t)}
                             >
-                              <Icon icon={Trash2} size={12} />
+                              <Icon icon={Trash2} size={12} /> 删除
                             </button>
                           )}
                         </div>
@@ -489,7 +572,7 @@ export function TaskQueuePage({
                   )}
                   {reviewTasks.map(task => <div className="task-item" key={`review-${task.id}`}>
                     <div className="task-row-top"><span className="task-name" title={taskDisplayName(task)}>{taskDisplayName(task)}</span><span className="badge warn">待核对</span></div>
-                    <div className="task-row-bottom"><span className="small muted">提取结果需要确认，与文件历史的校验问题同步。</span><button className="btn secondary sm" onClick={() => onOpenTask?.(task)}>核对结果</button></div>
+                    <div className="task-row-bottom"><span className="small muted">提取结果需要确认，与文件历史的校验问题同步。</span><div className="task-actions"><button className="btn secondary sm" onClick={() => onOpenTask?.(task)}>核对结果</button><button className="btn ghost sm" aria-label={"取消 " + taskDisplayName(task)} title="取消会保留任务记录、原件、已有数据和修订历史" disabled={busyTaskId === task.id} onClick={() => void handleCancelTask(task)}>取消任务</button></div></div>
                   </div>)}
                   {pendingTotals.review > pendingPageSize && <div className="row" aria-label="待核对事项翻页">
                     <button className="btn secondary sm" disabled={reviewPage === 0} onClick={() => setReviewPage(page => page - 1)}>上一页待核对</button>
@@ -516,7 +599,7 @@ export function TaskQueuePage({
                       <div className="task-row-top"><span className="task-name" title={taskDisplayName(t)}>{taskDisplayName(t)}</span><span className="badge warn">待确认范围</span></div>
                       <PartialInputAction task={t} onUpdated={() => void load()} />
                       <button className="btn ghost sm" onClick={() => onOpenTask?.(t)}>查看任务</button>
-                      <button className="btn ghost sm danger-btn" onClick={() => setDeleteMatchTarget(t)}>删除任务</button>
+                      <button className="btn ghost sm danger-btn" aria-label={"删除任务 " + taskDisplayName(t)} title="删除任务记录、内部原件、当前数据和该文件修订历史" disabled={busyTaskId === t.id} onClick={() => setDeleteTarget(t)}>删除任务</button>
                     </div>;
                     const choosingTable = t.candidate_templates.some((candidate) => candidate.description?.includes("指定表不符"));
                     const options = choosingTable
@@ -524,9 +607,7 @@ export function TaskQueuePage({
                           const candidate = t.candidate_templates[0];
                           const template = templates.find((item) => item.id === candidate?.id);
                           if (!candidate || !template) return false;
-                          const key = template.builtin_key ?? candidate.id;
-                          const version = template.builtin_key ? "builtin-v1" : String(candidate.version);
-                          return table.template_key === key && table.template_version === version;
+                          return table.template_key === candidate.id;
                         }).map((table) => ({ id: table.id, name: table.name }))
                       : [
                           ...t.candidate_templates.map((candidate) => ({ id: candidate.id, name: `${candidate.name}（推荐）` })),
@@ -568,8 +649,10 @@ export function TaskQueuePage({
                             {!choosingTable && <button className="btn sm" onClick={() => handleRetry(t.id)}>重试</button>}
                             <button
                               className="btn ghost sm danger-btn"
-                              title="删除此任务（没有产生记录，确认后删除）"
-                              onClick={() => setDeleteMatchTarget(t)}
+                              aria-label={"删除任务 " + taskDisplayName(t)}
+                              title="删除任务记录、内部原件、当前数据和该文件修订历史"
+                              disabled={busyTaskId !== null}
+                              onClick={() => setDeleteTarget(t)}
                             >
                               <Icon icon={Trash2} size={12} />
                             </button>
@@ -649,7 +732,7 @@ export function TaskQueuePage({
                   <button
                     className="btn ghost sm"
                     title="重试本页失败任务"
-                    disabled={retryingAll}
+                    disabled={retryingAll || busyTaskId !== null}
                     onClick={(e) => {
                       e.stopPropagation();
                       void handleBatchRetry();
@@ -662,14 +745,14 @@ export function TaskQueuePage({
                 {failedTasks.length > 0 && (
                   <button
                     className="btn ghost sm"
-                    title="批量删除本页失败任务（其他页不受影响）"
+                    title="批量删除本页失败或已取消任务（其他页不受影响）"
                     disabled={busyTaskId !== null}
                     onClick={(e) => {
                       e.stopPropagation();
-                      void handleBatchDeleteFailed();
+                      setBatchDeleteFailedOpen(true);
                     }}
                   >
-                    <Icon icon={Trash2} size={12} /> 删除本页失败任务
+                    <Icon icon={Trash2} size={12} /> 删除本页失败/已取消任务
                   </button>
                 )}
               </div>
@@ -691,24 +774,25 @@ export function TaskQueuePage({
                         <span className="task-name" title={taskDisplayName(t)}>{taskDisplayName(t)}</span>
                         <span className="badge danger">{STATUS_TEXT[t.status]}</span>
                       </div>
-                      <div className="task-row-bottom">
-                        <div className="task-meta">
-                          {t.status === "cancelled"
-                            ? "任务已取消，可清除该记录"
-                            : (t.failure_message ?? "处理失败，可重试")}
+                      <div className="task-row-bottom task-failure-row">
+                        <div className="task-failure-content">
+                          <div className="task-failure-message">{t.status === "cancelled"
+                            ? "任务已取消。删除会同时移除原件及已有数据/修订（如有）。"
+                            : (t.failure_message ?? "处理失败，可重试")}</div>
                           {t.status === "failed" && <TaskFailureDetails taskId={t.id} />}
                         </div>
-                        <div className="task-actions">
+                        <div className="task-actions task-failure-actions">
                           {t.status === "failed" && (
-                            <><button className="btn ghost sm" onClick={() => handleRetry(t.id)}>重试</button><button className="btn ghost sm" title="使用当前文件读取设置重新准备输入；模型仍沿用任务绑定的方案" onClick={() => handleRetry(t.id, true)}>按当前读取设置重试</button></>
+                            <><button className="btn ghost sm" disabled={busyTaskId !== null || retryingAll} onClick={() => void handleRetry(t.id)}>重试</button><button className="btn ghost sm" title="使用当前文件读取设置重新准备输入；模型仍沿用任务绑定的方案" disabled={busyTaskId !== null || retryingAll} onClick={() => void handleRetry(t.id, true)}>按当前读取设置重试</button></>
                           )}
                           <button
                             className="btn ghost sm danger-btn"
-                            title="删除任务（失败任务没有产生数据，直接删除不确认）"
-                            disabled={busyTaskId === t.id}
-                            onClick={() => void handleDeleteImmediate(t.id)}
+                            aria-label={"删除任务 " + taskDisplayName(t)}
+                            title="删除任务记录、内部原件、当前数据和该文件修订历史"
+                            disabled={busyTaskId !== null || retryingAll}
+                            onClick={() => setDeleteTarget(t)}
                           >
-                            <Icon icon={Trash2} size={12} />
+                            <Icon icon={Trash2} size={12} /> 删除
                           </button>
                         </div>
                       </div>
@@ -738,21 +822,23 @@ export function TaskQueuePage({
         </div>
       </div>
 
-      {/* 待选模板单删：没有产生记录，弹确认但无需输入文件名 */}
+      {/* 各类别单项删除都展示真实删除范围。 */}
       <ConfirmDialog
-        open={deleteMatchTarget !== null}
+        open={deleteTarget !== null}
         title="删除任务"
-        description="这个任务还没有产生任何数据记录。确认删除吗？"
+        description={deleteTarget
+          ? "将永久删除“" + taskDisplayName(deleteTarget) + "”的任务记录、平台内部原件、当前数据和该文件的修订历史（如有）。外部归档/副本文件及独立导入/合并表不受影响。取消任务可停止处理并保留原件和历史。此删除无法从应用恢复。"
+          : "将删除所选任务及其关联内容。此删除无法从应用恢复。"}
         buttonLabel="确认删除"
-        busy={busyTaskId === deleteMatchTarget?.id}
+        busy={busyTaskId === deleteTarget?.id}
         onConfirm={() => void handleDelete()}
-        onClose={() => setDeleteMatchTarget(null)}
+        onClose={() => setDeleteTarget(null)}
       />
       {/* 待选模板批量删除：一次弹窗，删除全部 */}
       <ConfirmDialog
         open={batchDeleteMatchOpen}
         title="批量删除任务"
-        description={`将删除本页 ${matchFailedTasks.length} 个待选模板或待确认范围任务及知意内部原件。已确认的数据行保留但断开原件追溯；外部副本不受影响。其他页任务不会删除。确认删除吗？`}
+        description={`将删除本页 ${matchFailedTasks.length} 个待处理任务的记录、平台内部原件、当前数据和文件修订历史（如有）。外部归档/副本文件及独立导入/合并表不受影响；其他页任务不会删除。此操作无法从应用恢复。`}
         buttonLabel="确认删除"
         busy={busyTaskId === "batch"}
         onConfirm={() => void handleBatchDeleteMatch()}
@@ -762,11 +848,20 @@ export function TaskQueuePage({
       <ConfirmDialog
         open={batchDeletePausedOpen}
         title="批量删除暂停任务"
-        description={`将删除 ${activeTasks.filter((t) => t.status === "paused").length} 个暂停任务（都没有产生任何数据记录，删除后不可恢复）。确认删除吗？`}
+        description={`将删除本页 ${activeTasks.filter((t) => t.status === "paused").length} 个暂停任务的记录、平台内部原件、当前数据和文件修订历史（如有）。外部归档/副本文件及独立导入/合并表不受影响。其他状态和其他页任务不会删除；此操作无法从应用恢复。`}
         buttonLabel="确认删除"
         busy={busyTaskId === "batch"}
         onConfirm={() => void handleBatchDeletePaused()}
         onClose={() => setBatchDeletePausedOpen(false)}
+      />
+      <ConfirmDialog
+        open={batchDeleteFailedOpen}
+        title="批量删除失败或已取消任务"
+        description={`将删除当前页 ${failedTasks.filter((t) => t.status === "failed" || t.status === "cancelled").length} 个失败/已取消任务的记录、平台内部原件、当前数据和文件修订历史（如有）。外部归档/副本文件及独立导入/合并表不受影响；其他页任务不会删除。此操作无法从应用恢复。`}
+        buttonLabel="确认删除"
+        busy={busyTaskId === "batch"}
+        onConfirm={() => void handleBatchDeleteFailed()}
+        onClose={() => setBatchDeleteFailedOpen(false)}
       />
     </div>
   );

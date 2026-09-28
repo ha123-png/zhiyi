@@ -60,7 +60,7 @@ def test_automatic_name_exports_copy_without_extra_model_call(tmp_path: Path):
         assert client.get("/api/v1/tasks", params={"search": "光合作用"}).json()[0]["id"] == task_id
         assert client.get("/api/v1/tasks", params={"search": "1001656"}).json()[0]["id"] == task_id
         # Changing a confirmed name is metadata only; the already exported file stays put.
-        changed = client.put(f"/api/v1/tasks/{task_id}/review", json={"expected_version": 1, "result": result.result.model_dump(), "filename": "新的展示名称.txt"})
+        changed = client.put(f"/api/v1/tasks/{task_id}/review", json={"expected_version": response.json()["review_version"], "result": result.result.model_dump(), "filename": "新的展示名称.txt"})
         assert changed.status_code == 200
         assert len(changed.json()["file_name"]["decisions"]) == 2
         assert (external / "实验记录" / suggested).exists()

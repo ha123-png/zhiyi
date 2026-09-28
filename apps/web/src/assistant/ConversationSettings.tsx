@@ -35,6 +35,7 @@ export function scopeText(context: BusinessContext) {
           ? `${tables} 张表`
           : "",
       context.row_ids != null ? `${context.row_ids.length} 条选中记录` : "",
+      context.source_keys != null ? `${context.source_keys.length} 个选中来源` : "",
       context.view_id ? "当前分组" : "",
       context.search ? `搜索：${context.search}` : "",
       tasks ? `${tasks} 份文件` : "",
@@ -151,6 +152,7 @@ export function ConversationSettings() {
       if (item.kind === "table") {
         delete next.table_name;
         delete next.row_ids;
+        delete next.source_keys;
         delete next.view_id;
         delete next.search;
       }
@@ -167,6 +169,7 @@ export function ConversationSettings() {
             table_id: undefined,
             table_name: undefined,
             row_ids: undefined,
+            source_keys: undefined,
             search: undefined,
             view_id: undefined,
             task_id: undefined,
@@ -207,6 +210,11 @@ export function ConversationSettings() {
             <X size={16} />
           </Popover.Close>
         </header>
+        {ask.authorizationPending && <p className="ask-authorization-notice" role="status">正在同步这段对话的授权变化；同步完成前不能确认旧操作预览。</p>}
+        {ask.authorizationError && <div className="ask-authorization-notice error" role="alert">
+          <span>授权尚未同步，操作预览不能确认。{ask.authorizationError}</span>
+          <button type="button" disabled={ask.busy} onClick={() => void ask.retryAuthorizationSync()}>重试同步</button>
+        </div>}
         <section className="ask-setting-section" aria-label="聊天模型设置">
         <label className="ask-setting-label">
           聊天模型 <span>{ask.busy ? "本轮使用" : "下一条使用"}</span>
@@ -299,7 +307,7 @@ export function ConversationSettings() {
             : selected.length
               ? ctx.row_ids != null
                 ? `仅限当前表选中的 ${ctx.row_ids.length} 条记录${selected.filter(item => item.kind === "table").length > 1 ? "；其他已选表使用全部记录" : ""}`
-                : ctx.view_id || ctx.search
+                : ctx.view_id || ctx.search || ctx.source_keys != null
                   ? scopeText(ctx)
                   : "已选资料可用于这段对话；数据表默认使用全部记录"
               : "尚未选择资料，模型只能与你聊天"}

@@ -43,7 +43,8 @@ def test_increment_is_exact_and_confirm_is_idempotent_and_undo_restores(client):
     assert decide(client, tool["id"]).json() == first.json()
     assert values(client, 1, 2) == [(200.1, 2), (1000.6, 2)]
     undo = client.post(f"/api/v1/assistant/tools/{tool['id']}/undo").json()
-    assert decide(client, undo["id"]).status_code == 200
+    reversed_response = decide(client, undo["id"])
+    assert reversed_response.status_code == 200, reversed_response.text
     assert values(client, 1, 2) == [(200, 3), (1000.5, 3)]
 
 
@@ -62,6 +63,12 @@ def test_shared_numeric_field_increments_once_per_document(client):
         columns = json.loads(table.columns_json)
         columns[1]["value_type"] = "number"
         table.columns_json = json.dumps(columns)
+        # A numeric contract must start with numeric facts; changing only the
+        # schema would create an impossible legacy value for strict undo.
+        for identifier in (1, 2):
+            row = session.get(DataRowRecord, identifier)
+            before = json.loads(row.row_json)
+            row.row_json = json.dumps({**before, "total": 1200.5})
         session.commit()
     detail = plan_run(client, [increment((1, 2), field="total")])
     assert decide(client, detail["tools"][0]["id"]).status_code == 200
@@ -201,6 +208,9 @@ def test_shared_and_item_increments_merge_all_affected_fields(client):
         columns = json.loads(table.columns_json)
         columns[1]["value_type"] = "number"
         table.columns_json = json.dumps(columns)
+        for identifier in (1, 2):
+            row = session.get(DataRowRecord, identifier)
+            row.row_json = json.dumps({**json.loads(row.row_json), "total": 1200.5})
         session.commit()
     op = {**increment(), "changes": {"total": 1, "amount": 2}}
     detail = plan_run(client, [op])
@@ -211,7 +221,8 @@ def test_shared_and_item_increments_merge_all_affected_fields(client):
     assert decide(client, tool["id"]).status_code == 200
     assert [v for v, _ in values(client, 1, 2)] == [202, 1002.5]
     undo = client.post(f"/api/v1/assistant/tools/{tool['id']}/undo").json()
-    assert decide(client, undo["id"]).status_code == 200
+    reversed_response = decide(client, undo["id"])
+    assert reversed_response.status_code == 200, reversed_response.text
     assert [v for v, _ in values(client, 1, 2)] == [200, 1000.5]
 
 

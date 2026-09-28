@@ -1,5 +1,6 @@
 import { Disclosure } from "./Disclosure";
 import { useUnsavedChanges } from "../useUnsavedChanges";
+import { useModalFocus } from "../useModalFocus";
 import { useAssistantPageContext } from "../assistant/AssistantProvider";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -45,6 +46,7 @@ import { PresentationSettings, TemplateNameSettings, cleanPresentation } from ".
 import { Icon } from "./Icon";
 import { Toast, useToast } from "./Toast";
 import { TemplateExportSettings, type TemplateExportHandle } from "./TemplateExportSettings";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 import { editableTemplate, mergeTemplateHints, moveTemplateField } from "../templateEditing";
 import { useFieldSort } from "../useFieldSort";
@@ -96,7 +98,10 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
   const importInput = useRef<HTMLInputElement>(null);
   const [fieldAnnouncement, setFieldAnnouncement] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
-  const unsaved = useUnsavedChanges(() => !saving && ((!isSystem && JSON.stringify(draft) !== savedDraft.current) || Boolean(exportSettings.current?.isDirty())));
+  const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const deleteInFlight = useRef(false);
+  const unsaved = useUnsavedChanges(() => JSON.stringify(draft) !== savedDraft.current || Boolean(exportSettings.current?.isDirty()));
 
   const fieldSort = useFieldSort(draft.fields.map(f => `${f.section}:${f.key}`).join("|"), moveField);
 
@@ -117,6 +122,8 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
   const [aiProfiles, setAiProfiles] = useState<ModelProfile[]>([]);
   const [aiProfileId, setAiProfileId] = useState("");
   const [aiProfilesLoaded, setAiProfilesLoaded] = useState(false);
+  const [discardAiDraftOpen, setDiscardAiDraftOpen] = useState(false);
+  const aiDialog = useModalFocus(aiOpen, handleAiClose, aiGenerating);
 
   // 打开弹窗时加载全局模型方案（AI 生成可独立选择，与任务激活方案解耦）
   useEffect(() => {
@@ -158,7 +165,7 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
     return () => window.clearInterval(timer);
   }, [aiGenerating]);
 
-  async function refreshTemplates(preferredId?: string) {
+  async function refreshTemplates(preferredId?: string, replaceDraft = false) {
     try {
       const next = await getTemplates(true);
       setTemplates(next);
@@ -168,7 +175,7 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
         ?? next[0];
       if (selected && !initialDraft && (!handedDraft.current || preferredId)) {
         handedDraft.current = false;
-        selectTemplate(selected, saving);
+        selectTemplate(selected, replaceDraft);
       }
       if (!handedDraft.current) setMessage("");
     } catch (error) {
@@ -231,15 +238,16 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
     setFieldAnnouncement(`已将${draft.fields[from].label || "字段"}移到第 ${to + 1} 位`);
   }
 
-  async function handleCopy(templateId?: string) {
+  async function handleCopy(templateId?: string, confirmed = false) {
     const id = templateId ?? selectedId;
     if (!id) {
       return;
     }
+    if (!confirmed) { unsaved.protect(() => void handleCopy(id, true)); return; }
     setSaving(true);
     try {
       const copied = await copyTemplate(id);
-      await refreshTemplates(copied.id);
+      await refreshTemplates(copied.id, true);
       notify("已创建可编辑副本。副本默认不参与智能匹配，可在提取页的匹配范围中勾选。", "success");
     } catch (error) {
       notify(error instanceof Error ? error.message : "复制模板失败。", "error");
@@ -248,13 +256,14 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
     }
   }
 
-  async function handleArchive(templateId?: string) {
+  async function handleArchive(templateId?: string, confirmed = false) {
     const id = templateId ?? selectedId;
     if (!id) return;
+    if (!confirmed) { unsaved.protect(() => void handleArchive(id, true)); return; }
     setSaving(true);
     try {
       const archived = await archiveTemplate(id);
-      await refreshTemplates(archived.id);
+      await refreshTemplates(archived.id, true);
       notify("模板已停用；旧任务和旧数据仍可追溯，可随时恢复。", "success");
     } catch (error) {
       notify(error instanceof Error ? error.message : "模板停用失败。", "error");
@@ -263,13 +272,14 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
     }
   }
 
-  async function handleRestore(templateId?: string) {
+  async function handleRestore(templateId?: string, confirmed = false) {
     const id = templateId ?? selectedId;
     if (!id) return;
+    if (!confirmed) { unsaved.protect(() => void handleRestore(id, true)); return; }
     setSaving(true);
     try {
       const restored = await restoreTemplate(id);
-      await refreshTemplates(restored.id);
+      await refreshTemplates(restored.id, true);
       notify("模板已恢复，可以继续用于新文件。", "success");
     } catch (error) {
       notify(error instanceof Error ? error.message : "模板恢复失败。", "error");
@@ -278,22 +288,30 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
     }
   }
 
-  async function handleDelete() {
+  async function handleDelete(discardConfirmed = false) {
     if (!selectedId) return;
-    const confirmed = window.confirm(
-      "确定删除这个模板吗？删除后不可恢复。\n已被任务或数据表引用的模板会被系统拒绝，只能停用。",
-    );
-    if (!confirmed) return;
+    if (!discardConfirmed) { unsaved.protect(() => void handleDelete(true)); return; }
+    setDeleteError(null);
+    setDeleteTargetId(selectedId);
+  }
+
+  async function confirmDelete() {
+    const targetId = deleteTargetId;
+    if (!targetId || deleteInFlight.current) return;
+    deleteInFlight.current = true;
+    setDeleteError(null);
     setSaving(true);
     try {
-      await deleteTemplate(selectedId);
+      await deleteTemplate(targetId);
       notify("模板已删除。", "success");
+      setDeleteTargetId(null);
       setSelectedId("");
-      startNew();
-      await refreshTemplates();
+      startNew(true);
+      await refreshTemplates(undefined, true);
     } catch (error) {
-      notify(error instanceof Error ? error.message : "删除模板失败。", "error");
+      setDeleteError(error instanceof Error ? error.message : "删除模板失败。");
     } finally {
+      deleteInFlight.current = false;
       setSaving(false);
     }
   }
@@ -317,17 +335,26 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
 
   function handleAiClose() {
     if (aiGenerating) return; // 生成中禁止关闭
-    if (aiDraft && !window.confirm("模板尚未保存，确定不保存并关闭？")) return;
+    if (aiDraft) {
+      setDiscardAiDraftOpen(true);
+      return;
+    }
+    setAiOpen(false);
+    resetAiState();
+  }
+
+  function discardAiDraft() {
+    setDiscardAiDraftOpen(false);
     setAiOpen(false);
     resetAiState();
   }
 
   function handleAiFilesPicked(files: FileList | File[]) {
-    const picked = Array.from(files).filter(
-      (file) =>
-        /\.(pdf|png|jpe?g|webp)$/i.test(file.name) &&
-        !aiFiles.some((existing) => existing.name === file.name),
-    );
+    const incoming = Array.from(files);
+    const picked = incoming.filter(file => /\.(pdf|png|jpe?g|webp)$/i.test(file.name));
+    const unsupported = incoming.filter(file => !picked.includes(file));
+    setAiError(unsupported.length ? `有 ${unsupported.length} 个样例未添加：仅支持 PDF、PNG、JPG 和 WebP。其他文件可在“文件提取”中处理。` : null);
+    // Filenames are not identities: scans from different folders can share a name.
     setAiFiles((current) => [...current, ...picked]);
   }
 
@@ -375,16 +402,16 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
     );
   }
 
-  /** 内置模板占用"发票/送货单"等常用名：AI 生成名撞名时自动追加后缀，保证保存总能成功。 */
-  function uniqueTemplateName(base: string): string {
+  /** 按创建来源建议未占用名称；服务端仍负责最终的名称冲突检查。 */
+  function uniqueTemplateName(base: string, aiGenerated = true): string {
     const names = new Set(
       templates.map((t) => t.name),
     );
     if (!names.has(base)) return base;
-    let candidate = `${base}（AI 生成）`;
+    let candidate = aiGenerated ? `${base}（AI 生成）` : `${base}（2）`;
     let suffix = 2;
     while (names.has(candidate)) {
-      candidate = `${base}（AI 生成）${suffix}`;
+      candidate = aiGenerated ? `${base}（AI 生成）${suffix}` : `${base}（${suffix + 1}）`;
       suffix += 1;
     }
     return candidate;
@@ -424,7 +451,7 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
           .map((suggestion) => suggestion.rule!),
         output_mapping: {},
       });
-      await refreshTemplates(saved.id);
+      await refreshTemplates(saved.id, true);
       notify(
         finalName === requestedName
           ? "模板已保存。"
@@ -459,11 +486,14 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
         // Keep the successful schema revision if the local binding save fails.
         // Retrying must not create a second version or discard unsaved path input.
         setVersion(saved.version);
+        setTemplates(items => items.some(item => item.id === saved.id)
+          ? items.map(item => item.id === saved.id ? saved : item)
+          : [...items, saved]);
         savedDraft.current = JSON.stringify(draft);
         if (isNew) { setSelectedId(saved.id); setIsNew(false); }
       }
       await exportSettings.current?.save();
-      await refreshTemplates(savedId);
+      await refreshTemplates(savedId, true);
       notify(definitionChanged ? `模板已保存（第 ${savedVersion} 版）。` : "设置已保存。", "success");
     } catch (error) {
       notify(error instanceof Error ? error.message : "模板保存失败。", "error");
@@ -508,7 +538,8 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
     notify("模板已导出为 JSON 文件。", "success");
   }
 
-  async function handleImport(file: File) {
+  async function handleImport(file: File, confirmed = false) {
+    if (!confirmed) { unsaved.protect(() => void handleImport(file, true)); return; }
     setSaving(true);
     try {
       const parsed = JSON.parse(await file.text()) as {
@@ -532,7 +563,7 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
         output_mapping: imported.output_mapping ?? {},
         behavior: imported.behavior,
       });
-      await refreshTemplates(saved.id);
+      await refreshTemplates(saved.id, true);
       notify(`已导入模板“${saved.name}”。`, "success");
     } catch (error) {
       notify(error instanceof Error ? error.message : "模板导入失败。", "error");
@@ -544,15 +575,16 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
     }
   }
 
+  const isAutonomous = templates.find(template => template.id === selectedId)?.engine_kind === "autonomous";
   const canSave =
-    !isSystem
+    (!isSystem || isAutonomous)
     && isActive
     && draft.name.trim().length > 0
-    && draft.fields.length > 0
+    && (isAutonomous || draft.fields.length > 0)
     && draft.fields.every((field) => field.label.trim().length > 0);
 
   const typeLabel = isSystem ? "内置" : isNew ? "新建" : "自定义";
-  const supportText = `${typeLabel}模板${isActive ? "" : " · 已停用"} · ${draft.fields.length} 个字段 · ${draft.description || "尚未填写用途"}`;
+  const supportText = isAutonomous ? "内置模板 · 每份文件各自决定字段" : `${typeLabel}模板${isActive ? "" : " · 已停用"} · ${draft.fields.length} 个字段 · ${draft.description || "尚未填写用途"}`;
   const editorDisabled = isSystem || saving || !isActive;
 
   return (
@@ -562,7 +594,7 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
         <span className="eyebrow">配置</span>
         <h1>模板管理</h1>
         <p className="support">
-          定义提取内容与默认展示，已处理文件和表格不受影响
+          定义后续提取的字段与规则；已有数据保留，旧文件沿用当时的规则
         </p>
       </header>
 
@@ -582,8 +614,7 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
               disabled={saving}
               onClick={() => {
                 // 每次打开都从空白开始，避免残留上次生成的数据
-                resetAiState();
-                setAiOpen(true);
+                unsaved.protect(() => { resetAiState(); setAiOpen(true); });
               }}
               title="上传样例文件（可选）+ 需求描述，AI 生成字段草稿"
               type="button"
@@ -612,7 +643,8 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
               </button>
               <button
                 className="btn ghost xs"
-                disabled={!draft.name.trim()}
+                disabled={!draft.name.trim() || isAutonomous}
+                title={isAutonomous ? "自主提取随知意提供，高级设置保存在本机" : undefined}
                 onClick={handleExport}
                 type="button"
               >
@@ -625,6 +657,7 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
               className="visually-hidden"
               onChange={(event) => {
                 const file = event.target.files?.[0];
+                event.target.value = "";
                 if (file) {
                   void handleImport(file);
                 }
@@ -656,14 +689,14 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
                   <div className="tpl-item-main">
                     <div className="tpl-item-name">{template.name}</div>
                     <div className="tpl-item-meta">
-                      {template.fields.length} 字段 · {template.is_system ? "内置" : `第 ${template.version} 版`}
+                      {template.engine_kind === "autonomous" ? "按文件确定字段" : `${template.fields.length} 字段`} · 第 {template.version} 版
                     </div>
                   </div>
                   <div
                     className="tpl-list-actions"
                     onClick={(event) => event.stopPropagation()}
                   >
-                    <button
+                    {template.engine_kind !== "autonomous" && <button
                       className="tpl-act-btn"
                       disabled={saving || template.is_active === false}
                       onClick={() => void handleCopy(template.id)}
@@ -671,7 +704,7 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
                       type="button"
                     >
                       <Icon icon={Copy} size={12} />
-                    </button>
+                    </button>}
                     {!template.is_system ? (
                       <button
                         className="tpl-act-btn"
@@ -725,7 +758,7 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
                   className="btn danger-soft"
                   disabled={saving}
                   onClick={() => void handleDelete()}
-                  title="物理删除；已被任务或数据表引用的模板会被拒绝，只能停用"
+                  title="删除模板入口，保留已有文件、当前数据和历史规则"
                   type="button"
                 >
                   <Icon icon={Trash2} size={13} />
@@ -743,8 +776,8 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
                   复制
                 </button>
               ) : null}
-              {isSystem && <button className="btn secondary" disabled={saving} onClick={() => void handleSave()} type="button"><Icon icon={Save} size={13} />保存</button>}
-              {isSystem ? (
+              {isSystem && !isAutonomous && <button className="btn secondary" disabled={saving} onClick={() => void handleSave()} type="button"><Icon icon={Save} size={13} />保存</button>}
+              {isSystem && !isAutonomous ? (
                 <button
                   className="btn primary"
                   disabled={saving}
@@ -784,7 +817,7 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
               value={draft.name}
             />
             {isNew && templates.some(t => t.name.trim() === draft.name.trim()) && <p className="field-hint" role="status">
-              已有同名模板。<button type="button" onClick={() => setDraft(current => ({ ...current, name: uniqueTemplateName(current.name.trim()) }))}>使用名称“{uniqueTemplateName(draft.name.trim())}”</button>
+              已有同名模板。<button type="button" onClick={() => setDraft(current => ({ ...current, name: uniqueTemplateName(current.name.trim(), false) }))}>使用名称“{uniqueTemplateName(draft.name.trim(), false)}”</button>
             </p>}
           </div>
 
@@ -806,9 +839,12 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
             />
           </div>
 
-          <PresentationSettings value={draft.behavior} disabled={editorDisabled}
+          {isAutonomous ? <section className="autonomous-field-note">
+            <h3>字段由 AI 按文件确定</h3>
+            <p className="support">无需预设字段或固定校验规则。提取后仍可修订；提取重点、命名和归档可在下方设置。</p>
+          </section> : <><PresentationSettings value={draft.behavior} disabled={editorDisabled}
             onChange={(behavior) => setDraft((current) => ({ ...current, behavior }))} />
-          <p className="support field-order-hint">字段顺序用于表格和卡片；第一个字段作为卡片标题。</p>
+          <p className="support field-order-hint">字段顺序用于当前表格与文件卡片；历史版本保留当时的名称和顺序。</p>
           <span className="visually-hidden" role="status">{fieldAnnouncement}</span>
           <div className="field-list" ref={fieldSort.list}>
             {fieldSort.placeholder && <div className="field-sort-placeholder" aria-hidden="true" style={fieldSort.placeholder} />}
@@ -952,13 +988,13 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
                 添加字段
               </button>
             ) : null}
-          </div>
+          </div></>}
 
           <div className="form-field tpl-extra-field">
             <label className="form-label" htmlFor="tpl-extra">额外提示词</label>
             <textarea
               className="form-textarea"
-              disabled={editorDisabled}
+              disabled={saving || !isActive || (isSystem && !isAutonomous)}
               id="tpl-extra"
               onChange={(event) =>
                 setDraft((current) => ({
@@ -975,7 +1011,8 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
 
           <Disclosure className="template-advanced" title="高级设置">
             <div className="template-advanced-body">
-              <DeterministicRulesEditor
+              {!isAutonomous && <DeterministicRulesEditor
+                contextKey={JSON.stringify([selectedId, version, draft])}
                 disabled={editorDisabled}
                 fields={draft.fields}
                 onChange={(deterministicRules) =>
@@ -985,8 +1022,8 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
                   }))
                 }
                 rules={draft.deterministic_rules}
-              />
-          <TemplateNameSettings value={draft.behavior} disabled={editorDisabled} onChange={(behavior) => setDraft((current) => ({ ...current, behavior }))} />
+              />}
+          <TemplateNameSettings value={draft.behavior} disabled={saving || !isActive || (isSystem && !isAutonomous)} onChange={(behavior) => setDraft((current) => ({ ...current, behavior }))} />
           {!isNew && selectedId && <TemplateExportSettings ref={exportSettings} key={selectedId} templateId={selectedId} disabled={saving || !isActive} />}
             </div>
           </Disclosure>
@@ -1002,6 +1039,10 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
         >
           <div
             className="modal-card ai-tpl-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="智能创建提取模板"
+            {...aiDialog}
             onClick={(event) => event.stopPropagation()}
           >
             <div className="modal-head">
@@ -1201,13 +1242,15 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
                     <div style={{ fontWeight: 600, fontSize: "0.875rem", marginTop: 8 }}>
                       拖拽文件到此处，或点击选择
                     </div>
-                    <div className="tpl-item-meta" style={{ marginTop: 4 }}>
+                    <div className="support ai-tpl-upload-help">
                       支持 PDF / 图片 · 每份 PDF 分析首页。关键字段在后续页时，可上传该页图片；也可只填写需求。
                     </div>
                   </div>
                   <input
                     ref={aiFileInput}
                     className="visually-hidden"
+                    tabIndex={-1}
+                    aria-hidden="true"
                     type="file"
                     multiple
                     accept=".pdf,.png,.jpg,.jpeg,.webp"
@@ -1221,9 +1264,10 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
                       {aiFiles.map((file, index) => (
                         <div className="ai-file-item" key={`${file.name}-${index}`}>
                           <Icon icon={FileText} size={13} />
-                          <span>{file.name}</span>
+                          <span title={file.name}>{index + 1}. {file.name}</span>
+                          <small className="muted">{Math.max(1, Math.ceil(file.size / 1024))} KB</small>
                           <button
-                            aria-label={`移除 ${file.name}`}
+                            aria-label={`移除样例 ${index + 1} ${file.name}`}
                             className="btn ghost xs icon-only"
                             onClick={() => handleAiRemoveFile(index)}
                             type="button"
@@ -1347,6 +1391,27 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
         </div>
       ) : null}
       <Toast toast={toast} onDismiss={clear} />
+      <ConfirmDialog
+        open={deleteTargetId !== null}
+        title="确定删除这个模板吗？"
+        description="它将不再用于新任务。已有数据表、文件和修订历史保留，已开始的任务仍使用当时的规则。"
+        buttonLabel="删除模板"
+        cancelLabel="取消"
+        busy={saving}
+        error={deleteError}
+        onClose={() => { setDeleteTargetId(null); setDeleteError(null); }}
+        onConfirm={() => { void confirmDelete(); }}
+      />
+      <ConfirmDialog
+        open={discardAiDraftOpen}
+        tone="normal"
+        title="模板尚未保存"
+        description="确定不保存并关闭？"
+        eyebrow="未保存的草稿"
+        buttonLabel="不保存并关闭"
+        onClose={() => setDiscardAiDraftOpen(false)}
+        onConfirm={discardAiDraft}
+      />
       {historyOpen && templates.find(t => t.id === selectedId) && <TemplateHistory current={templates.find(t => t.id === selectedId)!} initialVersion={selectedId === initialTemplateId ? initialVersion : null}
         dirty={JSON.stringify(draft) !== savedDraft.current} onClose={() => setHistoryOpen(false)}
         onRestored={restored => { setHistoryOpen(false); setTemplates(items => items.map(t => t.id === restored.id ? restored : t)); selectTemplate(restored); notify(`已将第 ${restored.version} 版设为当前版本。`, "success"); }} />}

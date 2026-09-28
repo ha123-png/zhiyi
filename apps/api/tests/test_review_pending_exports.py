@@ -56,7 +56,15 @@ def test_pending_review_survives_export_import_merge_history_and_clears_on_revie
         assert imported_detail["rows"][0]["review_pending"] is True
         assert REVIEW_LABEL not in [col["label"] for col in imported_detail["columns"]]
         merged = client.post("/api/v1/tables/merge", json={"name": "合并", "table_ids": [table_id, imported_id]})
-        assert merged.status_code == 201
+        if suffix != "json":
+            # A flat spreadsheet cannot recover a single-row header's section.
+            # Same-label header/item contracts must not be silently collapsed.
+            assert merged.status_code == 409, merged.text
+            with client.app.state.session_factory() as session:
+                second = create_table_from_import(session, "再次独立导入", imported_rows)
+                second_id = second.id
+            merged = client.post("/api/v1/tables/merge", json={"name": "合并", "table_ids": [imported_id, second_id]})
+        assert merged.status_code == 201, merged.text
         assert all(row["review_pending"] for row in client.get(f"/api/v1/tables/{merged.json()['id']}").json()["rows"])
         if resolve_review:
             updated = client.put(f"/api/v1/tasks/{task['id']}/review", json={"expected_version": 0, "result": {"header": {"owner": "合成负责人"}, "items": []}})
@@ -68,5 +76,6 @@ def test_pending_review_survives_export_import_merge_history_and_clears_on_revie
             cleared = client.get(f"/api/v1/tables/{table_id}/export.json").json()
             assert REVIEW_KEY not in cleared[0]
         assert client.delete(f"/api/v1/tasks/{task['id']}").status_code == 200
-        assert client.get(f"/api/v1/tables/{table_id}").json()["rows"][0]["review_pending"] is (not resolve_review)
+        assert client.get(f"/api/v1/tables/{table_id}").json()["rows"] == []
+        assert all(row["review_pending"] for row in client.get(f"/api/v1/tables/{merged.json()['id']}").json()["rows"])
         assert json.loads(client.get(f"/api/v1/tables/{imported_id}/export.json").content)[0][REVIEW_KEY] is True

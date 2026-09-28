@@ -25,6 +25,7 @@ class ExtractionRecord(Base):
     )
     elapsed_seconds: Mapped[float] = mapped_column(Float)
     result_json: Mapped[str] = mapped_column(Text)
+    output_schema_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     validation_json: Mapped[str] = mapped_column(Text)
     evidence_json: Mapped[str] = mapped_column(Text, default="[]")
     input_scope_json: Mapped[str | None] = mapped_column(Text, nullable=True)

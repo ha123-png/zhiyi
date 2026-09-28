@@ -1,6 +1,7 @@
 import { summarizeRule } from "../ruleDescriptions";
 import { PatternRulePreview } from "./PatternRulePreview";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { previewTemplatePattern } from "../api";
 import type {
   DeterministicRule,
   RuleExpression,
@@ -14,9 +15,10 @@ interface Props {
   fields: TemplateField[];
   rules: DeterministicRule[];
   onChange: (rules: DeterministicRule[]) => void;
+  contextKey?: string;
 }
 
-export function DeterministicRulesEditor({ disabled, fields, rules, onChange }: Props) {
+export function DeterministicRulesEditor({ disabled, fields, rules, onChange, contextKey }: Props) {
   const available = useMemo(
     () => fields.filter((field): field is TemplateField & { key: string } => Boolean(field.key)),
     [fields],
@@ -39,8 +41,21 @@ export function DeterministicRulesEditor({ disabled, fields, rules, onChange }: 
   const [severity, setSeverity] = useState<"error" | "warning">("error");
   const [tolerance, setTolerance] = useState("0.01");
   const labels = new Map(available.map((field) => [pathFor(field), field.label]));
+  const [checking, setChecking] = useState(false);
+  const [addError, setAddError] = useState("");
+  const request = useRef(0);
+  const builderKey = JSON.stringify([contextKey, disabled, fields, rules, kind, fieldPath, minimum, maximum,
+    values, pattern, leftField, rightField, resultField, severity, tolerance]);
+  const latestKey = useRef(builderKey);
+  latestKey.current = builderKey;
+  useEffect(() => {
+    request.current += 1;
+    setChecking(false); setAddError("");
+    return () => { request.current += 1; };
+  }, [builderKey]);
 
-  function addRule() {
+  async function addRule() {
+    if (disabled || checking || !canAdd) return;
     const rule = buildRule({
       kind,
       fieldPath,
@@ -53,6 +68,24 @@ export function DeterministicRulesEditor({ disabled, fields, rules, onChange }: 
       resultField,
     });
     if (rule) {
+      if (rule.kind === "pattern") {
+        const current = ++request.current;
+        setChecking(true); setAddError("");
+        try {
+          // Syntax is defined by the server's restricted pattern engine. A
+          // valid expression need not match the empty sample used here.
+          const result = await previewTemplatePattern(rule.pattern, "");
+          if (current !== request.current || latestKey.current !== builderKey) return;
+          if (!result.valid) { setAddError(`${result.message}规则尚未添加。`); return; }
+        } catch (error) {
+          if (current === request.current && latestKey.current === builderKey) {
+            setAddError(`${error instanceof Error ? error.message : "格式检查失败，请重试。"}规则尚未添加。`);
+          }
+          return;
+        } finally {
+          if (current === request.current) setChecking(false);
+        }
+      }
       if (rule.kind === "enum") {
         const type = available.find(field => pathFor(field) === fieldPath)?.value_type;
         rule.values = rule.values.map(value => type === "number" ? Number(value) : type === "boolean" ? value === "true" : value);
@@ -64,7 +97,7 @@ export function DeterministicRulesEditor({ disabled, fields, rules, onChange }: 
   const selectedType = available.find(field => pathFor(field) === fieldPath)?.value_type;
   const validChoice = kind === "range" ? selectedType === "number"
     : kind === "enum" ? splitValues(values).every(value => selectedType === "number" ? Number.isFinite(Number(value)) : selectedType === "boolean" ? ["true", "false"].includes(value) : true)
-    : true;
+    : kind === "pattern" ? labels.has(fieldPath) : true;
   const validTolerance = !["row_multiply", "sum"].includes(kind) || (tolerance.trim() !== "" && Number.isFinite(Number(tolerance)) && Number(tolerance) >= 0 && Number(tolerance) <= 1000000);
   const canAdd = validChoice && validTolerance && canBuildRule({
     kind,
@@ -191,8 +224,9 @@ export function DeterministicRulesEditor({ disabled, fields, rules, onChange }: 
           {["row_multiply", "sum"].includes(kind) ? <label><span>允许误差</span><input className="form-input" disabled={disabled} type="number" min="0" max="1000000" step="0.01" value={tolerance} onChange={event => setTolerance(event.target.value)} /><span className="support">两侧数值差的绝对值不超过此值即通过，不会改变或四舍五入原结果。</span></label> : null}
           <label><span>发现问题时</span><select className="form-select" disabled={disabled} value={severity} onChange={event => setSeverity(event.target.value as "error" | "warning")}><option value="error">错误：需要核对</option><option value="warning">提醒：建议核对</option></select></label>
           {!validChoice || !validTolerance || (kind === "range" && minimum !== "" && maximum !== "" && Number(minimum) > Number(maximum)) ? <p className="support" role="alert">请检查字段类型、允许值、范围上下限或允许误差。</p> : null}
-          <button className="btn secondary sm" disabled={disabled || !canAdd} onClick={addRule} type="button">
-            添加校验规则
+          {addError && <p className="support" role="alert">{addError}</p>}
+          <button className="btn secondary sm" disabled={disabled || checking || !canAdd} onClick={() => void addRule()} type="button">
+            {checking ? "检查格式中…" : "添加校验规则"}
           </button>
         </div>
       )}

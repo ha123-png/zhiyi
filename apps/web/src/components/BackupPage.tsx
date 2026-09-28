@@ -159,9 +159,9 @@ export function BackupPage() {
         <div className="backup-stat-divider"></div>
         <div className="backup-stat-item">
           <div className="backup-stat-value">
-            {status?.count ?? 0} / {status?.retention ?? 10}
+            {status?.count ?? 0}
           </div>
-          <div className="backup-stat-label">备份数量 / 保留上限</div>
+          <div className="backup-stat-label">已保存的备份</div>
         </div>
         <div className="backup-stat-divider"></div>
         <div className="backup-stat-item">
@@ -184,8 +184,8 @@ export function BackupPage() {
               <Icon icon={DatabaseBackup} size={18} /> 立即创建备份
             </div>
             <div className="backup-cta-support">
-              备份包含任务记录、提取结果、数据表和原文件，不包含模型密钥。
-              最多保留 {status?.retention ?? 10} 份，超出时自动删除最旧的。
+              备份包含当前数据、文件修订历史、模板与内部原件，不包含模型密钥。
+              手工备份由你保留和删除，新建备份不会删除旧备份。
             </div>
           </div>
           <button

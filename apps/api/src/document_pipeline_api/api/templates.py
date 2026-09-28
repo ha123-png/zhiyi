@@ -16,6 +16,7 @@ from document_pipeline_api.public_errors import public_error_message
 from document_pipeline_api.schemas.file_export import LocalExportRead, LocalExportUpdate
 from document_pipeline_api.services.local_exports import read_local_export, update_local_export
 from document_pipeline_api.schemas.templates import (
+    TemplateBody,
     TemplateCreate,
     TemplateDraft,
     TemplateRead,
@@ -250,7 +251,7 @@ def update(
         session,
         template_id,
         body.expected_version,
-        TemplateCreate.model_validate(body.model_dump(exclude={"expected_version", "expected_updated_at"})),
+        TemplateBody.model_validate(body.model_dump(exclude={"expected_version", "expected_updated_at"})),
         body.expected_updated_at,
     )
 

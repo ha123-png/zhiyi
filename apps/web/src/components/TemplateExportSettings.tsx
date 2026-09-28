@@ -48,7 +48,7 @@ export const TemplateExportSettings = forwardRef<TemplateExportHandle, { templat
     <label className="form-label" htmlFor={`original-action-${templateId}`}>原文件处理</label>
     <select className="form-input" id={`original-action-${templateId}`} value={enabled ? mode : "disabled"} disabled={!binding || busy || disabled}
       onChange={event => { setEnabled(event.target.value !== "disabled"); if (event.target.value !== "disabled") setMode(event.target.value as "copy" | "move"); }}>
-      <option value="disabled">不额外处理</option><option value="move">原文件归档</option><option value="copy">复制原件副本</option>
+      <option value="disabled">{binding ? "不额外处理" : error ? "未能读取设置" : "正在读取设置…"}</option><option value="move">原文件归档</option><option value="copy">复制原件副本</option>
     </select>
     {enabled && <p className="support">{mode === "move" ? "结果保存成功后，将导入的原文件移动到“所选位置 / 模板名”。知意保留内部原件用于预览；需在桌面版通过“选择文件”导入。" : "额外复制到“所选位置 / 模板名”，原位置的文件保留。内部原件仍由知意保存。"}</p>}
     {enabled && <div className="template-folder-choice">

@@ -17,6 +17,9 @@ from document_pipeline_api.services.worker_health import (
 @huey.on_startup(name="worker-heartbeat")
 def start_heartbeat() -> None:
     settings = Settings.local()
+    from document_pipeline_api.business_backup import restore_journal_path
+    if restore_journal_path(settings.storage_dir.parent).exists():
+        raise RuntimeError("备份恢复未完成，不能启动文件处理。")
     engine = build_engine(settings.database_url)
     try:
         wait_for_database_head(engine)
@@ -35,7 +38,8 @@ def stop_heartbeat() -> None:
 def run_extraction(task_id: str) -> None:
     settings = Settings.local()
     from document_pipeline_api.services.clear_data import clear_journal_path
-    if clear_journal_path(settings).exists():
+    from document_pipeline_api.business_backup import restore_journal_path
+    if clear_journal_path(settings).exists() or restore_journal_path(settings.storage_dir.parent).exists():
         return
     engine = build_engine(settings.database_url)
     try:
@@ -59,7 +63,8 @@ def _recover_interrupted_tasks() -> None:
 
     settings = Settings.local()
     from document_pipeline_api.services.clear_data import clear_journal_path
-    if clear_journal_path(settings).exists():
+    from document_pipeline_api.business_backup import restore_journal_path
+    if clear_journal_path(settings).exists() or restore_journal_path(settings.storage_dir.parent).exists():
         return
     engine = build_engine(settings.database_url)
     try:

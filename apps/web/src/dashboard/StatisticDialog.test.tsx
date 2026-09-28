@@ -50,3 +50,25 @@ it("invalidates an accepted preview immediately when its configuration changes",
   fireEvent.submit(save.closest("form")!);
   expect(dashboardApi.save).not.toHaveBeenCalled();
 });
+
+it("keeps the chosen numeric field through repeated aggregation changes", async () => {
+  vi.mocked(dashboardApi.options).mockResolvedValue({tables: [{id: "table", name: "账本", columns: [
+    {key: "quantity", label: "数量", value_type: "number", section: "item"},
+    {key: "amount", label: "金额", value_type: "number", section: "item"},
+  ]}]});
+  vi.mocked(dashboardApi.preview).mockResolvedValue({status: "empty", display: "number"});
+  render(<StatisticDialog onClose={vi.fn()} onSaved={vi.fn()} />);
+  await waitFor(() => expect(screen.getByRole("button", {name: "保存统计"})).toBeEnabled());
+  const metric = screen.getByRole("combobox", {name: "统计什么"});
+  fireEvent.change(metric, {target: {value: "sum"}});
+  fireEvent.change(screen.getByRole("combobox", {name: "数值字段"}), {target: {value: "amount"}});
+  fireEvent.change(screen.getByRole("textbox", {name: "名称"}), {target: {value: "金额观察"}});
+  for (const value of ["avg", "sum", "count", "sum", "avg"]) {
+    fireEvent.change(metric, {target: {value}});
+    if (value !== "count") expect(screen.getByRole("combobox", {name: "数值字段"})).toHaveValue("amount");
+    expect(screen.getByRole("textbox", {name: "名称"})).toHaveValue("金额观察");
+  }
+  await waitFor(() => expect(screen.getByRole("button", {name: "保存统计"})).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", {name: "保存统计"}));
+  await waitFor(() => expect(dashboardApi.save).toHaveBeenCalledWith(expect.objectContaining({metric: "avg", metric_field: "amount", name: "金额观察"}), undefined, 7));
+});

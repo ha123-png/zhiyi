@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile, status
 from pydantic import BaseModel
@@ -83,6 +83,7 @@ async def upload_task(
     file: Annotated[UploadFile, File()],
     template_mode: Annotated[str, Form()] = "smart",
     template_id: Annotated[str | None, Form()] = None,
+    duplicate_policy: Annotated[Literal["reject", "allow"], Form()] = "reject",
 ) -> TaskRead:
     settings: Settings = request.app.state.settings
     task = await create_task_from_upload(
@@ -91,6 +92,7 @@ async def upload_task(
         file,
         template_mode,
         template_id,
+        duplicate_policy=duplicate_policy,
     )
     frozen = freeze_new_task_if_paused(session, task.id)
     if settings.queue_enabled and not frozen:

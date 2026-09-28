@@ -440,7 +440,51 @@ EXPECTED_SCHEMA.update(GROWTH_SCHEMA)
 EXPECTED_SCHEMA["assistant_runs"] = EXPECTED_SCHEMA["assistant_runs"] | {"stream_version", "snapshot_sequence"}
 SCHEMA_REVISIONS["0038_growth_and_streaming"] = SCHEMA_REVISIONS["0037_model_context_policy"] | GROWTH_SCHEMA.keys()
 SCHEMA_REVISIONS["0039_original_archive"] = SCHEMA_REVISIONS["0038_growth_and_streaming"]
+FILE_DATA_SCHEMA = {
+    "pending_original_deletions": {"relative_path", "task_id", "created_at", "attempts", "failure_code"},
+    "file_current_data": {"task_id", "table_id", "header_json", "schema_json", "validation_json", "has_data", "current_version", "next_item_index", "updated_at"},
+    "data_edit_sessions": {"id", "owner", "editor", "created_at", "sealed_at"},
+    "file_revisions": {"id", "task_id", "session_id", "version", "operation", "editor", "schema_json", "changes_json", "created_at", "sealed_at"},
+}
+EXPECTED_SCHEMA.update(FILE_DATA_SCHEMA)
+EXPECTED_SCHEMA["data_rows"] = EXPECTED_SCHEMA["data_rows"] | {"is_header_only"}
+SCHEMA_REVISIONS["0040_file_current_data"] = SCHEMA_REVISIONS["0039_original_archive"] | FILE_DATA_SCHEMA.keys()
+TEMPLATE_CONTRACT_SCHEMA = {"template_table_bindings": {"template_id", "table_id"}}
+EXPECTED_SCHEMA.update(TEMPLATE_CONTRACT_SCHEMA)
+EXPECTED_SCHEMA["templates"] |= {"is_deleted"}
+EXPECTED_SCHEMA["template_versions"] |= {"engine_kind"}
+SCHEMA_REVISIONS["0041_template_contract"] = SCHEMA_REVISIONS["0040_file_current_data"] | TEMPLATE_CONTRACT_SCHEMA.keys()
+AUTONOMOUS_COLUMNS = {
+    "tasks": {"template_pool_json"}, "extractions": {"output_schema_json"},
+    "data_tables": {"collection_kind"},
+}
+for _table, _columns in AUTONOMOUS_COLUMNS.items():
+    EXPECTED_SCHEMA[_table] |= _columns
+SCHEMA_REVISIONS["0042_autonomous_contract"] = SCHEMA_REVISIONS["0041_template_contract"]
+EXPECTED_SCHEMA["data_tables"] |= {"grouping_json"}
+SCHEMA_REVISIONS["0043_dynamic_groupings"] = SCHEMA_REVISIONS["0042_autonomous_contract"]
+REVISION_DETAIL_SCHEMA = {"file_revision_details": {"revision_id", "row_id", "item_index", "change_json"}}
+REVISION_COUNTS = {"modified_fields", "deleted_details", "added_details", "total_details"}
+EXPECTED_SCHEMA.update(REVISION_DETAIL_SCHEMA)
+EXPECTED_SCHEMA["file_revisions"] |= REVISION_COUNTS
+SCHEMA_REVISIONS["0044_revision_details"] = SCHEMA_REVISIONS["0043_dynamic_groupings"] | REVISION_DETAIL_SCHEMA.keys()
+ASSISTANT_AUTH_SCHEMA = {
+    "assistant_threads": {"authorization_json", "authorization_revision"},
+    "assistant_runs": {"authorization_revision", "dataset_generation"},
+}
+for _table, _columns in ASSISTANT_AUTH_SCHEMA.items():
+    EXPECTED_SCHEMA[_table] |= _columns
+SCHEMA_REVISIONS["0045_assistant_authorization"] = SCHEMA_REVISIONS["0044_revision_details"]
+EXPECTED_SCHEMA["tasks"].add("upload_intent_json")
+SCHEMA_REVISIONS["0046_upload_intent"] = SCHEMA_REVISIONS["0045_assistant_authorization"]
 COLUMNS_INTRODUCED_BY_REVISION = {
+    "0046_upload_intent": {"tasks": {"upload_intent_json"}},
+    "0045_assistant_authorization": ASSISTANT_AUTH_SCHEMA,
+    "0044_revision_details": {**REVISION_DETAIL_SCHEMA, "file_revisions": REVISION_COUNTS},
+    "0043_dynamic_groupings": {"data_tables": {"grouping_json"}},
+    "0042_autonomous_contract": AUTONOMOUS_COLUMNS,
+    "0041_template_contract": {**TEMPLATE_CONTRACT_SCHEMA, "templates": {"is_deleted"}, "template_versions": {"engine_kind"}},
+    "0040_file_current_data": {**FILE_DATA_SCHEMA, "data_rows": {"is_header_only"}},
     "0039_original_archive": {"tasks": {"source_file_json"}, "template_local_bindings": {"mode"}},
     "0038_growth_and_streaming": {**GROWTH_SCHEMA, "assistant_runs": {"stream_version", "snapshot_sequence"}},
     "0037_model_context_policy": {"model_profile_versions": {"context_policy"}},

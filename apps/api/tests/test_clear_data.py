@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 
 from document_pipeline_api.config import Settings
+from document_pipeline_api import db
 from document_pipeline_api.main import create_app
 from document_pipeline_api.model_secrets import ModelSecretStore
 from document_pipeline_api.models import ModelProfileVersionRecord, TaskRecord
@@ -22,22 +23,22 @@ from test_model_secrets import MemoryCredentialBackend
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows connection recovery")
 def test_clear_connection_recovery_is_bounded_and_does_not_retry_other_failures(monkeypatch):
-    monkeypatch.setattr(clear_data.time, "sleep", Mock())
+    monkeypatch.setattr(db.time, "sleep", Mock())
     transient = OperationalError(None, None, SimpleNamespace(sqlite_errorcode=4874, sqlite_errorname="SQLITE_IOERR_SHMSIZE"))
     connected = object()
     engine = Mock()
     engine.connect.side_effect = [transient, connected]
-    assert clear_data._open_clear_connection(engine) is connected
+    assert db.connect_after_process_exit(engine) is connected
     assert engine.connect.call_count == 2
     engine.connect.reset_mock(side_effect=True)
     engine.connect.side_effect = transient
     with pytest.raises(OperationalError):
-        clear_data._open_clear_connection(engine)
+        db.connect_after_process_exit(engine)
     assert engine.connect.call_count == 6
     engine.connect.reset_mock(side_effect=True)
     engine.connect.side_effect = OperationalError(None, None, SimpleNamespace(sqlite_errorcode=11))
     with pytest.raises(OperationalError):
-        clear_data._open_clear_connection(engine)
+        db.connect_after_process_exit(engine)
     assert engine.connect.call_count == 1
 
 
@@ -77,7 +78,10 @@ def test_clear_removes_business_data_and_scoped_credentials_but_keeps_external_f
         assert response.json()["state"] == "succeeded"
         assert response.json()["cleared_tasks"] == 1
         assert client.get("/api/v1/tasks").json() == []
-        assert len(client.get("/api/v1/templates").json()) == 2
+        templates = client.get("/api/v1/templates").json()
+        assert len(templates) == 3
+        autonomous = next(template for template in templates if template['engine_kind'] == 'autonomous')
+        assert not autonomous['in_smart_pool']
         assert not list((root / "uploads").iterdir())
         assert not (root / "desktop-settings.json").exists()
         assert store.get(unrelated_ref) == "another-installation-secret"

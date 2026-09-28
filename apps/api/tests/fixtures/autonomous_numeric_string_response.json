@@ -1,0 +1,108 @@
+{
+  "header": {
+    "f1": "R3-0842",
+    "f2": "2026-09-14",
+    "f3": false,
+    "f4": 0.0,
+    "f5": "CNY",
+    "f6": "21.50",
+    "f7": "R3-TAIL-21"
+  },
+  "items": [
+    {
+      "f8": "Turbo filter A12",
+      "f9": 2,
+      "f10": "piece",
+      "f11": 12.5,
+      "f12": 25.0
+    },
+    {
+      "f8": "Backup label paper",
+      "f9": 0,
+      "f10": "roll",
+      "f11": 8.0,
+      "f12": 0.0
+    },
+    {
+      "f8": "Freight credit adjustment",
+      "f9": 1,
+      "f10": "item",
+      "f11": -3.5,
+      "f12": -3.5
+    }
+  ],
+  "fields": [
+    {
+      "key": "f1",
+      "label": "Record ID",
+      "section": "header",
+      "value_type": "text"
+    },
+    {
+      "key": "f2",
+      "label": "Record date",
+      "section": "header",
+      "value_type": "date"
+    },
+    {
+      "key": "f3",
+      "label": "Approved",
+      "section": "header",
+      "value_type": "boolean"
+    },
+    {
+      "key": "f4",
+      "label": "Opening balance",
+      "section": "header",
+      "value_type": "number"
+    },
+    {
+      "key": "f5",
+      "label": "Currency",
+      "section": "header",
+      "value_type": "text"
+    },
+    {
+      "key": "f6",
+      "label": "Net total",
+      "section": "header",
+      "value_type": "number"
+    },
+    {
+      "key": "f7",
+      "label": "Closing code",
+      "section": "header",
+      "value_type": "text"
+    },
+    {
+      "key": "f8",
+      "label": "Item name",
+      "section": "item",
+      "value_type": "text"
+    },
+    {
+      "key": "f9",
+      "label": "Quantity",
+      "section": "item",
+      "value_type": "number"
+    },
+    {
+      "key": "f10",
+      "label": "Unit",
+      "section": "item",
+      "value_type": "text"
+    },
+    {
+      "key": "f11",
+      "label": "Unit price",
+      "section": "item",
+      "value_type": "number"
+    },
+    {
+      "key": "f12",
+      "label": "Line total",
+      "section": "item",
+      "value_type": "number"
+    }
+  ]
+}

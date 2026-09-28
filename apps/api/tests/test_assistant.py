@@ -346,7 +346,8 @@ def test_write_preview_confirmation_is_atomic_idempotent_and_checks_version(clie
     ]
     client.app.state.conversation_factory = ScriptedProvider
     detail = finish(
-        client, send(client, select_profile(client), context={"table_id": "ledger", "row_ids": [1]})
+        # This shared header affects both details, so both must be granted.
+        client, send(client, select_profile(client), context={"table_id": "ledger", "row_ids": [1, 2]})
     )
     assert detail["runs"][0]["status"] == "completed", detail
     tool = detail["tools"][0]
@@ -373,6 +374,100 @@ def test_write_preview_confirmation_is_atomic_idempotent_and_checks_version(clie
     )
     client.delete(f"/api/v1/assistant/threads/{detail['id']}")
     assert client.get(f"/api/v1/assistant/threads/{detail['id']}").status_code == 404
+
+
+@pytest.mark.parametrize("changed_context", [
+    {"table_id": "ledger", "row_ids": [1], "mode": "assist"},
+    {"table_id": "ledger", "row_ids": [1, 2], "mode": "read"},
+    {"table_id": "ledger", "row_ids": [1, 2], "mode": "assist", "capabilities": ["tasks"]},
+    {"table_id": "removed-source", "mode": "read"},
+])
+def test_authorization_change_invalidates_old_plan_even_if_restored(client, changed_context):
+    ScriptedProvider.plan = [[{"type": "tool", "id": "change", "name": "propose_changes",
+                              "arguments": {"table_id": "ledger", "row_id": 1, "changes": {"total": "100"}}}]]
+    client.app.state.conversation_factory = ScriptedProvider
+    profile = select_profile(client)
+    original = {"table_id": "ledger", "row_ids": [1, 2]}
+    detail = finish(client, send(client, profile, context=original))
+    tool_id = detail["tools"][0]["id"]
+    url = f"/api/v1/assistant/threads/{detail['id']}/authorization"
+    body = {"context": changed_context, "profile_id": profile["id"],
+            "profile_version": profile["version"], "remote_authorized": False}
+    changed = client.put(url, json=body)
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["invalidated_tools"] == 1
+    assert client.put(url, json=body).json()["authorization_revision"] == changed.json()["authorization_revision"]
+    assert client.put(url, json={**body, "context": original}).status_code == 200
+    assert client.post(f"/api/v1/assistant/tools/{tool_id}/decision", json={"approve": True}).json()["status"] == "stale"
+    with client.app.state.session_factory() as session:
+        assert json.loads(session.get(DataRowRecord, 1).row_json)["total"] == "1,200.50"
+
+
+def test_restored_backup_cannot_confirm_old_assistant_plan(client):
+    ScriptedProvider.plan = [[{"type": "tool", "id": "change", "name": "propose_changes",
+                              "arguments": {"table_id": "ledger", "row_id": 1, "changes": {"total": "100"}}}]]
+    client.app.state.conversation_factory = ScriptedProvider
+    profile = select_profile(client)
+    detail = finish(client, send(client, profile, context={"table_id": "ledger", "row_ids": [1, 2]}))
+    tool_id = detail["tools"][0]["id"]
+    created = client.post("/api/v1/backups")
+    assert created.status_code == 201, created.text
+    restored = client.post(f"/api/v1/backups/{created.json()['name']}/restore")
+    assert restored.status_code == 200, restored.text
+    rejected = client.post(f"/api/v1/assistant/tools/{tool_id}/decision", json={"approve": True})
+    assert rejected.status_code == 200 and rejected.json()["status"] == "expired", rejected.text
+    with client.app.state.session_factory() as session:
+        assert json.loads(session.get(DataRowRecord, 1).row_json)["total"] == "1,200.50"
+
+
+def test_authorization_revoke_interrupts_inflight_tool_before_execution(client):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class DelayedProvider(ScriptedProvider):
+        def close(self):
+            release.set()
+
+        def stream(self, messages, tools):
+            entered.set()
+            assert release.wait(5)
+            yield {"type": "tool", "id": "late", "name": "propose_changes",
+                   "arguments": {"table_id": "ledger", "row_id": 1, "changes": {"total": "100"}}}
+
+    client.app.state.conversation_factory = DelayedProvider
+    profile = select_profile(client)
+    started = send(client, profile, context={"table_id": "ledger", "row_ids": [1, 2], "mode": "delegate"})
+    assert started.status_code == 200, started.text
+    assert entered.wait(5)
+    thread_id, run_id = started.json()["thread_id"], started.json()["run_id"]
+    revoked = client.put(f"/api/v1/assistant/threads/{thread_id}/authorization", json={
+        "context": {"table_id": "ledger", "row_ids": [1, 2], "mode": "read"},
+        "profile_id": profile["id"], "profile_version": profile["version"],
+        "remote_authorized": False,
+    })
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["cancelled_runs"] == 1
+    release.set()
+    with client.app.state.session_factory() as session:
+        assert json.loads(session.get(DataRowRecord, 1).row_json)["total"] == "1,200.50"
+    assert "run.completed" in client.get(f"/api/v1/assistant/runs/{run_id}/events").text
+
+
+def test_claimed_write_preview_without_tool_never_reaches_user_or_pending_state(client):
+    fake = "以下是修改预览：将供应方改为核对甲。请确认是否执行此操作。"
+    ScriptedProvider.plan = [[{"type": "text", "text": fake}], [{"type": "text", "text": fake}]]
+    client.app.state.conversation_factory = ScriptedProvider
+    started = send(client, select_profile(client), text="把供应方改为核对甲",
+                   context={"table_id": "ledger"})
+    assert started.status_code == 200, started.text
+    payload = started.json()
+    stream = client.get(f"/api/v1/assistant/runs/{payload['run_id']}/events")
+    assert "run.completed" in stream.text
+    assert fake not in stream.text
+    detail = client.get(f"/api/v1/assistant/threads/{payload['thread_id']}").json()
+    assert detail['runs'][0]['status'] == 'failed'
+    assert not any(tool['status'] == 'pending' for tool in detail['tools'])
+    assert fake not in json.dumps(detail['messages'], ensure_ascii=False)
 
 
 def test_reference_pagination_and_deleted_source(client):

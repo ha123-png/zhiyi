@@ -30,6 +30,8 @@ class TaskRecord(Base):
     file_name_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     internal_storage_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     sha256: Mapped[str] = mapped_column(String(64), index=True)
+    # Immutable submission intent; matching/reselection may change template fields.
+    upload_intent_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     storage_path: Mapped[str] = mapped_column(String(1024))
     template_mode: Mapped[str] = mapped_column(String(32), default="smart")
     template_id: Mapped[str | None] = mapped_column(
@@ -37,6 +39,7 @@ class TaskRecord(Base):
         nullable=True,
     )
     template_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    template_pool_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     candidate_templates_json: Mapped[str] = mapped_column(Text, default="[]")
     model_config_version: Mapped[str] = mapped_column(
         String(32),
@@ -96,6 +99,10 @@ class TaskRecord(Base):
     def display_filename(self) -> str:
         state = self.file_name
         return (state.confirmed_filename or state.suggested_filename) if state else self.filename
+
+    @property
+    def autonomous_fallback(self) -> bool:
+        return self.template_mode == "smart" and self.template_id == "builtin-autonomous"
 
     @property
     def candidate_templates(self) -> list[dict[str, str | int]]:

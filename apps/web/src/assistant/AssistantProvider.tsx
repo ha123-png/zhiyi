@@ -1,3 +1,4 @@
+import { serverDate } from "../time";
 import {
   createContext,
   useCallback,
@@ -23,8 +24,50 @@ import { applyDeltas, mergePage, type TextDelta } from "./stream";
 
 const running = new Set(["running", "waiting", "cancelling"]);
 const convertMessage = (message: ThreadMessageLike) => message;
+interface ThreadAuthorizationPayload {
+  context: BusinessContext;
+  profile_id: string | null;
+  profile_version: number | null;
+  remote_authorized: boolean;
+}
+interface ThreadAuthorizationSnapshot {
+  threadId: string;
+  key: string;
+  body: ThreadAuthorizationPayload;
+}
+interface ThreadAuthorizationState {
+  threadId: string;
+  key: string;
+  status: "syncing" | "ready" | "failed";
+  error?: string;
+}
+interface ThreadAuthorizationResponse {
+  authorization_revision: number;
+  invalidated_tools: number;
+  cancelled_runs: number;
+}
 function currentContext(context: BusinessContext): BusinessContext {
   return { ...context, ...(context.capabilities ? { capabilities: context.capabilities.filter(value => value !== "templates") } : {}) };
+}
+function authorizationSnapshot(
+  threadId: string,
+  context: BusinessContext,
+  profileId: string,
+  profileVersion: number | null,
+  remoteAuthorized: boolean,
+): ThreadAuthorizationSnapshot {
+  const body: ThreadAuthorizationPayload = {
+    context: currentContext(context),
+    profile_id: profileId || null,
+    profile_version: profileVersion,
+    remote_authorized: remoteAuthorized,
+  };
+  const normalizedContext = Object.fromEntries(Object.entries(body.context)
+    .filter(([key, value]) => key !== "table_name" && value !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => [key, Array.isArray(value) ? [...value].sort() : value]));
+  const key = JSON.stringify({ ...body, context: { ...normalizedContext, mode: body.context.mode || "assist" } });
+  return { threadId, key, body };
 }
 export function navigateAssistant(
   reference: Reference | { kind: "draft"; draft: Record<string, unknown> },
@@ -52,6 +95,8 @@ function useController() {
   const [pageContext, setPageContext] = useState<BusinessContext>({});
   const [error, setError] = useState("");
   const [status, setStatus] = useState("");
+  const [authorizationState, setAuthorizationState] = useState<ThreadAuthorizationState | null>(null);
+  const [authorizationReadyThread, setAuthorizationReadyThread] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -67,10 +112,27 @@ function useController() {
   const defaultId = useRef("");
   const selectionRevision = useRef(0);
   const analysisSubmission = useRef<{ signature: string; id: string } | null>(null);
+  const authorizationQueue = useRef<Promise<void>>(Promise.resolve());
+  const synchronizedAuthorization = useRef(new Map<string, string>());
+  const authorizationSnapshotRef = useRef<ThreadAuthorizationSnapshot | null>(null);
+  const authorizationReadyThreadRef = useRef<string | null>(null);
   const lastModelRun = detail?.last_model_run ?? detail?.runs.find(run => run.execution_kind !== "analysis_refresh");
   const profile = profiles.find((p) => p.id === profileId);
   const grantKey = (thread = activeId.current || draftThread.current) => profile ? consentKey(thread, profile, context) : "";
   const remoteConsent = grants.includes(grantKey());
+  const authProfileVersion = profile?.version ?? (lastModelRun?.profile_id === profileId ? lastModelRun.profile_version : null);
+  const authorizationThread = detail?.id && activeId.current === detail.id ? detail.id : null;
+  const authorizationSnapshotCurrent = authorizationThread
+    ? authorizationSnapshot(authorizationThread, context, profileId, authProfileVersion, !!profile?.is_remote && remoteConsent)
+    : null;
+  authorizationSnapshotRef.current = authorizationSnapshotCurrent;
+  authorizationReadyThreadRef.current = authorizationReadyThread;
+  const sendStateRef = useRef({ context, profile, remoteConsent });
+  sendStateRef.current = { context, profile, remoteConsent };
+  const authorizationPending = !!authorizationThread && (
+    authorizationReadyThread !== authorizationThread || authorizationState?.threadId !== authorizationThread ||
+    authorizationState?.key !== authorizationSnapshotCurrent?.key || authorizationState.status !== "ready"
+  );
   function rememberConsent(key: string, allowed: boolean) {
     setGrants(previous => {
       const next = [...previous.filter(v => v !== key), ...(allowed ? [key] : [])].slice(-100);
@@ -172,6 +234,67 @@ function useController() {
     }
     return next;
   }, []);
+  const synchronizeAuthorization = useCallback(async (
+    snapshot: ThreadAuthorizationSnapshot,
+    force = false,
+  ) => {
+    const synchronize = async () => {
+      if (!force && synchronizedAuthorization.current.get(snapshot.threadId) === snapshot.key) {
+        setAuthorizationState(previous => previous?.threadId === snapshot.threadId && previous.key === snapshot.key && previous.status === "ready"
+          ? previous : { threadId: snapshot.threadId, key: snapshot.key, status: "ready" });
+        return;
+      }
+      setAuthorizationState(previous => previous?.threadId === snapshot.threadId && previous.key === snapshot.key && previous.status === "syncing"
+        ? previous : { threadId: snapshot.threadId, key: snapshot.key, status: "syncing" });
+      try {
+        const response = await assistantApi<ThreadAuthorizationResponse>(
+          `/threads/${encodeURIComponent(snapshot.threadId)}/authorization`,
+          "PUT",
+          snapshot.body,
+        );
+        synchronizedAuthorization.current.set(snapshot.threadId, snapshot.key);
+        if (authorizationSnapshotRef.current?.threadId === snapshot.threadId && authorizationSnapshotRef.current.key === snapshot.key) {
+          setAuthorizationState({ threadId: snapshot.threadId, key: snapshot.key, status: "ready" });
+        }
+        if (response.invalidated_tools > 0) {
+          if (activeId.current === snapshot.threadId) {
+            setStatus("授权已变化，旧操作预览已失效，请重新生成");
+            await refresh(snapshot.threadId);
+          }
+        }
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : "授权同步失败";
+        if (authorizationSnapshotRef.current?.threadId === snapshot.threadId && authorizationSnapshotRef.current.key === snapshot.key) {
+          setAuthorizationState({ threadId: snapshot.threadId, key: snapshot.key, status: "failed", error: message });
+        }
+        throw reason;
+      }
+    };
+    const pending = authorizationQueue.current.catch(() => undefined).then(synchronize);
+    authorizationQueue.current = pending.then(() => undefined, () => undefined);
+    await pending;
+  }, [refresh]);
+  const ensureAuthorizationCurrent = useCallback(async () => {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const snapshot = authorizationSnapshotRef.current;
+      if (!snapshot) return;
+      if (authorizationReadyThreadRef.current !== snapshot.threadId) {
+        throw new Error("当前对话授权状态尚未读取完成，请稍后重试。");
+      }
+      await synchronizeAuthorization(snapshot);
+      const latest = authorizationSnapshotRef.current;
+      if (latest?.threadId === snapshot.threadId && latest.key === snapshot.key) return;
+    }
+    throw new Error("授权范围刚刚发生变化，请重新确认后再操作。");
+  }, [synchronizeAuthorization]);
+  useEffect(() => {
+    const snapshot = authorizationSnapshotCurrent;
+    if (!snapshot || authorizationReadyThread !== snapshot.threadId || loading || busy || submitting.current) return;
+    void synchronizeAuthorization(snapshot).catch(reason => {
+      const message = reason instanceof Error ? reason.message : "授权同步失败";
+      setError(`未能同步当前对话授权，操作预览无法确认：${message}`);
+    });
+  }, [authorizationSnapshotCurrent?.threadId, authorizationSnapshotCurrent?.key, authorizationReadyThread, loading, busy, synchronizeAuthorization]);
   const observe = useCallback(
     (id: string, runId: string) => {
       observer.current?.close();
@@ -265,6 +388,8 @@ function useController() {
       observer.current?.close();
       streamCleanup.current?.();
       activeId.current = id;
+      setAuthorizationReadyThread(null);
+      setAuthorizationState(null);
       setLoading(true);
       setError("");
       setStatus("");
@@ -279,6 +404,7 @@ function useController() {
           ...currentContext(restored),
           mode: restored.mode === "delegate" ? "assist" : restored.mode,
         });
+        setAuthorizationReadyThread(id);
         const run = next.runs.find((r) => running.has(r.status));
         if (run) observe(id, run.id);
       } catch (e) {
@@ -295,6 +421,8 @@ function useController() {
     observer.current?.close();
     streamCleanup.current?.();
     activeId.current = null;
+    setAuthorizationReadyThread(null);
+    setAuthorizationState(null);
     setDetail(null);
     setBusy(false);
     setProfileId(defaultId.current);
@@ -317,28 +445,25 @@ function useController() {
   }
   async function send(text: string) {
     if (submitting.current || busy) return;
-    if (!profile) {
-      setError("请先选择问知意使用的模型方案。");
-      throw new Error("尚未选择模型");
-    }
-    if (profile.is_remote && !remoteConsent) {
-      setError("请先确认本次向远程模型发送的范围。");
-      throw new Error("尚未同意远程发送");
-    }
     submitting.current = true;
     setBusy(true);
     setError("");
-    setStatus("正在连接模型…");
-    const signature = JSON.stringify({
-      text,
-      thread: activeId.current,
-      profile: profile.id,
-      version: profile.version,
-      context,
-    });
-    if (submission.current?.signature !== signature)
-      submission.current = { signature, id: crypto.randomUUID() };
+    setStatus(activeId.current ? "正在同步授权…" : "正在连接模型…");
     try {
+      if (activeId.current) await ensureAuthorizationCurrent();
+      const current = sendStateRef.current;
+      if (!current.profile) throw new Error("请先选择问知意使用的模型方案。");
+      if (current.profile.is_remote && !current.remoteConsent) throw new Error("请先确认本次向远程模型发送的范围。");
+      const signature = JSON.stringify({
+        text,
+        thread: activeId.current,
+        profile: current.profile.id,
+        version: current.profile.version,
+        context: current.context,
+      });
+      if (submission.current?.signature !== signature)
+        submission.current = { signature, id: crypto.randomUUID() };
+      setStatus("正在连接模型…");
       const started = await assistantApi<{ thread_id: string; run_id: string }>(
         "/runs",
         "POST",
@@ -346,15 +471,20 @@ function useController() {
           request_id: submission.current.id,
           text,
           thread_id: activeId.current,
-          profile_id: profile.id,
-          profile_version: profile.version,
-          remote_consent: profile.is_remote
-            ? `${profile.id}:${profile.version}`
+          profile_id: current.profile.id,
+          profile_version: current.profile.version,
+          remote_consent: current.profile.is_remote
+            ? `${current.profile.id}:${current.profile.version}`
             : null,
-          context: currentContext(context),
+          context: currentContext(current.context),
         },
       );
-      if (profile.is_remote && remoteConsent) rememberConsent(grantKey(started.thread_id), true);
+      if (current.profile.is_remote && current.remoteConsent) rememberConsent(consentKey(started.thread_id, current.profile, current.context), true);
+      const sentAuthorization = authorizationSnapshot(started.thread_id, current.context, current.profile.id, current.profile.version,
+        current.profile.is_remote && current.remoteConsent);
+      synchronizedAuthorization.current.set(started.thread_id, sentAuthorization.key);
+      setAuthorizationReadyThread(started.thread_id);
+      setAuthorizationState({ threadId: started.thread_id, key: sentAuthorization.key, status: "ready" });
       activeId.current = started.thread_id;
       submission.current = null;
       setContext((previous) =>
@@ -399,6 +529,7 @@ function useController() {
   }
   async function decision(id: string, approve: boolean) {
     try {
+      if (approve) await ensureAuthorizationCurrent();
       const outcome = await assistantApi<{
         status: string;
         result?: {
@@ -424,11 +555,13 @@ function useController() {
       return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : "操作失败");
+      if (activeId.current) void refresh(activeId.current).catch(() => {});
       return false;
     }
   }
   async function undo(id: string) {
     try {
+      await ensureAuthorizationCurrent();
       await assistantApi(`/tools/${encodeURIComponent(id)}/undo`, "POST");
       if (activeId.current) await refresh(activeId.current);
     } catch (e) {
@@ -454,7 +587,7 @@ function useController() {
       const value: ThreadMessageLike = {
         id: m.id,
         role: m.role,
-        createdAt: new Date(m.created_at),
+        createdAt: serverDate(m.created_at),
         content: m.parts.map((p) =>
           p.type === "text"
             ? p
@@ -478,7 +611,8 @@ function useController() {
     isRunning: busy,
     isLoading: loading,
     isDisabled: !!detail?.archived,
-    isSendDisabled: !profile || (profile.is_remote && !remoteConsent),
+    isSendDisabled: !profile || (profile.is_remote && !remoteConsent) ||
+      (authorizationThread !== null && authorizationState?.threadId === authorizationThread && authorizationState.status === "failed"),
     onNew: async (message) => {
       await send(
         message.content
@@ -512,11 +646,13 @@ function useController() {
     submitting.current = true;
     setBusy(true);
     setError("");
-    setStatus("正在按原统计口径刷新…");
+    setStatus("正在同步授权…");
     const signature = JSON.stringify({ threadId, toolId, context: currentContext(context) });
     if (analysisSubmission.current?.signature !== signature)
       analysisSubmission.current = { signature, id: crypto.randomUUID() };
     try {
+      await ensureAuthorizationCurrent();
+      setStatus("正在按原统计口径刷新…");
       await assistantApi(`/tools/${encodeURIComponent(toolId)}/refresh-analysis`, "POST", {
         request_id: analysisSubmission.current.id, thread_id: threadId, context: currentContext(context),
       });
@@ -529,6 +665,16 @@ function useController() {
       submitting.current = false;
       setBusy(false);
       setStatus("");
+    }
+  }
+  async function retryAuthorizationSync() {
+    try {
+      const snapshot = authorizationSnapshotRef.current;
+      if (!snapshot) throw new Error("请先打开一段对话。");
+      await synchronizeAuthorization(snapshot, true);
+      setError("");
+    } catch (reason) {
+      setError(`未能同步当前对话授权，操作预览无法确认：${reason instanceof Error ? reason.message : "授权同步失败"}`);
     }
   }
   return {
@@ -553,6 +699,10 @@ function useController() {
     setError,
     status,
     busy,
+    authorizationPending,
+    authorizationError: authorizationState?.status === "failed" && authorizationState.threadId === authorizationThread
+      ? authorizationState.error || "授权同步失败" : "",
+    retryAuthorizationSync,
     loading,
     loadingOlder,
     loadOlder,

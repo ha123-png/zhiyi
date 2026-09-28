@@ -110,6 +110,8 @@ def test_mcp_read_capabilities_are_independently_registered(tmp_path: Path) -> N
         "get_task_diagnostics",
         "list_templates",
         "get_task_result",
+        "get_task_evidence",
+        "get_task_result_value",
         "list_data_tables",
         "get_data_table",
         "aggregate_data_table",

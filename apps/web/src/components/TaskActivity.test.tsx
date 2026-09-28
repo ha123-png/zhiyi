@@ -49,7 +49,7 @@ describe("GlobalTaskCard", () => {
     expect(screen.getByText(/此时不计处理耗时/)).toBeInTheDocument();
   });
 
-  it("offers pause while processing, resume and delete while paused", () => {
+  it("offers pause while processing and confirms deletion of paused task data", async () => {
     const onPause = vi.fn();
     const onResume = vi.fn();
     const onDelete = vi.fn();
@@ -78,7 +78,11 @@ describe("GlobalTaskCard", () => {
     // 暂停任务提供"启动队列"（全部放回队列）与"删除"（含原文件）
     fireEvent.click(screen.getByRole("button", { name: /启动队列/ }));
     expect(onResume).toHaveBeenCalledWith("active-task");
-    fireEvent.click(screen.getByRole("button", { name: /删除/ }));
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
+    const dialog = screen.getByRole("dialog", { name: "删除暂停任务" });
+    expect(dialog).toHaveTextContent("平台内部原件、当前数据和该文件的修订历史");
+    expect(onDelete).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "确认删除" }));
     expect(onDelete).toHaveBeenCalledWith("active-task");
   });
 

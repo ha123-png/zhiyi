@@ -2,6 +2,7 @@ export interface BusinessContext {
   table_id?: string | null;
   table_name?: string | null;
   row_ids?: number[] | null;
+  source_keys?: string[] | null;
   search?: string;
   task_id?: string | null;
   template_id?: string | null;
@@ -52,6 +53,8 @@ export interface Analysis {
     generated_at: string;
     scope_description?: string | null;
     request: Record<string, unknown>;
+    view_id?: string | null;
+    source_keys?: string[] | null;
   };
   data?: Record<string, string | number | null>[];
   rows?: {

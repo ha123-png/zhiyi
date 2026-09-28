@@ -1,10 +1,12 @@
 import hashlib
 import json
 from datetime import datetime
+from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile, status
-from sqlalchemy import delete, func, insert, literal, select, update
+from sqlalchemy import and_, delete, func, insert, literal, or_, select, update
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.config import Settings
@@ -17,6 +19,7 @@ from document_pipeline_api.models import (
     ConfirmedDocumentRecord,
     DataRowRecord,
     ExtractionRecord,
+    FileCurrentDataRecord,
     ReviewRevisionRecord,
 )
 from document_pipeline_api.models.task import TaskRecord, utc_now
@@ -69,7 +72,20 @@ async def create_task_from_upload(
     *,
     target_table_id: str | None = None,
     source_file: dict | None = None,
+    duplicate_policy: Literal["reject", "allow"] = "reject",
 ) -> TaskRecord:
+    # All ingress adapters share the same semantic modes. The worker's legacy
+    # fallback treats unknown/no-template modes as smart; admitting those here
+    # would create distinct duplicate keys for the same actual extraction.
+    if template_mode not in {"smart", "manual", "invoice", "delivery"}:
+        await upload.close()
+        raise HTTPException(422, "template_mode 只能是 smart、manual、invoice 或 delivery。")
+    if template_mode == "manual" and not template_id:
+        await upload.close()
+        raise HTTPException(422, "手动提取必须选择模板。")
+    if duplicate_policy not in {"reject", "allow"}:
+        await upload.close()
+        raise HTTPException(422, "duplicate_policy 只能是 reject 或 allow。")
     if upload.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
@@ -133,9 +149,10 @@ async def create_task_from_upload(
             .limit(1)
         )
         temporary_path.replace(final_path)
-        selected_template = (
-            get_active_template(session, template_id) if template_id else None
+        selected_id = template_id or (
+            f"builtin-{template_mode}" if template_mode in {"invoice", "delivery"} else None
         )
+        selected_template = get_active_template(session, selected_id) if selected_id else None
         _insert_task_if_capacity_available(
             session,
             settings,
@@ -154,11 +171,15 @@ async def create_task_from_upload(
             ),
             duplicate_of_task_id=duplicate_id,
             target_table_id=target_table_id,
+            duplicate_policy=duplicate_policy,
         )
         task = session.get(TaskRecord, task_id)
         task.source_file_json = json.dumps(source_file, ensure_ascii=False) if source_file else None
         task.input_policy_json = policy.model_dump_json()
         task.input_plan_json = prepared.scope.model_dump_json()
+        if selected_template is None and template_mode == "smart":
+            from document_pipeline_api.services.autonomous_extraction import frozen_pool
+            frozen_pool(session, task)
         if selected_template is not None:
             from document_pipeline_api.services.local_exports import snapshot_task_export
             snapshot_task_export(session, task, selected_template)
@@ -207,7 +228,30 @@ def _insert_task_if_capacity_available(
     template_version: int | None,
     duplicate_of_task_id: str | None,
     target_table_id: str | None = None,
+    duplicate_policy: Literal["reject", "allow"] = "reject",
 ) -> None:
+    intent = {"mode": template_mode, "template_id": template_id,
+              "template_version": template_version, "target_table_id": target_table_id}
+    intent_json = json.dumps(intent, sort_keys=True, separators=(",", ":"))
+    # Old records have no immutable snapshot. Smart stays smart after matching;
+    # for manual legacy records only their retained template can be compared.
+    legacy_intent = [TaskRecord.template_mode == template_mode,
+                     TaskRecord.target_table_id == target_table_id]
+    if template_mode != "smart":
+        legacy_intent += [TaskRecord.template_id == template_id,
+                          TaskRecord.template_version == template_version]
+    duplicates = select(TaskRecord.id).where(
+        TaskRecord.sha256 == sha256,
+        # Cancelling a needs-review task keeps its extracted facts. Terminal
+        # state alone therefore does not mean it is safe to create another set.
+        or_(TaskRecord.status.not_in([TaskStatus.FAILED.value, TaskStatus.CANCELLED.value]),
+            select(ExtractionRecord.task_id).where(ExtractionRecord.task_id == TaskRecord.id)
+            .correlate(TaskRecord).exists(),
+            select(FileCurrentDataRecord.task_id).where(FileCurrentDataRecord.task_id == TaskRecord.id)
+            .correlate(TaskRecord).exists()),
+        or_(TaskRecord.upload_intent_json == intent_json,
+            and_(TaskRecord.upload_intent_json.is_(None), *legacy_intent)),
+    )
     capacity_conditions = _capacity_conditions(
         settings,
         additional_bytes=size_bytes,
@@ -222,6 +266,7 @@ def _insert_task_if_capacity_available(
         "page_count",
         "processing_units",
         "sha256",
+        "upload_intent_json",
         "storage_path",
         "template_mode",
         "template_id",
@@ -259,6 +304,7 @@ def _insert_task_if_capacity_available(
         literal(page_count),
         literal(processing_units),
         literal(sha256),
+        literal(intent_json),
         literal(storage_path),
         literal(template_mode),
         literal(template_id),
@@ -287,8 +333,22 @@ def _insert_task_if_capacity_available(
         literal(now),
         literal(now),
     ).where(*capacity_conditions)
+    if duplicate_policy == "reject":
+        # The predicate and insert share the SQLite write statement/lock. A
+        # preceding SELECT alone permits concurrent uploads to both enqueue.
+        values = values.where(~duplicates.exists())
     result = session.execute(insert(TaskRecord).from_select(columns, values))
     if result.rowcount != 1:
+        if duplicate_policy == "reject":
+            duplicate_id = session.scalar(duplicates.order_by(TaskRecord.created_at.desc()).limit(1))
+            if duplicate_id is not None:
+                duplicate = session.get(TaskRecord, duplicate_id)
+                raise HTTPException(409, {
+                    "code": "duplicate_upload",
+                    "message": "这份文件已按相同方式导入。再次提取会新建任务，可能重复生成数据并产生模型费用。",
+                    "duplicate_task_id": duplicate_id,
+                    "duplicate_status": duplicate.status,
+                })
         raise _capacity_error(settings)
 
 
@@ -532,6 +592,8 @@ def select_task_template(
         raise HTTPException(status_code=404, detail="没有找到这个任务。")
     if task.status != TaskStatus.WAITING_FOR_TEMPLATE.value:
         raise HTTPException(status_code=409, detail="这个任务当前不需要选择模板。")
+    if session.get(ExtractionRecord, task_id) is not None or session.get(FileCurrentDataRecord, task_id) is not None:
+        raise HTTPException(status_code=409, detail="这份文件已有提取结果，请确认已有数据；不能重新选择模板覆盖初始提取证据。")
 
     candidates = json.loads(task.candidate_templates_json)
     candidate = next(
@@ -703,11 +765,11 @@ DELETABLE_TASK_STATUSES = {
 def _task_storage_paths(
     settings: Settings,
     tasks: list[TaskRecord],
-) -> list[object]:
+) -> list[Path]:
     """解析任务原文件路径；引用无效的任务不阻塞删除。"""
     from document_pipeline_api.storage_paths import resolve_task_storage_path, ensure_managed_path
 
-    paths: list[object] = []
+    paths: list[Path] = []
     for task in tasks:
         try:
             path = resolve_task_storage_path(settings.storage_dir, task)
@@ -720,11 +782,11 @@ def _task_storage_paths(
 def _delete_task_records(session: Session, task_ids: list[str]) -> None:
     if not task_ids:
         return
-    session.execute(
-        update(DataRowRecord)
-        .where(DataRowRecord.task_id.in_(task_ids))
-        .values(task_id=None)
-    )
+    from document_pipeline_api.models import DataRowRevisionRecord, FileCurrentDataRecord, FileRevisionRecord
+    session.execute(delete(DataRowRevisionRecord).where(DataRowRevisionRecord.task_id.in_(task_ids)))
+    session.execute(delete(FileRevisionRecord).where(FileRevisionRecord.task_id.in_(task_ids)))
+    session.execute(delete(DataRowRecord).where(DataRowRecord.task_id.in_(task_ids)))
+    session.execute(delete(FileCurrentDataRecord).where(FileCurrentDataRecord.task_id.in_(task_ids)))
     session.execute(
         delete(ConfirmedDocumentRecord).where(ConfirmedDocumentRecord.task_id.in_(task_ids))
     )
@@ -742,19 +804,22 @@ def _delete_task_records(session: Session, task_ids: list[str]) -> None:
     session.execute(delete(TaskRecord).where(TaskRecord.id.in_(task_ids)))
 
 
-def _discard_task_files(paths: list[object]) -> None:
-    for path in paths:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            continue
+def _delete_files_and_records(session: Session, settings: Settings, tasks: list[TaskRecord]) -> None:
+    from document_pipeline_api.services.original_cleanup import (
+        enqueue_original_deletions, enqueue_rendered_deletions, drain_original_deletions,
+    )
+    enqueue_original_deletions(session, settings, _task_storage_paths(settings, tasks))
+    enqueue_rendered_deletions(session, [task.id for task in tasks])
+    _delete_task_records(session, [task.id for task in tasks])
+    session.commit()
+    drain_original_deletions(session, settings)
 
 
 @guard_file_operation
 def delete_task(session: Session, settings: Settings, task_id: str) -> int:
-    """删除单个历史任务：断开数据行溯源、删除提取/确认/评审记录与原文件。
+    """删除整个文件：当前数据、该文件修订、提取历史与内部原文件一起删除。
 
-    返回保留的数据表行数（数据表本身不删除，任务与数据行解耦）。
+    旧接口保留行数固定返回 0；独立合并/导入的数据不属于此文件。
     """
     task = session.get(TaskRecord, task_id)
     if task is None:
@@ -764,15 +829,9 @@ def delete_task(session: Session, settings: Settings, task_id: str) -> int:
             status_code=409,
             detail="只有已完成、失败、已取消、待选模板或已暂停的任务可以删除。",
         )
-    kept_rows = session.scalar(
-        select(func.count(DataRowRecord.id)).where(DataRowRecord.task_id == task_id)
-    )
-    paths = _task_storage_paths(settings, [task])
-    _delete_task_records(session, [task_id])
-    session.commit()
-    _discard_task_files(paths)
+    _delete_files_and_records(session, settings, [task])
     clear_pause_if_queue_empty(session)
-    return kept_rows or 0
+    return 0
 
 
 @guard_file_operation
@@ -800,22 +859,14 @@ def delete_tasks_batch(
             status_code=409,
             detail="只有已完成、失败、已取消、待选模板或已暂停的任务可以删除。",
         )
-    kept_rows = session.scalar(
-        select(func.count(DataRowRecord.id)).where(
-            DataRowRecord.task_id.in_([task.id for task in deletable])
-        )
-    )
-    paths = _task_storage_paths(settings, deletable)
-    _delete_task_records(session, [task.id for task in deletable])
-    session.commit()
-    _discard_task_files(paths)
+    _delete_files_and_records(session, settings, deletable)
     clear_pause_if_queue_empty(session)
-    return len(deletable), kept_rows or 0
+    return len(deletable), 0
 
 
 @guard_file_operation
 def clear_history(session: Session, settings: Settings) -> int:
-    """清理全部历史任务：已完成/失败/取消/待确认，保留进行中任务和数据表数据。"""
+    """清理全部历史任务：已完成/失败/取消/待确认，保留进行中任务及独立数据。"""
     tasks = list(
         session.scalars(
             select(TaskRecord).where(
@@ -825,9 +876,5 @@ def clear_history(session: Session, settings: Settings) -> int:
     )
     if not tasks:
         return 0
-    task_ids = [task.id for task in tasks]
-    paths = _task_storage_paths(settings, tasks)
-    _delete_task_records(session, task_ids)
-    session.commit()
-    _discard_task_files(paths)
-    return len(task_ids)
+    _delete_files_and_records(session, settings, tasks)
+    return len(tasks)

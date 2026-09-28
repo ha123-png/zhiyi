@@ -40,7 +40,7 @@ def test_backup_status_empty_then_after_create(client: TestClient) -> None:
     status = client.get("/api/v1/backups/status").json()
     assert status["count"] == 0
     assert status["last_success_at"] is None
-    assert status["retention"] == 10
+    assert status["retention"] is None
 
     _add_task(client)
     response = client.post("/api/v1/backups")
@@ -58,7 +58,7 @@ def test_backup_status_empty_then_after_create(client: TestClient) -> None:
     assert (_backup_dir(client) / backup["name"]).is_file()
 
 
-def test_backup_retention_keeps_newest(client: TestClient, tmp_path: Path) -> None:
+def test_new_manual_backup_preserves_all_existing_backups(client: TestClient, tmp_path: Path) -> None:
     # 预置 12 个按时间递增命名的占位备份
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -72,8 +72,9 @@ def test_backup_retention_keeps_newest(client: TestClient, tmp_path: Path) -> No
     created = response.json()["name"]
 
     backups = client.get("/api/v1/backups").json()
-    assert len(backups) == 10
+    assert len(backups) == 13
     assert backups[0]["name"] == created  # 最新在前
+    assert all((backup_dir / f"20260809T100000{index:05d}Z.dpbak").read_bytes() == b"placeholder" for index in range(12))
 
 
 def test_delete_backup(client: TestClient) -> None:

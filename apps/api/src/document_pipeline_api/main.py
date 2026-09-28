@@ -92,6 +92,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         validate_integration_tokens(active_settings)
+        from document_pipeline_api.business_backup import recover_interrupted_restore
+        recover_interrupted_restore(active_settings.storage_dir.parent)
         active_settings.storage_dir.mkdir(parents=True, exist_ok=True)
         upgrade_database(engine)
         from document_pipeline_api.services.templates import ensure_builtin_templates
@@ -101,6 +103,9 @@ def create_app(
         )
 
         with application.state.session_factory() as session:
+            from document_pipeline_api.services.current_data import recover_edit_sessions
+            recover_edit_sessions(session, owner=application.state.edit_session_owner)
+            session.commit()
             from document_pipeline_api.services.assistant_events import recover_interrupted_runs
             recover_interrupted_runs(session)
             ensure_builtin_templates(session)
@@ -124,14 +129,42 @@ def create_app(
                 )
 
                 start_runtime_recovery(application.state.session_factory, active_settings)
+        import asyncio
+        import logging
+        from starlette.concurrency import run_in_threadpool
+        from document_pipeline_api.services.original_cleanup import recover_original_deletions
+        from document_pipeline_api.business_backup import restore_journal_path
+        cleanup_stop = asyncio.Event()
+
+        async def cleanup_originals():
+            while not cleanup_stop.is_set():
+                if (not application.state.maintenance_active and not clear_journal_path(active_settings).exists()
+                        and not restore_journal_path(active_settings.storage_dir.parent).exists()):
+                    try:
+                        await run_in_threadpool(recover_original_deletions, application.state.session_factory, active_settings)
+                    except Exception as error:
+                        # The durable queue stays intact; a lock does not fail app startup.
+                        logging.getLogger(__name__).warning("Original cleanup postponed: %s", type(error).__name__)
+                try:
+                    await asyncio.wait_for(cleanup_stop.wait(), timeout=30)
+                except TimeoutError:
+                    pass
+
+        cleanup_worker = asyncio.create_task(cleanup_originals())
         try:
             yield
         finally:
+            cleanup_stop.set()
+            await cleanup_worker
             from document_pipeline_api.api.assistant import stop_conversations
             stop_conversations(application)
             for state in list(application.state.assistant_active.values()):
                 if state.get("thread"):
                     state["thread"].join(timeout=5)
+            from document_pipeline_api.services.current_data import recover_edit_sessions
+            with application.state.session_factory() as session:
+                recover_edit_sessions(session, owner="shutdown")
+                session.commit()
             engine.dispose()
             if active_settings.queue_enabled:
                 from document_pipeline_api.queue import huey
@@ -150,6 +183,13 @@ def create_app(
     application.state.model_secret_store = model_secret_store
     application.state.session_factory = sessionmaker(engine, expire_on_commit=False)
     application.state.assistant_active = {}
+    from uuid import uuid4
+    application.state.edit_session_owner = str(uuid4())
+    from document_pipeline_api.api.file_data import router as file_data_router
+    # Register fixed /tables/edit-sessions paths before /tables/{table_id}.
+    from document_pipeline_api.api.guide import router as guide_router
+    application.include_router(guide_router, prefix="/api/v1")
+    application.include_router(file_data_router, prefix="/api/v1")
     application.include_router(assistant_router, prefix="/api/v1")
     import threading
     application.state.maintenance_condition = threading.Condition()
@@ -159,6 +199,9 @@ def create_app(
     @application.middleware("http")
     async def maintenance_barrier(request: Request, call_next):
         from document_pipeline_api.services.clear_data import clear_journal_path
+        from document_pipeline_api.business_backup import restore_journal_path
+        if restore_journal_path(active_settings.storage_dir.parent).exists():
+            return JSONResponse(status_code=503, content={"detail": "备份恢复尚未完成，请重启知意完成恢复后再继续。"})
         mutation = request.method not in {"GET", "HEAD", "OPTIONS"}
         clearing = request.url.path == "/api/v1/system/admin/clear-data"
         if mutation:

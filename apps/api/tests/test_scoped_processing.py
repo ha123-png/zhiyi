@@ -93,7 +93,7 @@ def test_global_scope_policy_snapshot_review_and_original_survive(client):
         assert stored.template_version == 1
         assert stored.status == "needs_review"
         assert (client.app.state.settings.storage_dir / stored.storage_path).read_text(encoding="utf-8") == LONG_TEXT
-    confirmed = client.post(f"/api/v1/tasks/{task['id']}/confirm", json={"expected_review_version": 1})
+    confirmed = client.post(f"/api/v1/tasks/{task['id']}/confirm", json={"expected_review_version": review.json()["review_version"]})
     assert confirmed.status_code == 200, confirmed.text
     table_id = confirmed.json()["table_id"]
     expected_scope = result.input_scope.model_dump()
@@ -107,6 +107,8 @@ def test_global_scope_policy_snapshot_review_and_original_survive(client):
     assert merged_row["task_id"] is None
     assert merged_row["input_scope"] == expected_scope
     assert client.post("/api/v1/system/admin/clear-history", json={"confirm_text": "清除历史"}).status_code == 200
+    assert client.get(f"/api/v1/tables/{table_id}").json()["rows"] == []
+    table_id = merged.json()["id"]
     remaining = client.get(f"/api/v1/tables/{table_id}").json()["rows"][0]
     assert remaining["task_id"] is None
     assert remaining["input_scope"] == expected_scope

@@ -73,7 +73,7 @@ describe("TaskQueuePage", () => {
     expect(onOpenData).toHaveBeenCalledWith(task);
   });
 
-  it("shows paused tasks and logs but keeps queue controls out of status monitoring", async () => {
+  it("shows single-task resume and cancellation controls for paused tasks", async () => {
     const pausedTask = { ...BASE_TASK, id: "task-paused", filename: "paused.png", status: "paused" };
     vi.stubGlobal(
       "fetch",
@@ -81,6 +81,9 @@ describe("TaskQueuePage", () => {
         const url = String(input);
         if (url.includes("/templates")) {
           return Promise.resolve({ ok: true, json: async () => [] });
+        }
+        if (url.includes("/queue/status")) {
+          return Promise.resolve({ ok: true, json: async () => ({ paused: false }) });
         }
         return Promise.resolve({ ok: true, json: async () => [pausedTask] });
       }),
@@ -90,16 +93,20 @@ describe("TaskQueuePage", () => {
 
     expect(await screen.findByText("paused.png")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "暂停队列" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "启动队列" })).not.toBeInTheDocument();
-    expect(screen.getByTitle("删除此任务（防止上传错文件，直接删除不确认）")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "继续 paused.png" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "取消 paused.png" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "删除任务 paused.png" })).toBeInTheDocument();
   });
 
-  it("deletes a failed task directly without confirmation", async () => {
+  it("confirms failed-task deletion and states the real data scope", async () => {
     const failedTask = { ...BASE_TASK, id: "task-failed", filename: "failed.png", status: "failed" };
     const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.includes("/templates")) {
         return Promise.resolve({ ok: true, json: async () => [] });
+      }
+      if (url.includes("/queue/status")) {
+        return Promise.resolve({ ok: true, json: async () => ({ paused: false }) });
       }
       if (url.endsWith("/tasks/task-failed") && init?.method === "DELETE") {
         return Promise.resolve({ ok: true, status: 200, json: async () => ({ kept_rows: 3 }) });
@@ -111,8 +118,16 @@ describe("TaskQueuePage", () => {
     render(<TaskQueuePage />);
 
     expect(await screen.findByText("failed.png")).toBeInTheDocument();
-    // 失败任务没有产生数据：直接点删除，不弹确认
-    fireEvent.click(screen.getByTitle("删除任务（失败任务没有产生数据，直接删除不确认）"));
+    fireEvent.click(screen.getByRole("button", { name: "删除任务 failed.png" }));
+    const dialog = await screen.findByRole("dialog", { name: "删除任务" });
+    expect(dialog).toHaveTextContent("平台内部原件、当前数据和该文件的修订历史");
+    expect(dialog).toHaveTextContent("独立导入/合并表不受影响");
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith("/tasks/task-failed") && init?.method === "DELETE")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "删除任务 failed.png" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认删除" }));
 
     await waitFor(() => {
       expect(
@@ -120,8 +135,7 @@ describe("TaskQueuePage", () => {
           String(url).endsWith("/tasks/task-failed") && init?.method === "DELETE"),
       ).toBe(true);
     });
-    // 失败任务没有数据：直接删除，提示已删除
-    expect(await screen.findByText("任务已删除。")).toBeInTheDocument();
+    expect(await screen.findByText("文件及关联数据已删除。")).toBeInTheDocument();
   });
 
   it("batch retry submits only failed tasks", async () => {
@@ -189,7 +203,7 @@ describe("TaskQueuePage", () => {
           String(url).endsWith("/tasks/batch-delete") && init?.method === "POST"),
       ).toBe(true);
     });
-    expect(await screen.findByText(/已删除 1 个任务/)).toBeInTheDocument();
+    expect(await screen.findByText(/已删除 1 个文件及关联数据/)).toBeInTheDocument();
   });
 
   it("pages pending actions using backend totals instead of the loaded row count", async () => {
@@ -264,12 +278,15 @@ describe("TaskQueuePage", () => {
     ).toBe(true);
   });
 
-  it("deletes a paused task directly without confirmation", async () => {
+  it("confirms paused-task deletion before removing the task", async () => {
     const pausedTask = { ...BASE_TASK, id: "task-paused", filename: "p.png", status: "paused" };
     const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.includes("/templates")) {
         return Promise.resolve({ ok: true, json: async () => [] });
+      }
+      if (url.includes("/queue/status")) {
+        return Promise.resolve({ ok: true, json: async () => ({ paused: false }) });
       }
       if (url.endsWith("/tasks/task-paused") && init?.method === "DELETE") {
         return Promise.resolve({ ok: true, json: async () => ({ kept_rows: 0 }) });
@@ -281,7 +298,10 @@ describe("TaskQueuePage", () => {
     render(<TaskQueuePage />);
 
     expect(await screen.findByText("p.png")).toBeInTheDocument();
-    fireEvent.click(screen.getByTitle("删除此任务（防止上传错文件，直接删除不确认）"));
+    fireEvent.click(screen.getByRole("button", { name: "删除任务 p.png" }));
+    expect(await screen.findByRole("dialog", { name: "删除任务" })).toHaveTextContent("任务记录、平台内部原件、当前数据和该文件的修订历史");
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith("/tasks/task-paused") && init?.method === "DELETE")).toBe(false);
+    fireEvent.click(await screen.findByRole("button", { name: "确认删除" }));
 
     await waitFor(() => {
       expect(
@@ -289,5 +309,138 @@ describe("TaskQueuePage", () => {
           String(url).endsWith("/tasks/task-paused") && init?.method === "DELETE"),
       ).toBe(true);
     });
+  });
+
+  it("pauses and resumes only the selected task when the global queue is running", async () => {
+    let currentTask = { ...BASE_TASK, id: "task-control", filename: "control.png", status: "queued" };
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/templates") || url.includes("/tables")) return Promise.resolve({ ok: true, json: async () => [] });
+      if (url.includes("/queue/status")) return Promise.resolve({ ok: true, json: async () => ({ paused: false }) });
+      if (url.includes("/tasks/summary")) return Promise.resolve({ ok: true, json: async () => ({ failed: 0, cancelled: 0, needs_review: 0, waiting_for_action: 0, pending_exports: 0 }) });
+      if (url.endsWith("/tasks/task-control/pause") && init?.method === "POST") {
+        currentTask = { ...currentTask, status: "paused" };
+        return Promise.resolve({ ok: true, json: async () => currentTask });
+      }
+      if (url.endsWith("/tasks/task-control/resume") && init?.method === "POST") {
+        currentTask = { ...currentTask, status: "queued" };
+        return Promise.resolve({ ok: true, json: async () => currentTask });
+      }
+      return Promise.resolve({ ok: true, json: async () => [currentTask] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<TaskQueuePage />);
+
+    expect(await screen.findByText("control.png")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "暂停 control.png" }));
+    expect(await screen.findByRole("button", { name: "继续 control.png" })).toBeEnabled();
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith("/tasks/task-control/pause") && init?.method === "POST")).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "继续 control.png" }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith("/tasks/task-control/resume") && init?.method === "POST")).toBe(true));
+    expect(await screen.findByText(/已继续处理/)).toBeInTheDocument();
+  });
+
+  it("does not resume one task while the global queue is paused, but cancels without deleting its data", async () => {
+    let currentTask = { ...BASE_TASK, id: "task-paused", filename: "paused.png", status: "paused" };
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/templates") || url.includes("/tables")) return Promise.resolve({ ok: true, json: async () => [] });
+      if (url.includes("/queue/status")) return Promise.resolve({ ok: true, json: async () => ({ paused: true }) });
+      if (url.includes("/tasks/summary")) return Promise.resolve({ ok: true, json: async () => ({ failed: 0, cancelled: 0, needs_review: 0, waiting_for_action: 0, pending_exports: 0 }) });
+      if (url.endsWith("/tasks/task-paused/resume") && init?.method === "POST") return Promise.resolve({ ok: true, json: async () => currentTask });
+      if (url.endsWith("/tasks/task-paused/cancel") && init?.method === "POST") {
+        currentTask = { ...currentTask, status: "cancelled" };
+        return Promise.resolve({ ok: true, json: async () => currentTask });
+      }
+      if (url.includes("status=failed%2Ccancelled")) return Promise.resolve({ ok: true, json: async () => currentTask.status === "cancelled" ? [currentTask] : [] });
+      return Promise.resolve({ ok: true, json: async () => currentTask.status === "cancelled" ? [] : [currentTask] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<TaskQueuePage />);
+
+    expect(await screen.findByText("paused.png")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "继续 paused.png" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "继续 paused.png" }));
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith("/tasks/task-paused/resume") && init?.method === "POST")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "取消 paused.png" }));
+    expect(await screen.findByText(/任务记录、原件、已有数据和修订历史均保留/)).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith("/tasks/task-paused/cancel") && init?.method === "POST")).toBe(true);
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith("/tasks/task-paused") && init?.method === "DELETE")).toBe(false);
+  });
+
+  it("puts failure diagnostics and recovery actions on separate full-width rows", async () => {
+    const failedTask = { ...BASE_TASK, id: "task-layout", filename: "layout.png", status: "failed", failure_message: "A long diagnostic explanation that should wrap within the card." };
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/templates") || url.includes("/tables")) return Promise.resolve({ ok: true, json: async () => [] });
+      if (url.includes("/queue/status")) return Promise.resolve({ ok: true, json: async () => ({ paused: false }) });
+      return Promise.resolve({ ok: true, json: async () => [failedTask] });
+    }));
+    const { container } = render(<TaskQueuePage />);
+
+    await screen.findByText("layout.png");
+    const failureRow = container.querySelector(".task-failure-row");
+    const content = container.querySelector(".task-failure-content");
+    const actions = container.querySelector(".task-failure-actions");
+    expect(failureRow).not.toBeNull();
+    expect(content?.parentElement).toBe(failureRow);
+    expect(actions?.parentElement).toBe(failureRow);
+    expect(failureRow?.children[0]).toBe(content);
+    expect(failureRow?.children[1]).toBe(actions);
+    expect(content).toHaveTextContent("A long diagnostic explanation");
+  });
+
+  it("disables retry immediately and submits only once while a retry is pending", async () => {
+    const failedTask = { ...BASE_TASK, id: "task-retry", filename: "retry.png", status: "failed" };
+    let releaseRetry: ((value: { ok: boolean; json: () => Promise<typeof failedTask> }) => void) | undefined;
+    const retryPromise = new Promise<{ ok: boolean; json: () => Promise<typeof failedTask> }>((resolve) => { releaseRetry = resolve; });
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/templates") || url.includes("/tables")) return Promise.resolve({ ok: true, json: async () => [] });
+      if (url.includes("/queue/status")) return Promise.resolve({ ok: true, json: async () => ({ paused: true }) });
+      if (url.endsWith("/tasks/task-retry/retry")) return retryPromise;
+      return Promise.resolve({ ok: true, json: async () => [failedTask] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<TaskQueuePage />);
+
+    await screen.findByText("retry.png");
+    const retryButton = screen.getByRole("button", { name: "重试" });
+    fireEvent.click(retryButton);
+    expect(retryButton).toBeDisabled();
+    fireEvent.click(retryButton);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/tasks/task-retry/retry"))).toHaveLength(1);
+
+    releaseRetry?.({ ok: true, json: async () => ({ ...failedTask, status: "queued" }) });
+    await waitFor(() => expect(retryButton).toBeEnabled());
+  });
+
+  it("batch deletion confirms only the visible failed/cancelled page and scopes its API request", async () => {
+    const failedTask = { ...BASE_TASK, id: "task-failed", filename: "failed.png", status: "failed" };
+    const cancelledTask = { ...BASE_TASK, id: "task-cancelled", filename: "cancelled.png", status: "cancelled" };
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/templates") || url.includes("/tables")) return Promise.resolve({ ok: true, json: async () => [] });
+      if (url.includes("/queue/status")) return Promise.resolve({ ok: true, json: async () => ({ paused: false }) });
+      if (url.includes("/tasks/summary")) return Promise.resolve({ ok: true, json: async () => ({ failed: 1, cancelled: 1, needs_review: 0, waiting_for_action: 0, pending_exports: 0 }) });
+      if (url.endsWith("/tasks/batch-delete") && init?.method === "POST") return Promise.resolve({ ok: true, json: async () => ({ deleted: 2, kept_rows: 1 }) });
+      if (url.includes("status=failed%2Ccancelled")) return Promise.resolve({ ok: true, json: async () => [failedTask, cancelledTask] });
+      return Promise.resolve({ ok: true, json: async () => [failedTask, cancelledTask] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<TaskQueuePage />);
+
+    await screen.findByText("failed.png");
+    fireEvent.click(screen.getByRole("button", { name: "删除本页失败/已取消任务" }));
+    const dialog = await screen.findByRole("dialog", { name: "批量删除失败或已取消任务" });
+    expect(dialog).toHaveTextContent("当前页 2 个失败/已取消任务");
+    expect(dialog).toHaveTextContent("当前数据和文件修订历史（如有）");
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith("/tasks/batch-delete") && init?.method === "POST")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "确认删除" }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith("/tasks/batch-delete") && init?.method === "POST")).toBe(true));
+    const request = fetchMock.mock.calls.find(([url, init]) => String(url).endsWith("/tasks/batch-delete") && init?.method === "POST");
+    expect(JSON.parse(String(request?.[1]?.body)).task_ids).toEqual(["task-failed", "task-cancelled"]);
   });
 });

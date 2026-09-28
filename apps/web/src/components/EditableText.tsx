@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 
 interface EditableTextProps {
   editing: boolean;
@@ -23,6 +23,13 @@ export function EditableText({
   const ref = useRef<HTMLElement | null>(null);
   // Esc 取消时抑制随后 blur 触发的 commit，避免"Esc 反而保存"
   const cancelledRef = useRef(false);
+
+  useLayoutEffect(() => {
+    // The browser owns this text while editing. React will not restore an
+    // unchanged value after a rejected save, so explicitly restore the supplied
+    // value whenever editing ends (including while an async commit is pending).
+    if (!editing && ref.current) ref.current.textContent = value;
+  }, [editing, value]);
 
   useEffect(() => {
     if (!editing || !ref.current) return;
@@ -55,9 +62,14 @@ export function EditableText({
           event.currentTarget.blur();
         } else if (event.key === "Escape") {
           event.preventDefault();
+          event.stopPropagation();
           cancelledRef.current = true;
+          // contentEditable owns its DOM while typing; the unchanged React value
+          // does not redraw it on cancel. Restore it before suppressing blur.
+          event.currentTarget.textContent = value;
           onCancel?.();
           event.currentTarget.blur();
+          event.currentTarget.parentElement?.focus({ preventScroll: true });
         }
       }}
     >

@@ -1,6 +1,14 @@
 import { describe, expect, test } from "vitest";
 
-import { responseErrorMessage } from "./api";
+import { getTableExportUrl, getTableViewsExportUrl, responseErrorMessage } from "./api";
+
+test("export preserves empty selections and composes the group/search boundary", () => {
+  const query = new URL(getTableExportUrl("one", "json", {viewId: "group", search: "日期 + 编号", rowIds: []}), "http://localhost").searchParams;
+  expect(query.get("row_ids")).toBe("");
+  expect(query.get("view_id")).toBe("group");
+  expect(query.get("search")).toBe("日期 + 编号");
+  expect(new URL(getTableViewsExportUrl("one", {taskIds: ["file-a", "file-b"]}), "http://localhost").searchParams.get("task_ids")).toBe("file-a,file-b");
+});
 
 describe("responseErrorMessage", () => {
   test("优先显示后端提供的中文业务提示", async () => {

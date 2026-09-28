@@ -26,6 +26,7 @@ class TemplateRecord(Base):
     )
     is_system: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
     # 智能匹配预选池：只有池内的模板才会参与智能匹配候选
     in_smart_pool: Mapped[bool] = mapped_column(Boolean, default=True)
     current_version: Mapped[int] = mapped_column(Integer, default=1)
@@ -57,6 +58,7 @@ class TemplateVersionRecord(Base):
         index=True,
     )
     version: Mapped[int] = mapped_column(Integer)
+    engine_kind: Mapped[str] = mapped_column(String(16), default="template")
     name: Mapped[str] = mapped_column(String(128))
     description: Mapped[str] = mapped_column(String(512), default="")
     extra_instructions: Mapped[str] = mapped_column(Text, default="")
@@ -76,3 +78,11 @@ class TemplateRestorationRecord(Base):
     from_version: Mapped[int] = mapped_column(Integer)
     to_version: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class TemplateTableBindingRecord(Base):
+    """A template's future extractions target one table, independently of version."""
+    __tablename__ = "template_table_bindings"
+
+    template_id: Mapped[str] = mapped_column(ForeignKey("templates.id"), primary_key=True)
+    table_id: Mapped[str] = mapped_column(ForeignKey("data_tables.id"), unique=True)

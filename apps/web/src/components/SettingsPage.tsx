@@ -1,3 +1,4 @@
+import { deletionNotice } from "../deletionNotice";
 import { Disclosure } from "./Disclosure";
 import { useEffect, useState } from "react";
 import {
@@ -181,9 +182,9 @@ export function SettingsPage({
       const result = await clearHistory("清除历史");
       setClearOpen(false);
       setNotice(
-        result.cleared_count > 0
-          ? `已清理 ${result.cleared_count} 条历史任务记录及其原文件。`
-          : "没有可清理的历史记录。",
+        deletionNotice(result, result.cleared_count > 0
+          ? `已清理 ${result.cleared_count} 个文件及其当前数据、原件和修订历史。`
+          : "没有可清理的历史记录。"),
       );
     } catch (reason) {
       setSettingsError(reason instanceof Error ? reason.message : "清理历史失败");
@@ -277,7 +278,7 @@ export function SettingsPage({
             icon={Rocket}
             id="onboarding"
             onToggle={toggleCard}
-            support="可随时重新查看首次使用引导：上传 → 提取 → 保存到表 → 数据仓库。"
+            support="可随时重新查看首次使用引导：上传 → 提取 → 核对当前数据 → 数据仓库。"
             title="使用引导"
           >
             <div className="setting-row">
@@ -439,7 +440,7 @@ export function SettingsPage({
               <div className="setting-row">
                 <div>
                   <div className="settings-name">清理历史数据</div>
-                  <div className="small muted">删除已完成/失败/取消任务及内部原件；数据表保留但断开追溯，外部副本保留</div>
+                  <div className="small muted">删除已完成、待核对、失败和已取消文件，以及对应当前数据、修订历史和内部原件；保留独立导入/合并数据、外部归档文件与备份</div>
                 </div>
                 <button className="btn danger sm" type="button" onClick={() => setClearOpen(true)}>
                   <Icon icon={Trash2} size={13} /> 清理
@@ -464,7 +465,7 @@ export function SettingsPage({
       <ConfirmDialog
         open={clearOpen}
         title="清理历史数据"
-        description="将删除全部已完成、失败、已取消任务的处理历史、校验记录和知意内部原件。数据表中已确认的数据保留，但会断开与原文件的追溯。已导出的外部副本和备份保留。此操作不可恢复。"
+        description="将删除全部已完成、待核对、失败和已取消文件的记录、当前数据、修订历史及内部原件。独立导入和合并结果、外部归档文件、备份保留。此操作不可恢复。"
         confirmText="清除历史"
         buttonLabel="确认清理"
         busy={clearBusy}

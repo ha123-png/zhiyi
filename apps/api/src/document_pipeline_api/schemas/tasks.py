@@ -34,6 +34,7 @@ class TasksSummary(BaseModel):
 
 
 class TaskRead(BaseModel):
+    autonomous_fallback: bool = False
     model_config = ConfigDict(from_attributes=True)
 
     id: str

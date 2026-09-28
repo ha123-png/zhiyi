@@ -7,22 +7,21 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.models.extraction import ExtractionRecord
-from document_pipeline_api.models.review import ReviewRevisionRecord
+from document_pipeline_api.models import FileCurrentDataRecord
 from document_pipeline_api.schemas.extraction import (
-    DocumentExtraction,
     DocumentKind,
-    TemplateExtraction,
     ValidationIssue,
 )
 from document_pipeline_api.services.rule_evaluation import evaluate_rules
 from document_pipeline_api.services.processing_input import input_scope_issues
+from document_pipeline_api.services.current_data import extraction_result, validation_result
 
 
 class RuleAuditEntry(BaseModel):
     task_id: str
     template_id: str | None
     template_version: int | None
-    result_source: Literal["extraction", "review"]
+    result_source: Literal["current"]
     review_version: int
     stored_engine_version: str
     current_engine_version: str | None
@@ -52,33 +51,17 @@ def audit_rule_engine(session: Session) -> RuleAuditReport:
         select(ExtractionRecord).order_by(ExtractionRecord.task_id)
     ).all()
     for extraction in extractions:
-        review = session.scalar(
-            select(ReviewRevisionRecord)
-            .where(ReviewRevisionRecord.task_id == extraction.task_id)
-            .order_by(ReviewRevisionRecord.version.desc())
-            .limit(1)
-        )
-        result_json = review.result_json if review is not None else extraction.result_json
-        validation_json = (
-            review.validation_json if review is not None else extraction.validation_json
-        )
-        stored_engine = (
-            review.rule_engine_version
-            if review is not None
-            else extraction.rule_engine_version
-        )
+        current = session.get(FileCurrentDataRecord, extraction.task_id)
+        stored_engine = extraction.rule_engine_version
         stored_issues: list[RuleIssueSummary] = []
         try:
             document_kind = DocumentKind(extraction.document_kind)
-            result_type = (
-                TemplateExtraction
-                if document_kind is DocumentKind.CUSTOM
-                else DocumentExtraction
-            )
-            result = result_type.model_validate_json(result_json)
+            if current is None:
+                raise ValueError("文件未建立唯一当前数据。")
+            result = validation_result(extraction, extraction_result(session, extraction))
             stored_issues = [
                 _summarize(ValidationIssue.model_validate(item))
-                for item in json.loads(validation_json)
+                for item in json.loads(current.validation_json)
             ]
             evaluation = evaluate_rules(
                 session,
@@ -87,15 +70,16 @@ def audit_rule_engine(session: Session) -> RuleAuditReport:
                 template_id=extraction.template_id,
                 template_version=extraction.template_version,
             )
-            current_issues = [_summarize(issue) for issue in evaluation.issues + input_scope_issues(extraction.input_scope_json)]
+            current_issues = ([_summarize(issue) for issue in evaluation.issues + input_scope_issues(extraction.input_scope_json)]
+                              if current.has_data else [])
             changed = stored_issues != current_issues
             entries.append(
                 RuleAuditEntry(
                     task_id=extraction.task_id,
                     template_id=extraction.template_id,
                     template_version=extraction.template_version,
-                    result_source="review" if review is not None else "extraction",
-                    review_version=review.version if review is not None else 0,
+                    result_source="current",
+                    review_version=current.current_version,
                     stored_engine_version=stored_engine,
                     current_engine_version=evaluation.engine_version,
                     changed=changed,
@@ -109,8 +93,8 @@ def audit_rule_engine(session: Session) -> RuleAuditReport:
                     task_id=extraction.task_id,
                     template_id=extraction.template_id,
                     template_version=extraction.template_version,
-                    result_source="review" if review is not None else "extraction",
-                    review_version=review.version if review is not None else 0,
+                    result_source="current",
+                    review_version=current.current_version if current else 0,
                     stored_engine_version=stored_engine,
                     current_engine_version=None,
                     changed=True,

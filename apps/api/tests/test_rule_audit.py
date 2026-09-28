@@ -50,7 +50,7 @@ def test_rule_audit_uses_exact_template_and_never_writes(
                 content_type="image/png",
                 size_bytes=1,
                 sha256="audit-digest",
-                storage_path=str(tmp_path / "audit.png"),
+                storage_path="audit-task.png",
                 template_mode="manual",
                 template_id=template.id,
                 template_version=template.version,
@@ -72,6 +72,10 @@ def test_rule_audit_uses_exact_template_and_never_writes(
                 validation_json="[]",
             )
         )
+        session.commit()
+
+        from document_pipeline_api.services.data_tables import materialize_task_result
+        materialize_task_result(session, "audit-task")
         session.commit()
 
         before = session.get(ExtractionRecord, "audit-task")

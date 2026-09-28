@@ -5,9 +5,8 @@ from datetime import timedelta
 from pathlib import Path
 
 from fastapi import HTTPException
-from pydantic import ValidationError, create_model
+from pydantic import create_model
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.config import Settings
@@ -17,7 +16,6 @@ from document_pipeline_api.model_providers import ModelProvider, build_model_pro
 from document_pipeline_api.model_providers.base import ModelServiceError
 from document_pipeline_api.models.extraction import ExtractionRecord
 from document_pipeline_api.models.model_profile import ModelProfileVersionRecord
-from document_pipeline_api.models.review import ReviewRevisionRecord
 from document_pipeline_api.models.task import TaskRecord
 from document_pipeline_api.schemas.extraction import (
     DocumentExtraction,
@@ -37,7 +35,7 @@ from document_pipeline_api.services.input_scope import InputBudgetError, select_
 from document_pipeline_api.schemas.input_scope import InputPolicy, InputScope
 from document_pipeline_api.services.model_runtime import settings_for_task
 from document_pipeline_api.services.system_settings import get_bool_setting
-from document_pipeline_api.storage_paths import resolve_task_storage_path
+from document_pipeline_api.storage_paths import InvalidOriginalReference, resolve_task_storage_path
 from document_pipeline_api.services.rule_evaluation import evaluate_rules
 from document_pipeline_api.services.template_processing import (
     TEMPLATE_PROMPT_VERSION,
@@ -85,37 +83,35 @@ EXTRACTION_PROMPTS = {
 }
 
 
-def _latest_review(
-    session: Session,
-    task_id: str,
-) -> ReviewRevisionRecord | None:
-    return session.scalar(
-        select(ReviewRevisionRecord)
-        .where(ReviewRevisionRecord.task_id == task_id)
-        .order_by(ReviewRevisionRecord.version.desc())
-        .limit(1)
-    )
-
-
 def _read_extraction(
     session: Session,
     record: ExtractionRecord,
 ) -> ExtractionRead:
+    from document_pipeline_api.services.read_snapshot import begin_read_snapshot
+    begin_read_snapshot(session)
     result_type = (
         TemplateExtraction
         if record.document_kind == DocumentKind.CUSTOM.value
         else DocumentExtraction
     )
     original_result = result_type.model_validate_json(record.result_json)
-    review = _latest_review(session, record.task_id)
-    current_result = (
-        result_type.model_validate_json(review.result_json)
-        if review is not None
-        else original_result
+    from document_pipeline_api.services.current_data import get_current, current_snapshot
+    current = get_current(session, record.task_id)
+    snapshot = current_snapshot(session, record.task_id)
+    current_result = TemplateExtraction(
+        header=snapshot["header"], items=[item["values"] for item in snapshot["items"]],
     )
+    from document_pipeline_api.services.data_baseline_audit import split_legacy_result
+    original_header, original_items = split_legacy_result(record.result_json, custom=record.document_kind == "custom")
+    changes = _diff_values({"header": original_header, "items": original_items}, current_result.model_dump())
+    # Positional evidence from initial extraction cannot be reassigned to a
+    # surviving detail after deletion. Mark moved positions as edited evidence.
+    changes.extend({"path": f"items[{index}]"} for index, item in enumerate(snapshot["items"])
+                   if item["item_index"] != index + 1)
     task = session.get(TaskRecord, record.task_id)
     page_count = task.page_count if task is not None else 1
     return ExtractionRead(
+        current_schema=json.loads(current.schema_json),
         file_name=task.file_name if task is not None else None,
         task_id=record.task_id,
         document_kind=DocumentKind(record.document_kind),
@@ -133,19 +129,21 @@ def _read_extraction(
         model_name=record.model_name,
         prompt_version=record.prompt_version,
         elapsed_seconds=record.elapsed_seconds,
-        review_version=review.version if review is not None else 0,
+        review_version=current.current_version,
+        detail_ids=[item["id"] for item in snapshot["items"]],
+        has_current_data=current.has_data,
         original_result=original_result,
         result=current_result,
         validation_issues=[
             ValidationIssue.model_validate(issue)
             for issue in json.loads(
-                review.validation_json if review is not None else record.validation_json
+                current.validation_json
             )
         ],
         input_scope=InputScope.model_validate_json(record.input_scope_json) if record.input_scope_json else None,
         evidence=_effective_evidence(
             record,
-            review,
+            {change["path"] for change in changes},
             current_result,
             page_count=page_count,
         ),
@@ -153,6 +151,8 @@ def _read_extraction(
 
 
 def get_extraction(session: Session, task_id: str) -> ExtractionRead:
+    from document_pipeline_api.services.read_snapshot import begin_read_snapshot
+    begin_read_snapshot(session)
     record = session.get(ExtractionRecord, task_id)
     if record is None:
         raise HTTPException(status_code=404, detail="这个任务还没有提取结果。")
@@ -179,46 +179,21 @@ def save_review(
     if extraction is None:
         raise HTTPException(status_code=404, detail="这个任务还没有提取结果。")
 
-    latest = _latest_review(session, task_id)
-    current_version = latest.version if latest is not None else 0
-    if update.expected_version != current_version:
-        raise HTTPException(
-            status_code=409,
-            detail="结果已在其他位置更新，请刷新后再修改。",
-        )
-    result_type = (
-        TemplateExtraction
-        if extraction.document_kind == DocumentKind.CUSTOM.value
-        else DocumentExtraction
-    )
-    current_result = (
-        result_type.model_validate_json(latest.result_json)
-        if latest is not None
-        else result_type.model_validate_json(extraction.result_json)
-    )
+    from document_pipeline_api.services.current_data import get_current, current_snapshot, revise_current
+    from document_pipeline_api.services.data_baseline_audit import split_legacy_result
+    current = get_current(session, task_id)
+    if update.expected_version != current.current_version:
+        raise HTTPException(409, "结果已在其他位置更新，请刷新后再修改。")
+    from document_pipeline_api.services.current_data import validation_result
     if isinstance(update.result, DocumentExtraction):
-        saved_result = update.result
+        header, items = split_legacy_result(update.result.model_dump_json(), custom=False)
+        saved_result = TemplateExtraction(header=header, items=items)
     else:
-        if extraction.template_id is None or extraction.template_version is None:
-            raise HTTPException(status_code=409, detail="这次结果缺少模板版本，不能保存。")
-        template = get_template_version(
-            session,
-            extraction.template_id,
-            extraction.template_version,
-        )
-        dynamic_type = build_template_extraction_model(template)
-        try:
-            dynamic_result = dynamic_type.model_validate(update.result.model_dump())
-        except ValidationError as error:
-            raise HTTPException(
-                status_code=422,
-                detail="提交的字段与模板不符，请刷新后按模板字段重新填写。",
-            ) from error
-        saved_result = TemplateExtraction.model_validate(dynamic_result.model_dump())
+        saved_result = update.result
     evaluation = evaluate_rules(
         session,
         document_kind=DocumentKind(extraction.document_kind),
-        result=saved_result,
+        result=validation_result(extraction, saved_result),
         template_id=extraction.template_id,
         template_version=extraction.template_version,
     )
@@ -230,70 +205,43 @@ def save_review(
         for index, issue in enumerate(issues)
     ]
     blocking_issues = [issue for issue in stored_issues if not issue.ignored]
-    revision = ReviewRevisionRecord(
-        task_id=task_id,
-        version=current_version + 1,
-        result_json=saved_result.model_dump_json(),
-        validation_json=json.dumps(
-            [issue.model_dump() for issue in stored_issues],
-            ensure_ascii=False,
-        ),
-        rule_engine_version=evaluation.engine_version,
-        changes_json=json.dumps(
-            _diff_values(current_result.model_dump(), saved_result.model_dump()),
-            ensure_ascii=False,
-        ),
+    snapshot = current_snapshot(session, task_id)
+    header, items = saved_result.header, saved_result.items
+    detail_ids = update.detail_ids
+    if detail_ids is None:
+        if len(items) != len(snapshot["items"]):
+            raise HTTPException(409, "明细数量已变化，请刷新后使用当前文件编辑入口。")
+        detail_ids = [item["id"] for item in snapshot["items"]]
+    if len(detail_ids) != len(items) or len([value for value in detail_ids if value is not None]) != len({value for value in detail_ids if value is not None}):
+        raise HTTPException(422, "明细身份与提交的数据不一致。")
+    existing_ids = {item["id"] for item in snapshot["items"]}
+    supplied_ids = {value for value in detail_ids if value is not None}
+    if not supplied_ids <= existing_ids:
+        raise HTTPException(409, "部分明细已经删除或不属于这份文件，请刷新。")
+    stored_json = json.dumps([issue.model_dump() for issue in stored_issues], ensure_ascii=False)
+    current = revise_current(
+        session, task_id, expected_version=update.expected_version,
+        header_changes={key: header.get(key) for key in snapshot["header"].keys() | header.keys()},
+        detail_changes={identity: item for identity, item in zip(detail_ids, items) if identity is not None},
+        deleted_ids=list(existing_ids - supplied_ids),
+        new_items=[item for identity, item in zip(detail_ids, items) if identity is None],
+        validation_json=stored_json, operation="file_edit",
     )
-    session.add(revision)
+    if not current.has_data:
+        current.validation_json = "[]"
+        blocking_issues = []
     from document_pipeline_api.services.file_names import confirm_file_name
     confirm_file_name(task, update.filename)
-    session.flush()
-    from document_pipeline_api.services.data_tables import (
-        confirm_task,
-        materialize_task_result,
-    )
-
-    if task.status == TaskStatus.COMPLETED.value and blocking_issues:
-        # 已完成任务带着未忽略的阻断问题：保存本次草稿与校验问题（含忽略标记），
-        # 但不写数据表、不更新确认记录。前端据此展示 error 条目，用户可逐条忽略后再次保存。
-        try:
-            session.commit()
-        except IntegrityError as error:
-            session.rollback()
-            raise HTTPException(
-                status_code=409,
-                detail="结果已在其他位置更新，请刷新后再修改。",
-            ) from error
-        return _read_extraction(session, extraction)
-
-    materialize_task_result(
-        session,
-        task_id,
-        result_json=saved_result.model_dump_json(),
-    )
-    if task.status == TaskStatus.COMPLETED.value:
-        from document_pipeline_api.models import ConfirmedDocumentRecord
-
-        confirmation = session.get(ConfirmedDocumentRecord, task_id)
-        if confirmation is not None:
-            confirmation.review_version = current_version + 1
-            confirmation.result_json = saved_result.model_dump_json()
-    elif not blocking_issues:
-        confirm_task(
-            session,
-            task_id,
-            expected_review_version=current_version + 1,
-        )
-        return _read_extraction(session, extraction)
-    try:
-        session.commit()
-    except IntegrityError as error:
-        session.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail="结果已在其他位置更新，请刷新后再修改。",
-        ) from error
+    task.status = TaskStatus.NEEDS_REVIEW.value if blocking_issues else TaskStatus.COMPLETED.value
+    session.execute(update_rows_pending_statement(task_id, bool(blocking_issues)))
+    session.commit()
     return _read_extraction(session, extraction)
+
+
+def update_rows_pending_statement(task_id: str, pending: bool):
+    from sqlalchemy import update
+    from document_pipeline_api.models import DataRowRecord
+    return update(DataRowRecord).where(DataRowRecord.task_id == task_id).values(review_pending=pending)
 
 
 def _diff_values(before, after, path: str = "") -> list[dict[str, object]]:
@@ -396,6 +344,15 @@ def process_task(
     )
     if lease is None:
         raise HTTPException(status_code=409, detail="只有等待处理的任务可以开始。")
+    from document_pipeline_api.models import FileCurrentDataRecord
+    if session.get(ExtractionRecord, task_id) is not None or session.get(FileCurrentDataRecord, task_id) is not None:
+        # Old queues or callers outside template selection must not replace the
+        # immutable extraction while materialization keeps the existing facts.
+        fail_leased_task(
+            session, task_id, lease.token, code="existing_extraction",
+            message="这份文件已有提取结果，已停止重复处理以保留初始证据和当前数据。请查看已有结果。",
+        )
+        return None
     # 二次暂停检查：关闭「首次检查 → 获取租约」之间的竞态窗口。暂停事务先设标志、
     # 再 UPDATE 处理中任务，若暂停提交恰好落在两次操作之间，本任务刚拿到的租约
     # 不会被那次 UPDATE 命中，必须在这里把租约退回（转回已暂停），保持队列冻结。
@@ -480,7 +437,6 @@ def process_task(
         ensure_builtin_templates(session)
         templates = list_templates(session)
         # 智能匹配只从预选池模板中选（设置页可调整），池内模板语义不重叠时匹配最稳
-        smart_pool = [template for template in templates if template.in_smart_pool]
         selected_template = None
         if task.template_id is not None and task.template_version is not None:
             selected_template = get_template_version(
@@ -498,6 +454,9 @@ def process_task(
                 None,
             )
         else:
+            from document_pipeline_api.services.autonomous_extraction import frozen_pool
+            smart_pool = frozen_pool(session, task)
+            session.commit()
             from document_pipeline_api.services.model_usage import model_call
             if smart_pool:
                 with model_call(session, model_client, "matching", task_settings.model_provider):
@@ -509,12 +468,12 @@ def process_task(
             if decision.outcome == "matched":
                 selected_template = next(
                     template
-                    for template in templates
+                    for template in smart_pool
                     if template.id == decision.template_ids[0]
                 )
             elif decision.outcome == "ambiguous":
                 candidate_lookup = {
-                    template.id: template for template in templates
+                    template.id: template for template in smart_pool
                 }
                 task.candidate_templates_json = json.dumps(
                     [
@@ -555,7 +514,12 @@ def process_task(
             },
         ):
             return None
-        if selected_template.builtin_key in {"invoice", "delivery"}:
+        if selected_template.engine_kind == "autonomous":
+            from document_pipeline_api.services.autonomous_extraction import AutonomousExtraction, extraction_prompt
+            document_kind = DocumentKind.CUSTOM
+            result_type = AutonomousExtraction
+            prompt = extraction_prompt(selected_template)
+        elif selected_template.engine_kind == "legacy" and selected_template.builtin_key in {"invoice", "delivery"}:
             document_kind = DocumentKind(selected_template.builtin_key)
             result_type = DocumentExtraction
             prompt = EXTRACTION_PROMPTS[document_kind]
@@ -578,6 +542,11 @@ def process_task(
             raw_result = _extract_from_pages(model_client, image_paths, prompt + "\n" + input_text, model_type)
         raw_values = raw_result.model_dump()
         naming_advice = raw_values.pop("file_name_advice", None)
+        output_schema = None
+        if selected_template.engine_kind == "autonomous":
+            dynamic_result = AutonomousExtraction.model_validate(raw_values)
+            output_schema = dynamic_result.columns()
+            raw_values.pop("fields")
         result = (DocumentExtraction if document_kind != DocumentKind.CUSTOM else TemplateExtraction).model_validate(raw_values)
         if not transition_leased_task(
             session,
@@ -617,6 +586,7 @@ def process_task(
             rule_engine_version=evaluation.engine_version,
             elapsed_seconds=round(time.perf_counter() - started_at, 3),
             result_json=result.model_dump_json(),
+            output_schema_json=json.dumps(output_schema, ensure_ascii=False) if output_schema is not None else None,
             validation_json=json.dumps(
                 [issue.model_dump() for issue in issues],
                 ensure_ascii=False,
@@ -634,33 +604,25 @@ def process_task(
                 ensure_ascii=False,
             ),
         )
-        session.merge(record)
+        # An extraction is initial evidence. A primary-key collision must roll
+        # back this attempt rather than silently replace the earlier evidence.
+        session.add(record)
         session.flush()
         from document_pipeline_api.services.data_tables import (
             confirm_task,
             materialize_task_result,
         )
 
-        # 先保留提取快照，再校验指定表。这样用户选错表后可以直接改选兼容表，
-        # 无需再次调用模型；此时不物化数据行，也不进入文件历史完成态。
+        # The extraction is already the file's current fact even when the old
+        # requested destination is incompatible. Keep it in its template table,
+        # and surface the routing issue without a second result-only state.
         if task.target_table_id:
-            from document_pipeline_api.models import DataTableRecord
 
-            target_table = session.get(DataTableRecord, task.target_table_id)
-            expected_key = (
-                selected_template.id
-                if selected_template.builtin_key is None
-                else selected_template.builtin_key
-            )
-            expected_version = (
-                str(selected_template.version)
-                if selected_template.builtin_key is None
-                else "builtin-v1"
-            )
-            if target_table is None or (
-                target_table.template_key != expected_key
-                or target_table.template_version != expected_version
-            ):
+            from document_pipeline_api.services.template_contract import destination_for_extraction
+            destination = destination_for_extraction(session,record)
+            if destination is None or task.target_table_id != destination.id:
+                task.target_table_id = None
+                materialize_task_result(session, task.id)
                 task.candidate_templates_json = json.dumps(
                     [{
                         "id": selected_template.id,
@@ -711,6 +673,8 @@ def process_task(
             if isinstance(error, ModelServiceError)
             else "input_preprocessing_failed"
             if isinstance(error, InputBudgetError)
+            else "invalid_original_reference"
+            if isinstance(error, InvalidOriginalReference)
             else "storage_unavailable"
             if isinstance(error, OSError)
             else "processing_failed"
@@ -720,6 +684,8 @@ def process_task(
             if is_match_error
             else str(error)
             if isinstance(error, (ModelServiceError, InputBudgetError))
+            else "内部原件引用无效，已停止处理。请重新导入原文件。"
+            if isinstance(error, InvalidOriginalReference)
             else "文件存储不可用，请检查磁盘空间和文件权限后重试。"
             if isinstance(error, OSError)
             else "文件处理失败，原文件仍在。请检查模型服务后重试。"
@@ -754,7 +720,7 @@ def _extract_from_pages(
 
 def _effective_evidence(
     record: ExtractionRecord,
-    review: ReviewRevisionRecord | None,
+    changed_paths: set[str],
     result: DocumentExtraction | TemplateExtraction,
     *,
     page_count: int,
@@ -769,11 +735,17 @@ def _effective_evidence(
         }
     except (TypeError, ValueError):
         stored = {}
-    changed_paths = {
-        change["path"]
-        for change in (json.loads(review.changes_json) if review is not None else [])
-        if isinstance(change, dict) and isinstance(change.get("path"), str)
-    }
+    if record.document_kind != "custom":
+        from document_pipeline_api.services.data_baseline_audit import ITEM_ALIASES
+        normalized = {}
+        for path, evidence in stored.items():
+            if path.startswith("items[") and "." in path:
+                parent, key = path.rsplit(".", 1)
+                path = f"{parent}.{ITEM_ALIASES.get(key, key)}"
+            elif not path.startswith("header."):
+                path = f"header.{path}"
+            normalized[path] = evidence.model_copy(update={"field_path": path})
+        stored = normalized
     fallback = {
         evidence.field_path: evidence
         for evidence in _baseline_evidence(result, page_count=page_count, scope=InputScope.model_validate_json(record.input_scope_json) if record.input_scope_json else None)

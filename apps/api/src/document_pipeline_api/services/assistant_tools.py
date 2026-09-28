@@ -5,20 +5,22 @@ from typing import Literal
 from uuid import uuid4
 from fastapi import HTTPException
 from pydantic import Field
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 
+from document_pipeline_api.services.current_data import row_values
 from document_pipeline_api.models import (
     DataRowRecord,
-    DataRowRevisionRecord,
     DataTableRecord,
     TaskRecord,
+    FileCurrentDataRecord,
+    FileRevisionRecord,
+    ExtractionRecord,
 )
 from document_pipeline_api.services.assistant_analysis import (
     Strict,
     AnalysisRequest,
     Filter,
     analyze,
-    document_key,
 )
 from document_pipeline_api.services.data_tables import list_data_tables, table_columns
 from document_pipeline_api.services.templates import (
@@ -26,7 +28,6 @@ from document_pipeline_api.services.templates import (
     get_template_version,
     get_template,
 )
-from document_pipeline_api.services.extraction import get_extraction
 from document_pipeline_api.model_diagnostics import safe_diagnostic
 from document_pipeline_api.services.assistant_operations import (
     Plan,
@@ -40,6 +41,7 @@ class Context(Strict):
     table_id: str | None = None
     table_name: str | None = None
     row_ids: list[int] | None = Field(default=None, max_length=2000)
+    source_keys: list[str] | None = Field(default=None, max_length=50)
     search: str = Field(default="", max_length=500)
     task_id: str | None = None
     template_id: str | None = None
@@ -56,10 +58,16 @@ class Context(Strict):
 
 
 class Resource(Strict):
-    kind: Literal["table", "task", "template", "revisions"]
+    kind: Literal["table", "task", "template", "revisions", "file_data", "file_revisions"]
     id: str
     version: int | None = None
     row_id: int | None = None
+    page: int = Field(default=1, ge=1)
+    limit: int = Field(default=3, ge=1, le=20)
+
+
+class Handbook(Strict):
+    topic: str | None = Field(default=None, description="省略读取目录，再用目录中的主题 ID 读取一章。")
 
 
 class Catalog(Strict):
@@ -160,6 +168,7 @@ class ToolDetail(Strict):
 
 
 TOOL_MODELS = {
+    "read_handbook": (Handbook, "按需读取知意使用手册：数据流、修订删除、模板、命名归档、智能匹配、问知意、统计、备份、API 和 MCP。不读取用户资料，也不执行修改。"),
     "enable_analysis_options": (
         AnalysisOptions,
         "仅当用户提出额外条件筛选、排序或统计粒度要求时，准备完整分析参数；普通按字段分组、按月汇总只需 analyze_data_table，无需此步骤。",
@@ -203,7 +212,7 @@ TOOL_MODELS = {
     "catalog": (Catalog, "查找本次已授权的表、模板或任务；不列出范围外资料。"),
     "read_resource": (
         Resource,
-        "读取授权表结构、任务结果/诊断、模板版本或数据行修订。引用由系统提供。",
+        "读取授权资料。table 表结构；task 文件状态和前三条当前明细；file_data 按 page/limit 读当前明细；file_revisions 读文件版本目录，指定 version 读变化；template 模板版本；revisions 按 page/limit 读独立行历史，可指定 row_id，省略需整表授权。文件类 id 是文件 ID。引用由系统提供。",
     ),
     "analyze_data_table": (
         AnalysisRequest,
@@ -286,6 +295,9 @@ def tool_specs(enabled, draft=False):
 def scoped_tool_specs(session, context, artifacts, draft, question="", *, stable=False):
     draft = False  # Template writing belongs to the native template workflow.
     tables = bool(context.table_id or context.table_ids or context.workspace)
+    selected_tables = set(context.table_ids + ([context.table_id] if context.table_id else []))
+    tabular = context.workspace or bool(selected_tables and session.scalar(select(DataTableRecord.id).where(
+        DataTableRecord.id.in_(selected_tables), DataTableRecord.collection_kind != "files").limit(1)))
     tasks = bool(context.task_id or context.task_ids or context.workspace)
     any_scope = tables or tasks or context.template_id or context.template_ids
     writable = context.mode != "read"
@@ -329,7 +341,7 @@ def scoped_tool_specs(session, context, artifacts, draft, question="", *, stable
         )
     )
     allowed = {"catalog", "read_resource"} if any_scope else {"catalog"}
-    if tables:
+    if tabular:
         allowed.update({"read_data_rows", "analyze_data_table", "enable_analysis_options"})
     if tasks or tables:
         allowed.add("read_original_page")
@@ -337,7 +349,7 @@ def scoped_tool_specs(session, context, artifacts, draft, question="", *, stable
         allowed.add("render_chart")
     if all_snapshots:
         allowed.update({"read_analysis_snapshot", "prepare_export"})
-    if stable and tables:
+    if stable and tabular:
         # References are returned by tools; do not rebuild the entire provider
         # tool prefix with fresh random snapshot IDs after every calculation.
         allowed.update({"render_chart", "read_analysis_snapshot", "prepare_export"})
@@ -373,6 +385,7 @@ def scoped_tool_specs(session, context, artifacts, draft, question="", *, stable
         allowed.add("read_tool_result")
         if not any(s["function"]["name"] == "read_tool_result" for s in specs):
             specs += [s for s in tool_specs(True) if s["function"]["name"] == "read_tool_result"]
+    allowed.add("read_handbook")
     specs = [s for s in specs if s["function"]["name"] in allowed]
     if "propose_operations" in allowed and not any(
         s["function"]["name"] == "propose_operations" for s in specs
@@ -396,6 +409,10 @@ def scoped_tool_specs(session, context, artifacts, draft, question="", *, stable
                 for kind, cap in CAPABILITY.items()
                 if cap in context.capabilities and (not categories or cap in categories)
             ]
+            if context.task_id and not context.workspace:
+                kinds = [kind for kind in kinds if kind in {
+                    "update_rows", "increment_rows", "delete_rows", "tasks",
+                }]
             operation["properties"]["kind"]["enum"] = kinds
             if categories == {"data"}:
                 # The explicitly requested capability determines this schema.
@@ -491,7 +508,17 @@ def scoped_tool_specs(session, context, artifacts, draft, question="", *, stable
     return specs
 
 
+def resolve_file_context(session, context):
+    """A selected file may use its own current table, never the whole table."""
+    if context.task_id and not context.table_id:
+        current = session.get(FileCurrentDataRecord, context.task_id)
+        if current is not None and current.table_id:
+            context.table_id = current.table_id
+    return context
+
+
 def check_context(session, context):
+    resolve_file_context(session, context)
     for identifier in context.table_ids:
         if session.get(DataTableRecord, identifier) is None:
             raise HTTPException(404, "选定的数据表已不存在。")
@@ -502,8 +529,11 @@ def check_context(session, context):
         get_template(session, identifier)
     if context.table_id and session.get(DataTableRecord, context.table_id) is None:
         raise HTTPException(404, "当前表已不存在，请重新选择上下文。")
-    if context.row_ids is not None and not context.table_id:
+    if (context.row_ids is not None or context.source_keys is not None) and not context.table_id:
         raise HTTPException(422, "选择记录时必须同时指定数据表。")
+    if context.source_keys is not None:
+        from document_pipeline_api.services.data_groups import validate_source_keys
+        context.source_keys = validate_source_keys(session, context.table_id, context.source_keys)
     if context.row_ids:
         found = set(
             session.scalars(
@@ -541,23 +571,68 @@ def permit_read(session, context, kind, identifier):
     except HTTPException:
         if kind != "task":
             raise
-    # A selected warehouse fact includes its verified source document, not other tasks.
+    # Resolve the source identity without expanding the selected detail scope.
+    # Reading current details/history/evidence checks its own narrower boundary.
     for table_id in set(context.table_ids + ([context.table_id] if context.table_id else [])):
-        try:
-            request = scoped_analysis(
-                session,
-                context,
-                AnalysisRequest(table_id=table_id, task_id=identifier, records=True, limit=1),
-            )
-            if request.task_id == identifier and any(
-                row.get("task_id") == identifier
-                for row in analyze(session, request).get("rows", [])
-            ):
-                return
-        except HTTPException as error:
-            if error.status_code != 403:
-                raise
+        if session.scalar(select(TaskRecord.id).where(TaskRecord.id == identifier,
+                              TaskRecord.id.in_(source_task_query(session, context, table_id)))):
+            return
     raise HTTPException(403, "该文件不属于授权资料的来源。")
+
+
+def source_task_query(session, context, table_id):
+    request = scoped_analysis(session, context, AnalysisRequest(table_id=table_id, records=True, limit=1))
+    # Whole-table permission includes its cleared files' history, while a row,
+    # search or group selection must still have a matching current source row.
+    if request.row_ids is None and request._scope_source_keys is None and not request.search and not request._scope_view_id:
+        query = select(FileCurrentDataRecord.task_id).where(FileCurrentDataRecord.table_id == table_id)
+        return query.where(FileCurrentDataRecord.task_id == request.task_id) if request.task_id else query
+    return select(DataRowRecord.task_id).where(*source_row_predicates(session, request))
+
+
+def source_row_predicates(session, request):
+    predicates = [DataRowRecord.table_id == request.table_id]
+    if request.row_ids is not None:
+        predicates.append(DataRowRecord.id.in_(request.row_ids))
+    if request._scope_source_keys is not None:
+        from document_pipeline_api.services.data_groups import source_identity_expression
+        predicates.append(source_identity_expression().in_(request._scope_source_keys))
+    if request.task_id:
+        predicates.append(DataRowRecord.task_id == request.task_id)
+    if request.search:
+        from document_pipeline_api.services.current_data import row_search_predicate
+        predicates.append(row_search_predicate(request.search))
+    if request._scope_view_id:
+        from document_pipeline_api.models import DataViewRecord
+        from document_pipeline_api.services.data_views import _view_predicate
+        predicates.append(_view_predicate(session.get(DataViewRecord, request._scope_view_id)))
+    return predicates
+
+
+def file_row_scope(session, context, task_id):
+    """None means the complete file; otherwise return authorized current row IDs.
+
+    A source link from one selected row is not a grant for the entire document.
+    Explicitly selecting that file separately does grant its full contents.
+    """
+    if task_id in context.task_ids:
+        return None
+    current = session.get(FileCurrentDataRecord, task_id)
+    if current is None or current.table_id != context.table_id:
+        return None  # permit_read already established a file/whole-table grant
+    request = scoped_analysis(session, context, AnalysisRequest(table_id=current.table_id, records=True, limit=1))
+    if request.row_ids is None and not request.search and not request._scope_view_id:
+        # A whole source card grants this complete file, while an empty or
+        # different source selection must never become a full-file permission.
+        if request._scope_source_keys is None or json.dumps({'id': task_id, 'kind': 'file'},
+                ensure_ascii=False, separators=(',', ':')) in request._scope_source_keys:
+            return None
+    return select(DataRowRecord.id).where(DataRowRecord.task_id == task_id, *source_row_predicates(session, request))
+
+
+def require_full_file(session, context, task_id):
+    if file_row_scope(session, context, task_id) is not None:
+        raise HTTPException(403, "当前只授权了部分明细。读取原件或完整文件修订历史，请在对话设置中选择这份文件；没有自动扩大范围。")
 
 
 def require_capability(context, capability):
@@ -568,6 +643,9 @@ def require_capability(context, capability):
 def scoped_analysis(session, context, body):
     permitted(context, "table", body.table_id)
     if body.table_id == context.table_id:
+        if context.source_keys is not None:
+            from document_pipeline_api.services.data_groups import validate_source_keys
+            body._scope_source_keys = validate_source_keys(session, body.table_id, context.source_keys)
         if context.task_id:
             if body.task_id and body.task_id != context.task_id:
                 raise HTTPException(403, "本次只能分析所选文件。")
@@ -591,13 +669,9 @@ def scoped_analysis(session, context, body):
             view = session.get(DataViewRecord, context.view_id)
             if not view or view.table_id != body.table_id:
                 raise HTTPException(409, "分组已变化，请重新选择上下文。")
-            value = json.loads(view.field_value_json)
-            if view.field_key == "":
-                body.task_id = value
-            else:
-                from document_pipeline_api.services.assistant_analysis import Filter
-
-                body.filters.append(Filter(field=view.field_key, value=value))
+            # A view is an authorization boundary, not a loose business filter.
+            # Use the warehouse's SQL predicate, including JSON type and NULL.
+            body._scope_view_id = view.id
     return body
 
 
@@ -618,27 +692,33 @@ def change_preview(session, context, body):
     columns = {c.key: c for c in table_columns(session, table)}
     if any(k not in columns for k in body.changes):
         raise HTTPException(422, "修改包含未知字段。")
-    header = {k for k in body.changes if columns[k].section == "header"}
-    values = json.loads(row.row_json)
+    from document_pipeline_api.services.data_groups import effective_header_keys, row_source_key, source_identity_expression
+    header = effective_header_keys(session, row, list(columns.values())) & body.changes.keys()
+    values = row_values(row)
     related = [row]
     if header:
+        related_predicates = [DataRowRecord.id == row.id]
         if row.task_id:
-            related = session.scalars(
-                select(DataRowRecord).where(DataRowRecord.task_id == row.task_id)
-            ).all()
+            related_predicates = [DataRowRecord.task_id == row.task_id]
         elif values.get("__row_group"):
-            related = [
-                r
-                for r in session.scalars(
-                    select(DataRowRecord).where(DataRowRecord.table_id == body.table_id)
-                )
-                if document_key(r, json.loads(r.row_json)) == document_key(row, values)
-            ]
+            related_predicates = [DataRowRecord.table_id == body.table_id,
+                                  source_identity_expression() == row_source_key(row)]
+        # A shared header is one fact, but permission for one detail must not
+        # silently grant writes to every other detail displaying that fact.
+        scoped = scoped_analysis(session, context, AnalysisRequest(table_id=body.table_id, records=True, limit=1))
+        authorized = select(DataRowRecord.id).where(*source_row_predicates(session, scoped))
+        explicitly_selected_file = row.task_id is not None and row.task_id in context.task_ids
+        if not explicitly_selected_file and session.scalar(select(DataRowRecord.id).where(
+            *related_predicates, DataRowRecord.id.not_in(authorized),
+        ).limit(1)) is not None:
+            raise HTTPException(403, "当前只授权了部分明细，不能修改影响整份文件或来源的共享字段。请先选择完整文件或完整来源；没有自动扩大修改范围。")
+        related = list(session.scalars(select(DataRowRecord).where(*related_predicates)
+                                       .order_by(DataRowRecord.id).limit(201)))
     if any(r.table_id != body.table_id for r in related):
         raise HTTPException(409, "此公共字段会同步影响其他表，请在原生数据仓库中核对后修改。")
     affected = []
     for current in related:
-        before = json.loads(current.row_json)
+        before = row_values(current)
         changes = body.changes if current.id == row.id else {k: body.changes[k] for k in header}
         affected.append(
             {
@@ -658,7 +738,7 @@ def change_preview(session, context, body):
         "table_name": table.name,
         "columns": {k: columns[k].label for k in body.changes},
         "affected": affected,
-        "note": "修改仓库事实，不重新执行提取校验；公共字段的相关明细会同步。",
+        "note": "修改当前数据。关联文件按提取时规则重新校验，文件级字段只修改一次；独立数据保留原有来源状态。",
     }
 
 
@@ -694,6 +774,9 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
         raise HTTPException(422, "模板创建与修改请使用模板页面的 AI 生成或编辑入口。")
     model = TOOL_MODELS[name][0]
     body = model.model_validate(structured_arguments(model, arguments))
+    if name == "read_handbook":
+        from document_pipeline_api.services.handbook import handbook
+        return {"kind": "handbook", **handbook(body.topic)}
     if name == "enable_analysis_options":
         artifacts["_analysis_options"] = {"enabled": True}
         return {"note": "已准备条件分析，资料授权范围保持不变。"}
@@ -735,7 +818,6 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
         query = select(AssistantMessage).where(AssistantMessage.thread_id == artifacts["_history_thread"],
             AssistantMessage.position < artifacts["_history_before"])
         if body.search:
-            from sqlalchemy import func
             parts = func.json_each(AssistantMessage.parts_json).table_valued("value").alias("history_parts")
             query = query.where(select(1).select_from(parts).where(
                 func.json_extract(parts.c.value, "$.text").contains(body.search, autoescape=True)
@@ -814,7 +896,10 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
             "warnings": snapshot.get("warnings", []),
         }
     if name == "read_original_page":
+        from document_pipeline_api.services.read_snapshot import begin_read_snapshot
+        begin_read_snapshot(session)
         permit_read(session, context, "task", body.task_id)
+        require_full_file(session, context, body.task_id)
         if settings is None:
             raise HTTPException(503, "原件读取服务未配置。")
         from document_pipeline_api.services.assistant_originals import read_original
@@ -844,7 +929,9 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
             # recent-file cutoff or retaining the entire catalog in memory.
             query = select(TaskRecord.id, TaskRecord.filename, TaskRecord.status, TaskRecord.file_name_json).order_by(TaskRecord.created_at.desc(), TaskRecord.id)
             if not context.workspace:
-                query = query.where(TaskRecord.id.in_(allowed))
+                sources = [TaskRecord.id.in_(source_task_query(session, context, identifier))
+                           for identifier in set(context.table_ids + ([context.table_id] if context.table_id else []))]
+                query = query.where(or_(TaskRecord.id.in_(allowed), *sources))
             items, total = [], 0
             search = body.search.casefold()
             for row in session.execute(query.execution_options(yield_per=1000)):
@@ -860,6 +947,17 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
             values = [
                 {"id": v.id, "name": v.name, "rows": v.row_count} for v in list_data_tables(session)
             ]
+            if context.table_id:
+                # Catalog metadata is also model-visible business data. Use
+                # the same row/source/search/view/file intersection as reads,
+                # including explicitly empty selections.
+                scoped = scoped_analysis(session, context, AnalysisRequest(table_id=context.table_id, records=True, limit=1))
+                own_count = session.scalar(select(func.count()).select_from(DataRowRecord).where(
+                    *source_row_predicates(session, scoped),
+                )) or 0
+                for value in values:
+                    if value["id"] == context.table_id:
+                        value["rows"] = own_count
         elif body.kind == "templates":
             values = [
                 {"id": v.id, "name": v.name, "version": v.version} for v in list_templates(session)
@@ -874,8 +972,35 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
             "kind": body.kind,
         }
     if name == "read_resource":
-        permit_read(session, context, "table" if body.kind == "revisions" else body.kind, body.id)
+        from document_pipeline_api.services.read_snapshot import begin_read_snapshot
+        begin_read_snapshot(session)
+        permission_kind = "table" if body.kind == "revisions" else "task" if body.kind in {"file_data", "file_revisions"} else body.kind
+        permit_read(session, context, permission_kind, body.id)
         ref = {"kind": body.kind, "id": body.id, "row_id": body.row_id}
+        if body.kind in {"file_data", "file_revisions"}:
+            from document_pipeline_api.services.file_collections import file_details
+            from document_pipeline_api.services.file_revisions import list_revisions, revision_details
+            task = session.get(TaskRecord, body.id)
+            if task is None:
+                raise HTTPException(404, "文件已删除。")
+            reference = {"kind": "task", "id": body.id, "label": task.display_filename}
+            if body.kind == "file_data":
+                return {"reference": reference, "kind": "file_current",
+                        **file_details(session, body.id, page=body.page, page_size=body.limit,
+                                       row_ids=file_row_scope(session, context, body.id)),
+                        "scope": "仅本次授权范围内的当前数据"}
+            require_full_file(session, context, body.id)
+            if body.version is None:
+                return {"reference": reference, "kind": "file_revisions",
+                        **list_revisions(session, body.id, page=body.page, page_size=body.limit),
+                        "note": "这是文件级历史目录，读取某轮变化请指定 version；不是当前数据。"}
+            revision_id = session.scalar(select(FileRevisionRecord.id).where(
+                FileRevisionRecord.task_id == body.id, FileRevisionRecord.version == body.version))
+            if revision_id is None:
+                raise HTTPException(404, "没有找到这个文件版本。")
+            return {"reference": reference, "kind": "file_revision",
+                    **revision_details(session, body.id, revision_id, page=body.page, page_size=body.limit),
+                    "note": "这是历史变化。deleted_before 为删除前完整明细，历史值不代表当前值。"}
         if body.kind == "table":
             table = session.get(DataTableRecord, body.id)
             if not table:
@@ -883,7 +1008,9 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
             return {
                 "reference": {**ref, "label": table.name},
                 "columns": [c.model_dump() for c in table_columns(session, table)],
+                "collection_kind": table.collection_kind,
                 "scope": context.model_dump(),
+                "reading": "当前只授权所选文件的数据；不同文件不能按同名字段自动合并统计。" if context.task_id else "自主提取按文件读取：先 catalog tasks，再 read_resource 的 file_data；不同文件不能按同名字段自动合并统计。" if table.collection_kind == "files" else "普通数据表可按字段查询或汇总。",
             }
         if body.kind == "template":
             version = body.version or (
@@ -899,29 +1026,23 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
                 "template": template.model_dump(mode="json"),
             }
         if body.kind == "revisions":
-            ensure_row_scope(session, context, body.id, body.row_id)
-            row = session.get(DataRowRecord, body.row_id)
-            if not row or row.table_id != body.id:
-                raise HTTPException(404, "记录不存在。")
-            if context.row_ids is not None and row.id not in context.row_ids:
-                raise HTTPException(403, "该行未在本次选择中。")
-            revisions = session.scalars(
-                select(DataRowRevisionRecord)
-                .where(DataRowRevisionRecord.row_id == row.id)
-                .order_by(DataRowRevisionRecord.version.desc())
-                .limit(30)
-            ).all()
+            from document_pipeline_api.services.data_rows import independent_history
+            row = session.get(DataRowRecord, body.row_id) if body.row_id else None
+            if row is not None:
+                ensure_row_scope(session, context, body.id, row.id)
+            else:
+                scope = scoped_analysis(session, context, AnalysisRequest(table_id=body.id, records=True, limit=1))
+                if scope.row_ids is not None or scope._scope_source_keys is not None or scope.search or scope._scope_view_id or scope.task_id:
+                    raise HTTPException(403, "查看整表或已删除独立数据的历史，需要选择完整数据表。")
+            if row is not None and row.task_id:
+                return execute_tool(session, context, "read_resource", {
+                    "kind": "file_revisions", "id": row.task_id, "page": body.page, "limit": body.limit,
+                    **({"version": body.version} if body.version is not None else {}),
+                }, artifacts, settings)
             return {
-                "reference": {**ref, "label": "查看这行数据"},
-                "revisions": [
-                    {
-                        "version": r.version,
-                        "before": json.loads(r.before_json) if r.before_json else None,
-                        "after": json.loads(r.after_json) if r.after_json else None,
-                        "editor": r.editor,
-                    }
-                    for r in revisions
-                ],
+                "reference": {**ref, "label": "独立数据历史"},
+                **independent_history(session, body.id, row_id=body.row_id, page=body.page, page_size=body.limit),
+                "note": "这是手工、导入和独立合并数据的行历史，包含删除前内容，不代表当前值或文件版本。",
             }
         task = session.get(TaskRecord, body.id)
         if not task:
@@ -938,11 +1059,25 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
             "original": {"kind": "original", "id": task.id, "label": "查看原件"},
             "note": "只能根据保存的结果、校验及证据复核；不能复原原模型未记录的内部判断。",
         }
-        try:
-            result["extraction"] = get_extraction(session, task.id).model_dump(mode="json")
-        except HTTPException as e:
-            if e.status_code != 404:
-                raise
+        extraction = session.get(ExtractionRecord, task.id)
+        if extraction is not None:
+            from document_pipeline_api.services.file_collections import file_details
+            from document_pipeline_api.services.current_data import get_current
+            current = get_current(session, task.id)
+            row_scope = file_row_scope(session, context, task.id)
+            details = file_details(session, task.id, page=body.page, page_size=body.limit, row_ids=row_scope)
+            # File-wide issue text may contain values from unselected details.
+            issues = json.loads(current.validation_json) if row_scope is None else []
+            result["extraction"] = {
+                "result": {"header": details["header"], "items": [item["values"] for item in details["items"]]},
+                "schema": details["schema"], "version": details["version"], "has_data": current.has_data,
+                "item_count": details["total"], "detail_ids": [item["id"] for item in details["items"]],
+                "validation_issues": issues[(body.page - 1) * body.limit:body.page * body.limit], "issue_count": len(issues),
+                "input_scope": json.loads(extraction.input_scope_json) if extraction.input_scope_json else None,
+                "page": body.page, "page_size": body.limit,
+                "scope": "完整文件" if row_scope is None else "仅本次授权的明细；未读取文件级校验详情",
+            }
+            result["note"] = "当前结果按页读取，默认三条明细，不代表全文。更多内容用 file_data 翻页，修订用 file_revisions，原件用 read_original_page。"
         return result
     if name == "analyze_data_table":
         result = analyze(session, scoped_analysis(session, context, body))

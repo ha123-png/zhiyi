@@ -243,7 +243,9 @@ def test_fixed_names_are_unique_concurrently_and_stable_across_sessions(client):
     template = SimpleNamespace(id="fixed-template", name="送货单")
     ids = [
         client.post(
-            "/api/v1/tasks", files={"file": (f"original-{i}.txt", b"test", "text/plain")}
+            # Distinct files exercise the naming allocator without asking for
+            # intentional repeated extraction of identical bytes.
+            "/api/v1/tasks", files={"file": (f"original-{i}.txt", f"document {i}".encode(), "text/plain")}
         ).json()["id"]
         for i in range(24)
     ]

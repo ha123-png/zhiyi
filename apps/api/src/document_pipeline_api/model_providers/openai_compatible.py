@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 import httpx
+from pydantic import ValidationError
 
 from document_pipeline_api.model_providers.base import (
     ModelRequestRejectedError,
@@ -35,15 +36,38 @@ def _extract_json_text(content: str) -> str:
     return content
 
 
-def _unwrap_scalar_wrappers(value: object) -> object:
-    """模型偶尔会把标量包装成 {"value": ...}（附带单位或说明），
-    递归解包这种单键包装，避免严格 schema 校验失败或把 JSON 文本当值显示。"""
-    if isinstance(value, dict):
-        if len(value) == 1 and "value" in value:
-            return _unwrap_scalar_wrappers(value["value"])
-        return {key: _unwrap_scalar_wrappers(child) for key, child in value.items()}
-    if isinstance(value, list):
-        return [_unwrap_scalar_wrappers(child) for child in value]
+def _validate_payload(result_type: type[SchemaModel], payload: object) -> SchemaModel:
+    """Accept valid business JSON first. Repair wrappers only at scalar leaves."""
+    try:
+        return result_type.model_validate(payload)
+    except ValidationError:
+        schema = result_type.model_json_schema()
+        return result_type.model_validate(_unwrap_scalar_wrappers(payload, schema, schema))
+
+
+def _unwrap_scalar_wrappers(value: object, schema: dict, root: dict) -> object:
+    reference = schema.get("$ref", "")
+    if reference.startswith("#/$defs/"):
+        schema = root.get("$defs", {}).get(reference.removeprefix("#/$defs/"), {})
+    alternatives = schema.get("anyOf", schema.get("oneOf", [schema]))
+    shapes = [part for part in alternatives if part.get("type") != "null"]
+    if len(shapes) == 1 and shapes[0] is not schema:
+        return _unwrap_scalar_wrappers(value, shapes[0], root)
+    kind = schema.get("type")
+    if kind == "object" and isinstance(value, dict):
+        properties = schema.get("properties", {})
+        extra = schema.get("additionalProperties", {})
+        return {key: _unwrap_scalar_wrappers(child, properties.get(key, extra if isinstance(extra, dict) else {}), root)
+                for key, child in value.items()}
+    if kind == "array" and isinstance(value, list):
+        return [_unwrap_scalar_wrappers(child, schema.get("items", {}), root) for child in value]
+    scalar_types = {"string", "number", "integer", "boolean"}
+    if kind in scalar_types or (shapes and all(part.get("type") in scalar_types for part in shapes)):
+        # A bounded repair cannot reinterpret an object-valued business field.
+        for _ in range(8):
+            if not isinstance(value, dict) or set(value) != {"value"}:
+                break
+            value = value["value"]
     return value
 
 
@@ -280,7 +304,7 @@ class OpenAICompatibleProvider:
                 raise ModelResponseError("模型输出未完成，结果没有保存为成功。原件仍保留，请调整模型输出设置或缩小处理范围后重试。")
             content = choice["message"]["content"]
             payload = json.loads(_extract_json_text(content))
-            return result_type.model_validate({key: _unwrap_scalar_wrappers(value) for key, value in payload.items()} if isinstance(payload, dict) else payload)
+            return _validate_payload(result_type, payload)
         except httpx.TimeoutException as error:
             raise ModelTimeoutError(
                 "处理超时：模型可能未加载、正在加载或响应缓慢，"

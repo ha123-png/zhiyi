@@ -246,7 +246,7 @@ def test_catalog_is_direct_and_does_not_expand_permission(client, context, expec
         specs = scoped_tool_specs(
             session, context, {"_history": {"items": [{}]}}, False, "你可以看到什么表"
         )
-        assert [s["function"]["name"] for s in specs] == ["catalog"]
+        assert {s["function"]["name"] for s in specs} == {"catalog", "read_handbook"}
         result = execute_tool(session, context, "catalog", {"kind": "tables"}, {})
         assert [item["id"] for item in result["items"]] == expected
 

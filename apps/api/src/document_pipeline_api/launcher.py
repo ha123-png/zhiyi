@@ -97,12 +97,15 @@ def build_parser() -> argparse.ArgumentParser:
             "start",
             "stop",
             "stop-installation",
+            "validate-installation",
             "api",
             "worker",
             "mcp",
             "backup",
             "restore",
             "diagnose",
+            "audit-data",
+            "upgrade-data",
             "purge-data",
         ),
         help="内部运行模式；正式版由监督器调用。",
@@ -117,13 +120,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="API 端口；start 模式未指定时自动避让被占端口并持久化。",
     )
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--window-title", default="知意", help=argparse.SUPPRESS)
     parser.add_argument("--archive", type=Path)
+    parser.add_argument("--report", type=Path, help="audit-data 的只读预检报告；不覆盖已有文件。")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
 
 def main() -> None:
     arguments = build_parser().parse_args()
+    if arguments.report is not None and arguments.mode != "audit-data":
+        raise SystemExit("--report 只用于 audit-data。")
+    if arguments.mode in {"audit-data", "upgrade-data"}:
+        run_data_upgrade(arguments)
+        return
+    if arguments.mode == "validate-installation":
+        from document_pipeline_api.installation_layout import validate_installation_layout
+        if arguments.installation_dir is None:
+            raise SystemExit("An installation directory is required.")
+        try:
+            validate_installation_layout(arguments.installation_dir, arguments.data_dir or default_data_dir())
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        return
     if arguments.mode == "stop-installation":
         from document_pipeline_api.installation_processes import stop_installation
 
@@ -139,7 +158,7 @@ def main() -> None:
         ):
             from document_pipeline_api.desktop import run_desktop
 
-            run_desktop(data_dir, arguments.port)
+            run_desktop(data_dir, arguments.port, window_title=arguments.window_title)
             return
         from document_pipeline_api.supervisor import run_supervisor
 
@@ -203,6 +222,45 @@ def main() -> None:
         run_mcp()
         return
     run_worker()
+
+
+def run_data_upgrade(arguments) -> None:
+    """Offline packaging entry point; never silently pick a legacy current value."""
+    if arguments.mode == "upgrade-data" and arguments.data_dir is None:
+        raise SystemExit("升级必须通过 --data-dir 明确指定数据目录，并先退出知意。")
+    data_dir = (arguments.data_dir or default_data_dir()).resolve()
+    database = data_dir / "document-pipeline.db"
+    if not database.is_file():
+        raise SystemExit("没有找到现有数据库；未创建或修改数据。")
+    from document_pipeline_api.services.data_baseline_audit import audit_database
+
+    if arguments.mode == "audit-data":
+        report = audit_database(database)
+        rendered = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+        if arguments.report:
+            with arguments.report.open("x", encoding="utf-8") as output:
+                output.write(rendered)
+        else:
+            print(rendered, end="")
+        if not report["ready"]:
+            raise SystemExit(2)
+        return
+
+    from document_pipeline_api.db import build_engine
+    from document_pipeline_api.migrations import upgrade_database, DatabaseMigrationError
+    from document_pipeline_api.supervisor import SingleInstance
+
+    # Uses the same lock as the packaged desktop supervisor. An active program
+    # must finish its work and close before a standalone upgrade can start.
+    with SingleInstance(data_dir / "runtime" / "instance.lock"):
+        engine = build_engine(f"sqlite:///{database}")
+        try:
+            upgrade_database(engine)
+        except DatabaseMigrationError as error:
+            raise SystemExit(f"{error}\n原因：{error.__cause__}") from error
+        finally:
+            engine.dispose()
+    print("数据结构升级完成。原件保留；升级前数据库备份位于数据目录的 backups 文件夹。")
 
 
 if __name__ == "__main__":

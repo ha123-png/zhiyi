@@ -319,16 +319,22 @@ def test_authorized_source_page_and_pending_file_row_count(client, tmp_path):
         )
         session.add(task)
         session.flush()
+        from document_pipeline_api.models import FileCurrentDataRecord
+        session.add(FileCurrentDataRecord(task_id=task.id, table_id="ledger", header_json="{}", schema_json="[]", validation_json="[]"))
         for identifier in [1, 2, 3]:
             row = session.get(DataRowRecord, identifier)
             row.task_id = task.id
             row.review_pending = True
         session.get(DataRowRecord, 4).review_pending = False
         session.commit()
+        session.expire_all()
         context = Context(table_id="ledger", row_ids=[1])
         permit_read(session, context, "task", "source")
+        with pytest.raises(HTTPException) as error:
+            execute_tool(session, context, "read_original_page", {"task_id": "source"}, {}, settings)
+        assert error.value.status_code == 403
         original = execute_tool(
-            session, context, "read_original_page", {"task_id": "source"}, {}, settings
+            session, Context(task_id="source"), "read_original_page", {"task_id": "source"}, {}, settings
         )
         assert original["text"].startswith("合成原件") and original["next_offset"] == 4000
         with pytest.raises(HTTPException):

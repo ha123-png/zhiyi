@@ -722,6 +722,22 @@
   font-size: 0.875rem;
   animation: ask-pop-in 0.18s ease-out;
 }
+.ask-authorization-notice {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--muted-foreground);
+  font-size: .8rem;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.ask-authorization-notice.error { border-color: var(--destructive); color: var(--foreground); }
+.ask-authorization-notice button { flex: none; }
 .ask-settings-popover header {
   display: flex;
   justify-content: space-between;

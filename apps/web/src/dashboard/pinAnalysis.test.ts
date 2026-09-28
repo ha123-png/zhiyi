@@ -11,4 +11,7 @@ it("does not turn a restricted snapshot into a wider live statistic", () => {
     expect(statisticFromAnalysis({...base,source:{...base.source,request:{...base.source.request,...restriction}}})).toBeNull();
   }
   expect(statisticFromAnalysis({...base,truncated:true})).toBeNull();
+  expect(statisticFromAnalysis({...base,source:{...base.source,view_id:"view-a"}})).toBeNull();
+  expect(statisticFromAnalysis({...base,source:{...base.source,source_keys:[]}})).toBeNull();
+  expect(statisticFromAnalysis({...base,source:{...base.source,source_keys:['{"id":"A","kind":"file"}']}})).toBeNull();
 });

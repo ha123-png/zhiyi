@@ -27,4 +27,4 @@ def test_file_sqlite_enables_wal_foreign_keys_and_busy_timeout(
     assert journal_mode == "wal"
     assert foreign_keys == 1
     assert busy_timeout == 5000
-    assert synchronous == 1
+    assert synchronous == 2

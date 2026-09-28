@@ -5,7 +5,7 @@ import type { ExtractionTemplate } from "../types";
 import { Icon } from "./Icon";
 
 /** 智能匹配预选池：只有勾选的模板才会被智能匹配选中（设置 → 左侧）。 */
-export function SmartPoolSettings() {
+export function SmartPoolSettings({ onUpdated }: { onUpdated?: (templates: ExtractionTemplate[]) => void } = {}) {
   const [templates, setTemplates] = useState<ExtractionTemplate[]>([]);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -21,9 +21,9 @@ export function SmartPoolSettings() {
     setError(null);
     try {
       const updated = await updateTemplateSmartPool(template.id, checked);
-      setTemplates((current) =>
-        current.map((item) => (item.id === updated.id ? updated : item)),
-      );
+      const next = templates.map((item) => (item.id === updated.id ? updated : item));
+      setTemplates(next);
+      onUpdated?.(next);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "保存预选池失败。");
     } finally {
@@ -36,7 +36,7 @@ export function SmartPoolSettings() {
       <div className="callout" style={{ marginBottom: 12 }}>
         <Icon icon={ListChecks} size={14} />
         <span>
-          智能匹配只会从勾选的模板里选择。建议每类单据只对应一个模板，模板之间的用途描述不要重叠混淆，否则可能匹配到错误的模板。
+          只在勾选的普通模板中匹配。自主提取默认不勾选；加入后，仅在普通模板都不适用时兜底。更改只用于之后上传的文件。
         </span>
       </div>
       {error && <div className="callout danger">{error}</div>}
@@ -57,7 +57,7 @@ export function SmartPoolSettings() {
                 {template.is_system ? <span className="tpl-badge">内置</span> : null}
               </span>
               <span className="small muted smart-pool-desc">
-                {template.description || "尚未填写用途"}
+                {template.engine_kind === "autonomous" ? "可选兜底 · 普通模板均不适用时才使用" : template.description || "尚未填写用途"}
               </span>
               {busyId === template.id && (
                 <Icon icon={Loader2} size={13} className="spin" />

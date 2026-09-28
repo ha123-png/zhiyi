@@ -121,14 +121,25 @@ const assert = require('node:assert/strict');
     assert.equal(await page.locator('.guide-page .card').count(),4);
     assert(await page.locator('.guide-page .card').evaluateAll(nodes=>nodes.every(e=>parseFloat(getComputedStyle(e).borderTopWidth)>0)),'Guide uses bordered cards');
     await screenshot('guide-light.png');
-    await page.getByRole('button',{name:'模板怎么越用越顺手？',exact:true}).click();
+    // The old static FAQ question was replaced by the shared, on-demand handbook.
+    // Open the actual template topic and prove its current prose and action load.
+    const templateTopic=page.getByRole('button',{name:'模板、字段与规则版本',exact:true});
+    await templateTopic.click();
+    await page.getByRole('heading',{name:'普通模板',exact:true}).waitFor();
+    assert(await page.getByText('发票、送货单是可编辑、停用和删除的普通示例',{exact:false}).isVisible());
     await screenshot('guide-expanded.png');
     assert.equal(await page.locator('.guide-start').evaluate(e=>e.scrollWidth>e.clientWidth),false);
+    await page.getByRole('button',{name:'管理模板',exact:true}).click();
+    await page.getByRole('heading',{name:'模板管理',exact:true}).waitFor();
+    await page.getByRole('button',{name:'使用说明',exact:false}).click();
+    await page.getByRole('heading',{name:'使用说明',exact:true}).waitFor();
     await page.evaluate(()=>localStorage.setItem('theme','dark')); await page.reload();
     await page.getByRole('button',{name:'使用说明',exact:false}).click();
+    await page.getByRole('heading',{name:'使用说明',exact:true}).waitFor();
     await screenshot('guide-dark.png');
     await page.setViewportSize({width:480,height:760});
-    await page.getByRole('button',{name:'模板怎么越用越顺手？',exact:true}).click();
+    await page.getByRole('button',{name:'模板、字段与规则版本',exact:true}).click();
+    await page.getByRole('heading',{name:'普通模板',exact:true}).waitFor();
     await screenshot('guide-narrow-expanded.png');
     await page.locator('.app-page-wrap').evaluate(e=>e.scrollTop=0);
     await screenshot('guide-narrow.png');

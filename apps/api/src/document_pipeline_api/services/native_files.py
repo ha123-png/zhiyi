@@ -130,10 +130,20 @@ def import_source(path: Path):
 
 
 def issue_import_ticket(data_dir: Path, path: Path) -> dict:
+    from document_pipeline_api.services.file_operation_lock import file_operation_lock
+    with file_operation_lock(data_dir / "uploads"):
+        return _issue_import_ticket(data_dir, path)
+
+
+def _issue_import_ticket(data_dir: Path, path: Path) -> dict:
     # Called by the native dialog bridge only, never registered as an API route.
+    from document_pipeline_api.services.dataset_identity import dataset_generation, require_dataset_available
+    require_dataset_available(data_dir)
+    generation = dataset_generation(data_dir)
     with import_source(path) as source:
         value = fingerprint(source, path)
     value["expires"] = time.time() + 3600
+    value["generation"] = generation
     directory = data_dir / "native-imports"
     directory.mkdir(exist_ok=True)
     validate_local_path(directory)
@@ -155,18 +165,24 @@ def issue_import_ticket(data_dir: Path, path: Path) -> dict:
 
 @contextmanager
 def consume_import_ticket(data_dir: Path, token: str):
+    from document_pipeline_api.services.dataset_identity import dataset_generation, require_dataset_available
+    require_dataset_available(data_dir)
     if not re.fullmatch(r"[a-f0-9]{64}", token):
         raise CopyExportError("invalid_ticket", "文件选择已失效，请重新选择文件。")
     directory = data_dir / "native-imports"
     path = directory / f"{token}.json"
     claimed = path.with_suffix(".claimed")
+    claimed_owned = False
     try:
         validate_local_path(path)
         path.rename(claimed)  # Windows no-replace; one consumer owns the ticket.
+        claimed_owned = True
         value = json.loads(claimed.read_text(encoding="utf-8"))
-        if value["expires"] < time.time():
+        if value["expires"] < time.time() or value.get("generation") != dataset_generation(data_dir):
             raise ValueError
     except (OSError, ValueError, KeyError):
+        if claimed_owned:
+            claimed.unlink(missing_ok=True)
         raise CopyExportError("invalid_ticket", "文件选择已失效或已导入，请重新选择文件。") from None
     try:
         with import_source(Path(value["path"])) as source:
@@ -175,3 +191,24 @@ def consume_import_ticket(data_dir: Path, token: str):
             yield source, value
     finally:
         claimed.unlink(missing_ok=True)
+
+
+def renew_import_ticket(data_dir: Path, verified_origin: dict) -> str:
+    """Rotate a consumed capability after duplicate rejection, never from a path.
+
+    Only the native route calls this with the origin yielded by consume. Keep
+    the original expiry, fingerprint and dataset generation; consumption will
+    revalidate them. The client receives no filesystem authority beyond that
+    original native selection.
+    """
+    from document_pipeline_api.services.dataset_identity import dataset_generation, require_dataset_available
+    require_dataset_available(data_dir)
+    if (verified_origin.get("generation") != dataset_generation(data_dir)
+            or verified_origin.get("expires", 0) < time.time()):
+        raise CopyExportError("invalid_ticket", "文件选择已失效，请重新选择文件。")
+    directory = data_dir / "native-imports"
+    validate_local_path(directory)
+    token = secrets.token_hex(32)
+    with (directory / f"{token}.json").open("x", encoding="utf-8") as output:
+        json.dump(verified_origin, output, ensure_ascii=False)
+    return token

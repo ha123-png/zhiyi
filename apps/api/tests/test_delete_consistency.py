@@ -1,12 +1,4 @@
-"""删除一致性 + 镜像同步 + 指定目标表机制测试。
-
-用户批准的方案（2026-08-08）：
-- 删任务只删源（任务/提取/确认/原文件），数据表行保留（task_id 置空）；
-- 删数据行不影响任务/历史/统计；
-- 保存到表 = 按 item_index 对齐的镜像同步（原位更新/恢复；全删光追加末尾；
-  目标表被删则按模板重建）；
-- 历史页记录数 = 提取快照，不依赖数据表。
-"""
+"""File lifecycle and current-data deletion follow the v0.5 data baseline."""
 import json
 from pathlib import Path
 
@@ -17,9 +9,9 @@ from sqlalchemy import select
 from document_pipeline_api.config import Settings
 from document_pipeline_api.main import create_app
 from document_pipeline_api.models import (
-    ConfirmedDocumentRecord,
+    FileCurrentDataRecord,
+    FileRevisionRecord,
     DataRowRecord,
-    DataRowRevisionRecord,
     DataTableRecord,
     ExtractionRecord,
     TaskRecord,
@@ -97,23 +89,10 @@ def _seed_completed_task(session, task_id: str, *, target_table_id: str | None =
             evidence_json="[]",
         )
     )
+    session.flush()
+    from document_pipeline_api.services.data_tables import materialize_task_result
+    materialize_task_result(session, task_id)
     session.commit()
-
-
-def _seed_mirror_rows(session, task_id: str, table_id: str) -> list[int]:
-    row_ids: list[int] = []
-    for index in (1, 2):
-        row = DataRowRecord(
-            table_id=table_id,
-            task_id=task_id,
-            item_index=index,
-            row_json=json.dumps({"name": f"商品{index}"}),
-        )
-        session.add(row)
-        session.flush()
-        row_ids.append(row.id)
-    session.commit()
-    return row_ids
 
 
 def _seed_manual_table(session, table_id: str, name: str) -> None:
@@ -135,264 +114,107 @@ def _seed_manual_table(session, table_id: str, name: str) -> None:
     session.commit()
 
 
-def test_delete_task_keeps_table_rows_and_detaches_task_id(
-    client: TestClient,
-    tmp_path: Path,
-) -> None:
+def _data(client: TestClient) -> dict:
+    tables = client.get("/api/v1/tables").json()
+    source = next(table for table in tables if table["document_kind"] == "invoice")
+    return client.get(f"/api/v1/tables/{source['id']}").json()
+
+
+def _seed(client: TestClient, task_id: str = "file") -> dict:
     with client.app.state.session_factory() as session:
-        _seed_completed_task(session, "del-task-keep")
-        table = DataTableRecord(
-            id="table-keep",
-            name="发票",
-            template_key="invoice",
-            template_version="builtin-v1",
-            document_kind="invoice",
-        )
-        session.add(table)
-        session.flush()
-        _seed_mirror_rows(session, "del-task-keep", "table-keep")
-        session.add(
-            ConfirmedDocumentRecord(
-                task_id="del-task-keep",
-                table_id="table-keep",
-                review_version=0,
-                result_json="{}",
-            )
-        )
+        _seed_completed_task(session, task_id)
+    (client.app.state.settings.storage_dir / f"{task_id}.png").write_bytes(b"evidence")
+    return _data(client)
+
+
+def test_delete_whole_file_removes_bound_data_but_not_independent_copy(client):
+    data = _seed(client)
+    with client.app.state.session_factory() as session:
+        _seed_manual_table(session, "copy", "独立副本")
+        session.add(DataRowRecord(table_id="copy", item_index=1, row_json='{"name":"商品A"}'))
         session.commit()
-        (tmp_path / "uploads" / "del-task-keep.png").write_bytes(b"data")
-
-    response = client.delete("/api/v1/tasks/del-task-keep")
-
-    assert response.status_code == 200
-    assert response.json()["kept_rows"] == 2
+    response = client.delete("/api/v1/tasks/file")
+    assert response.status_code == 200, response.text
+    assert response.json()["kept_rows"] == 0
     with client.app.state.session_factory() as session:
-        assert session.get(TaskRecord, "del-task-keep") is None
-        assert session.get(ExtractionRecord, "del-task-keep") is None
-        assert session.get(ConfirmedDocumentRecord, "del-task-keep") is None
+        assert session.get(TaskRecord, "file") is None
+        assert session.get(ExtractionRecord, "file") is None
+        assert session.get(FileCurrentDataRecord, "file") is None
+        assert session.scalar(select(FileRevisionRecord).where(FileRevisionRecord.task_id == "file")) is None
         rows = list(session.scalars(select(DataRowRecord)))
-        assert len(rows) == 2
-        assert all(row.task_id is None for row in rows)
-        assert session.get(DataTableRecord, "table-keep") is not None
-    assert not (tmp_path / "uploads" / "del-task-keep.png").exists()
+        assert len(rows) == 1 and rows[0].table_id == "copy" and rows[0].task_id is None
+        assert session.get(DataTableRecord, data["id"]) is not None
+    assert not (client.app.state.settings.storage_dir / "file.png").exists()
 
 
-def test_delete_table_rows_does_not_affect_task_or_history_count(
-    client: TestClient,
-) -> None:
+def test_delete_detail_updates_both_views_and_current_count_preserving_evidence(client):
+    data = _seed(client)
+    row = data["rows"][0]
+    response = client.request("DELETE", f"/api/v1/tables/{data['id']}/rows", json={"row_ids": [row["id"]]})
+    assert response.status_code == 204, response.text
+    assert client.get("/api/v1/tasks").json()[0]["record_count"] == 1
+    result = client.get("/api/v1/tasks/file/result").json()
+    assert [item["name"] for item in result["result"]["items"]] == ["商品B"]
+    assert result["result"]["header"]["seller_name"] == "销售方"
+    assert (client.app.state.settings.storage_dir / "file.png").read_bytes() == b"evidence"
+    history = client.get("/api/v1/tasks/file/revisions").json()
+    detail = client.get(f"/api/v1/tasks/file/revisions/{history['revisions'][0]['id']}").json()
+    assert detail["items"][0]["before"]["values"]["name"] == "商品A"
+    assert detail["items"][0]["after"] is None
+
+
+def test_repeat_confirmation_never_restores_a_deleted_detail(client):
+    data = _seed(client)
+    deleted_id = data["rows"][1]["id"]
+    assert client.request("DELETE", f"/api/v1/tables/{data['id']}/rows", json={"row_ids": [deleted_id]}).status_code == 204
+    current = client.get("/api/v1/tasks/file/result").json()
+    response = client.post("/api/v1/tasks/file/confirm", json={"expected_review_version": current["review_version"]})
+    assert response.status_code == 200, response.text
+    assert response.json()["row_count"] == 1
     with client.app.state.session_factory() as session:
-        _seed_completed_task(session, "hist-task")
-        table = DataTableRecord(
-            id="table-hist",
-            name="发票",
-            template_key="invoice",
-            template_version="builtin-v1",
-            document_kind="invoice",
-        )
-        session.add(table)
-        session.flush()
-        _seed_mirror_rows(session, "hist-task", "table-hist")
-        session.add(
-            ConfirmedDocumentRecord(
-                task_id="hist-task",
-                table_id="table-hist",
-                review_version=0,
-                result_json="{}",
-            )
-        )
+        from document_pipeline_api.services.data_tables import materialize_task_result
+        materialize_task_result(session, "file")
         session.commit()
-
-    tasks_before = client.get("/api/v1/tasks").json()
-    assert tasks_before[0]["record_count"] == 2
-
-    with client.app.state.session_factory() as session:
-        rows = list(session.scalars(select(DataRowRecord)))
-        session.delete(rows[0])
-        session.commit()
-
-    # 删数据行后：任务仍在，历史计数仍是提取快照 2（不依赖数据表）
-    tasks_after = client.get("/api/v1/tasks").json()
-    assert tasks_after[0]["status"] == "completed"
-    assert tasks_after[0]["record_count"] == 2
+        assert session.get(DataRowRecord, deleted_id) is None
+    assert _data(client)["row_count"] == 1
 
 
-def test_confirm_rejects_incompatible_target_table(client: TestClient) -> None:
-    with client.app.state.session_factory() as session:
-        _seed_completed_task(session, "target-task")
-        _seed_manual_table(session, "manual-table", "手动发票表")
-        session.flush()
-        _seed_mirror_rows(session, "target-task", "manual-table")
-        session.add(
-            ConfirmedDocumentRecord(
-                task_id="target-task",
-                table_id="manual-table",
-                review_version=0,
-                result_json="{}",
-            )
-        )
-        session.commit()
+def test_last_detail_deletion_clears_header_without_deleting_file(client):
+    data = _seed(client)
+    for row in data["rows"]:
+        assert client.request("DELETE", f"/api/v1/tables/{data['id']}/rows", json={"row_ids": [row["id"]]}).status_code == 204
+    result = client.get("/api/v1/tasks/file/result").json()
+    assert result["result"] == {"header": {}, "items": []}
+    assert not result["has_current_data"]
+    assert client.get("/api/v1/tasks").json()[0]["record_count"] == 0
+    assert client.get("/api/v1/tasks/file/revisions").json()["total"] == 3
+    assert (client.app.state.settings.storage_dir / "file.png").exists()
 
-    _seed_manual_table_helper(client, "other-table", "其他表")
 
-    response = client.post(
-        "/api/v1/tasks/target-task/confirm",
-        json={"expected_review_version": 0, "target_table_id": "other-table"},
-    )
-
+def test_deleting_table_cannot_replay_original_result_or_recreate_table(client):
+    data = _seed(client)
+    assert client.delete(f"/api/v1/tables/{data['id']}").status_code == 204
+    current = client.get("/api/v1/tasks/file/result").json()
+    assert current["result"]["items"] == []
+    response = client.post("/api/v1/tasks/file/confirm", json={"expected_review_version": current["review_version"]})
     assert response.status_code == 409
-    assert response.json()["detail"] == "提取出字段与指定表不符，请重新选择指定表。"
+    assert client.get("/api/v1/tables").json() == []
+    assert client.get("/api/v1/tasks/file/revisions").json()["total"] == 2
+    assert (client.app.state.settings.storage_dir / "file.png").exists()
+
+
+def test_confirmation_cannot_copy_current_data_to_another_table(client):
+    data = _seed(client)
+    row = data["rows"][0]
+    response = client.patch(f"/api/v1/tables/{data['id']}/rows/{row['id']}", json={"expected_version": row["version"], "changes": {"name": "用户修正"}})
+    assert response.status_code == 200, response.text
     with client.app.state.session_factory() as session:
-        task = session.get(TaskRecord, "target-task")
-        assert task.target_table_id is None
-        assert not session.scalars(select(DataRowRecord).where(DataRowRecord.table_id == "other-table")).all()
-
-
-def test_rejected_incompatible_target_keeps_user_edited_rows_unchanged(client: TestClient) -> None:
-    with client.app.state.session_factory() as session:
-        _seed_completed_task(session, "edited-target-task")
-        _seed_manual_table(session, "old-table", "旧表")
-        _seed_manual_table(session, "new-table", "新表")
-        row_ids = _seed_mirror_rows(session, "edited-target-task", "old-table")
-        edited = session.get(DataRowRecord, row_ids[0])
-        assert edited is not None
-        edited.row_json = json.dumps({"name": "用户校正后的商品"}, ensure_ascii=False)
-        edited.row_version = 2
-        session.add(
-            DataRowRevisionRecord(
-                row_id=edited.id,
-                table_id="old-table",
-                task_id="edited-target-task",
-                version=2,
-                operation="table_edit",
-                before_json=json.dumps({"name": "商品1"}),
-                after_json=edited.row_json,
-                editor="user",
-            )
-        )
-        session.add(
-            ConfirmedDocumentRecord(
-                task_id="edited-target-task",
-                table_id="old-table",
-                review_version=0,
-                result_json="{}",
-            )
-        )
-        session.commit()
-
-    response = client.post(
-        "/api/v1/tasks/edited-target-task/confirm",
-        json={"expected_review_version": 0, "target_table_id": "new-table"},
-    )
-
+        _seed_manual_table(session, "other", "其他表")
+    current = client.get("/api/v1/tasks/file/result").json()
+    response = client.post("/api/v1/tasks/file/confirm", json={"expected_review_version": current["review_version"], "target_table_id": "other"})
     assert response.status_code == 409
-    with client.app.state.session_factory() as session:
-        moved = session.get(DataRowRecord, row_ids[0])
-        assert moved is not None
-        assert moved.table_id == "old-table"
-        assert json.loads(moved.row_json)["name"] == "用户校正后的商品"
-        assert moved.row_version == 2
-        assert not session.scalars(select(DataRowRecord).where(DataRowRecord.table_id == "new-table")).all()
-
-
-def _seed_manual_table_helper(client: TestClient, table_id: str, name: str) -> None:
-    with client.app.state.session_factory() as session:
-        _seed_manual_table(session, table_id, name)
-
-
-def test_materialize_mirrors_rows_by_item_index_restoring_deleted_position(
-    client: TestClient,
-) -> None:
-    """多明细删掉一条明细，再保存到表：缺失的 item_index 重新插入原位。"""
-    with client.app.state.session_factory() as session:
-        _seed_completed_task(session, "mirror-task")
-        table = DataTableRecord(
-            id="mirror-table",
-            name="发票",
-            template_key="invoice",
-            template_version="builtin-v1",
-            document_kind="invoice",
-        )
-        session.add(table)
-        session.flush()
-        _seed_mirror_rows(session, "mirror-task", "mirror-table")
-        session.add(
-            ConfirmedDocumentRecord(
-                task_id="mirror-task",
-                table_id="mirror-table",
-                review_version=0,
-                result_json="{}",
-            )
-        )
-        session.commit()
-
-    # 删掉 item_index=2 那行
-    with client.app.state.session_factory() as session:
-        rows = list(
-            session.scalars(
-                select(DataRowRecord).where(DataRowRecord.table_id == "mirror-table")
-            )
-        )
-        deleted_row = next(row for row in rows if row.item_index == 2)
-        session.delete(deleted_row)
-        session.commit()
-
-    # 重新保存到表 → 行恢复到 2 条，item_index 1 和 2 都在原位
-    response = client.post(
-        "/api/v1/tasks/mirror-task/confirm",
-        json={"expected_review_version": 0},
-    )
-    assert response.status_code == 200
-    assert response.json()["row_count"] == 2
-
-    with client.app.state.session_factory() as session:
-        rows = list(
-            session.scalars(
-                select(DataRowRecord)
-                .where(DataRowRecord.table_id == "mirror-table")
-                .order_by(DataRowRecord.item_index)
-            )
-        )
-        assert [row.item_index for row in rows] == [1, 2]
-
-
-def test_confirm_falls_back_to_template_table_when_target_deleted(
-    client: TestClient,
-) -> None:
-    """目标表被删除后，保存到表回退重建模板唯一表。"""
-    with client.app.state.session_factory() as session:
-        _seed_completed_task(session, "fallback-task", target_table_id="gone-table")
-        _seed_manual_table(session, "gone-table", "将被删除的表")
-        session.flush()
-        _seed_mirror_rows(session, "fallback-task", "gone-table")
-        session.add(
-            ConfirmedDocumentRecord(
-                task_id="fallback-task",
-                table_id="gone-table",
-                review_version=0,
-                result_json="{}",
-            )
-        )
-        session.commit()
-
-    # 真实场景：用户删除数据表（确认记录级联删除），任务仍在历史中
-    deleted = client.delete("/api/v1/tables/gone-table")
-    assert deleted.status_code == 204
-
-    response = client.post(
-        "/api/v1/tasks/fallback-task/confirm",
-        json={"expected_review_version": 0},
-    )
-
-    assert response.status_code == 200
-    with client.app.state.session_factory() as session:
-        assert session.get(DataTableRecord, "gone-table") is None
-        confirmation = session.get(ConfirmedDocumentRecord, "fallback-task")
-        assert confirmation is not None
-        assert confirmation.table_id != "gone-table"
-        rows = list(session.scalars(select(DataRowRecord)))
-        assert len(rows) == 2
-        assert rows[0].table_id == confirmation.table_id
-        assert rows[0].table_id is not None
+    assert _data(client)["rows"][0]["values"]["name"] == "用户修正"
+    assert client.get("/api/v1/tables/other").json()["row_count"] == 0
 
 
 def test_batch_retry_retries_only_failed_tasks(client: TestClient) -> None:

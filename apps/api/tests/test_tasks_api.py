@@ -50,10 +50,12 @@ def test_upload_persists_file_and_lists_real_task(client: TestClient, tmp_path: 
     task = response.json()
     assert task["filename"] == "invoice.png"
     assert task["status"] == "queued"
-    assert task["template_mode"] == "invoice"
+    assert task["template_mode"] == "manual"
+    assert task["template_id"] == "builtin-invoice"
+    assert task["template_version"] == 1
     assert task["sha256"] == hashlib.sha256(content).hexdigest()
     assert task["duplicate_of_task_id"] is None
-    assert len(list((tmp_path / "uploads").glob("*.png"))) == 1
+    assert len(list((tmp_path / "uploads").rglob("*.png"))) == 1
     with client.app.state.session_factory() as session:
         saved = session.get(TaskRecord, task["id"])
         assert saved is not None
@@ -87,6 +89,9 @@ def test_text_original_has_readable_preview(client: TestClient) -> None:
         "text": "# 标题\n正文",
         "truncated": False,
         "image_count": 0,
+        "offset": 0,
+        "next_offset": None,
+        "total_bytes": len("# 标题\n正文".encode()),
     }
 
 
@@ -120,8 +125,11 @@ def test_docx_preview_includes_text_and_numbered_images(client: TestClient) -> N
     assert preview.json()["text"] == "合同正文"
     assert preview.json()["image_count"] == 1
     assert image.status_code == 200
-    assert image.headers["content-type"] == "image/png"
-    assert image.content == PNG_BYTES
+    assert image.headers["content-type"] == "image/jpeg"
+    with Image.open(io.BytesIO(image.content)) as thumbnail:
+        assert max(thumbnail.size) <= 1600
+    original = client.get(f"/api/v1/tasks/{task_id}/file")
+    assert original.content == buffer.getvalue()
 
 
 def test_upload_storage_failure_returns_507_without_orphan_files(
@@ -212,12 +220,14 @@ def test_database_full_error_is_reported_without_exposing_sql(
     assert "hidden" not in response.text
 
 
-def test_duplicate_upload_is_marked_without_blocking_user(client: TestClient) -> None:
+def test_duplicate_upload_requires_explicit_confirmation(client: TestClient) -> None:
     upload = {"file": ("delivery.jpg", JPEG_BYTES, "image/jpeg")}
 
     first = client.post("/api/v1/tasks", files=upload).json()
     second = client.post("/api/v1/tasks", files=upload)
-
+    assert second.status_code == 409
+    assert second.json()["detail"]["duplicate_task_id"] == first["id"]
+    second = client.post("/api/v1/tasks", files=upload, data={"duplicate_policy": "allow"})
     assert second.status_code == 201
     assert second.json()["duplicate_of_task_id"] == first["id"]
 
@@ -396,7 +406,7 @@ def test_text_file_is_accepted_when_office_conversion_enabled(
 
     assert response.status_code == 201
     assert response.json()["page_count"] == 1
-    assert len(list((tmp_path / "uploads").glob("*.txt"))) == 1
+    assert len(list((tmp_path / "uploads").rglob("*.txt"))) == 1
 
 
 def test_text_file_is_rejected_when_office_conversion_disabled(
@@ -620,6 +630,7 @@ def test_active_queue_capacity_rejects_upload_without_leaking_file(
         second = test_client.post(
             "/api/v1/tasks",
             files={"file": ("second.png", PNG_BYTES, "image/png")},
+            data={"duplicate_policy": "allow"},  # Isolate capacity from duplicate protection.
         )
 
     assert first.status_code == 201
@@ -785,6 +796,7 @@ def test_concurrent_uploads_cannot_both_cross_single_task_capacity(
                         "image/png",
                     )
                 },
+                data={"duplicate_policy": "allow"},  # Deliberate repeat tests capacity atomically.
             ).status_code
 
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -870,7 +882,7 @@ def test_resume_fails_when_queue_capacity_is_full(tmp_path: Path) -> None:
     assert response.status_code == 429
 
 
-def test_failed_task_can_be_deleted_with_records_but_keeps_table_rows(
+def test_failed_task_deletion_removes_all_bound_records(
     client: TestClient,
     tmp_path: Path,
 ) -> None:
@@ -934,13 +946,12 @@ def test_failed_task_can_be_deleted_with_records_but_keeps_table_rows(
     response = client.delete("/api/v1/tasks/del-task")
 
     assert response.status_code == 200
-    assert response.json()["kept_rows"] == 1
+    assert response.json()["kept_rows"] == 0
     assert not (tmp_path / "uploads" / "del-task.png").exists()
     with client.app.state.session_factory() as session:
         assert session.get(TaskRecord, "del-task") is None
         assert session.get(DataTableRecord, "table-1") is not None
-        row = session.scalars(select(DataRowRecord)).one()
-        assert row.task_id is None
+        assert session.scalars(select(DataRowRecord)).all() == []
         assert session.scalar(select(func.count()).select_from(ExtractionRecord)) == 0
         assert (
             session.scalar(select(func.count()).select_from(ConfirmedDocumentRecord))
@@ -1062,12 +1073,11 @@ def test_batch_delete_tasks(client: TestClient) -> None:
     )
 
     assert response.status_code == 200
-    assert response.json() == {"deleted": 2, "skipped": 0, "kept_rows": 1}
+    assert response.json() == {"deleted": 2, "skipped": 0, "kept_rows": 0}
     with client.app.state.session_factory() as session:
         assert session.get(TaskRecord, "failed-1") is None
         assert session.get(TaskRecord, "failed-2") is None
-        row = session.scalars(select(DataRowRecord)).one()
-        assert row.task_id is None
+        assert session.scalars(select(DataRowRecord)).all() == []
 
 
 def _add_task(
@@ -1183,7 +1193,7 @@ def test_tasks_active_only_filters_terminal_states(client: TestClient) -> None:
 
 
 def test_tasks_record_count_limited_to_current_page(client: TestClient) -> None:
-    """ISSUE-067：非 active_only 时 record_count 只对本页任务做快照计数。"""
+    """非 active_only 时只查询本页任务的当前行数，不读取旧快照计数。"""
     base = datetime(2026, 1, 3, tzinfo=timezone.utc)
     with client.app.state.session_factory() as session:
         for index in range(3):
@@ -1194,7 +1204,7 @@ def test_tasks_record_count_limited_to_current_page(client: TestClient) -> None:
                 created_at=base + timedelta(minutes=index),
             )
         session.flush()
-        # 只有最新一个任务有提取快照：2 条明细
+        # 原始快照有三条，当前数据只保留两条；计数必须来自当前数据。
         session.add(
             ExtractionRecord(
                 task_id="page-task-2",
@@ -1202,10 +1212,16 @@ def test_tasks_record_count_limited_to_current_page(client: TestClient) -> None:
                 model_name="test-model",
                 prompt_version="test-v1",
                 elapsed_seconds=0.5,
-                result_json=json.dumps({"items": [{"name": "a"}, {"name": "b"}]}),
+                result_json=json.dumps({"items": [{"name": "a"}, {"name": "b"}, {"name": "deleted"}]}),
                 validation_json="[]",
             )
         )
+        from document_pipeline_api.models import FileCurrentDataRecord
+        session.add(DataTableRecord(id="count-table", name="计数", template_key="invoice", template_version="1", document_kind="invoice"))
+        session.flush()
+        session.add(FileCurrentDataRecord(task_id="page-task-2", table_id="count-table"))
+        for index in (1, 2):
+            session.add(DataRowRecord(table_id="count-table", task_id="page-task-2", item_index=index, row_json="{}"))
         session.commit()
 
     page = client.get("/api/v1/tasks", params={"limit": 2}).json()

@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { X } from "lucide-react";
 
 export type ToastTone = "info" | "error" | "success";
 
@@ -39,11 +41,13 @@ export function useToast() {
     };
   }, [toast]);
 
+  const notify = useCallback((message: string, tone: ToastTone = "info", duration?: number) =>
+    setToast({ message, tone, duration }), []);
+  const clear = useCallback(() => setToast(null), []);
   return {
     toast,
-    notify: (message: string, tone: ToastTone = "info", duration?: number) =>
-      setToast({ message, tone, duration }),
-    clear: () => setToast(null),
+    notify,
+    clear,
   };
 }
 
@@ -54,17 +58,40 @@ export function Toast({
   toast: ToastState | null;
   onDismiss?: () => void;
 }) {
+  const [host, setHost] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!toast) return;
+    let activeHost: HTMLElement | null = null;
+    // Native dialogs occupy the browser top layer: z-index on body cannot put
+    // a notice above them. Mount inside the active dialog without moving focus.
+    const locate = () => {
+      const dialogs = Array.from(document.querySelectorAll<HTMLDialogElement>("dialog[open]"));
+      const focused = document.activeElement?.closest<HTMLDialogElement>("dialog[open]");
+      activeHost = focused ?? dialogs.at(-1) ?? document.body;
+      setHost(activeHost);
+    };
+    locate();
+    const observer = new MutationObserver(records => {
+      // Streaming text and virtualised previews mutate often. Only dialog
+      // lifecycle changes need another top-layer lookup.
+      if (!activeHost?.isConnected || records.some(record => record.type === "attributes" ||
+        [...record.addedNodes].some(node => node instanceof Element &&
+          (node.matches("dialog[open]") || node.querySelector("dialog[open]"))))) locate();
+    });
+    observer.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ["open"] });
+    document.addEventListener("focusin", locate);
+    return () => { observer.disconnect(); document.removeEventListener("focusin", locate); };
+  }, [toast]);
   if (!toast) {
     return null;
   }
-  return (
+  return createPortal(
     <div
       className={`app-toast ${toast.tone}`}
-      onClick={onDismiss}
       role={toast.tone === "error" ? "alert" : "status"}
-      title={toast.tone === "error" ? "点击关闭" : undefined}
     >
-      {toast.message}
-    </div>
+      <span>{toast.message}</span>
+      {onDismiss && <button type="button" className="toast-dismiss" aria-label="关闭通知" onClick={onDismiss}><X size={16} aria-hidden="true" /></button>}
+    </div>, host?.isConnected ? host : document.body,
   );
 }

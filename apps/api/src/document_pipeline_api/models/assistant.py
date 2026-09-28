@@ -18,6 +18,8 @@ class AssistantThread(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    authorization_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    authorization_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class AssistantMessage(Base):
@@ -54,6 +56,8 @@ class AssistantRun(Base):
     events_json: Mapped[str] = mapped_column(Text, default="[]")
     stream_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     snapshot_sequence: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    authorization_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    dataset_generation: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 

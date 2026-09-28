@@ -7,7 +7,7 @@ from document_pipeline_api.config import Settings
 from document_pipeline_api.main import create_app
 from document_pipeline_api.models import (
     ExtractionRecord,
-    ReviewRevisionRecord,
+    FileRevisionRecord,
     TaskRecord,
 )
 from document_pipeline_api.schemas.extraction import DocumentExtraction
@@ -65,6 +65,9 @@ def _seed_review_task(client: TestClient) -> None:
             )
         )
         session.commit()
+        from document_pipeline_api.services.data_tables import materialize_task_result
+        materialize_task_result(session, "review-task")
+        session.commit()
 
 
 def test_review_update_preserves_model_result_and_records_changes(
@@ -92,25 +95,21 @@ def test_review_update_preserves_model_result_and_records_changes(
         review = response.json()
         assert review["review_version"] == 1
         assert review["original_result"]["seller_name"] == "模型销售方"
-        assert review["result"]["seller_name"] == "人工修正销售方"
+        assert review["result"]["header"]["seller_name"] == "人工修正销售方"
         assert review["validation_issues"][0]["code"] == "invoice_tax_total_mismatch"
         seller_evidence = next(
             item
             for item in review["evidence"]
-            if item["field_path"] == "seller_name"
+            if item["field_path"] == "header.seller_name"
         )
         assert seller_evidence["status"] == "user_edited"
         assert seller_evidence["source"] == "user"
         assert seller_evidence["page_number"] is None
 
         with client.app.state.session_factory() as session:
-            revision = session.query(ReviewRevisionRecord).one()
+            revision = session.query(FileRevisionRecord).filter_by(task_id="review-task", version=2).one()
             changes = json.loads(revision.changes_json)
-            assert {
-                "path": "seller_name",
-                "before": "模型销售方",
-                "after": "人工修正销售方",
-            } in changes
+            assert changes["header"]["seller_name"] == {"before": "模型销售方", "after": "人工修正销售方"}
 
 
 def test_review_update_rejects_stale_version(tmp_path: Path) -> None:
@@ -172,6 +171,10 @@ def test_completed_task_rejects_wrong_edit_with_validation_error(
                     validation_json="[]",
                 )
             )
+            session.commit()
+
+            from document_pipeline_api.services.data_tables import materialize_task_result
+            materialize_task_result(session, "completed-task")
             session.commit()
 
         # 改错：不含税 100 + 税 6 = 106，把价税合计改成 999

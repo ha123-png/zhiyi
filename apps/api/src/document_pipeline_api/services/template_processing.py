@@ -32,6 +32,10 @@ def match_template(
 ) -> TemplateMatchDecision:
     if not templates:
         return TemplateMatchDecision(outcome="none", template_ids=[])
+    fallback = next((template for template in templates if template.engine_kind == "autonomous"), None)
+    templates = [template for template in templates if template.engine_kind != "autonomous"]
+    if not templates:
+        return TemplateMatchDecision(outcome="matched", template_ids=[fallback.id])
     candidate_text = "\n".join(
         f"- {template.id}: {template.name}｜{template.description or '没有补充说明'}"
         for template in templates
@@ -47,6 +51,9 @@ def match_template(
         "不要把模板名称当作 ID，不添加理由、置信度或其他字段。\n"
         f"候选模板：\n{candidate_text}"
     )
+    if fallback is not None:
+        prompt += ("\n用户已启用自主提取作为兜底。它不参与上述候选比较；仅当普通模板都不适用时返回 none，"
+                   "知意随后使用自主提取。不能把技术错误或信息不足当成普通模板都不适用。")
     prompt += "\n本次文件输入（仅据此判断）：\n" + text_input
     if image_paths is not None and len(image_paths) > 1:
         decision = model_client.extract_images(image_paths, prompt, TemplateMatchDecision)
@@ -65,6 +72,8 @@ def match_template(
         raise HTTPException(status_code=502, detail="模型的模板候选不足。")
     if decision.outcome == "none" and decision.template_ids:
         raise HTTPException(status_code=502, detail="模型的模板匹配结果互相矛盾。")
+    if decision.outcome == "none" and fallback is not None:
+        return TemplateMatchDecision(outcome="matched", template_ids=[fallback.id])
     return decision
 
 

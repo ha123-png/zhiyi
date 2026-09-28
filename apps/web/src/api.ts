@@ -35,6 +35,78 @@ import type {
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
 
+export interface GuideTopic {
+  id: string; title: string; target: import("./types").NavigationKey; action: string;
+}
+export interface GuideContent extends GuideTopic {
+  sections: { title: string; paragraphs: string[] }[];
+}
+export async function getGuideIndex(): Promise<{ version: string; topics: GuideTopic[] }> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/guide`));
+}
+export async function getGuideTopic(topic: string): Promise<GuideContent> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/guide/${encodeURIComponent(topic)}`));
+}
+
+export interface FileRevisionSummary {
+  id: string; version: number; operation: string; editor: string; created_at: string;
+  sealed: boolean; modified_fields: number; deleted_details: number; added_details: number;
+}
+export interface RevisionItem { id: number; item_index: number; values: Record<string, unknown> }
+export interface FileRevisionDetail extends FileRevisionSummary {
+  schema: TableColumnDef[];
+  header: Record<string, { before: unknown; after: unknown }>;
+  items: Array<{ before: RevisionItem | null; after: RevisionItem | null; deleted_before?: RevisionItem }>;
+  page: number; page_size: number; total_details: number;
+}
+export async function getFileRevisions(taskId: string, page = 1): Promise<{revisions: FileRevisionSummary[]; total: number}> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/tasks/${taskId}/revisions?page=${page}`));
+}
+export async function getFileRevision(taskId: string, revisionId: string, page = 1): Promise<FileRevisionDetail> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/tasks/${taskId}/revisions/${revisionId}?page=${page}`));
+}
+export async function beginDataEditSession(): Promise<string> {
+  const value = await readResponse<{id: string}>(await apiFetch(`${API_BASE_URL}/tables/edit-sessions`, {method: "POST"}));
+  return value.id;
+}
+export async function sealDataEditSession(id: string): Promise<void> {
+  await expectOk(await apiFetch(`${API_BASE_URL}/tables/edit-sessions/${id}/seal`, {method: "POST", keepalive: true}));
+}
+
+type WarehouseEditing = { id: Promise<string> | null; writes: Set<Promise<unknown>> };
+let warehouseEditing: WarehouseEditing | null = null;
+
+export function enterWarehouseEditing(): () => void {
+  const editing: WarehouseEditing = {id: null, writes: new Set()};
+  warehouseEditing = editing;
+  const finish = () => {
+    if (warehouseEditing === editing) warehouseEditing = null;
+    void (async () => {
+      await Promise.allSettled([...editing.writes]);
+      if (editing.id) await sealDataEditSession(await editing.id);
+    })().catch(() => {
+      // Values and deltas were already committed. Startup seals any unfinished
+      // session if closing the page interrupted the final request.
+    });
+  };
+  window.addEventListener("pagehide", finish, {once: true});
+  return () => { window.removeEventListener("pagehide", finish); finish(); };
+}
+
+function withWarehouseSession<T>(explicit: string | undefined, action: (id?: string) => Promise<T>): Promise<T> {
+  const editing = warehouseEditing;
+  if (explicit || !editing) return action(explicit);
+  if (!editing.id) {
+    const opening = beginDataEditSession();
+    editing.id = opening;
+    void opening.catch(() => { if (editing.id === opening) editing.id = null; });
+  }
+  const write = editing.id.then(id => action(id));
+  editing.writes.add(write);
+  void write.then(() => editing.writes.delete(write), () => editing.writes.delete(write));
+  return write;
+}
+
 export interface LocalExportBinding {
   mode?: "copy" | "move";
   revision: number;
@@ -78,12 +150,16 @@ export async function responseErrorMessage(response: Response, action = "请求"
   return statusFallback(response.status, action);
 }
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) { super(message); this.name = "ApiError"; }
+}
+
 async function readResponse<T>(response: Response): Promise<T> {
   if (response.ok) {
     return response.json() as Promise<T>;
   }
 
-  throw new Error(await responseErrorMessage(response));
+  throw new ApiError(await responseErrorMessage(response), response.status);
 }
 
 /** 校验无响应体接口（如 204 删除）是否成功；失败时把后端 detail 抛成友好错误。 */
@@ -322,34 +398,46 @@ export async function unloadLocalModel(modelName: string): Promise<LocalModelAct
   );
 }
 
+export class DuplicateUploadError extends Error {
+  constructor(message: string, readonly taskId: string, readonly status: string, readonly retryToken?: string) {
+    super(message);
+    this.name = "DuplicateUploadError";
+  }
+}
+
+async function readUploadResponse(response: Response): Promise<Task> {
+  if (response.status === 409) {
+    const body = await response.clone().json().catch(() => null);
+    const detail = body?.detail;
+    if (detail?.code === "duplicate_upload" && typeof detail.duplicate_task_id === "string") {
+      throw new DuplicateUploadError(detail.message, detail.duplicate_task_id, detail.duplicate_status,
+        typeof detail.retry_token === "string" ? detail.retry_token : undefined);
+    }
+  }
+  return readResponse<Task>(response);
+}
+
 export async function uploadTask(
   file: File | import("./desktop").NativeImportFile,
   templateSelection: string,
   targetTableId?: string,
+  duplicatePolicy: "reject" | "allow" = "reject",
 ): Promise<Task> {
   if ("token" in file) {
-    return readResponse<Task>(await apiFetch(`${API_BASE_URL}/tasks/native-import`, {
+    return readUploadResponse(await apiFetch(`${API_BASE_URL}/tasks/native-import`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: file.token, template_mode: templateSelection === "smart" ? "smart" : "manual",
-        template_id: templateSelection === "smart" ? null : templateSelection, target_table_id: targetTableId ?? null }),
+        template_id: templateSelection === "smart" ? null : templateSelection, target_table_id: targetTableId ?? null,
+        duplicate_policy: duplicatePolicy }),
     }));
   }
   const body = new FormData();
   body.append("file", file);
   body.append("template_mode", templateSelection === "smart" ? "smart" : "manual");
-  if (templateSelection !== "smart") {
-    body.append("template_id", templateSelection);
-  }
-  if (targetTableId) {
-    body.append("target_table_id", targetTableId);
-  }
-
-  return readResponse<Task>(
-    await apiFetch(`${API_BASE_URL}/tasks`, {
-      method: "POST",
-      body,
-    }),
-  );
+  body.append("duplicate_policy", duplicatePolicy);
+  if (templateSelection !== "smart") body.append("template_id", templateSelection);
+  if (targetTableId) body.append("target_table_id", targetTableId);
+  return readUploadResponse(await apiFetch(`${API_BASE_URL}/tasks`, { method: "POST", body }));
 }
 
 export async function getOnboardingState(): Promise<number> {
@@ -469,16 +557,16 @@ export async function resumeTask(taskId: string): Promise<Task> {
   );
 }
 
-export async function deleteTask(taskId: string): Promise<{ kept_rows: number }> {
-  return readResponse<{ kept_rows: number }>(
+export async function deleteTask(taskId: string): Promise<{ kept_rows: number; pending_cleanup?: number }> {
+  return readResponse<{ kept_rows: number; pending_cleanup?: number }>(
     await apiFetch(`${API_BASE_URL}/tasks/${taskId}`, { method: "DELETE" }),
   );
 }
 
 export async function deleteTasksBatch(
   taskIds: string[],
-): Promise<{ deleted: number; kept_rows: number }> {
-  return readResponse<{ deleted: number; kept_rows: number }>(
+): Promise<{ deleted: number; kept_rows: number; pending_cleanup?: number }> {
+  return readResponse<{ deleted: number; kept_rows: number; pending_cleanup?: number }>(
     await apiFetch(`${API_BASE_URL}/tasks/batch-delete`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -507,8 +595,8 @@ export async function updateSystemSettings(
   );
 }
 
-export async function clearHistory(confirmText: string): Promise<{ cleared_count: number }> {
-  return readResponse<{ cleared_count: number }>(
+export async function clearHistory(confirmText: string): Promise<{ cleared_count: number; pending_cleanup?: number }> {
+  return readResponse<{ cleared_count: number; pending_cleanup?: number }>(
     await apiFetch(`${API_BASE_URL}/system/admin/clear-history`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -548,6 +636,7 @@ export async function updateReview(
   result: ExtractionResult,
   ignoredIssueIndices: number[] = [],
   filename?: string,
+  detailIds?: Array<number | null>,
 ): Promise<Extraction> {
   return readResponse<Extraction>(
     await apiFetch(`${API_BASE_URL}/tasks/${taskId}/review`, {
@@ -558,6 +647,7 @@ export async function updateReview(
         result,
         ignored_issue_indices: ignoredIssueIndices,
         filename,
+        detail_ids: detailIds,
       }),
     }),
   );
@@ -784,12 +874,13 @@ export async function addCustomColumn(
   tableId: string,
   label: string,
   section: "header" | "item",
+  valueType: "text" | "number" | "date" | "boolean" = "text",
 ): Promise<TableColumnDef> {
   return readResponse<TableColumnDef>(
     await apiFetch(`${API_BASE_URL}/tables/${tableId}/columns`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ label, section }),
+      body: JSON.stringify({ label, section, value_type: valueType }),
     }),
   );
 }
@@ -817,14 +908,16 @@ export async function addDataRow(
 export async function deleteDataRows(
   tableId: string,
   rowIds: number[],
+  editSessionId?: string,
+  expectedVersions?: Record<number, number>,
 ): Promise<void> {
-  await expectOk(
+  await withWarehouseSession(editSessionId, async id => expectOk(
     await apiFetch(`${API_BASE_URL}/tables/${tableId}/rows`, {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ row_ids: rowIds }),
+      body: JSON.stringify({ row_ids: rowIds, edit_session_id: id, expected_versions: expectedVersions }),
     }),
-  );
+  ));
 }
 
 export async function mergeTables(
@@ -840,12 +933,40 @@ export async function mergeTables(
   );
 }
 
-export function getTableExportUrl(tableId: string, format: "xlsx" | "csv" | "json" = "xlsx"): string {
-  return `${API_BASE_URL}/tables/${tableId}/export.${format}`;
+export interface TableExportScope { viewId?: string | null; search?: string; rowIds?: number[] | null; taskIds?: string[] | null; sourceKeys?: string[] | null }
+function tableExportQuery(scope: TableExportScope): string {
+  const query = new URLSearchParams();
+  if (scope.viewId) query.set("view_id", scope.viewId);
+  if (scope.search?.trim()) query.set("search", scope.search.trim());
+  if (scope.rowIds != null) query.set("row_ids", scope.rowIds.join(","));
+  if (scope.taskIds != null) query.set("task_ids", scope.taskIds.join(","));
+  if (scope.sourceKeys != null) query.set("source_keys", JSON.stringify(scope.sourceKeys));
+  return query.size ? `?${query}` : "";
+}
+export function getTableExportUrl(tableId: string, format: "xlsx" | "csv" | "json" | "zip" = "xlsx", scope: TableExportScope = {}): string {
+  return `${API_BASE_URL}/tables/${tableId}/export.${format}${tableExportQuery(scope)}`;
 }
 
-export function getTableViewsExportUrl(tableId: string): string {
-  return `${API_BASE_URL}/tables/${tableId}/export-views.xlsx`;
+export function getTableViewsExportUrl(tableId: string, scope: TableExportScope = {}): string {
+  return `${API_BASE_URL}/tables/${tableId}/export-views.xlsx${tableExportQuery(scope)}`;
+}
+
+export async function getSourceCards(tableId: string, scope: TableExportScope, page = 1, pageSize = 6): Promise<import("./types").SourceCardPage> {
+  const query = new URLSearchParams(tableExportQuery(scope));
+  query.set("page", String(page)); query.set("page_size", String(pageSize));
+  return readResponse(await apiFetch(`${API_BASE_URL}/tables/${encodeURIComponent(tableId)}/source-cards?${query}`));
+}
+export async function getSourceDetails(tableId: string, sourceKey: string, scope: TableExportScope, page = 1): Promise<import("./types").SourceCardDetail> {
+  const query = new URLSearchParams(tableExportQuery(scope));
+  query.set("source_key", sourceKey); query.set("page", String(page)); query.set("page_size", "10");
+  const response = await apiFetch(`${API_BASE_URL}/tables/${encodeURIComponent(tableId)}/source-details?${query}`);
+  if (response.status === 404) throw Object.assign(new Error(await responseErrorMessage(response)), {status: 404});
+  return readResponse(response);
+}
+export async function clearSourceCards(tableId: string, sources: {id: string; version: string}[], scope: TableExportScope = {}): Promise<{deleted: number; sources: number}> {
+  return withWarehouseSession(undefined, async id => readResponse(await apiFetch(`${API_BASE_URL}/tables/${encodeURIComponent(tableId)}/source-cards/clear${tableExportQuery(scope)}`, {
+    method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({sources, edit_session_id: id}),
+  })));
 }
 
 export async function updateDataRow(
@@ -853,8 +974,10 @@ export async function updateDataRow(
   rowId: number,
   expectedVersion: number,
   changes: Record<string, unknown>,
+  editSessionId?: string,
+  expectedSharedHeaderKeys?: string[],
 ): Promise<DataRowRead> {
-  return readResponse<DataRowRead>(
+  return withWarehouseSession(editSessionId, async id => readResponse<DataRowRead>(
     await apiFetch(`${API_BASE_URL}/tables/${tableId}/rows/${rowId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -862,17 +985,25 @@ export async function updateDataRow(
         expected_version: expectedVersion,
         changes,
         editor: "local-user",
+        edit_session_id: id,
+        expected_shared_header_keys: expectedSharedHeaderKeys,
       }),
     }),
-  );
+  ));
 }
 
 export async function getTableViews(
   tableId: string,
+  offset = 0,
 ): Promise<DataViewRead[]> {
   return readResponse<DataViewRead[]>(
-    await apiFetch(`${API_BASE_URL}/tables/${tableId}/views`),
+    await apiFetch(`${API_BASE_URL}/tables/${tableId}/views${offset ? `?offset=${offset}` : ""}`),
   );
+}
+
+export async function clearTableViews(tableId: string): Promise<void> {
+  const response = await apiFetch(`${API_BASE_URL}/tables/${tableId}/views`, {method: "DELETE"});
+  if (!response.ok) throw new Error(await responseErrorMessage(response, "取消分组"));
 }
 
 export async function getRowRevisions(
@@ -882,6 +1013,12 @@ export async function getRowRevisions(
   return readResponse<DataRowRevision[]>(
     await apiFetch(`${API_BASE_URL}/tables/${tableId}/rows/${rowId}/revisions`),
   );
+}
+
+export async function getIndependentHistory(tableId: string, page = 1, rowId?: number): Promise<{revisions: DataRowRevision[]; page: number; page_size: number; total: number}> {
+  const query = new URLSearchParams({page: String(page), page_size: "10"});
+  if (rowId !== undefined) query.set("row_id", String(rowId));
+  return readResponse(await apiFetch(`${API_BASE_URL}/tables/${tableId}/row-history?${query}`));
 }
 
 export async function createSplitViews(

@@ -205,7 +205,8 @@ def test_disk_full_before_publication_keeps_source_and_retry_can_choose_path(arc
 def test_browser_upload_has_no_move_authority_and_can_skip(archive_task):
     client, settings, _, source, _ = archive_task
     template = client.get("/api/v1/templates").json()[0]
-    uploaded = client.post("/api/v1/tasks", data={"template_id": template["id"]}, files={"file": (source.name, PNG_BYTES, "image/png")}).json()
+    # Deliberately repeat the native fixture via browser to test source authority.
+    uploaded = client.post("/api/v1/tasks", data={"template_id": template["id"], "duplicate_policy": "allow"}, files={"file": (source.name, PNG_BYTES, "image/png")}).json()
     with client.app.state.session_factory() as session:
         session.get(TaskRecord, uploaded["id"]).status = "completed"
         session.commit()

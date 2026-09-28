@@ -166,6 +166,6 @@ def test_clear_history_removes_history_keeps_active_and_data_rows(
             )
             assert [task.id for task in remaining] == ["active-queued"]
             rows = list(session.scalars(select(DataRowRecord).order_by(DataRowRecord.item_index)))
-            assert len(rows) == 2
+            assert len(rows) == 1  # Independent data survives; deleted file data does not.
             assert rows[0].task_id is None
             assert session.scalar(select(func.count()).select_from(ExtractionRecord)) == 0

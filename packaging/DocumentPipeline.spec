@@ -1,4 +1,5 @@
 from pathlib import Path
+import ast
 import os
 
 from PyInstaller.utils.hooks import collect_all
@@ -71,6 +72,17 @@ if RELEASE_RESOURCES.is_dir():
     datas.append((str(RELEASE_RESOURCES), "licenses"))
 datas.extend(pdf_datas)
 
+# Alembic loads migration files as data, outside PyInstaller's import graph.
+# Include their application imports so a clean installation and an old-database
+# upgrade have the same dependencies as a source-tree run.
+migration_imports = set()
+for migration in (API / "migrations").rglob("*.py"):
+    for node in ast.walk(ast.parse(migration.read_text(encoding="utf-8-sig"))):
+        names = [node.module] if isinstance(node, ast.ImportFrom) else (
+            [name.name for name in node.names] if isinstance(node, ast.Import) else []
+        )
+        migration_imports.update(name for name in names if name and name.startswith("document_pipeline_api."))
+
 analysis = Analysis(
     [str(API / "src" / "document_pipeline_api" / "launcher.py")],
     pathex=[str(API / "src")],
@@ -78,6 +90,7 @@ analysis = Analysis(
     datas=datas,
     hiddenimports=[
         *pdf_hiddenimports,
+        *sorted(migration_imports),
         "document_pipeline_api.main",
         "document_pipeline_api.desktop",
         "document_pipeline_api.mcp_server",

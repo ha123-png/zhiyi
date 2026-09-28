@@ -21,7 +21,7 @@ const backups = [
 const backupStatus = {
   backup_dir: "C:\\data\\backups",
   count: 1,
-  retention: 10,
+  retention: null,
   free_bytes: 1024 * 1024 * 1024,
   last_success_at: "2026-08-10T01:00:00",
   database_size_bytes: 512,
@@ -52,14 +52,14 @@ describe("BackupPage", () => {
 
   it("shows backup status and list", async () => {
     render(<BackupPage />);
-    expect(await screen.findByText("1 / 10")).toBeInTheDocument();
+    expect(await screen.findByText("1")).toBeInTheDocument();
     expect(screen.getByText("最近成功备份")).toBeInTheDocument();
     expect(screen.getByText("C:\\data\\backups")).toBeInTheDocument();
   });
 
   it("has no serious or critical automated accessibility violations", async () => {
     const { container } = render(<BackupPage />);
-    await screen.findByText("1 / 10");
+    await screen.findByText("1");
     const result = await axe.run(container, {
       // jsdom 没有 Canvas 颜色计算；真实颜色对比留给最终浏览器扫描，其他规则在 CI 执行。
       rules: { "color-contrast": { enabled: false } },

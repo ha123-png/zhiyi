@@ -17,7 +17,7 @@ from document_pipeline_api.model_providers.openai_compatible import (
     _extract_json_text,
     _image_mime_type,
     _response_error_detail,
-    _unwrap_scalar_wrappers,
+    _validate_payload,
 )
 
 
@@ -89,7 +89,7 @@ class OllamaProvider:
                 raise ModelResponseError("模型输出达到长度上限，结果未完成。原件仍保留，请调整模型设置后重试。")
             content = body["message"]["content"]
             payload = json.loads(_extract_json_text(content))
-            return result_type.model_validate({key: _unwrap_scalar_wrappers(value) for key, value in payload.items()} if isinstance(payload, dict) else payload)
+            return _validate_payload(result_type, payload)
         except httpx.TimeoutException as error:
             raise ModelTimeoutError(
                 "处理超时：模型可能未加载、正在加载或响应缓慢，"
@@ -227,7 +227,7 @@ class OllamaProvider:
                 raise ModelResponseError("模型输出达到长度上限，结果未完成。原件仍保留，请调整模型设置后重试。")
             content = body["message"]["content"]
             payload = json.loads(_extract_json_text(content))
-            return result_type.model_validate({key: _unwrap_scalar_wrappers(value) for key, value in payload.items()} if isinstance(payload, dict) else payload)
+            return _validate_payload(result_type, payload)
         except httpx.TimeoutException as error:
             raise ModelTimeoutError(
                 "Ollama 理解文件超时：模型可能未加载、正在加载或响应缓慢，"

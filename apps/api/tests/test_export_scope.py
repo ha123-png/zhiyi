@@ -10,6 +10,8 @@ from document_pipeline_api.services.export_scope import WorkbookInputScopes, rea
 def test_scope_sheet_deduplicates_sources_and_preserves_all_long_notes():
     scope = InputScope(rule="all", coverage="complete", selected=[SourceRange(kind="line", start=1, end=2)], omitted=[], selected_units=2, total_units=2, text_characters=20, text_budget=100, image_budget=1, notes=["长" * 40000])
     record = SimpleNamespace(input_scope_json=scope.model_dump_json(), review_pending=None, row_json='{"source_filename":"=external.xlsx"}', task_id="same-source", id=1)
+    record.item_index = 1
+    record.file_current = SimpleNamespace(header_json="{}", source=SimpleNamespace(display_filename="=external.xlsx"))
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "知意输入范围"

@@ -11,9 +11,10 @@ import re
 from typing import Literal
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 from sqlalchemy import select
 
+from document_pipeline_api.services.current_data import row_values
 from document_pipeline_api.models import DataRowRecord, DataTableRecord
 from document_pipeline_api.services.data_tables import table_columns
 
@@ -34,6 +35,9 @@ class Metric(Strict):
 
 
 class AnalysisRequest(Strict):
+    # Set only by the trusted context resolver, never accepted from model JSON.
+    _scope_view_id: str | None = PrivateAttr(default=None)
+    _scope_source_keys: list[str] | None = PrivateAttr(default=None)
     table_id: str
     filters: list[Filter] = Field(default_factory=list, max_length=12)
     dimensions: list[str] = Field(default_factory=list, max_length=2)
@@ -146,6 +150,8 @@ def analyze(session, request: AnalysisRequest):
     table = session.get(DataTableRecord, request.table_id)
     if table is None:
         raise HTTPException(404, "没有找到这张表。")
+    from document_pipeline_api.services.file_collections import require_tabular
+    require_tabular(table)
     columns = {c.key: c for c in table_columns(session, table)}
     fields = (
         request.dimensions
@@ -187,8 +193,21 @@ def analyze(session, request: AnalysisRequest):
     )
     if request.row_ids is not None:
         query = query.where(DataRowRecord.id.in_(request.row_ids))
+    if request._scope_source_keys is not None:
+        from document_pipeline_api.services.data_groups import source_identity_expression
+        query = query.where(source_identity_expression().in_(request._scope_source_keys))
     if request.task_id:
         query = query.where(DataRowRecord.task_id == request.task_id)
+    if request.search:
+        from document_pipeline_api.services.current_data import row_search_predicate
+        query = query.where(row_search_predicate(request.search))
+    if request._scope_view_id:
+        from document_pipeline_api.models import DataViewRecord
+        from document_pipeline_api.services.data_views import _view_predicate
+        view = session.get(DataViewRecord, request._scope_view_id)
+        if not view or view.table_id != table.id:
+            raise HTTPException(409, "分组已变化，请重新选择上下文。")
+        query = query.where(_view_predicate(view))
     # Apply the exact business predicates while streaming, before the result cap.
     # A narrow date range in a large table must not fail on unrelated old rows.
     rows = []
@@ -199,9 +218,7 @@ def analyze(session, request: AnalysisRequest):
         or c.key.rsplit(".", 1)[-1].casefold() in {"currency", "currency_code", "unit", "measurement_unit"})
     candidates, candidate_values, seen_documents = [], {}, set()
     for record in session.scalars(query.execution_options(yield_per=100)):
-        values = json.loads(record.row_json)
-        if request.search and request.search.casefold() not in json.dumps(values, ensure_ascii=False).casefold():
-            continue
+        values = row_values(record)
         if not all(matches(values.get(f.field), f) for f in request.filters):
             continue
         light = SimpleNamespace(id=record.id, task_id=record.task_id, row_version=record.row_version,
@@ -277,6 +294,8 @@ def analyze(session, request: AnalysisRequest):
         "document_count": len({document_key(r, v) for r, v in rows}),
         "grain": request.grain,
         "request": request.model_dump(),
+        "view_id": request._scope_view_id,
+        "source_keys": request._scope_source_keys,
         "scope_description": "筛选：" + "；".join(conditions) if conditions else None,
         "generated_at": datetime.now().astimezone().isoformat(),
     }

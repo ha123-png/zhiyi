@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ModelProfilesSettings } from "./ModelProfilesSettings";
 
@@ -56,5 +56,31 @@ describe("ModelProfilesSettings", () => {
     expect(body).not.toHaveProperty("max_tokens");
     expect(body.temperature).toBeNull();
     expect(body.context_length).toBeNull();
+  });
+
+  it("asks before archiving a profile and keeps failures visible for retry", async () => {
+    let archiveCalls = 0;
+    const profile = {id: "local", version: 1, name: "本地备用方案", provider: "lm_studio", base_url: "http://127.0.0.1:1234/v1",
+      model_name: "local-model", timeout_seconds: 180, context_length: 8192, temperature: null, reasoning_effort: "none",
+      is_active: false, is_archived: false, active_version: null, multimodal: true};
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+      if (String(input).endsWith("/archive")) {
+        archiveCalls += 1;
+        return new Response(JSON.stringify({detail: "方案正在使用，暂不能停用。"}), {status: 409});
+      }
+      return new Response(JSON.stringify([profile]));
+    }));
+    render(<ModelProfilesSettings />);
+    fireEvent.click(await screen.findByRole("button", {name: "停用方案"}));
+    const dialog = screen.getByRole("dialog", {name: "停用“本地备用方案”？"});
+    expect(dialog).toHaveTextContent("不能再次激活");
+    expect(archiveCalls).toBe(0);
+    fireEvent.click(within(dialog).getByRole("button", {name: "取消"}));
+    expect(archiveCalls).toBe(0);
+    fireEvent.click(screen.getByRole("button", {name: "停用方案"}));
+    fireEvent.click(within(screen.getByRole("dialog", {name: "停用“本地备用方案”？"})).getByRole("button", {name: "确认停用"}));
+    expect(await screen.findByRole("alert")).toHaveTextContent("方案正在使用，暂不能停用");
+    expect(archiveCalls).toBe(1);
+    expect(screen.getByRole("button", {name: "确认停用"})).toBeEnabled();
   });
 });

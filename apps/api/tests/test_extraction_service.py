@@ -48,30 +48,9 @@ class StubModelClient:
         self.total_amount = total_amount
 
     def extract_image(self, _path, _prompt, result_type):
-        return result_type.model_validate(
-            {
-                "document_type": "发票",
-                "seller_name": "销售方",
-                "buyer_name": "购买方",
-                "document_number": "NO-1",
-                "document_date": "2026-07-30",
-                "amount_before_tax": 100,
-                "tax_amount": 6,
-                "total_amount": self.total_amount,
-                "items": [
-                    {
-                        "name": "服务",
-                        "specification": None,
-                        "unit": "项",
-                        "quantity": 1,
-                        "unit_price": 100,
-                        "amount": 100,
-                        "tax_rate": "6%",
-                        "tax_amount": 6,
-                    }
-                ],
-            }
-        )
+        from template_model_test_data import invoice_response
+        return result_type.model_validate(invoice_response(total_amount=self.total_amount))
+
 
     def close(self) -> None:
         pass
@@ -93,7 +72,7 @@ def test_wrong_target_table_keeps_extraction_and_reselect_confirms_without_rerun
     with Session(engine) as session:
         delivery = DataTableRecord(id="delivery-table", name="送货单", template_key="delivery", template_version="builtin-v1", document_kind="delivery")
         invoice = DataTableRecord(id="invoice-table", name="发票", template_key="invoice", template_version="builtin-v1", document_kind="invoice")
-        task = TaskRecord(id="wrong-target", filename="invoice.png", content_type="image/png", size_bytes=5, sha256="wrong-target", storage_path=str(image), template_mode="invoice", target_table_id=delivery.id, status=TaskStatus.QUEUED.value)
+        task = TaskRecord(id="wrong-target", filename="invoice.png", content_type="image/png", size_bytes=5, sha256="wrong-target", storage_path=image.name, template_mode="invoice", target_table_id=delivery.id, status=TaskStatus.QUEUED.value)
         session.add_all([delivery, invoice, task])
         session.commit()
 
@@ -103,7 +82,7 @@ def test_wrong_target_table_keeps_extraction_and_reselect_confirms_without_rerun
         assert saved is not None and saved.status == TaskStatus.WAITING_FOR_TEMPLATE.value
         assert "提取出字段与指定表不符" in saved.candidate_templates_json
         assert session.get(ExtractionRecord, task.id) is not None
-        assert session.scalar(select(func.count(DataRowRecord.id)).where(DataRowRecord.task_id == task.id)) == 0
+        assert session.scalar(select(func.count(DataRowRecord.id)).where(DataRowRecord.task_id == task.id)) == 1
 
         confirmation = confirm_task(session, task.id, 0, target_table_id=invoice.id)
         assert confirmation.table_id == invoice.id
@@ -177,7 +156,7 @@ def test_process_task_persists_valid_result_and_enters_table(tmp_path: Path) -> 
             content_type="image/png",
             size_bytes=5,
             sha256="digest",
-            storage_path=str(image),
+            storage_path=image.name,
             template_mode="invoice",
             status=TaskStatus.QUEUED.value,
         )
@@ -192,12 +171,12 @@ def test_process_task_persists_valid_result_and_enters_table(tmp_path: Path) -> 
         )
 
         assert extraction is not None
-        assert extraction.result.total_amount == 106
+        assert extraction.result.header["total_amount"] == 106
         assert extraction.validation_issues == []
         seller_evidence = next(
             item
             for item in extraction.evidence
-            if item.field_path == "seller_name"
+            if item.field_path == "header.seller_name"
         )
         assert seller_evidence.page_number == 1
         assert seller_evidence.status == "page_only"
@@ -261,7 +240,7 @@ def test_worker_builds_provider_and_lease_from_queued_task_snapshot(
                 content_type="image/png",
                 size_bytes=5,
                 sha256="snapshot-digest",
-                storage_path=str(image),
+                storage_path=image.name,
                 template_mode="invoice",
                 status=TaskStatus.QUEUED.value,
                 model_config_version="environment-v1",
@@ -300,7 +279,7 @@ def test_invalid_model_snapshot_becomes_predictable_failed_task(tmp_path: Path) 
                 content_type="image/png",
                 size_bytes=1,
                 sha256="invalid-snapshot-digest",
-                storage_path=str(tmp_path / "invalid.png"),
+                storage_path="invalid-snapshot.png",
                 status=TaskStatus.QUEUED.value,
                 model_config_version="environment-v1",
                 model_provider="lm_studio",
@@ -342,7 +321,7 @@ def test_process_task_materializes_invalid_result_before_review(
             content_type="image/png",
             size_bytes=5,
             sha256="review-digest",
-            storage_path=str(image),
+            storage_path=image.name,
             template_mode="invoice",
             status=TaskStatus.QUEUED.value,
         )
@@ -382,18 +361,21 @@ def test_crash_before_final_commit_leaves_no_partial_extraction_or_fact_rows(
                 content_type="image/png",
                 size_bytes=5,
                 sha256="pre-commit-crash-digest",
-                storage_path=str(tmp_path / "invoice.png"),
+                storage_path="pre-commit-crash.png",
                 template_mode="invoice",
                 status=TaskStatus.VALIDATING.value,
                 lease_token="active-token",
             )
         )
         session.commit()
-        result = StubModelClient().extract_image(
-            tmp_path / "invoice.png",
-            "",
-            DocumentExtraction,
-        )
+        from template_model_test_data import invoice_response
+        fixture = invoice_response()
+        result = DocumentExtraction.model_validate({
+            'document_type': '发票', **fixture['header'], 'items': [
+                {('amount' if key == 'item_amount' else 'tax_amount' if key == 'item_tax_amount' else key): value
+                 for key, value in item.items()} for item in fixture['items']
+            ],
+        })
         session.add(
             ExtractionRecord(
                 task_id="pre-commit-crash",
@@ -576,7 +558,7 @@ def test_old_worker_cannot_write_after_task_is_reclaimed(tmp_path: Path) -> None
                 content_type="image/png",
                 size_bytes=5,
                 sha256="fenced-digest",
-                storage_path=str(image),
+                storage_path=image.name,
                 template_mode="invoice",
                 status=TaskStatus.QUEUED.value,
             )
@@ -657,7 +639,7 @@ def test_old_worker_cannot_auto_confirm_after_validation_lease_is_reclaimed(
                 content_type="image/png",
                 size_bytes=5,
                 sha256="confirm-fenced-digest",
-                storage_path=str(image),
+                storage_path=image.name,
                 template_mode="invoice",
                 status=TaskStatus.QUEUED.value,
             )
@@ -745,6 +727,29 @@ def test_worker_storage_failure_has_distinct_actionable_status(tmp_path: Path) -
         assert saved.lease_token is None
 
 
+def test_invalid_original_reference_stops_before_model_and_has_actionable_status(tmp_path: Path) -> None:
+    from document_pipeline_api.storage_paths import InvalidOriginalReference
+    engine = build_engine(f"sqlite:///{tmp_path / 'invalid-reference.db'}")
+    Base.metadata.create_all(engine)
+    image = tmp_path / "invalid-reference.png"
+    image.write_bytes(b"evidence-must-stay")
+    settings = Settings(database_url=str(engine.url), storage_dir=tmp_path)
+    with Session(engine) as session:
+        task = _add_task(session, image, "invalid-reference")
+        task.storage_path = str(image)  # An old/invalid stored reference, never a new upload contract.
+        session.commit()
+        model = StubModelClient()
+        with pytest.raises(InvalidOriginalReference):
+            process_task(session, settings, task.id, client=model)
+        session.refresh(task)
+        assert task.status == TaskStatus.FAILED.value
+        assert task.failure_code == "invalid_original_reference"
+        assert "重新导入" in task.failure_message and "模型" not in task.failure_message
+        assert session.get(ExtractionRecord, task.id) is None
+        assert image.read_bytes() == b"evidence-must-stay"
+    engine.dispose()
+
+
 def test_multi_page_pdf_is_understood_as_one_document(tmp_path: Path) -> None:
     engine = build_engine(f"sqlite:///{tmp_path / 'multi-page.db'}")
     Base.metadata.create_all(engine)
@@ -771,7 +776,7 @@ def test_multi_page_pdf_is_understood_as_one_document(tmp_path: Path) -> None:
             size_bytes=pdf_path.stat().st_size,
             page_count=2,
             sha256="multi-page-digest",
-            storage_path=str(pdf_path),
+            storage_path=pdf_path.name,
             template_mode="invoice",
             status=TaskStatus.QUEUED.value,
         )
@@ -809,7 +814,7 @@ def test_multi_frame_tiff_is_understood_as_one_document(tmp_path: Path) -> None:
             size_bytes=tiff_path.stat().st_size,
             page_count=2,
             sha256="multi-frame-digest",
-            storage_path=str(tiff_path),
+            storage_path=tiff_path.name,
             template_mode="invoice",
             status=TaskStatus.QUEUED.value,
         )
@@ -858,7 +863,7 @@ def test_docx_embedded_images_follow_word_include_images_setting(tmp_path: Path)
                     content_type=docx_mime,
                     size_bytes=task_docx.stat().st_size,
                     sha256=task_id,
-                    storage_path=str(task_docx),
+                    storage_path=task_docx.name,
                     template_mode="invoice",
                     status=TaskStatus.QUEUED.value,
                 )
@@ -901,7 +906,7 @@ def _add_task(session: Session, image: Path, task_id: str) -> TaskRecord:
         content_type="image/png",
         size_bytes=5,
         sha256=task_id,
-        storage_path=str(stored_image),
+        storage_path=stored_image.name,
         template_mode="smart",
         status=TaskStatus.QUEUED.value,
     )

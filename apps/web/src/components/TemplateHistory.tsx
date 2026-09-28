@@ -65,8 +65,8 @@ export function TemplateHistory({ current, dirty, onClose, onRestored, initialVe
     </div>
     <div className="template-history-foot"><p className="support">恢复会将选定版本设为当前，不新增版本。旧任务、已确认数据和外部副本保留；匹配字段的阅读顺序会更新，本机副本目录不变。</p>
       {dirty && <p className="support">模板有未保存编辑，请先保存后再恢复历史。</p>}
-      {current.is_system && <p className="support">内置模板只读，修改请使用顶部复制入口。</p>}
-      <button className="btn primary sm" disabled={dirty || busy || !target || selected === current.version || current.is_system || !current.is_active} onClick={() => void restore()}><Icon icon={RotateCcw} size={14} />{busy ? "正在恢复…" : "设为当前版本"}</button>
+      {current.is_system && current.engine_kind !== "autonomous" && <p className="support">这个历史内置定义只读，可在模板页查看当前可编辑版本。</p>}
+      <button className="btn primary sm" disabled={dirty || busy || !target || selected === current.version || (current.is_system && current.engine_kind !== "autonomous") || !current.is_active} onClick={() => void restore()}><Icon icon={RotateCcw} size={14} />{busy ? "正在恢复…" : "设为当前版本"}</button>
     </div>
   </dialog>;
 }

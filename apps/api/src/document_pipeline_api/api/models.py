@@ -48,8 +48,16 @@ class ModelStatus(BaseModel):
 
 
 @router.get("/profiles", response_model=list[ModelProfileRead])
-def profiles(session: SessionDependency) -> list[ModelProfileRead]:
-    return list_model_profiles(session)
+def profiles(request: Request, session: SessionDependency) -> list[ModelProfileRead]:
+    store = request.app.state.model_secret_store
+    if store is None:
+        try:
+            store = create_model_secret_store()
+        except SecretStoreError:
+            pass
+        else:
+            request.app.state.model_secret_store = store
+    return list_model_profiles(session, store)
 
 
 @router.post("/profiles", response_model=ModelProfileRead, status_code=201)

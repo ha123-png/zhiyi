@@ -1,4 +1,5 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useModalFocus } from "../useModalFocus";
 import { Loader2, ShieldAlert } from "lucide-react";
 import { Icon } from "./Icon";
 
@@ -10,7 +11,10 @@ interface ConfirmDialogProps {
   /** 必须逐字输入的确认文字（参考 GitHub 删除仓库）。为空表示无需输入、可直接确认 */
   confirmText?: string;
   buttonLabel: string;
+  cancelLabel?: string;
+  eyebrow?: string;
   busy?: boolean;
+  error?: string | null;
   onConfirm: () => void;
   onClose: () => void;
 }
@@ -22,26 +26,24 @@ export function ConfirmDialog({
   description,
   confirmText,
   buttonLabel,
+  cancelLabel = "取消",
+  eyebrow,
   busy = false,
+  error = null,
   onConfirm,
   onClose,
 }: ConfirmDialogProps) {
   const [input, setInput] = useState("");
-  const dialogRef = useRef<HTMLDivElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const titleId = useId();
   const descriptionId = useId();
   // 未提供确认文字时无需输入，按钮始终可用
   const requireText = typeof confirmText === "string" && confirmText !== "";
   const matched = requireText ? input === confirmText : true;
 
-  useEffect(() => {
-    if (!open) {
-      setInput("");
-      return;
-    }
-    if (!requireText) cancelRef.current?.focus();
-  }, [open, requireText]);
+  const dialog = useModalFocus(open, onClose, busy, requireText ? inputRef : cancelRef);
+  useLayoutEffect(() => { if (!open) setInput(""); }, [open]);
 
   if (!open) return null;
 
@@ -54,35 +56,12 @@ export function ConfirmDialog({
         aria-labelledby={titleId}
         aria-modal="true"
         className="modal-card ai-tpl-modal"
-        onKeyDown={(event) => {
-          if (event.key === "Escape" && !busy) {
-            event.preventDefault();
-            onClose();
-            return;
-          }
-          if (event.key !== "Tab" || !dialogRef.current) return;
-          const focusable = Array.from(
-            dialogRef.current.querySelectorAll<HTMLElement>(
-              'button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
-            ),
-          );
-          if (focusable.length === 0) return;
-          const first = focusable[0];
-          const last = focusable[focusable.length - 1];
-          if (event.shiftKey && document.activeElement === first) {
-            event.preventDefault();
-            last.focus();
-          } else if (!event.shiftKey && document.activeElement === last) {
-            event.preventDefault();
-            first.focus();
-          }
-        }}
-        ref={dialogRef}
+        {...dialog}
         role="dialog"
       >
         <div className="modal-head modal-head-centered">
           <span className="modal-eyebrow">
-            <Icon icon={ShieldAlert} size={13} /> {tone === "danger" ? "危险操作" : "未保存的编辑"}
+            <Icon icon={ShieldAlert} size={13} /> {eyebrow ?? (tone === "danger" ? "危险操作" : "未保存的编辑")}
           </span>
           <h3 id={titleId}>{title}</h3>
           <div className="support" id={descriptionId}>{description}</div>
@@ -95,10 +74,10 @@ export function ConfirmDialog({
             <input
               aria-label={`输入 ${confirmText} 确认删除`}
               className="form-input"
+              ref={inputRef}
               id="confirm-dialog-input"
               type="text"
               value={input}
-              autoFocus
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && matched && !busy) onConfirm();
@@ -107,9 +86,10 @@ export function ConfirmDialog({
             />
           </div>
         )}
+        {error && <div className="callout danger" role="alert" style={{ margin: "0 20px 14px" }}>{error}</div>}
         <div className="modal-foot">
           <button ref={cancelRef} className="btn secondary" type="button" disabled={busy} onClick={onClose}>
-            取消
+            {cancelLabel}
           </button>
           <button
             className={`btn ${tone === "danger" ? "danger" : "primary"}`}

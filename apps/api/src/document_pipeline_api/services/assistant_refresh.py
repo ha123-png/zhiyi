@@ -31,9 +31,13 @@ def refreshed_result(session, call, context):
         raise HTTPException(422, "历史统计口径不完整，请重新提问。") from None
     check_context(session, context)
     scoped = scoped_analysis(session, context, query.model_copy(deep=True))
+    if "view_id" in snapshot["source"] and snapshot["source"]["view_id"] != scoped._scope_view_id:
+        raise HTTPException(409, "当前分组与原统计口径不同，请恢复原范围后刷新。")
+    if snapshot["source"].get("source_keys") != scoped._scope_source_keys:
+        raise HTTPException(409, "当前选择的文件或来源与原统计口径不同，请恢复原范围后刷新。")
     if canonical_request(scoped) != canonical_request(query):
         raise HTTPException(409, "当前资料范围与原统计口径不同，请恢复原范围后刷新；没有缩小范围或改写条件。")
-    result = analyze(session, query)
+    result = analyze(session, scoped)
     if query.records and snapshot.get("columns"):
         fields = {column["key"] for column in snapshot["columns"]}
         if not fields.issubset({column["key"] for column in result["columns"]}):

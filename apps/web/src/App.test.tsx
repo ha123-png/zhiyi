@@ -72,6 +72,46 @@ describe("App", () => {
     ).toBeInTheDocument();
   });
 
+  it("refreshes worker recovery without a reload and pauses checks while hidden", async () => {
+    const originalFetch = globalThis.fetch;
+    let workerOnline = false;
+    let checks = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/system/status")) {
+        checks += 1;
+        return { ok: true, json: async () => ({
+          api: { connected: true, message: "API 已连接" },
+          worker: { connected: workerOnline, message: workerOnline ? "任务消费者在线" : "任务消费者未启动" },
+          model: { connected: true, message: "模型可用" },
+          model_provider: "openai_compatible", configured_model: "test-model",
+        }) };
+      }
+      return originalFetch(input, init);
+    }));
+    const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+    vi.useFakeTimers();
+    let view: ReturnType<typeof render> | undefined;
+    try {
+      await act(async () => { view = render(<App />); });
+      expect(screen.getByRole("button", { name: /文件处理未启动/ })).toBeInTheDocument();
+      workerOnline = true;
+      await act(async () => { await vi.advanceTimersByTimeAsync(15000); });
+      expect(screen.getByRole("button", { name: /服务已就绪/ })).toBeInTheDocument();
+      const beforeHidden = checks;
+      hidden.mockReturnValue(true);
+      workerOnline = false;
+      await act(async () => { await vi.advanceTimersByTimeAsync(30000); });
+      expect(checks).toBe(beforeHidden);
+      hidden.mockReturnValue(false);
+      await act(async () => { document.dispatchEvent(new Event("visibilitychange")); });
+      expect(screen.getByRole("button", { name: /文件处理未启动/ })).toBeInTheDocument();
+    } finally {
+      view?.unmount();
+      hidden.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("renders dashboard, settings and connections pages", async () => {
     render(<App />);
 
@@ -308,6 +348,7 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByRole("heading", { name: "数据仪表盘" })).toBeInTheDocument());
 
     const dashboardWrap = container.querySelector(".app-page-wrap") as HTMLDivElement;
+    expect(dashboardWrap).toBe(pageWrap);
     Object.defineProperty(dashboardWrap, "scrollTop", { value: 160, writable: true });
     fireEvent.click(screen.getByRole("button", { name: "状态监控" }));
 
@@ -315,5 +356,22 @@ describe("App", () => {
       const restored = container.querySelector(".app-page-wrap") as HTMLDivElement;
       expect(restored.scrollTop).toBe(420);
     });
+  });
+
+  it("cancels interrupted page animation and keeps the last requested page", async () => {
+    const cancel = vi.fn();
+    const animate = vi.fn(() => ({cancel}));
+    const originalAnimate = HTMLElement.prototype.animate;
+    HTMLElement.prototype.animate = animate as unknown as typeof HTMLElement.prototype.animate;
+    try {
+      const { container } = render(<App />);
+      const wrapper = container.querySelector(".app-page-wrap");
+      fireEvent.click(screen.getByRole("button", {name: "文件提取"}));
+      fireEvent.click(screen.getByRole("button", {name: "设置"}));
+      fireEvent.click(screen.getByRole("button", {name: "文件提取"}));
+      expect(screen.getByRole("heading", {name: "文件提取"})).toBeInTheDocument();
+      expect(container.querySelector(".app-page-wrap")).toBe(wrapper);
+      expect(cancel).toHaveBeenCalledTimes(3);
+    } finally { HTMLElement.prototype.animate = originalAnimate; }
   });
 });

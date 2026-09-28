@@ -597,7 +597,6 @@
 
     /* Page wrapper */
     .app-page-wrap {
-      animation: pageEnter 180ms var(--ease-out);
       flex: 1;
       min-height: 0;
       overflow: auto;
@@ -1035,7 +1034,6 @@
       border-radius: var(--radius-md);
       overflow: hidden;
       background: var(--card);
-      transition: border-color 220ms ease, transform 260ms ease, box-shadow 260ms ease;
       animation: fadeUp 420ms ease both;
       position: relative;
       display: flex;
@@ -1045,11 +1043,6 @@
     .task-queue-card:nth-child(2) { animation-delay: 70ms; }
     .task-queue-card:nth-child(3) { animation-delay: 140ms; }
     .task-queue-card:nth-child(4) { animation-delay: 210ms; }
-    .task-queue-card:hover {
-      border-color: var(--color-border-strong);
-      transform: translateY(-2px);
-      box-shadow: 0 8px 24px -14px color-mix(in srgb, var(--brand-500) 20%, transparent);
-    }
     .task-queue-header {
       /* 三段式 grid：左=标题、中=徽章/呼吸灯、右=操作按钮，等高不随按钮撑开 */
       display: grid;
@@ -1140,7 +1133,6 @@
       border: 1px solid color-mix(in srgb, var(--color-border) 55%, transparent);
       border-radius: var(--radius-sm);
       background: var(--card);
-      transition: border-color 320ms var(--ease-out), transform 260ms ease, box-shadow 260ms ease;
       /* 任务卡不被压缩：高度随内容撑开，溢出由外层滚动区承载，
          避免待选模板的提示框被压到卡片边界之外 */
       flex-shrink: 0;
@@ -1151,11 +1143,6 @@
     .task-queue-card.is-warning .task-item { background: var(--color-warning-50); }
     .task-queue-card.is-success .task-item { background: var(--color-success-50); }
     .task-queue-card.is-danger .task-item { background: var(--color-danger-50); }
-    .task-item:hover {
-      border-color: var(--color-border-strong);
-      transform: translateY(-1px);
-      box-shadow: 0 4px 16px -10px color-mix(in srgb, var(--brand-500) 18%, transparent);
-    }
     .task-row-top {
       display: flex;
       align-items: center;
@@ -1167,6 +1154,11 @@
       align-items: center;
       justify-content: space-between;
       gap: calc(var(--space-4) * 3);
+    }
+    .task-queue-card.is-active .task-row-bottom {
+      align-items: stretch;
+      flex-direction: column;
+      gap: calc(var(--space-4) * 2);
     }
     .task-name {
       flex: 1 1 0;
@@ -1189,6 +1181,43 @@
     .task-row-top > .badge, .task-row-bottom > .btn { flex-shrink: 0; white-space: nowrap; }
     .task-actions { display: flex; flex-shrink: 0; gap: calc(var(--space-4) * 1.5); }
     .task-meta { min-width: 0; }
+    .task-queue-card.is-active .task-meta,
+    .task-queue-card.is-active .task-actions {
+      width: 100%;
+      min-width: 0;
+    }
+    .task-queue-card.is-active .task-meta { flex-wrap: wrap; }
+    .task-queue-card.is-active .task-actions {
+      flex-shrink: 1;
+      flex-wrap: wrap;
+      justify-content: flex-start;
+    }
+    .task-failure-row {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      justify-content: flex-start;
+    }
+    .task-failure-content {
+      display: grid;
+      gap: calc(var(--space-4) * 1.5);
+      width: 100%;
+      min-width: 0;
+    }
+    .task-failure-message {
+      min-width: 0;
+      color: var(--color-text-muted);
+      font-size: 0.875rem;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .task-failure-actions {
+      width: 100%;
+      min-width: 0;
+      flex-shrink: 1;
+      flex-wrap: wrap;
+      justify-content: flex-start;
+    }
     .task-reason { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-text-muted); font-size: .875rem; }
     .task-recovery-dialog { width: min(540px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); padding: 24px; border: 1px solid var(--color-border); border-radius: var(--radius-md); color: var(--color-text); background: var(--card); overflow: auto; }
     .task-recovery-dialog::backdrop { background: rgb(0 0 0 / 24%); }
@@ -1709,6 +1738,7 @@
 
     /* 垂直拖拽分隔条 */
     .splitter-v {
+      touch-action: none;
       width: 6px;
       flex-shrink: 0;
       cursor: col-resize;
@@ -2585,6 +2615,9 @@
       text-align: center;
       transition: border-color 260ms var(--ease-out), background 260ms var(--ease-out);
     }
+    .ai-tpl-upload { min-width: 0; }
+    .ai-tpl-upload > * { max-width: 100%; }
+    .ai-tpl-upload-help { margin-top: 8px; white-space: normal; overflow-wrap: anywhere; line-height: 1.6; }
     .ai-tpl-upload:hover {
       border-color: var(--color-primary);
       background: color-mix(in srgb, var(--color-primary) 4%, var(--muted));
@@ -2838,6 +2871,7 @@
       padding-top: 0;
     }
     .form-field { display: flex; flex-direction: column; gap: 9px; }
+    .tpl-desc-field { margin-top: calc(var(--space-4) * 4); }
     .form-label {
       font-size: var(--text-label); font-weight: 500;
       color: var(--color-text-muted);
@@ -3696,7 +3730,11 @@
       top: 20px;
       right: 20px;
       z-index: 1000;
-      max-width: 440px;
+      max-width: min(440px, calc(100vw - 40px));
+      max-height: calc(100dvh - 40px);
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
       padding: calc(var(--space-4) * 3) calc(var(--space-4) * 4);
       border-radius: var(--radius-sm);
       background: var(--color-primary);
@@ -3704,9 +3742,14 @@
       font-size: 0.8125rem;
       line-height: 1.5;
       box-shadow: var(--shadow-lg);
-      cursor: pointer;
       animation: slideIn 220ms ease;
+      box-sizing: border-box;
+      overflow: auto;
     }
+    .app-toast > span { min-width: 0; overflow-wrap: anywhere; }
+    .toast-dismiss { display: grid; place-items: center; flex-shrink: 0; padding: 4px; margin: -2px -4px -2px 0; border: 0; border-radius: 4px; background: transparent; color: inherit; cursor: pointer; }
+    .toast-dismiss:hover { background: rgb(255 255 255 / 15%); }
+    .toast-dismiss:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
     .app-toast.error {
       background: var(--destructive);
       color: #fff;
@@ -3995,6 +4038,18 @@
 
     /* 明细表圆角配合（内容不溢出） */
     .extract-item-wrap { overflow: hidden; }
+    .extract-data-block .data-table { font-size: 0.9375rem; }
+    .extract-data-block .data-table thead th { font-size: 0.875rem; }
+    .extract-header-label { font-size: 0.875rem; }
+    .extract-header-value { font-size: 0.9375rem; }
+    .data-table :is(th, td).detail-row-gutter { width: 52px; padding: 6px; text-align: center; background: var(--color-surface-muted); color: var(--color-text-muted); }
+    .detail-row-action { display: inline-flex; align-items: center; justify-content: center; gap: 3px; min-height: 30px; width: 100%; padding: 0 2px; border: 0; border-radius: 5px; background: transparent; color: var(--color-text-muted); font: inherit; font-size: 0.75rem; cursor: pointer; }
+    .detail-row-action:hover, .detail-row-action[data-state="open"] { background: var(--color-surface-hover, #e8e8e8); color: var(--color-text); }
+    .autonomous-field-note { margin: 24px 0; padding: 18px 20px; border: 1px solid var(--color-border); border-radius: 10px; background: var(--color-surface-muted); }
+    .autonomous-field-note h3 { margin: 0 0 8px; font-size: 0.9375rem; font-weight: 600; }
+    .autonomous-field-note p { margin: 0; line-height: 1.6; }
+    .history-original-body .extract-item-wrap .data-table-scroll { max-height: min(56vh, 560px); }
+    .extract-item-wrap > .file-revision-pagination { margin: 0; padding: 12px 16px; border-top: 1px solid var(--color-border); }
     .extract-item-wrap .data-table thead th:first-child { border-top-left-radius: 0; }
     .extract-item-wrap .data-table thead th:last-child { border-top-right-radius: 0; }
 
@@ -4358,7 +4413,7 @@
 
 .history-table-card .history-table {
   width: 100%;
-  min-width: 1180px;
+  min-width: 960px;
 }
 
 .history-table-card .history-table th:nth-last-child(-n + 3),
@@ -4381,24 +4436,14 @@
   padding-right: 8px;
 }
 
-/* 校验问题只有三个紧凑操作按钮，不让宽屏把该列拉伸成大片空白。 */
-.history-table-card .history-table.problems th:last-child,
-.history-table-card .history-table.problems td:last-child {
-  width: 188px !important;
-  min-width: 188px;
-  max-width: 188px;
-  padding-left: 6px;
-  padding-right: 6px;
+.history-table-card .history-table .history-actions-gutter {
+  width: 48px !important;
+  min-width: 48px;
+  max-width: 48px;
+  padding: 6px;
+  text-align: center;
 }
-
-.history-table-card .history-table.problems th:last-child {
-  text-align: right;
-}
-
-.history-table-card .history-table.problems .hist-actions {
-  width: 100%;
-  justify-content: flex-end;
-}
+.history-table .badge { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .history-table-card .history-table th:last-child {
   z-index: 5;
@@ -5645,7 +5690,8 @@ details.collapse[open] > .collapse-content {
 .template-history-body { display:grid; grid-template-columns:180px minmax(0,1fr); min-height:0; height:min(470px,55dvh); }
 .template-version-list { overflow:auto; padding:12px; border-right:1px solid var(--border); }
 .template-version-list button { display:grid; gap:6px; width:100%; border:0; border-radius:var(--radius-sm); text-align:left; padding:12px; background:none; color:var(--foreground); font:inherit; font-size:var(--text-label); cursor:pointer; }
-.template-version-list button:hover, .template-version-list button[aria-pressed=true] { background:var(--muted); }
+.template-version-list button:hover { background:var(--control-hover); }
+.template-version-list button[aria-pressed=true] { background:var(--control-selected); box-shadow:inset 0 0 0 1px var(--color-border-strong); }
 .template-version-list span { color:var(--muted-foreground); font-size:var(--text-help); }
 .template-version-detail { overflow:auto; padding:20px 24px; }
 .template-version-detail h4 { margin:0 0 16px; font-size:var(--text-body); }
@@ -5701,3 +5747,41 @@ details.collapse[open] > .collapse-content {
 }
 
 .task-header-toggle { display:inline-flex; align-items:center; gap:inherit; padding:0; border:0; background:none; color:inherit; font:inherit; text-align:left; cursor:pointer; }
+/* File history reuses the template-history frame and current type tokens. */
+.file-revision-dialog .template-history-head > div { min-width: 0; }
+.file-revision-dialog .template-history-head .support { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-revision-dialog .revision-item { margin: 12px 0; padding: 12px; border: 1px solid var(--border, #e5e5e5); border-radius: 10px; }
+.file-revision-dialog .revision-item h5 { margin: 0 0 12px; font-size: inherit; }
+.file-revision-dialog .revision-diff-row { align-items: start; }
+.file-revision-dialog .revision-diff-row > span { overflow-wrap: anywhere; }
+.file-revision-deleted { margin: 0; }
+.file-revision-deleted > div { display: grid; grid-template-columns: minmax(88px, 1fr) minmax(0, 2fr); gap: 12px; padding: 6px 0; }
+.file-revision-deleted dt { color: var(--text-muted, #777); }
+.file-revision-deleted dd { margin: 0; overflow-wrap: anywhere; }
+.file-revision-pagination { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-top: 16px; }
+.independent-history-dialog { width: min(800px, 94vw); }
+.independent-history-content { padding: 12px 24px 24px; overflow-y: auto; min-height: 0; }
+.independent-history-content .revision-diff-row { align-items: start; }
+.independent-history-content .revision-diff-row > span { overflow-wrap: anywhere; }
+.record-menu { z-index: 300; min-width: 160px; padding: 5px; border: 1px solid var(--border); border-radius: 9px; background: var(--popover); color: var(--foreground); box-shadow: var(--shadow-lg); }
+.record-menu [role="menuitem"] { display: flex; align-items: center; gap: 9px; padding: 8px 10px; font-size: 0.875rem; border-radius: 5px; cursor: pointer; outline: none; }
+.record-menu [data-highlighted] { background: var(--muted); }
+.record-menu [data-disabled] { color: var(--muted-foreground); opacity: .4; cursor: default; }
+.record-menu [role="separator"] { height: 1px; background: var(--border); margin: 4px 0; }
+.record-menu [role="menuitem"].danger { color:var(--color-danger-700); }
+.record-menu-note { max-width:240px; margin:8px 10px; font-size:14px; color:var(--muted-foreground); line-height:1.6; }
+:is(.file-revision-dialog, .independent-history-dialog) .revision-diff { font-size: 0.9375rem; gap: 12px; }
+:is(.file-revision-dialog, .independent-history-dialog) .revision-diff-row { display: grid; grid-template-columns: minmax(90px, .8fr) minmax(0, 1fr) 16px minmax(0, 1fr); }
+:is(.file-revision-dialog, .independent-history-dialog) :is(.revision-field, .revision-before, .revision-after) { min-width: 0; max-width: none; white-space: pre-wrap; overflow-wrap: anywhere; }
+.file-revision-dialog .file-revision-deleted { font-size: 0.9375rem; }
+/* Keep the existing revision cards; ordinary before/after values are not error/success states. */
+.file-revision-dialog .revision-before { color:var(--muted-foreground); text-decoration:none; font-weight:400; }
+.file-revision-dialog .revision-after { color:var(--foreground); font-weight:500; }
+.file-revision-dialog .revision-field { font-weight:400; }
+.file-revision-dialog .template-version-list button { font-size:16px; }
+.file-revision-dialog .template-version-list span { font-size:14px; }
+@media(max-width: 640px) {
+  :is(.file-revision-dialog, .independent-history-dialog) .revision-diff-row { grid-template-columns: minmax(0, 1fr) 14px minmax(0, 1fr); }
+  :is(.file-revision-dialog, .independent-history-dialog) .revision-field { grid-column: 1 / -1; }
+}
+.confirm-source-list { display:flex; flex-direction:column; gap:6px; max-height:160px; overflow:auto; margin-top:12px; padding:10px 12px; background:var(--muted); border-radius:8px; font-size:var(--text-label); overflow-wrap:anywhere; }

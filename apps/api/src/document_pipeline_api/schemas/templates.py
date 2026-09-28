@@ -47,7 +47,7 @@ class TemplateBody(BaseModel):
     # Legacy understanding rules had no per-rule length limit. Consolidating them
     # must not truncate an existing template; the HTTP request limit still applies.
     extra_instructions: str = ""
-    fields: list[TemplateField] = Field(min_length=1, max_length=100)
+    fields: list[TemplateField] = Field(default_factory=list, max_length=100)
     validation_rules: list[str] = Field(default_factory=list, max_length=50)
     deterministic_rules: list[ValidationRule] = Field(default_factory=list, max_length=50)
     output_mapping: dict[str, str] = Field(default_factory=dict)
@@ -55,7 +55,7 @@ class TemplateBody(BaseModel):
 
 
 class TemplateCreate(TemplateBody):
-    pass
+    fields: list[TemplateField] = Field(min_length=1, max_length=100)
 
 
 class TemplateUpdate(TemplateBody):
@@ -92,6 +92,8 @@ class TemplateRead(TemplateBody):
     fields: list[TemplateFieldRead]
     id: str
     version: int
+    engine_kind: Literal["legacy", "template", "autonomous"] = "template"
+    is_deleted: bool = False
     is_system: bool
     is_active: bool = True
     # 智能匹配预选池：只有池内模板才会参与智能匹配候选

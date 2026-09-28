@@ -71,6 +71,16 @@ def test_no_browser_flag_is_available_for_headless_packaged_smoke() -> None:
     assert arguments.no_browser is True
 
 
+@pytest.mark.parametrize("title_args, expected", [([], "知意"), (["--window-title", "知意 · v0.5.0 验收"], "知意 · v0.5.0 验收")])
+def test_packaged_desktop_can_use_a_separate_acceptance_window(monkeypatch, tmp_path, title_args, expected):
+    calls = []
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "Zhiyi.exe"))
+    monkeypatch.setattr(sys, "argv", ["Zhiyi.exe", "--data-dir", str(tmp_path), "--port", "18827", *title_args])
+    monkeypatch.setattr("document_pipeline_api.desktop.run_desktop", lambda *args, **kwargs: calls.append((args, kwargs)))
+    main()
+    assert calls == [((tmp_path, 18827), {"window_title": expected})]
+
+
 def test_single_instance_lock_rejects_a_second_supervisor(tmp_path: Path) -> None:
     lock_path = tmp_path / "instance.lock"
 

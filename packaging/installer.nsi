@@ -7,7 +7,7 @@ SetCompressor /SOLID zlib
 !include "FileFunc.nsh"
 
 !ifndef APP_VERSION
-  !define APP_VERSION "0.4.0"
+  !define APP_VERSION "0.5.0"
 !endif
 !ifndef BUILD_ROOT
   !error "BUILD_ROOT must point to the PyInstaller dist directory"
@@ -31,6 +31,8 @@ SetCompressor /SOLID zlib
 !define LEGACY_UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\DocumentPipeline"
 !define USER_DATA_DIR "$LOCALAPPDATA\Zhiyi"
 !define LEGACY_USER_DATA_DIR "$LOCALAPPDATA\DocumentPipeline"
+
+!system 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${__FILEDIR__}\write-uninstall-list.ps1" -Payload "${BUILD_ROOT}\Zhiyi" -Output "${OUTPUT_DIR}\uninstall-owned.nsh"' = 0
 
 Var DeleteUserData
 
@@ -83,6 +85,15 @@ Section "主程序" SEC_MAIN
   InitPluginsDir
   SetOutPath "$PLUGINSDIR\payload"
   File /r "${BUILD_ROOT}\Zhiyi\*"
+!ifdef SMOKE_MODE
+  nsExec::ExecToLog '"$PLUGINSDIR\payload\${APP_CLI_EXE}" validate-installation --installation-dir "$INSTDIR" --data-dir "${SMOKE_DATA_DIR}"'
+!else
+  nsExec::ExecToLog '"$PLUGINSDIR\payload\${APP_CLI_EXE}" validate-installation --installation-dir "$INSTDIR"'
+!endif
+  Pop $0
+  ${If} $0 != 0
+    Abort "安装目录与业务数据冲突或含其他文件。请查看上方原因，选择独立安装目录。"
+  ${EndIf}
   nsExec::ExecToLog '"$PLUGINSDIR\payload\${APP_CLI_EXE}" stop-installation --installation-dir "$INSTDIR"'
   Pop $0
   ${If} $0 != 0
@@ -121,12 +132,21 @@ SectionEnd
 !endif
 
 Function un.onInit
+!ifdef SMOKE_MODE
+  nsExec::ExecToLog '"$INSTDIR\${APP_CLI_EXE}" validate-installation --installation-dir "$INSTDIR" --data-dir "${SMOKE_DATA_DIR}"'
+!else
+  nsExec::ExecToLog '"$INSTDIR\${APP_CLI_EXE}" validate-installation --installation-dir "$INSTDIR"'
+!endif
+  Pop $0
+  ${If} $0 != 0
+    Abort "目录存在业务数据重叠或链接，已保留全部文件并停止卸载。请先整理目录。"
+  ${EndIf}
   StrCpy $DeleteUserData "0"
 !ifndef SMOKE_MODE
   ${GetParameters} $0
   ${GetOptions} $0 "/PURGE" $1
   ${IfNot} ${Silent}
-    MessageBox MB_YESNOCANCEL|MB_ICONQUESTION "是否同时删除知意的全部本地数据？选择‘是’会删除文件历史、仪表盘统计、模板、设置和缓存；选择‘否’只卸载程序并保留数据；选择‘取消’将退出卸载。" IDYES purge_data IDNO keep_data
+    MessageBox MB_YESNOCANCEL|MB_ICONQUESTION "是否同时删除知意的全部本地数据？选择‘是’会永久删除当前数据、内部原件、文件修订历史、仪表盘统计、模板、设置、缓存，以及数据目录内的全部备份。请先将需要保留的备份导出到其他目录。选择‘否’只卸载程序并保留数据；选择‘取消’将退出卸载。" IDYES purge_data IDNO keep_data
     Abort
     purge_data:
       StrCpy $DeleteUserData "1"
@@ -156,20 +176,30 @@ FunctionEnd
 
 Section "Uninstall"
 !ifndef SMOKE_MODE
+  ${If} $DeleteUserData == "1"
+    IfFileExists "$INSTDIR\${APP_CLI_EXE}" +2 0
+      Abort "未找到数据清理程序，已保留本地数据。"
+    IfFileExists "${USER_DATA_DIR}" 0 current_data_done
+      nsExec::ExecToLog '"$INSTDIR\${APP_CLI_EXE}" purge-data --data-dir "${USER_DATA_DIR}"'
+      Pop $0
+      ${If} $0 != 0
+        Abort "本地数据清理未完成，已停止卸载并保留剩余文件。请检查数据目录权限后重试。"
+      ${EndIf}
+    RMDir /r "${USER_DATA_DIR}"
+    current_data_done:
+    IfFileExists "${LEGACY_USER_DATA_DIR}" 0 legacy_data_done
+      nsExec::ExecToLog '"$INSTDIR\${APP_CLI_EXE}" purge-data --data-dir "${LEGACY_USER_DATA_DIR}"'
+      Pop $0
+      ${If} $0 != 0
+        Abort "旧版本数据清理未完成，已停止卸载并保留剩余文件。请检查数据目录权限后重试。"
+      ${EndIf}
+    RMDir /r "${LEGACY_USER_DATA_DIR}"
+    legacy_data_done:
+  ${EndIf}
   Delete "$DESKTOP\${APP_NAME}.lnk"
   RMDir /r "$SMPROGRAMS\${APP_NAME}"
   DeleteRegKey HKCU "${UNINSTALL_KEY}"
   DeleteRegKey HKCU "${APP_KEY}"
 !endif
-!ifndef SMOKE_MODE
-  ${If} $DeleteUserData == "1"
-    IfFileExists "$INSTDIR\${APP_CLI_EXE}" 0 +2
-      nsExec::ExecToLog '"$INSTDIR\${APP_CLI_EXE}" purge-data --data-dir "${USER_DATA_DIR}"'
-    RMDir /r "${USER_DATA_DIR}"
-    IfFileExists "${LEGACY_USER_DATA_DIR}" 0 +2
-      nsExec::ExecToLog '"$INSTDIR\${APP_CLI_EXE}" purge-data --data-dir "${LEGACY_USER_DATA_DIR}"'
-    RMDir /r "${LEGACY_USER_DATA_DIR}"
-  ${EndIf}
-!endif
-  RMDir /r "$INSTDIR"
+  !include "${OUTPUT_DIR}\uninstall-owned.nsh"
 SectionEnd

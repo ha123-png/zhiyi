@@ -21,6 +21,9 @@ import type { ThreadDetail } from "./types";
 
 let posted: Record<string, unknown>[];
 let stored: ThreadDetail | null;
+let authorizationCalls: {url: string; body: Record<string, unknown>}[];
+let requestOrder: string[];
+let failAuthorizationSync: boolean;
 let sources: Source[];
 class Source {
   onmessage: ((event: { data: string; lastEventId?: string }) => void) | null = null;
@@ -70,6 +73,9 @@ function Shell() {
 beforeEach(() => {
   posted = [];
   stored = null;
+  authorizationCalls = [];
+  requestOrder = [];
+  failAuthorizationSync = false;
   sources = [];
   vi.stubGlobal("EventSource", Source);
   HTMLElement.prototype.scrollTo = vi.fn();
@@ -93,6 +99,17 @@ beforeEach(() => {
         return Response.json([local, remote]);
       if (url.endsWith("/assistant/settings"))
         return Response.json({ profile_id: null });
+      if (url.endsWith("/assistant/threads/thread/authorization") && method === "PUT") {
+        authorizationCalls.push({url, body: JSON.parse(init.body)});
+        requestOrder.push("authorization");
+        return failAuthorizationSync
+          ? Response.json({detail: "授权服务暂不可用"}, {status: 503})
+          : Response.json({authorization_revision: authorizationCalls.length, invalidated_tools: 0, cancelled_runs: 0});
+      }
+      if (url.endsWith("/assistant/tools/pending-tool/decision") && method === "POST") {
+        requestOrder.push("decision");
+        return Response.json({status: "approved"});
+      }
       if (url.endsWith("/assistant/threads") || url.includes("threads?"))
         return Response.json(
           stored && !url.includes("archived=true") ? [stored] : [],
@@ -144,6 +161,42 @@ beforeEach(() => {
 });
 
 describe("问知意", () => {
+  it("synchronizes a restored authorization snapshot before approving a pending preview", async () => {
+    const pending = {id: "pending-tool", name: "propose_task_control", status: "pending",
+      result: {kind: "task_control", action: "pause", filename: "待处理.pdf", expected_status: "queued"}};
+    stored = {id: "thread", title: "待确认操作", profile_id: "local", archived: false, updated_at: "2026-09-13T00:00:00Z",
+      last_model_run: {id: "run", status: "completed", error: null, model: "qwen", profile_id: "local", profile_version: 1},
+      runs: [], tools: [pending], messages: [{id: "assistant", role: "assistant", parts: [{type: "tool", ...pending}],
+        context: {table_id: "t", mode: "assist", capabilities: ["data"]}, created_at: "2026-09-13T00:00:00Z"}]} as ThreadDetail;
+    render(<Shell />);
+    fireEvent.click(await screen.findByText("待确认操作"));
+    const approve = await screen.findByRole("button", {name: "确认执行"});
+    await waitFor(() => expect(approve).toBeEnabled());
+    expect(authorizationCalls[0].body).toMatchObject({
+      context: {table_id: "t", mode: "assist", capabilities: ["data"]},
+      profile_id: "local", profile_version: 1, remote_authorized: false,
+    });
+    fireEvent.click(approve);
+    await waitFor(() => expect(requestOrder.slice(-2)).toEqual(["authorization", "decision"]));
+  });
+
+  it("keeps approval blocked when thread authorization cannot be synchronized", async () => {
+    failAuthorizationSync = true;
+    const pending = {id: "pending-tool", name: "propose_task_control", status: "pending",
+      result: {kind: "task_control", action: "pause", filename: "待处理.pdf", expected_status: "queued"}};
+    stored = {id: "thread", title: "授权待同步", profile_id: "local", archived: false, updated_at: "2026-09-13T00:00:00Z",
+      last_model_run: {id: "run", status: "completed", error: null, model: "qwen", profile_id: "local", profile_version: 1},
+      runs: [], tools: [pending], messages: [{id: "assistant", role: "assistant", parts: [{type: "tool", ...pending}],
+        context: {table_id: "t", mode: "assist", capabilities: ["data"]}, created_at: "2026-09-13T00:00:00Z"}]} as ThreadDetail;
+    render(<Shell />);
+    fireEvent.click(await screen.findByText("授权待同步"));
+    const approve = await screen.findByRole("button", {name: "确认执行"});
+    await waitFor(() => expect(approve).toBeDisabled());
+    fireEvent.click(screen.getByRole("button", {name: "对话设置"}));
+    expect(await screen.findByRole("button", {name: "重试同步"})).toBeEnabled();
+    expect(requestOrder).not.toContain("decision");
+  });
+
   it("restores the last actual model and scope despite a late default response", async () => {
     const modelRun = { id: "old-cloud", status: "completed", error: null, model: "cloud-original", profile_id: "cloud", profile_version: 1 };
     stored = { id: "thread", title: "云端历史", profile_id: "local", archived: false, updated_at: "2026-09-13T00:00:00Z",
@@ -209,6 +262,25 @@ describe("问知意", () => {
     expect(screen.getByRole("textbox", { name: "向问知意提问" })).toHaveValue("未发送的草稿");
     expect(screen.getAllByText("50,005,000").length).toBeGreaterThanOrEqual(2);
     expect(screen.getAllByRole("button", { name: "重新回答" })).toHaveLength(1);
+  });
+  it("keeps the answer visible and puts raw row evidence behind one disclosure", async () => {
+    const result = { analysis_id: "rows", source: { table_id: "t", table_name: "采购", row_count: 1,
+      document_count: 1, grain: "row", generated_at: "2026-09-21", request: {} },
+      rows: [{ row_id: 1, version: 0, task_id: null, values: { amount: 10 } }], columns: [{ key: "amount", label: "金额" }],
+      warnings: [], truncated: false };
+    const tool = { id: "rows", name: "analyze_data_table", status: "completed", result };
+    stored = { id: "thread", title: "明细阅读", profile_id: "local", archived: false,
+      updated_at: "2026-09-21T00:00:00Z", runs: [], tools: [tool], messages: [
+        { id: "a", role: "assistant", context: {}, created_at: "2026-09-21T00:00:00Z",
+          parts: [{ type: "tool", ...tool }, { type: "text", text: "金额为 10，以下是说明。" }] },
+      ] };
+    render(<Shell />);
+    fireEvent.click(await screen.findByRole("button", { name: /明细阅读.*2026/ }));
+    expect(await screen.findByText("金额为 10，以下是说明。")).toBeVisible();
+    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "已读取的数据与来源" }));
+    // The disclosure mounts its content before its opening opacity animation completes.
+    await waitFor(() => expect(screen.getByRole("table")).toBeVisible());
   });
   it("renders incremental Unicode text without polling and reconciles final saved content", async () => {
     stored = { id: "thread", title: "真实增量通路", profile_id: "local", archived: false, updated_at: "2026-09-13T00:00:00Z",

@@ -1,3 +1,7 @@
+import { FileRevisionHistory } from "./FileRevisionHistory";
+import { IndependentHistory } from "./IndependentHistory";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { enterWarehouseEditing } from "../api";
 import { useAssistantPageContext } from "../assistant/AssistantProvider";
 import { assistantApi } from "../assistant/api";
 import {
@@ -9,7 +13,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
-  ArrowRight,
+  MoreHorizontal,
   Braces,
   CheckCheck,
   ChevronDown,
@@ -38,9 +42,12 @@ import {
 } from "lucide-react";
 import {
   addDataRow,
+  ApiError,
   addCustomColumn,
   createSplitViews,
+  clearTableViews,
   createTable,
+  clearSourceCards,
   deleteDataRows,
   deleteTable,
   deleteCustomColumn,
@@ -50,28 +57,30 @@ import {
   getTables,
   getTableView,
   getTableViews,
-  getRowRevisions,
   getTemplates,
   mergeTables,
   renameTable,
+  responseErrorMessage,
   updateDataRow,
 } from "../api";
 import { desktopApi } from "../desktop";
 import type {
   DataRowRead,
-  DataRowRevision,
   DataTableDetail,
   DataTableRead,
   DataViewDetail,
   DataViewRead,
   ExtractionTemplate,
   TableColumnDef,
+  SourceCard,
 } from "../types";
-import { serverDate } from "../time";
 import { Icon } from "./Icon";
 import { EditableText } from "./EditableText";
-import { CardCollection } from "./CardCollection";
+import { SourceCardCollection } from "./SourceCardCollection";
+import { ImportSheetDialog } from "./ImportSheetDialog";
 import { InputScopeDetails } from "./InputScopeDetails";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { Toast, useToast } from "./Toast";
 
 // --- Types ---
 
@@ -83,6 +92,15 @@ interface ColumnDef {
   section?: string | null;
   width: number;
   userDefined: boolean;
+}
+
+interface UnsavedCellDraft {
+  key: string;
+  tableName: string;
+  tableId: string;
+  rowId: number;
+  columnLabel: string;
+  input: string;
 }
 
 const TABLE_PAGE_SIZE = 10;
@@ -116,20 +134,24 @@ export function DataTablePage({
 }: DataTablePageProps = {}) {
   const [dsFilterOpen, setDsFilterOpen] = useState(false);
   const [importMenuOpen, setImportMenuOpen] = useState(false);
+  const [pendingImport, setPendingImport] = useState<{file: File; tableId: string | null; sheets: string[]} | null>(null);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [fieldFilterOpen, setFieldFilterOpen] = useState(false);
   const [addColumnOpen, setAddColumnOpen] = useState(false);
   const [newColumnLabel, setNewColumnLabel] = useState("");
   const [newColumnSection, setNewColumnSection] = useState<"header" | "item">("header");
+  const [newColumnType, setNewColumnType] = useState<"text" | "number" | "date" | "boolean">("text");
   const [mergeModalOpen, setMergeModalOpen] = useState(false);
   const [splitModalOpen, setSplitModalOpen] = useState(false);
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deleteRowsConfirm, setDeleteRowsConfirm] = useState(false);
+  const [deleteColumnTarget, setDeleteColumnTarget] = useState<ColumnDef | null>(null);
+  const { toast, notify, clear } = useToast();
+  useEffect(() => enterWarehouseEditing(), []);
   const [revisionsOpen, setRevisionsOpen] = useState(false);
   const [revisionSource, setRevisionSource] = useState<DataRowRead | null>(null);
-  const [revisions, setRevisions] = useState<DataRowRevision[]>([]);
-  const [revisionsLoading, setRevisionsLoading] = useState(false);
-  const [revisionsError, setRevisionsError] = useState<string | null>(null);
+  const [independentHistoryOpen, setIndependentHistoryOpen] = useState(false);
 
   const [tables, setTables] = useState<DataTableRead[]>([]);
   const [tablesLoading, setTablesLoading] = useState(true);
@@ -141,6 +163,10 @@ export function DataTablePage({
   const [tableLoading, setTableLoading] = useState(false);
   const [tableError, setTableError] = useState<string | null>(null);
   const [tableNotice, setTableNotice] = useState<string | null>(null);
+  const [unsavedCellDrafts, setUnsavedCellDrafts] = useState<UnsavedCellDraft[]>([]);
+  const cellSaveAttempts = useRef(new Map<string, number>());
+  useEffect(() => { if (tableError) notify(tableError, "error"); }, [tableError, notify]);
+  useEffect(() => { if (tableNotice) notify(tableNotice, "success"); }, [tableNotice, notify]);
 
   const [page, setPage] = useState(1);
   const [jumpPageInput, setJumpPageInput] = useState("");
@@ -157,6 +183,9 @@ export function DataTablePage({
     return () => window.removeEventListener("zhiyi:assistant-changed", changed);
   }, [currentTableId]);
   const [views, setViews] = useState<DataViewRead[]>([]);
+  const [moreViews, setMoreViews] = useState(false);
+  const [loadingMoreViews, setLoadingMoreViews] = useState(false);
+  const viewsGeneration = useRef(0);
   const [currentViewId, setCurrentViewId] = useState<string | null>(null);
   const [splitFieldKey, setSplitFieldKey] = useState("");
   const [groupBy, setGroupBy] = useState<"none" | "file" | "field">("field");
@@ -164,7 +193,19 @@ export function DataTablePage({
 
   const [hiddenCols, setHiddenCols] = useState<string[]>([]);
   const [selectedRows, setSelectedRows] = useState<number[]>([]);
-  useAssistantPageContext("tables", { table_id: currentTableId, table_name: tableDetail?.name, row_ids: selectedRows.length ? selectedRows : null, view_id: currentViewId, search: searchText });
+  const selectedRowSnapshots = useRef<Record<number, DataRowRead>>({});
+  const [selectedSources, setSelectedSources] = useState<SourceCard[]>([]);
+  const [clearSourcesConfirm, setClearSourcesConfirm] = useState(false);
+  useEffect(() => {
+    const selected = new Set(selectedRows);
+    for (const id of Object.keys(selectedRowSnapshots.current)) {
+      if (!selected.has(Number(id))) delete selectedRowSnapshots.current[Number(id)];
+    }
+  }, [selectedRows]);
+  useEffect(() => { setSelectedSources([]); setClearSourcesConfirm(false); setDeleteRowsConfirm(false); setDeleteColumnTarget(null); }, [currentTableId, currentViewId, searchText]);
+  useAssistantPageContext("tables", { table_id: currentTableId, table_name: tableDetail?.name,
+    row_ids: selectedRows.length ? selectedRows : null, source_keys: selectedSources.length ? selectedSources.map(source => source.id) : null,
+    view_id: currentViewId, search: searchText });
   const [editingCell, setEditingCell] = useState<string | null>(null);
   const [mergeSelection, setMergeSelection] = useState<string[]>([]);
   const [mergeName, setMergeName] = useState("");
@@ -187,7 +228,9 @@ export function DataTablePage({
   const importInputRef = useRef<HTMLInputElement>(null);
   const importNewInputRef = useRef<HTMLInputElement>(null);
 
-  const sidebarWidth = 240;
+  const [sidebarWidth, setSidebarWidth] = useState(240);
+  const sidebarDrag = useRef<{x: number; width: number} | null>(null);
+  const resizeSidebar = (width: number) => setSidebarWidth(Math.max(180, Math.min(360, width)));
 
   // 加载表列表
   useEffect(() => {
@@ -219,42 +262,18 @@ export function DataTablePage({
   }, []);
 
   const detailMatches = tableDetail && ("table_id" in tableDetail ? tableDetail.table_id : tableDetail.id) === currentTableId;
-  const presentationMode = (currentTableId && presentationOverrides[currentTableId]) || (detailMatches ? tableDetail.presentation?.mode : undefined) || "table";
+  const isFileCollection = tables.find(table => table.id === currentTableId)?.collection_kind === "files";
+  const presentationMode = isFileCollection ? "card" : (currentTableId && presentationOverrides[currentTableId]) || (detailMatches ? tableDetail.presentation?.mode : undefined) || "table";
   const cardArea = useRef<HTMLDivElement>(null);
-  const presentationPages = useRef<Record<string, Partial<Record<"table" | "card", number>>>>({});
-  const [cardCapacity, setCardCapacity] = useState(2);
-  const cardCapacityRef = useRef(2);
-  const pageSize = presentationMode === "card" ? cardCapacity : TABLE_PAGE_SIZE;
+  const pageSize = TABLE_PAGE_SIZE;
   useEffect(() => {
     if (!initialRowId || !currentTableId || currentTableId !== initialTableId) return;
     let cancelled = false;
     void assistantApi<{ page: number }>(`/references/tables/${encodeURIComponent(currentTableId)}/rows/${initialRowId}?page_size=${pageSize}`).then(result => {
-      if (!cancelled) { setCurrentViewId(null); setSearchText(""); setPage(result.page); setSelectedRows([initialRowId]); }
+      if (!cancelled) { setCurrentViewId(null); setSearchText(""); setPage(result.page); setSelectedRows([initialRowId]); setPresentationOverrides(previous => ({...previous, [currentTableId]: "table"})); }
     }).catch(error => { if (!cancelled) setTableNotice(error.message); });
     return () => { cancelled = true; };
   }, [initialRowId, currentTableId, initialTableId, pageSize]);
-  useEffect(() => {
-    const area = cardArea.current;
-    if (presentationMode !== "card" || !area || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(([entry]) => {
-      const width = Math.max(0, entry.contentRect.width - 32);
-      const height = Math.max(0, entry.contentRect.height - 32);
-      const columns = Math.max(1, Math.min(3, Math.floor((width + 16) / 316)));
-      const rowCount = height >= 600 ? 2 : 1;
-      area.style.setProperty("--card-columns", String(columns));
-      area.style.setProperty("--card-rows", String(rowCount));
-      const previous = cardCapacityRef.current;
-      const next = columns * rowCount;
-      if (previous !== next) {
-        cardCapacityRef.current = next;
-        setCardCapacity(next);
-        setPage(p => Math.floor((p - 1) * previous / next) + 1);
-      }
-    });
-    observer.observe(area);
-    return () => observer.disconnect();
-  }, [presentationMode, currentTableId]);
-
   useEffect(() => {
     const area = cardArea.current;
     if (!area?.animate || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
@@ -293,6 +312,8 @@ export function DataTablePage({
   }, [currentTableId, currentViewId, page, pageSize, searchText, reloadTrigger]);
 
   useEffect(() => {
+    const generation = ++viewsGeneration.current;
+    setMoreViews(false); setLoadingMoreViews(false);
     if (!currentTableId) {
       setViews([]);
       return;
@@ -300,10 +321,10 @@ export function DataTablePage({
     let cancelled = false;
     getTableViews(currentTableId)
       .then((nextViews) => {
-        if (!cancelled) setViews(nextViews);
+        if (!cancelled && generation === viewsGeneration.current) { setViews(nextViews); setMoreViews(nextViews.length === 200); }
       })
       .catch((err) => {
-        if (!cancelled) {
+        if (!cancelled && generation === viewsGeneration.current) {
           setTableError(err instanceof Error ? err.message : "加载分 Sheet 失败");
         }
       });
@@ -311,6 +332,20 @@ export function DataTablePage({
       cancelled = true;
     };
   }, [currentTableId, reloadTrigger]);
+
+  async function loadMoreViews() {
+    if (!currentTableId || loadingMoreViews) return;
+    const generation = viewsGeneration.current;
+    setLoadingMoreViews(true);
+    try {
+      const next = await getTableViews(currentTableId, views.length);
+      if (generation !== viewsGeneration.current) return;
+      setViews(previous => [...previous, ...next.filter(view => !previous.some(old => old.id === view.id))]);
+      setMoreViews(next.length === 200);
+    } catch (error) {
+      if (generation === viewsGeneration.current) setTableError(error instanceof Error ? error.message : "读取分组失败");
+    } finally { if (generation === viewsGeneration.current) setLoadingMoreViews(false); }
+  }
 
   // 跳转定位：找到包含该任务记录的第一页并高亮（最多扫描 50 页）
   useEffect(() => {
@@ -372,7 +407,7 @@ export function DataTablePage({
   const tableMinWidth = 44 + visibleColumns.reduce((sum, col) => sum + widthFor(col), 0);
   const rows = (tableDetail?.rows ?? []).slice(0, pageSize);
 
-  const contentUnit = presentationMode === "card" ? "条内容" : "行";
+  const contentUnit = "行";
   const totalRows = tableDetail?.row_count ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
 
@@ -443,7 +478,8 @@ export function DataTablePage({
   }
 
   function goToPage(p: number) {
-    if (p < 1 || p > totalPages) return;
+    if (p < 1 || p > totalPages || p === page) return;
+    if (selectedRows.length) notify("已切换页面，并清除上一页的明细选择。", "info");
     setPage(p);
     setSelectedRows([]);
     setEditingCell(null);
@@ -458,6 +494,7 @@ export function DataTablePage({
   }
 
   function toggleSelectAll() {
+    setSelectedSources([]);
     if (allSelected) {
       setSelectedRows([]);
     } else {
@@ -466,6 +503,7 @@ export function DataTablePage({
   }
 
   function toggleSelectRow(rowId: number) {
+    setSelectedSources([]);
     setSelectedRows((current) =>
       current.includes(rowId)
         ? current.filter((id) => id !== rowId)
@@ -542,7 +580,7 @@ export function DataTablePage({
     }
   }
 
-  async function handleExport(format: "xlsx" | "csv" | "json" | "views") {
+  async function handleExport(format: "xlsx" | "csv" | "json" | "views" | "zip") {
     if (!currentTableId) return;
     setExportMenuOpen(false);
     if (format === "views" && views.length === 0) {
@@ -550,15 +588,27 @@ export function DataTablePage({
       setTableNotice("当前数据表还没有分 Sheet，请先创建分 Sheet 后再导出。");
       return;
     }
-    const url = format === "views" ? getTableViewsExportUrl(currentTableId) : getTableExportUrl(currentTableId, format);
+    const scope = { viewId: currentViewId, search: searchText, rowIds: !isFileCollection && selectedRows.length ? selectedRows : null,
+      sourceKeys: selectedSources.length ? selectedSources.map(source => source.id) : null };
+    const url = format === "views" ? getTableViewsExportUrl(currentTableId, scope) : getTableExportUrl(currentTableId, format, scope);
     const bridge = desktopApi();
-    if (!bridge) {
-      window.open(url, "_blank");
-      return;
-    }
     try {
       const absoluteUrl = new URL(url, window.location.origin).toString();
-      const filename = `${currentSheetName || "数据表"}${format === "views" ? "-分Sheet.xlsx" : `.${format}`}`;
+      const filename = `${currentSheetName || "数据表"}${searchText.trim() ? "-搜索结果" : ""}${selectedSources.length ? "-选中来源" : selectedRows.length && !isFileCollection ? "-选中明细" : ""}${format === "views" ? "-分Sheet.xlsx" : `.${format}`}`;
+      if (!bridge) {
+        const response = await fetch(url);
+        if (!response.ok) {
+          throw new Error(await responseErrorMessage(response, "导出"));
+        }
+        const match = /filename\*=UTF-8''([^;]+)/i.exec(response.headers.get("Content-Disposition") || "");
+        const objectUrl = URL.createObjectURL(await response.blob());
+        const link = document.createElement("a");
+        link.href = objectUrl; link.download = match ? decodeURIComponent(match[1]) : filename;
+        document.body.appendChild(link); link.click(); link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+        setTableError(null); setTableNotice("已导出当前范围。");
+        return;
+      }
       const path = await bridge.export_table(absoluteUrl, filename);
       setTableError(null);
       setTableNotice(`已导出到 ${path}`);
@@ -567,58 +617,60 @@ export function DataTablePage({
     }
   }
 
-  async function handleImportFile(file: File) {
+  async function importFile(file: File, tableId: string | null, sheetName?: string) {
     setImportMenuOpen(false);
-    if (!currentTableId) return;
     setBusyAction(true);
     setTableError(null);
     try {
       const body = new FormData();
       body.append("file", file);
-      const response = await fetch(`/api/v1/tables/${currentTableId}/import`, {
+      if (sheetName) body.append("sheet_name", sheetName);
+      const response = await fetch(tableId ? `/api/v1/tables/${tableId}/import` : "/api/v1/tables/import-new", {
         method: "POST",
         body,
       });
-      if (!response.ok) {
-        const data = (await response.json().catch(() => null)) as { detail?: string } | null;
-        throw new Error(data?.detail ?? "导入失败");
+      const data = await response.clone().json().catch(() => null) as {id?: string; name?: string; detail?: unknown} | null;
+      const detail = data?.detail as {code?: string; sheets?: unknown} | undefined;
+      if (!response.ok && detail?.code === "select_sheet" && Array.isArray(detail.sheets) && detail.sheets.every(sheet => typeof sheet === "string")) {
+        setPendingImport({file, tableId, sheets: detail.sheets});
+        return;
       }
-      await response.json();
-      setTableNotice(`已把「${file.name}」导入当前数据表。`);
+      if (!response.ok) throw new Error(await responseErrorMessage(response, "导入"));
+      if (!data?.id) throw new Error("导入结果未能确认，请刷新数据表查看。");
+      setPendingImport(null);
+      if (!tableId) { setCurrentTableId(data.id); setCurrentViewId(null); }
+      setTableNotice(`已将「${file.name}${sheetName ? ` · ${sheetName}` : ""}」导入「${data.name || "数据表"}」。`);
       setReloadTrigger((n) => n + 1);
       await getTables().then(setTables);
     } catch (err) {
       setTableError(err instanceof Error ? err.message : "导入失败");
     } finally {
       setBusyAction(false);
-      if (importInputRef.current) {
-        importInputRef.current.value = "";
-      }
+      if (importInputRef.current) importInputRef.current.value = "";
+      if (importNewInputRef.current) importNewInputRef.current.value = "";
     }
   }
 
+  async function handleImportFile(file: File) {
+    if (currentTableId) await importFile(file, currentTableId);
+  }
+
   async function handleImportNewTable(file: File) {
-    setImportMenuOpen(false);
-    setBusyAction(true);
-    setTableError(null);
-    try {
-      const body = new FormData(); body.append("file", file);
-      const response = await fetch("/api/v1/tables/import-new", { method: "POST", body });
-      const data = await response.json().catch(() => null) as { id?: string; name?: string; detail?: string } | null;
-      if (!response.ok || !data?.id) throw new Error(data?.detail ?? "新建表导入失败");
-      setCurrentTableId(data.id); setCurrentViewId(null);
-      setTableNotice(`已从「${file.name}」新建数据表「${data.name ?? file.name}」。`);
-      setReloadTrigger((n) => n + 1); await getTables().then(setTables);
-    } catch (err) { setTableError(err instanceof Error ? err.message : "新建表导入失败"); }
-    finally { setBusyAction(false); if (importNewInputRef.current) importNewInputRef.current.value = ""; }
+    await importFile(file, null);
   }
 
   async function commitCellEdit(row: DataRowRead, colKey: string, newValue: string) {
     if (!currentTableId || !tableDetail) return;
     const oldValue = getCellValue(row, colKey);
     if (newValue === oldValue) return;
+    const key = JSON.stringify([currentTableId, row.id, colKey]);
+    const attempt = (cellSaveAttempts.current.get(key) ?? 0) + 1;
+    cellSaveAttempts.current.set(key, attempt);
+    const column = columns.find((item) => item.key === colKey);
+    const draft: UnsavedCellDraft = {key, tableId: currentTableId,
+      tableName: tables.find(table => table.id === currentTableId)?.name ?? currentTableId,
+      rowId: row.id, columnLabel: column?.label ?? colKey, input: newValue};
     try {
-      const column = columns.find((item) => item.key === colKey);
       let value: unknown = newValue === "" ? null : newValue;
       if (value !== null && column?.valueType === "number") {
         const normalized = Number(newValue.replace(/,/g, "").trim());
@@ -634,10 +686,19 @@ export function DataTablePage({
       }
       await updateDataRow(currentTableId, row.id, row.version, {
         [colKey]: value,
-      });
+      }, undefined, row.shared_header_keys ?? undefined);
+      if (cellSaveAttempts.current.get(key) !== attempt) return;
+      setUnsavedCellDrafts(drafts => drafts.filter(item => item.key !== key));
       setReloadTrigger((n) => n + 1);
     } catch (err) {
-      setTableError(err instanceof Error ? err.message : "保存失败");
+      if (cellSaveAttempts.current.get(key) !== attempt) return;
+      setUnsavedCellDrafts(drafts => [...drafts.filter(item => item.key !== key), draft]);
+      if (err instanceof ApiError && err.status === 409) {
+        notify("这行数据已被更新，本次修改未保存；请核对刷新后的值再修改。", "error");
+        setReloadTrigger((n) => n + 1);
+      } else {
+        setTableError(err instanceof Error ? err.message : "保存失败");
+      }
     }
   }
 
@@ -645,10 +706,11 @@ export function DataTablePage({
     if (!currentTableId || !newColumnLabel.trim()) return;
     setBusyAction(true);
     try {
-      await addCustomColumn(currentTableId, newColumnLabel.trim(), newColumnSection);
+      await addCustomColumn(currentTableId, newColumnLabel.trim(), newColumnSection, newColumnType);
       setAddColumnOpen(false);
       setNewColumnLabel("");
       setNewColumnSection("header");
+      setNewColumnType("text");
       setReloadTrigger((n) => n + 1);
       setTableNotice("附加列已创建；它只属于数据表，不会发送给模型。 ");
     } catch (err) {
@@ -660,24 +722,34 @@ export function DataTablePage({
 
   async function handleDeleteColumn(column: ColumnDef) {
     if (!currentTableId || !column.userDefined) return;
-    if (!window.confirm(`删除附加列“${column.label}”？这一列现有内容也会删除。`)) return;
+    setBusyAction(true);
+    setTableError(null);
     try {
       await deleteCustomColumn(currentTableId, column.key);
+      setDeleteColumnTarget(null);
       setReloadTrigger((n) => n + 1);
       setTableNotice(`已删除附加列“${column.label}”。`);
     } catch (err) {
       setTableError(err instanceof Error ? err.message : "删除列失败");
+    } finally {
+      setBusyAction(false);
     }
   }
 
   async function handleCreateSplitViews() {
     if (!currentTableId || (groupBy === "field" && !splitFieldKey)) return;
-    if (groupBy === "none") { setCurrentViewId(null); setPage(1); setSplitModalOpen(false); return; }
+    const generation = ++viewsGeneration.current;
+    setLoadingMoreViews(false);
     setSplitting(true);
     setTableError(null);
     try {
-      const created = await createSplitViews(currentTableId, groupBy === "file" ? "source_filename" : splitFieldKey, groupBy);
+      const created = groupBy === "none" ? (await clearTableViews(currentTableId), []) : await createSplitViews(currentTableId, groupBy === "file" ? "source_filename" : splitFieldKey, groupBy);
+      if (generation !== viewsGeneration.current) return;
       setViews(created);
+      setMoreViews(created.length === 200);
+      setTableNotice(groupBy === "none" ? "已取消分组，数据未改变。" : "分组会随当前数据更新，新类别会自动出现。");
+      await getTables().then(setTables);
+      if (generation !== viewsGeneration.current) return;
       setCurrentViewId(created[0]?.id ?? null);
       setPage(1);
       setSelectedRows([]);
@@ -752,7 +824,9 @@ export function DataTablePage({
       const rowIds = selectedRows.filter(
         (id): id is number => typeof id === "number",
       );
-      await deleteDataRows(currentTableId, rowIds);
+      const currentRows = new Map([...Object.values(selectedRowSnapshots.current), ...rows].map(row => [row.id, row]));
+      await deleteDataRows(currentTableId, rowIds, undefined, Object.fromEntries(rowIds.flatMap(id => currentRows.has(id) ? [[id, currentRows.get(id)!.version]] : [])));
+      setDeleteRowsConfirm(false);
       setSelectedRows([]);
       setReloadTrigger((n) => n + 1);
       await getTables().then(setTables);
@@ -761,6 +835,17 @@ export function DataTablePage({
     } finally {
       setBusyAction(false);
     }
+  }
+
+  async function handleClearSources() {
+    if (!currentTableId || !selectedSources.length) return;
+    setBusyAction(true); setTableError(null);
+    try {
+      await clearSourceCards(currentTableId, selectedSources.map(({id, version}) => ({id, version})), {viewId: currentViewId, search: searchText});
+      setSelectedSources([]); setClearSourcesConfirm(false); setReloadTrigger(n => n + 1);
+      await getTables().then(setTables);
+    } catch (err) { setTableError(err instanceof Error ? err.message : "清空未完成，请重试。"); }
+    finally { setBusyAction(false); }
   }
 
   async function handleDeleteTable() {
@@ -783,19 +868,10 @@ export function DataTablePage({
 
   async function openRevisions(rowId: number) {
     if (!currentTableId) return;
-    setRevisionSource(rows.find((row) => row.id === rowId) ?? null);
+    const source = rows.find((row) => row.id === rowId) ?? selectedRowSnapshots.current[rowId] ?? null;
+    setRevisionSource(source);
     setRevisionsOpen(true);
-    setRevisionsLoading(true);
-    setRevisionsError(null);
-    setRevisions([]);
-    try {
-      const items = await getRowRevisions(currentTableId, rowId);
-      setRevisions(items);
-    } catch (err) {
-      setRevisionsError(err instanceof Error ? err.message : "读取修订历史失败");
-    } finally {
-      setRevisionsLoading(false);
-    }
+
   }
 
   // 全局行索引（rowGroups 展开时递增）
@@ -803,6 +879,22 @@ export function DataTablePage({
 
   return (
     <div className={`view${presentationMode === "card" ? " presentation-card" : ""}`}>
+      {unsavedCellDrafts.length > 0 && <details className="callout warning" style={{marginBottom: 16}}>
+        <summary>未保存输入（{unsavedCellDrafts.length}）· 展开查看或复制</summary>
+        <p>以下输入未写入数据表，仅在本页暂存。可复制后重新修改；关闭条目或离开本页会丢弃输入。</p>
+        {unsavedCellDrafts.map(draft => {
+          const label = `${draft.tableName} · 行 ${draft.rowId} · ${draft.columnLabel}`;
+          return <div key={draft.key} style={{marginTop: 12}}>
+            <p title={`数据表：${draft.tableId}`}>{label}</p>
+            <textarea className="form-input" aria-label={`未保存输入：${label}`} readOnly
+              value={draft.input} rows={3} />
+            <button type="button" className="btn secondary sm" aria-label={`丢弃未保存输入：${label}`}
+              onClick={() => setUnsavedCellDrafts(drafts => drafts.filter(item => item.key !== draft.key))}>
+              关闭此输入
+            </button>
+          </div>;
+        })}
+      </details>}
       {jumpNotice && (
         <div className="callout warning" style={{ marginBottom: 16 }}>
           {jumpNotice}
@@ -812,6 +904,7 @@ export function DataTablePage({
         {/* Toolbar */}
         <div className="datastore-toolbar">
           <div className="datastore-toolbar-left" style={{ gap: "calc(var(--space-4) * 2)" }}>
+            {!isFileCollection && <>
             <button className="btn secondary sm" onClick={() => setFieldFilterOpen(true)}>
               <Icon icon={Columns3} size={15} /> 字段
               {hiddenCols.length > 0 && (
@@ -834,14 +927,15 @@ export function DataTablePage({
               <Icon icon={Table2} size={15} /> {presentationMode === "card" ? "分组" : "分 Sheet"}
             </button>
             <div className="toolbar-divider" />
-            <button
+            </>}
+            {!isFileCollection && <button
               className="btn secondary sm"
-              disabled={tables.length < 2}
+              disabled={isFileCollection || tables.filter(table => table.collection_kind !== "files").length < 2}
               onClick={() => setMergeModalOpen(true)}
               title={tables.length < 2 ? "至少需要两张表才能合并" : undefined}
             >
               <Icon icon={GitMerge} size={15} /> 合并表
-            </button>
+            </button>}
             <div className="toolbar-menu-wrap">
               <button
                 className="btn secondary sm"
@@ -863,7 +957,7 @@ export function DataTablePage({
               <input ref={importNewInputRef} className="visually-hidden" type="file" accept=".xlsx,.csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) void handleImportNewTable(file); }} />
               {importMenuOpen && (
                 <div className="toolbar-menu">
-                  <button className="toolbar-menu-item" onClick={() => importInputRef.current?.click()}>
+                  <button className="toolbar-menu-item" disabled={isFileCollection} onClick={() => importInputRef.current?.click()}>
                     <Icon icon={FileSpreadsheet} size={15} /> 追加到当前表<span className="menu-hint">XLSX / CSV</span>
                   </button>
                   <button className="toolbar-menu-item" onClick={() => importNewInputRef.current?.click()}>
@@ -879,20 +973,21 @@ export function DataTablePage({
               </button>
               {exportMenuOpen && (
                 <div className="toolbar-menu">
-                  <button className="toolbar-menu-item" onClick={() => handleExport("xlsx")}>
-                    <Icon icon={FileSpreadsheet} size={15} /> 导出 Excel (.xlsx)<span className="menu-hint">XLSX</span>
+                  <div className="menu-hint" role="note">{selectedSources.length ? `选中 ${selectedSources.length} 个完整来源` : selectedRows.length && !isFileCollection ? `选中 ${selectedRows.length} 条明细` : searchText.trim() ? (isFileCollection ? "搜索匹配的文件" : "当前搜索结果") : currentViewId ? "当前分组" : "当前表全部数据"}</div>
+                  <button className="toolbar-menu-item" onClick={() => handleExport(isFileCollection && (tables.find(table => table.id === currentTableId)?.file_count ?? 0) > 100 ? "zip" : "xlsx")}>
+                    <Icon icon={FileSpreadsheet} size={15} /> 导出 Excel<span className="menu-hint">{isFileCollection ? ((tables.find(table => table.id === currentTableId)?.file_count ?? 0) > 100 ? "ZIP · 每包最多 100 份" : "XLSX · 每文件一页") : "XLSX"}</span>
                   </button>
-                  <button
+                  {!isFileCollection && <><button
                     className="toolbar-menu-item"
                     disabled={views.length === 0}
                     onClick={() => handleExport("views")}
                     title={views.length === 0 ? "当前数据表还没有分 Sheet，请先创建分 Sheet" : undefined}
                   >
-                    <Icon icon={FileSpreadsheet} size={15} /> 导出全部分 Sheet<span className="menu-hint">多工作表</span>
+                    <Icon icon={FileSpreadsheet} size={15} /> 按分 Sheet 导出<span className="menu-hint">当前范围</span>
                   </button>
                   <button className="toolbar-menu-item" onClick={() => handleExport("csv")}>
                     <Icon icon={FileText} size={15} /> 导出 CSV (.csv)<span className="menu-hint">CSV</span>
-                  </button>
+                  </button></>}
                   <div className="toolbar-menu-sep" />
                   <button className="toolbar-menu-item" onClick={() => handleExport("json")}>
                     <Icon icon={Braces} size={15} /> 导出 JSON<span className="menu-hint">JSON</span>
@@ -911,6 +1006,9 @@ export function DataTablePage({
                 placeholder="搜索当前表…"
                 value={searchText}
                 onChange={(event) => {
+                  if (selectedRows.length || selectedSources.length) notify("搜索范围已改变，已清除之前的选择。", "info");
+                  setSelectedRows([]);
+                  setSelectedSources([]);
                   setSearchText(event.target.value);
                   setPage(1);
                 }}
@@ -923,7 +1021,7 @@ export function DataTablePage({
           <label className="visually-hidden" htmlFor="compact-table">选择数据表或分组</label>
           <select id="compact-table" className="form-select" value={currentViewId ? `view:${currentViewId}` : `table:${currentTableId ?? ""}`}
             onChange={(event) => { const value = event.target.value; if (value.startsWith("view:")) selectView(value.slice(5)); else selectTable(value.slice(6)); }}>
-            <optgroup label="数据表">{tables.map((table) => <option key={table.id} value={`table:${table.id}`}>{table.name} · {table.row_count}</option>)}</optgroup>
+            <optgroup label="数据表">{tables.map((table) => <option key={table.id} value={`table:${table.id}`}>{table.name} · {table.collection_kind === "files" ? `${table.file_count ?? 0} 份文件` : `${table.row_count} 行`}</option>)}</optgroup>
             {views.length > 0 && <optgroup label="当前表的分组">{views.map((view) => <option key={view.id} value={`view:${view.id}`}>{view.name}</option>)}</optgroup>}
           </select>
           <button className="btn ghost sm icon-only" title="新建表" onClick={() => { setNewTableName(""); setNewTableTemplate(""); setCreateModalOpen(true); }}><Icon icon={Plus} size={14} /></button>
@@ -980,12 +1078,12 @@ export function DataTablePage({
                     >
                       <Icon icon={Table2} size={14} />
                       <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.name}</span>
-                      <span className="row-count">{t.row_count}</span>
+                      <span className="row-count">{t.collection_kind === "files" ? `${t.file_count ?? 0} 份` : t.row_count}</span>
                     </button>
                   ))}
                     </div>
                   </div>
-                  <button
+                  {!isFileCollection && <><button
                     className="sheet-tree-group-title"
                     aria-expanded={treeGroupsOpen.views}
                     onClick={() =>
@@ -1012,17 +1110,31 @@ export function DataTablePage({
                     ))
                   ) : (
                     <div className="sheet-tree-empty">
-                      {currentTableId ? "尚未分组，可从上方“分组”选择文件或字段" : "选择一张表查看其视图"}
+                      {currentTableId ? (tables.find(table => table.id === currentTableId)?.grouping_fields?.length ? "分组规则已保存，当前暂无分类数据" : "尚未分组，可从上方“分组”选择文件或字段") : "选择一张表查看其视图"}
                     </div>
                   )}
+                  {moreViews && <button className="sheet-tree-item" disabled={loadingMoreViews} onClick={() => void loadMoreViews()}>{loadingMoreViews ? "正在读取…" : "更多分组"}</button>}
                     </div>
-                  </div>
+                  </div></>}
                 </>
               )}
             </div>
           </div>
 
-          <div className="splitter-v" onMouseDown={() => {}} />
+          <div className="splitter-v" role="separator" aria-label="调整数据表列表宽度" aria-orientation="vertical"
+            aria-valuemin={180} aria-valuemax={360} aria-valuenow={sidebarWidth} tabIndex={0}
+            onPointerDown={event => {
+              if (event.button !== 0) return;
+              event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId);
+              sidebarDrag.current = {x: event.clientX, width: sidebarWidth};
+            }}
+            onPointerMove={event => { if (sidebarDrag.current) resizeSidebar(sidebarDrag.current.width + event.clientX - sidebarDrag.current.x); }}
+            onPointerUp={event => { sidebarDrag.current = null; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); }}
+            onPointerCancel={() => { sidebarDrag.current = null; }} onLostPointerCapture={() => { sidebarDrag.current = null; }}
+            onKeyDown={event => {
+              if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+              event.preventDefault(); resizeSidebar(event.key === "Home" ? 180 : event.key === "End" ? 360 : sidebarWidth + (event.key === "ArrowLeft" ? -12 : 12));
+            }} />
 
           <div className="sheet-detail">
             <div className="panel-title" style={{ marginBottom: 0 }}>
@@ -1055,45 +1167,40 @@ export function DataTablePage({
                     onBlur={() => void commitRenameSheet()}
                   />
                 )}
-                <div className="support">共 <span>{totalRows}</span> {contentUnit} · <span>{currentSheetSource}</span></div>
+                <div className="support">{isFileCollection ? `字段按文件保存 · 共 ${tables.find(table => table.id === currentTableId)?.file_count ?? 0} 份文件` : <>共 <span>{totalRows}</span> {contentUnit} · <span>{currentSheetSource}</span></>}</div>
               </div>
               <div className="sheet-detail-actions">
                 {!currentViewId && currentTableId ? (
-                  <>
-                    <button className="btn ghost sm" onClick={startRenameSheet}>
-                      <Icon icon={Pencil} size={14} /> 重命名
-                    </button>
-                    <button className="btn danger-soft sm" onClick={() => setDeleteConfirmOpen(true)}>
-                      <Icon icon={Trash2} size={14} /> 删除
-                    </button>
-                  </>
+                  <DropdownMenu.Root>
+                    <DropdownMenu.Trigger asChild><button className="btn ghost sm icon-only" aria-label="数据表操作"><Icon icon={MoreHorizontal} size={18} /></button></DropdownMenu.Trigger>
+                    <DropdownMenu.Portal><DropdownMenu.Content className="record-menu" align="end" sideOffset={6}>
+                      <DropdownMenu.Item onSelect={startRenameSheet}><Icon icon={Pencil} size={14} />重命名</DropdownMenu.Item>
+                      {!isFileCollection && <DropdownMenu.Item onSelect={() => setIndependentHistoryOpen(true)}><Icon icon={History} size={14} />独立数据历史</DropdownMenu.Item>}
+                      <DropdownMenu.Separator />
+                      <DropdownMenu.Item className="danger" onSelect={() => setDeleteConfirmOpen(true)}><Icon icon={Trash2} size={14} />删除数据表</DropdownMenu.Item>
+                    </DropdownMenu.Content></DropdownMenu.Portal>
+                  </DropdownMenu.Root>
                 ) : null}
               </div>
             </div>
-
-            {tableError && (
-              <div className="callout danger" style={{ marginBottom: 16 }}>{tableError}</div>
-            )}
-            {tableNotice && (
-              <div className="callout success" style={{ marginBottom: 16 }}>{tableNotice}</div>
-            )}
 
             <div className="data-table-wrap">
               {/* 行级操作栏 */}
               <div className="row-actions-bar">
                 <div className="row-actions-left">
-                  <button
+                  {(presentationMode === "card" && selectedRows.length === 0 || selectedSources.length > 0) ? <button className="btn xs danger-soft" disabled={busyAction || !selectedSources.length} onClick={() => setClearSourcesConfirm(true)}><Icon icon={Trash2} size={14} />清空选中来源数据</button> : <button
                     className="btn xs danger-soft"
-                    disabled={selectedRows.length === 0}
-                    onClick={() => void handleDeleteRows()}
+                    disabled={busyAction || selectedRows.length === 0}
+                    onClick={() => setDeleteRowsConfirm(true)}
                   >
                     <Icon icon={Trash2} size={14} /> 删除选中
-                  </button>
+                  </button>}
+                  {!isFileCollection && <>
                   <button
                     className="btn xs secondary"
                     disabled={selectedRows.length !== 1}
                     onClick={() => {
-                      const row = rows.find((r) => r.id === selectedRows[0]);
+                      const row = rows.find((r) => r.id === selectedRows[0]) ?? selectedRowSnapshots.current[selectedRows[0]];
                       if (row) void openRevisions(row.id);
                     }}
                     title={selectedRows.length !== 1 ? "先勾选一行查看其修订历史" : "查看选中行的修订历史"}
@@ -1106,7 +1213,7 @@ export function DataTablePage({
                     onClick={() => void handleAddRow()}
                     title={presentationMode === "card" ? "新增空白内容，展开卡片后填写" : "在表尾新增一行空记录，直接在表格里填写"}
                   >
-                    <Icon icon={Plus} size={14} /> {presentationMode === "card" ? "新增内容" : "新增一行"}
+                    <Icon icon={Plus} size={14} /> {presentationMode === "card" ? "新增独立记录" : "新增一行"}
                   </button>
                   <button className="btn xs secondary" onClick={() => setFieldFilterOpen(true)}>
                     <Icon icon={Columns3} size={14} /> 字段筛选
@@ -1114,34 +1221,30 @@ export function DataTablePage({
                       <span className="filter-count-badge">{hiddenCols.length}</span>
                     )}
                   </button>
+                  </>}
                 </div>
                 <div className="row-actions-right">
-                  <div className="presentation-switch" aria-label="内容展示方式">
+                  {!isFileCollection && <div className="presentation-switch" aria-label="内容展示方式">
                     {(["table", "card"] as const).map((mode) => <button key={mode} className={`btn xs ${presentationMode === mode ? "primary" : "ghost"}`}
                       disabled={!currentTableId} aria-pressed={presentationMode === mode}
                       onClick={() => {
                         if (!currentTableId || mode === presentationMode) return;
-                        const key = `${currentTableId}/${currentViewId ?? ""}`;
-                        const remembered = presentationPages.current[key] ?? {};
-                        remembered[presentationMode] = page;
-                        presentationPages.current[key] = remembered;
-                        const size = mode === "table" ? TABLE_PAGE_SIZE : cardCapacity;
-                        setPage(Math.min(Math.max(1, Math.ceil(totalRows / size)), remembered[mode] ?? Math.floor((page - 1) * pageSize / size) + 1));
                         setPresentationOverrides({ ...presentationOverrides, [currentTableId]: mode });
                       }}>
                       {mode === "table" ? "表格" : "卡片"}
                     </button>)}
-                  </div>
+                  </div>}
+                  {selectedSources.length > 0 && <span className="row-selected-hint">已选 <strong>{selectedSources.length}</strong> 个完整来源 · <button className="link-btn" onClick={() => setSelectedSources([])}>取消</button></span>}
                   {selectedCount > 0 && (
                     <span className="row-selected-hint">已选 <strong>{selectedCount}</strong> 行 · <button className="link-btn" onClick={() => setSelectedRows([])}>取消</button></span>
                   )}
-                  <span className="row-total-hint">共 <span>{totalRows}</span> {contentUnit}</span>
+                  {presentationMode === "table" && <span className="row-total-hint">共 <span>{totalRows}</span> {contentUnit}</span>}
                 </div>
               </div>
-              {rows.some((row) => row.review_pending) && (
+              {presentationMode === "table" && rows.some((row) => row.review_pending) && (
                 <details className="support data-source-details" style={{ padding: "8px 16px", color: "var(--warning-text)", overflowWrap: "anywhere" }}>
                   <summary>本页有 {rows.filter((row) => row.review_pending).length} 条来源待核对的数据</summary>
-                  <p>请在文件历史中处理来源任务的校验提示。直接编辑表格不会重新执行提取校验；导出会保留待核对标记。</p>
+                  <p>关联文件的数据修改后，会按提取时的规则重新校验。可在文件历史查看问题；导出保留待核对标记。独立导入和合并数据只保留原来源的核对状态。</p>
                   {rows.filter((row, index) => row.review_pending && !rows.slice(0, index).some((previous) => previous.review_pending &&
                     (previous.task_id ?? previous.values.__row_group ?? previous.id) === (row.task_id ?? row.values.__row_group ?? row.id)
                   )).map((row) => <p key={row.id}>{String(row.values.source_filename || `内容 ${row.id}`)}{!row.task_id && " · 来源已移除或来自导入/合并，保留原待核对状态"}</p>)}
@@ -1163,16 +1266,17 @@ export function DataTablePage({
                   <div style={{ padding: 48, textAlign: "center" }}>
                     <Icon icon={Loader2} size={24} className="spin" />
                   </div>
+                ) : presentationMode === "card" && currentTableId ? (
+                  <SourceCardCollection key={`${currentTableId}:${currentViewId}`} tableId={currentTableId} scope={{viewId: currentViewId, search: searchText}}
+                    reload={reloadTrigger} selected={selectedSources} onSelect={sources => { setSelectedSources(sources); setSelectedRows([]); }}
+                    selectedRows={selectedRows} onSelectRow={isFileCollection ? undefined : (row, checked) => { selectedRowSnapshots.current[row.id] = row; setSelectedSources([]); setSelectedRows(previous => checked ? [...previous.filter(id => id !== row.id), row.id] : previous.filter(id => id !== row.id)); }}
+                    onChanged={() => { setSelectedSources([]); setSelectedRows([]); setReloadTrigger(n => n + 1); }} hiddenFields={hiddenCols} highlightTaskId={highlightTaskId} />
                 ) : rows.length === 0 && columns.length === 0 ? (
                   <div className="table-empty-state">
                     <Icon icon={Table2} size={28} />
                     <div>这张表还没有数据</div>
                     <div className="small muted">使用“新增一行”或“导入”开始填写</div>
                   </div>
-                ) : presentationMode === "card" && currentTableId ? (
-                  <CardCollection key={`${currentTableId}:${currentViewId}`} tableId={currentTableId} rows={rows}
-                    searchText={searchText} columns={tableDetail?.columns ?? []} hiddenFields={hiddenCols} presentation={tableDetail?.presentation}
-                    selectedRows={selectedRows} onSelect={setSelectedRows} onChanged={() => setReloadTrigger((n) => n + 1)} highlightTaskId={highlightTaskId} />
                 ) : (
                   <table className="data-table" style={{ minWidth: `${tableMinWidth}px` }}>
                     <colgroup>
@@ -1230,7 +1334,7 @@ export function DataTablePage({
                                 const isMatch =
                                   searchQuery !== "" &&
                                   cellText.toLowerCase().includes(searchQuery);
-                                if (headerKeys.has(col.key)) {
+                                if (headerKeys.has(col.key) && (row.shared_header_keys?.includes(col.key) ?? true)) {
                                   if (!isGroupFirst) {
                                     return null;
                                   }
@@ -1262,6 +1366,7 @@ export function DataTablePage({
                                         value={getCellValue(row, col.key)}
                                         onCancel={() => {
                                           cancelEditRef.current = true;
+                                          setEditingCell(null);
                                         }}
                                         onCommit={(raw) => {
                                           if (editingCell === `${idx}-${col.key}`) {
@@ -1304,6 +1409,7 @@ export function DataTablePage({
                                       value={getCellValue(row, col.key)}
                                       onCancel={() => {
                                         cancelEditRef.current = true;
+                                        setEditingCell(null);
                                       }}
                                       onCommit={(raw) => {
                                         if (editingCell === `${idx}-${col.key}`) {
@@ -1339,7 +1445,7 @@ export function DataTablePage({
                   </table>
                 )}
               </div>
-              <div className="table-footer">
+              {presentationMode === "table" && <div className="table-footer">
                 <span className="footer-info">显示 <span>{rows.length === 0 ? 0 : (page - 1) * pageSize + 1}</span>-<span>{(page - 1) * pageSize + rows.length}</span> {contentUnit}，共 <span>{totalRows}</span> {contentUnit}</span>
                 <div className="pagination">
                   <button className="btn icon-only sm" disabled={page <= 1} onClick={() => goToPage(1)} title="第一页">
@@ -1377,7 +1483,7 @@ export function DataTablePage({
                     </button>
                   </span>
                 </div>
-              </div>
+              </div>}
             </div>
           </div>
         </div>
@@ -1399,7 +1505,7 @@ export function DataTablePage({
             </div>
             <div className="modal-body">
               <div className="merge-sheet-list">
-                {tables.map((s) => (
+                {tables.filter(table => table.collection_kind !== "files").map((s) => (
                   <label className={`merge-sheet-row${mergeSelection.includes(s.id) ? " checked" : ""}`} key={s.id}>
                     <input type="checkbox" checked={mergeSelection.includes(s.id)} onChange={() => toggleMergeSheet(s.id)} />
                     <Icon icon={Table2} size={15} style={{ color: "var(--color-text-muted)" }} />
@@ -1464,7 +1570,7 @@ export function DataTablePage({
             <div className="modal-body">
               <label className="form-field"><span className="form-label">分组方式</span>
                 <select className="form-select" value={groupBy} onChange={(event) => setGroupBy(event.target.value as "none" | "file" | "field")}>
-                  <option value="none">不分组</option><option value="file">按来源文件</option><option value="field">按字段</option>
+                  <option value="none">取消全部分组</option><option value="file">按文件或独立来源组</option><option value="field">按字段</option>
                 </select>
               </label>
               {groupBy === "field" && <label className="form-field">
@@ -1529,7 +1635,7 @@ export function DataTablePage({
                   onChange={(e) => setNewTableTemplate(e.target.value)}
                 >
                   <option value="">请选择模板</option>
-                  {templates.map((t) => (
+                  {templates.filter(template => template.engine_kind !== "autonomous").map((t) => (
                     <option key={t.id} value={t.id}>{t.name}</option>
                   ))}
                 </select>
@@ -1558,7 +1664,7 @@ export function DataTablePage({
               <div>
                 <div className="modal-eyebrow"><Icon icon={Trash2} size={15} /> 删除表</div>
                 <h3>删除“{currentSheetName}”？</h3>
-                <div className="support">将同时删除该表的全部行、分 Sheet 视图和确认记录，此操作不可恢复。</div>
+                <div className="support">将删除该表、全部当前数据、分 Sheet 视图及独立数据历史。关联文件的原件与文件修订历史保留，模板仍可用于后续提取。此操作不可恢复。</div>
               </div>
               <button aria-label="关闭" className="btn ghost sm icon-only" onClick={() => setDeleteConfirmOpen(false)}>
                 <Icon icon={X} size={16} />
@@ -1603,12 +1709,12 @@ export function DataTablePage({
                     {col.userDefined && !currentViewId && (
                       <button
                         aria-label={`删除附加列 ${col.label}`}
-                        className="btn ghost sm icon-only"
+                        className="btn ghost sm icon-only danger-btn"
                         type="button"
                         onClick={(event) => {
                           event.preventDefault();
                           event.stopPropagation();
-                          void handleDeleteColumn(col);
+                          setDeleteColumnTarget(col);
                         }}
                         title="删除附加列"
                       ><Icon icon={Trash2} size={14} /></button>
@@ -1631,11 +1737,14 @@ export function DataTablePage({
         <div className="modal-overlay" onClick={(event) => { if (event.target === event.currentTarget) setAddColumnOpen(false); }}>
           <div className="modal-card" style={{ maxWidth: 480 }}>
             <div className="modal-head">
-              <div><h3>新增附加列</h3><div className="support">仅用于整理和导出，不参与模型提取，也不改变文件历史。</div></div>
+              <div><h3>新增附加列</h3><div className="support">用于整理当前数据，不改变模板的提取规则；填写后也会记录在文件修订中。</div></div>
               <button aria-label="关闭" className="btn ghost sm icon-only" onClick={() => setAddColumnOpen(false)}><Icon icon={X} size={16} /></button>
             </div>
             <div className="modal-body">
               <label className="form-field"><span>列名</span><input autoFocus className="form-input" maxLength={64} value={newColumnLabel} onChange={(event) => setNewColumnLabel(event.target.value)} placeholder="例如：内部备注" /></label>
+              <label className="form-field"><span>字段类型</span><select className="form-input" value={newColumnType} onChange={event => setNewColumnType(event.target.value as typeof newColumnType)}>
+                <option value="text">文字</option><option value="number">数字</option><option value="date">日期</option><option value="boolean">是 / 否</option>
+              </select></label>
               <div className="form-field"><span>填写方式</span><div className="column-mode-options" role="group" aria-label="附加列填写方式">
                 <button type="button" className={`column-mode-button${newColumnSection === "header" ? " active" : ""}`} onClick={() => setNewColumnSection("header")}><strong>按表头填写</strong><span>同一文件共用一个值，导出时合并单元格</span></button>
                 <button type="button" className={`column-mode-button${newColumnSection === "item" ? " active" : ""}`} onClick={() => setNewColumnSection("item")}><strong>按明细填写</strong><span>每条明细可以分别填写不同内容</span></button>
@@ -1646,99 +1755,29 @@ export function DataTablePage({
         </div>
       )}
 
+      {pendingImport && <ImportSheetDialog filename={pendingImport.file.name} sheets={pendingImport.sheets} busy={busyAction} error={tableError}
+        onClose={() => { setPendingImport(null); setTableError(null); }}
+        onChoose={sheet => { void importFile(pendingImport.file, pendingImport.tableId, sheet); }} />}
+
       {/* 行修订历史模态 */}
-      {revisionsOpen && (
-        <div className="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) setRevisionsOpen(false); }}>
-          <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 560 }}>
-            <div className="modal-head">
-              <div>
-                <div className="modal-eyebrow"><Icon icon={History} size={15} /> 修订历史</div>
-                <h3>选中行的变更记录</h3>
-                <div className="support">记录这行数据从哪里来，以及之后由谁在何时修改了哪些字段。</div>
-              </div>
-              <button className="btn ghost sm icon-only" onClick={() => setRevisionsOpen(false)}>
-                <Icon icon={X} size={16} />
-              </button>
-            </div>
-            <div className="modal-body">
-              {revisionsError && <div className="callout danger">{revisionsError}</div>}
-              {revisionsLoading ? (
-                <div style={{ padding: 24, textAlign: "center" }}>
-                  <Icon icon={Loader2} size={18} className="spin" />
-                </div>
-              ) : revisions.length === 0 ? (
-                <div className="small muted" style={{ padding: 16, textAlign: "center" }}>
-                  这行还没有任何变更记录。
-                </div>
-              ) : (
-                <div className="revision-list">
-                  {revisions.map((revision) => (
-                    <div className="revision-item" key={revision.id}>
-                      <div className="revision-head">
-                        <span className="revision-badge">v{revision.version}</span>
-                        <span className="revision-op">{REVISION_OPERATION[revision.operation] ?? revision.operation}</span>
-                        <span className="revision-meta">{revision.editor} · {formatRevisionTime(revision.created_at)}</span>
-                      </div>
-                      <div className="revision-diff">
-                        {diffFields(revision.before, revision.after).length === 0 ? (
-                          <span className="small muted">无字段变化</span>
-                        ) : (
-                          diffFields(revision.before, revision.after).map((key) => (
-                            <div className="revision-diff-row" key={key}>
-                              <span className="revision-field">
-                                {tableDetail?.columns.find((column) => column.key === key)?.label ?? key}
-                              </span>
-                              <span className="revision-before">{String(revision.before?.[key] ?? "—")}</span>
-                              <Icon icon={ArrowRight} size={12} className="revision-arrow" />
-                              <span className="revision-after">{String(revision.after?.[key] ?? "—")}</span>
-                            </div>
-                          ))
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-            <InputScopeDetails scope={revisionSource?.input_scope} label="来源与处理详情" originalAvailable={Boolean(revisionSource?.task_id)} />
-            <div className="modal-foot">
-              <button className="btn primary" onClick={() => setRevisionsOpen(false)}>关闭</button>
-            </div>
-          </div>
-        </div>
-      )}
+      {revisionsOpen && revisionSource?.task_id && <FileRevisionHistory taskId={revisionSource.task_id}
+        filename={String(revisionSource.values.source_filename ?? "文件") } onClose={() => setRevisionsOpen(false)} />}
+      {currentTableId && (independentHistoryOpen || revisionsOpen && !revisionSource?.task_id) && <IndependentHistory
+        key={`${currentTableId}-${independentHistoryOpen ? "all" : revisionSource?.id}`}
+        tableId={currentTableId} tableName={tables.find(table => table.id === currentTableId)?.name ?? "数据表"}
+        rowId={independentHistoryOpen ? undefined : revisionSource?.id} columns={tableDetail?.columns ?? []}
+        onClose={() => {setIndependentHistoryOpen(false); setRevisionsOpen(false);}} />}
+
+      <ConfirmDialog open={clearSourcesConfirm} title="清空选中来源数据"
+        description={<>{`将清空 ${selectedSources.length} 个完整来源的 ${selectedSources.reduce((count, source) => count + source.row_count, 0)} 条当前记录。文件原件和修订历史保留；这些数据将不再出现在统计、问知意或后续导出中。`}<span className="confirm-source-list" role="list" aria-label="将清空的完整来源">{selectedSources.map(source => <span role="listitem" key={source.id}>{source.filename || "独立记录"} · {source.row_count} 条</span>)}</span></>}
+        buttonLabel="确认清空" busy={busyAction} onConfirm={() => void handleClearSources()} onClose={() => setClearSourcesConfirm(false)} />
+      <ConfirmDialog open={deleteRowsConfirm} title={`删除 ${selectedRows.length} 条明细？`}
+        description="这些明细将从当前数据中删除，并保留删除前内容的修订记录。文件原件保留；若删去文件的最后一条明细，该文件的共享字段也会从当前数据中清空。"
+        buttonLabel="确认删除" busy={busyAction} onConfirm={() => void handleDeleteRows()} onClose={() => setDeleteRowsConfirm(false)} />
+      <ConfirmDialog open={deleteColumnTarget !== null} title={`删除附加列“${deleteColumnTarget?.label ?? ""}”？`}
+        description="仅能删除整张表中没有当前值、且未被分组或仪表盘使用的附加列。已有数据或依赖时会拒绝删除。历史内容保留。"
+        buttonLabel="确认删除" busy={busyAction} onConfirm={() => { if (deleteColumnTarget) void handleDeleteColumn(deleteColumnTarget); }} onClose={() => setDeleteColumnTarget(null)} />
+      <Toast toast={toast} onDismiss={clear} />
     </div>
   );
-}
-
-const REVISION_OPERATION: Record<string, string> = {
-  manual_create: "手动新增",
-  import_create: "从文件导入",
-  merge_create: "由表合并生成",
-  materialize_create: "由文件提取生成",
-  materialize_move: "移动到指定表",
-  materialize_update: "同步提取结果",
-  materialize_delete: "提取结果中已删除",
-  table_edit: "手动编辑",
-  merge: "由表合并生成",
-  update: "手动编辑",
-  delete: "删除",
-  review_sync: "保存到表",
-};
-
-function formatRevisionTime(iso: string): string {
-  const d = serverDate(iso);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-function diffFields(
-  before: Record<string, unknown> | null,
-  after: Record<string, unknown> | null,
-): string[] {
-  const keys = new Set([
-    ...Object.keys(before ?? {}),
-    ...Object.keys(after ?? {}),
-  ]);
-  return [...keys].filter((key) => (before?.[key] ?? null) !== (after?.[key] ?? null));
 }

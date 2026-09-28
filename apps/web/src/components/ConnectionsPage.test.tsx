@@ -78,3 +78,38 @@ function jsonResponse(value: unknown): Response {
     headers: { "Content-Type": "application/json" },
   });
 }
+
+test("a clipboard rejection shows a readable MCP error instead of claiming copied", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+    if (String(input).endsWith("/integration/settings/mcp-config")) return jsonResponse({runtime: "development", mcp_servers: {mcpServers: {}}});
+    if (String(input).endsWith("/integration/settings")) return jsonResponse({file_roots: [], data_read: true, result_read: true});
+    if (String(input).endsWith("/tables")) return jsonResponse([]);
+    return jsonResponse({enabled: false, message: "未启用"});
+  }));
+  const clipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  Object.defineProperty(navigator, "clipboard", {configurable: true, value: {writeText: vi.fn().mockRejectedValue(new Error("denied"))}});
+  try {
+    render(<ConnectionsPage />);
+    fireEvent.click(await screen.findByRole("button", {name: "复制配置"}));
+    expect(await screen.findByRole("alert")).toHaveTextContent("复制失败，请手动选中上方 MCP 配置复制");
+    expect(screen.queryByRole("button", {name: "已复制"})).not.toBeInTheDocument();
+    expect(screen.getByText(/独立授权，不受下方所选数据表限制/)).toBeInTheDocument();
+  } finally {
+    if (clipboard) Object.defineProperty(navigator, "clipboard", clipboard);
+    else Reflect.deleteProperty(navigator, "clipboard");
+  }
+});
+
+test("HTTP revocation confirmation and success both promise immediate effect", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+    if (String(input).endsWith("/integration/settings")) return jsonResponse({file_roots: [], read_token_set: true});
+    return jsonResponse({enabled: false, message: "未启用"});
+  }));
+  render(<ConnectionsPage />);
+  await waitFor(() => expect(screen.getByRole("button", {name: "撤销读"})).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", {name: "撤销读"}));
+  const confirm = screen.getByRole("dialog", {name: "撤销密钥"});
+  expect(confirm).toHaveTextContent("HTTP API 请求立即失效，无需重启");
+  fireEvent.click(within(confirm).getByRole("button", {name: "确认撤销"}));
+  expect(await screen.findByText("读密钥已撤销，HTTP API 立即生效。")).toBeInTheDocument();
+});

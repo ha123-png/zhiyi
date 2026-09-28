@@ -1,7 +1,10 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { expect, it, vi } from "vitest";
 import type { TemplateField } from "../types";
 import { DeterministicRulesEditor } from "./DeterministicRulesEditor";
+import { previewTemplatePattern } from "../api";
+
+vi.mock("../api", () => ({ previewTemplatePattern: vi.fn() }));
 
 const fields: TemplateField[] = [
   {
@@ -71,4 +74,60 @@ it("explains that natural-language requirements are not deterministic checks", (
   expect(
     screen.getByText("暂无校验规则。"),
   ).toBeInTheDocument();
+});
+
+function fillPattern(pattern = "PO-\\d{3}") {
+  fireEvent.change(screen.getByLabelText("规则类型"), { target: { value: "pattern" } });
+  fireEvent.change(screen.getByLabelText("检查字段"), { target: { value: "header.document_number" } });
+  fireEvent.change(screen.getByLabelText("格式表达式（正则）"), { target: { value: pattern } });
+}
+
+it("rejects server-invalid syntax before adding and permits a corrected valid pattern even when the sample does not match", async () => {
+  vi.mocked(previewTemplatePattern).mockReset()
+    .mockResolvedValueOnce({ valid: false, matches: false, message: "不支持分组。" })
+    .mockResolvedValueOnce({ valid: true, matches: false, message: "整段匹配不通过。" });
+  const onChange = vi.fn();
+  render(<DeterministicRulesEditor disabled={false} fields={fields} rules={[]} onChange={onChange} />);
+  fillPattern("(");
+  fireEvent.click(screen.getByRole("button", { name: "添加校验规则" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("不支持分组。规则尚未添加。");
+  expect(onChange).not.toHaveBeenCalled();
+  fireEvent.change(screen.getByLabelText("格式表达式（正则）"), { target: { value: "PO-\\d{3}" } });
+  fireEvent.click(screen.getByRole("button", { name: "添加校验规则" }));
+  await waitFor(() => expect(onChange).toHaveBeenCalledWith([{ kind: "pattern", field: "header.document_number", pattern: "PO-\\d{3}", severity: "error" }]));
+  expect(previewTemplatePattern).toHaveBeenLastCalledWith("PO-\\d{3}", "");
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it.each(["expression", "field", "template", "rules", "disabled", "unmount"])("discards a late pattern check after changing %s", async change => {
+  let resolve!: (result: Awaited<ReturnType<typeof previewTemplatePattern>>) => void;
+  vi.mocked(previewTemplatePattern).mockReset().mockImplementation(() => new Promise(done => { resolve = done; }));
+  const onChange = vi.fn();
+  const props = { disabled: false, fields, rules: [], onChange, contextKey: "template-A" };
+  const view = render(<DeterministicRulesEditor {...props} />);
+  fillPattern();
+  fireEvent.click(screen.getByRole("button", { name: "添加校验规则" }));
+  expect(screen.getByRole("button", { name: "检查格式中…" })).toBeDisabled();
+  if (change === "expression") fireEvent.change(screen.getByLabelText("格式表达式（正则）"), { target: { value: "PO-[0-9]+" } });
+  if (change === "field") fireEvent.change(screen.getByLabelText("检查字段"), { target: { value: "items[].amount" } });
+  if (change === "template") view.rerender(<DeterministicRulesEditor {...props} contextKey="template-B" />);
+  if (change === "rules") view.rerender(<DeterministicRulesEditor {...props} rules={[{ kind: "required", field: "header.document_number" }]} />);
+  if (change === "disabled") view.rerender(<DeterministicRulesEditor {...props} disabled />);
+  if (change === "unmount") view.unmount();
+  await act(async () => { resolve({ valid: true, matches: false, message: "整段匹配不通过。" }); });
+  expect(onChange).not.toHaveBeenCalled();
+});
+
+it("keeps failed checks out of the draft and can retry without a duplicate request", async () => {
+  vi.mocked(previewTemplatePattern).mockReset().mockRejectedValueOnce(new Error("连接失败，请重试。"))
+    .mockResolvedValueOnce({ valid: true, matches: false, message: "整段匹配不通过。" });
+  const onChange = vi.fn();
+  render(<DeterministicRulesEditor disabled={false} fields={fields} rules={[]} onChange={onChange} />);
+  fillPattern();
+  fireEvent.click(screen.getByRole("button", { name: "添加校验规则" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("连接失败，请重试。规则尚未添加。");
+  expect(onChange).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "添加校验规则" }));
+  await waitFor(() => expect(onChange).toHaveBeenCalledOnce());
+  expect(previewTemplatePattern).toHaveBeenCalledTimes(2);
 });

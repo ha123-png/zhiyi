@@ -173,9 +173,8 @@ def resolve_app_port(data_dir: Path, explicit_port: int | None) -> int:
 
 
 def _write_state(path: Path, payload: dict[str, object]) -> None:
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(payload), encoding="utf-8")
-    os.replace(temporary, path)
+    from document_pipeline_api.services.atomic_output import write_json
+    write_json(path, payload)
 
 
 def _wait_for_health(port: int, processes: list[subprocess.Popen[bytes]]) -> None:
@@ -226,6 +225,8 @@ def run_supervisor(
     token = secrets.token_urlsafe(32)
 
     with SingleInstance(runtime_dir / "instance.lock"), ExitStack() as stack:
+        from document_pipeline_api.business_backup import recover_interrupted_restore
+        recover_interrupted_restore(active_data_dir)
         control = _ControlServer(("127.0.0.1", 0), _ControlHandler)
         control.token = token
         control.stop_event = active_stop_event
@@ -308,6 +309,11 @@ def run_supervisor(
                 except subprocess.TimeoutExpired as error:
                     raise RuntimeError("程序组件停止超时，已拒绝恢复数据。") from error
 
+            # Windows Job Object termination does not run ASGI lifespan cleanup.
+            # All writers are now stopped and the data-directory lock is still
+            # held, so finish durable edit sessions before exit or maintenance.
+            _seal_stopped_edit_sessions(active_data_dir)
+
             with control.restore_lock:
                 restore_name = control.restore_name
                 control.restore_name = None
@@ -317,6 +323,23 @@ def run_supervisor(
                 _perform_supervised_clear_data(active_data_dir)
             else:
                 _perform_supervised_restore(active_data_dir, restore_name)
+
+
+def _seal_stopped_edit_sessions(data_dir: Path) -> None:
+    from sqlalchemy.orm import Session
+    from document_pipeline_api.db import build_engine, connect_after_process_exit
+    from document_pipeline_api.services.current_data import recover_edit_sessions
+
+    database = data_dir / "document-pipeline.db"
+    if not database.is_file():
+        return
+    engine = build_engine(f"sqlite:///{database}")
+    try:
+        with connect_after_process_exit(engine) as connection, Session(connection) as session:
+            recover_edit_sessions(session, owner="supervisor-shutdown")
+            session.commit()
+    finally:
+        engine.dispose()
 
 
 def _perform_supervised_clear_data(data_dir: Path) -> None:

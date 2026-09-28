@@ -36,30 +36,9 @@ class _SuccessfulModelClient:
     model_name = "successful-test-model"
 
     def extract_image(self, _path, _prompt, result_type):
-        return result_type.model_validate(
-            {
-                "document_type": "发票",
-                "seller_name": "销售方",
-                "buyer_name": "购买方",
-                "document_number": "RECOVERED-1",
-                "document_date": "2026-08-01",
-                "amount_before_tax": 100,
-                "tax_amount": 6,
-                "total_amount": 106,
-                "items": [
-                    {
-                        "name": "恢复后的明细",
-                        "specification": None,
-                        "unit": "项",
-                        "quantity": 1,
-                        "unit_price": 100,
-                        "amount": 100,
-                        "tax_rate": "6%",
-                        "tax_amount": 6,
-                    }
-                ],
-            }
-        )
+        from template_model_test_data import invoice_response
+        return result_type.model_validate(invoice_response(document_number="RECOVERED-1", name="恢复后的明细"))
+
 
 
 def _run_blocked_worker(
@@ -110,7 +89,7 @@ def test_force_killed_worker_recovers_and_retries_without_duplicate_facts(
                 content_type="image/png",
                 size_bytes=5,
                 sha256="force-killed-digest",
-                storage_path=str(source_file),
+                storage_path=source_file.name,
                 template_mode="invoice",
                 status=TaskStatus.QUEUED.value,
             )
@@ -176,7 +155,9 @@ def test_force_killed_worker_recovers_and_retries_without_duplicate_facts(
         assert recovered is not None
         assert recovered.status == TaskStatus.COMPLETED.value
         assert recovered.attempt_count == 2
-        assert session.get(ConfirmedDocumentRecord, "force-killed") is not None
+        from document_pipeline_api.models import FileCurrentDataRecord
+        assert session.get(FileCurrentDataRecord, "force-killed") is not None
+        assert session.get(ConfirmedDocumentRecord, "force-killed") is None
         assert session.scalar(
             select(func.count(DataRowRecord.id)).where(
                 DataRowRecord.task_id == "force-killed"

@@ -1,6 +1,7 @@
+import { deletionNotice } from "./deletionNotice";
 import { ModelConnectionState } from "./assistant/ModelConnectionState";
 import * as Popover from "@radix-ui/react-popover";
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AssistantProvider, useAssistant } from "./assistant/AssistantProvider";
 import { AssistantDrawer, AssistantPage, AssistantTrigger } from "./assistant/AssistantSurface";
 import { assistantApi } from "./assistant/api";
@@ -88,6 +89,36 @@ function AppContent() {
     applyTheme(
       (localStorage.getItem("theme") as "auto" | "light" | "dark") || "auto",
     );
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let checking = false;
+    let timer: number | undefined;
+    // A restored app can become reachable before its worker has started.
+    // Keep that transient state from remaining on screen until a reload.
+    const refresh = async () => {
+      if (checking || document.hidden) return;
+      checking = true;
+      window.clearTimeout(timer);
+      try {
+        const status = await getSystemStatus();
+        if (active) setSystemStatus(status);
+      } catch {
+        if (active) setSystemStatus(null);
+      } finally {
+        checking = false;
+        if (active) timer = window.setTimeout(() => void refresh(), 15000);
+      }
+    };
+    const visible = () => { if (!document.hidden) void refresh(); };
+    void refresh();
+    document.addEventListener("visibilitychange", visible);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", visible);
+    };
   }, []);
 
   useEffect(() => {
@@ -246,7 +277,6 @@ function AppContent() {
     };
     window.addEventListener("zhiyi:assistant-changed", assistantChanged);
     void getModelStatus().then(setModelStatus).catch(() => setModelStatus(null));
-    void getSystemStatus().then(setSystemStatus).catch(() => setSystemStatus(null));
     // SSE 实时推送：任务状态变化立即刷新全局任务条（上传/停止/完成马上反映）；
     // 低频轮询仅作断线兜底（EventSource 自动重连期间仍有刷新）。
     const unsub =
@@ -292,9 +322,9 @@ function AppContent() {
 
   const handleDeleteTask = useCallback(async (taskId: string) => {
     try {
-      await deleteTask(taskId);
+      const result = await deleteTask(taskId);
       await loadTasks();
-      notify("任务已删除。", "info");
+      notify(deletionNotice(result, "文件及其关联数据已删除。"), "info");
     } catch (err) {
       notify(err instanceof Error ? err.message : "删除任务失败", "error");
     }
@@ -302,17 +332,19 @@ function AppContent() {
 
   const navigateTo = useCallback((page: NavigationKey) => {
     const proceed = () => {
+      navSeqRef.current += 1;
       pageScrollPositionsRef.current[activePage] = pageWrapRef.current?.scrollTop ?? 0;
       setActivePage(page);
     };
     if (page === activePage || window.dispatchEvent(new CustomEvent("zhiyi:before-navigate", { cancelable: true, detail: { proceed } }))) proceed();
   }, [activePage]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const target = pageScrollPositionsRef.current[activePage] ?? 0;
     const wrapper = pageWrapRef.current;
     if (!wrapper) return;
-    let restored = target === 0;
+    wrapper.scrollTop = target;
+    let restored = Math.abs(wrapper.scrollTop - target) <= 2;
     const restoreWhenReady = () => {
       if (restored) return;
       wrapper.scrollTop = target;
@@ -332,6 +364,17 @@ function AppContent() {
       window.clearTimeout(timeout);
       observer.disconnect();
     };
+  }, [activePage]);
+
+  useEffect(() => {
+    const wrapper = pageWrapRef.current;
+    if (!wrapper?.animate || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    // Animate the existing scroll container; no animation key, delayed route
+    // switch or retained hidden page can reset a draft or defer session close.
+    const animation = wrapper.animate([{ opacity: 0.7 }, { opacity: 1 }], {
+      duration: 160, easing: "cubic-bezier(.2,0,0,1)",
+    });
+    return () => animation.cancel();
   }, [activePage]);
 
   const handleNavigate = useCallback((page: NavigationKey) => {
@@ -373,7 +416,7 @@ function AppContent() {
         if (navSeq !== navSeqRef.current) return;
         if (confirmation.row_count === 0) {
           setTableJumpNotice(
-            `该文件的数据记录已全部删除，表中不再有此记录；可回到提取页重新"保存到表"追加。`,
+            `该文件的当前数据已清空；原文件和修订历史仍保留在文件历史中。`,
           );
         } else {
           setSelectedTableId(confirmation.table_id);
@@ -382,7 +425,7 @@ function AppContent() {
         if (navSeq !== navSeqRef.current) return;
         // 无确认记录：按模板定位（可能从未确认或目标表已删）
         setTableJumpNotice(
-          "该文件尚未保存到任何数据表，或目标表已被删除；可回到提取页重新保存到表。",
+          "这份文件当前没有表内数据；可在文件历史查看原文件与修订记录。",
         );
       }
       navigateTo("tables");
@@ -446,7 +489,7 @@ function AppContent() {
             </Popover.Content></Popover.Root>
           </div>
 
-          <div className={`app-page-wrap ${activePage === "assistant" ? "ask-page-wrap" : ""}`} key={activePage} ref={pageWrapRef}>
+          <div className={`app-page-wrap ${activePage === "assistant" ? "ask-page-wrap" : ""}`} ref={pageWrapRef}>
             {activePage === "workspace" ? (
               <TaskQueuePage
                 logs={taskLogs}

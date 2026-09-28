@@ -10,15 +10,13 @@ import os
 from pathlib import Path
 import stat
 import tempfile
-import time
 
 from sqlalchemy import delete, select
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.config import Settings
-from document_pipeline_api.db import Base, build_engine
+from document_pipeline_api.db import Base, build_engine, connect_after_process_exit
 from document_pipeline_api.model_secrets import ModelSecretStore, create_model_secret_store
 from document_pipeline_api.models import ModelProfileVersionRecord, TaskRecord
 from document_pipeline_api.services.file_operation_lock import file_operation_lock
@@ -26,28 +24,6 @@ from document_pipeline_api.services.file_operation_lock import file_operation_lo
 
 class ClearDataError(RuntimeError):
     pass
-
-
-def _open_clear_connection(engine):
-    """Retry only connection setup after supervised Windows children exit.
-
-    No secret deletion or business SQL has begun. Persistent errors still leave
-    the existing clear journal in place; no SQLite sidecar is removed manually.
-    """
-    for attempt in range(6):
-        try:
-            return engine.connect()
-        except OperationalError as error:
-            code = getattr(error.orig, "sqlite_errorcode", 0)
-            if os.name != "nt" or code & 0xFF not in (5, 6, 10) or attempt == 5:
-                raise
-            import logging
-            logging.getLogger(__name__).warning(
-                "Retrying clear connection setup after %s (attempt %d/6)",
-                getattr(error.orig, "sqlite_errorname", "SQLite connection error"),
-                attempt + 1,
-            )
-            time.sleep(0.2)
 
 
 def clear_journal_path(settings: Settings) -> Path:
@@ -123,7 +99,7 @@ def clear_local_data(settings: Settings, secret_store: ModelSecretStore | None =
     with file_operation_lock(storage):
         engine = build_engine(settings.database_url)
         try:
-            with _open_clear_connection(engine) as connection, Session(connection) as session:
+            with connect_after_process_exit(engine) as connection, Session(connection) as session:
                 if journal.is_file():
                     pending = json.loads(journal.read_text(encoding="utf-8"))
                     if pending.get("version") != 1:
@@ -133,6 +109,8 @@ def clear_local_data(settings: Settings, secret_store: ModelSecretStore | None =
                     refs.update(session.scalars(select(TaskRecord.model_secret_ref).where(TaskRecord.model_secret_ref.is_not(None))))
                     pending = {"version": 1, "secret_refs": sorted(refs), "task_count": session.query(TaskRecord).count()}
                     _write_json(journal, pending)
+                from document_pipeline_api.services.dataset_identity import advance_dataset
+                advance_dataset(root)
                 if pending["secret_refs"]:
                     store = secret_store or create_model_secret_store()
                     for ref in pending["secret_refs"]:
@@ -149,7 +127,7 @@ def clear_local_data(settings: Settings, secret_store: ModelSecretStore | None =
                 ensure_default_local_profile(session)
                 session.commit()
             engine.dispose()
-            for path in [storage, root / "desktop-settings.json", root / "config" / "integration.json", root / "logs"]:
+            for path in [storage, root / "native-imports", root / "desktop-settings.json", root / "config" / "integration.json", root / "logs"]:
                 _remove_owned(root, path)
             for name in ("queue.db", "queue.db-wal", "queue.db-shm"):
                 _remove_owned(root, root / name)

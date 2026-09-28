@@ -23,6 +23,9 @@ class ConfirmationRead(BaseModel):
 
 
 class DataTableRead(BaseModel):
+    grouping_fields: list[str] = Field(default_factory=list)
+    collection_kind: Literal["table", "files"] = "table"
+    file_count: int = 0
     id: str
     name: str
     template_key: str
@@ -47,7 +50,9 @@ class RowCreate(BaseModel):
 
 
 class RowsDelete(BaseModel):
+    edit_session_id: str | None = Field(default=None, max_length=36)
     row_ids: list[int] = Field(min_length=1)
+    expected_versions: dict[int, int] | None = None
 
 
 class MergeTablesRequest(BaseModel):
@@ -56,6 +61,8 @@ class MergeTablesRequest(BaseModel):
 
 
 class DataRowRead(BaseModel):
+    is_header_only: bool = False
+    shared_header_keys: list[str] | None = None
     review_pending: bool | None = None
     input_scope: InputScope | None = None
     id: int
@@ -78,6 +85,7 @@ class ColumnDef(BaseModel):
 class CustomColumnCreate(BaseModel):
     label: str = Field(min_length=1, max_length=64)
     section: str = Field(pattern="^(header|item)$")
+    value_type: Literal["text", "number", "date", "boolean"] = "text"
 
 
 class DataTableDetail(DataTableRead):
@@ -89,6 +97,8 @@ class DataTableDetail(DataTableRead):
 
 
 class DataRowUpdate(BaseModel):
+    expected_shared_header_keys: list[str] | None = None
+    edit_session_id: str | None = Field(default=None, max_length=36)
     expected_version: int = Field(ge=1)
     changes: dict[str, object | None] = Field(min_length=1)
     editor: str = Field(default="local-user", min_length=1, max_length=64)

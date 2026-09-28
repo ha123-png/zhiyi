@@ -8,6 +8,8 @@ it("binds consent to conversation, provider version and data scope", () => {
   expect(consentKey("a", {...profile, base_url:"https://other.test"}, {table_ids:["one"]})).not.toBe(key);
   expect(consentKey("a", profile, {workspace:true})).not.toBe(key);
   expect(consentKey("a", profile, {table_ids:["one"], row_ids:[]})).not.toBe(key);
+  expect(consentKey("a", profile, {table_id:"one", source_keys:[]})).not.toBe(consentKey("a", profile, {table_id:"one"}));
+  expect(consentKey("a", profile, {table_id:"one", source_keys:['{"id":"A","kind":"file"}']})).not.toBe(consentKey("a", profile, {table_id:"one", source_keys:['{"id":"B","kind":"file"}']}));
 });
 it("ignores permission-mode downgrade and order without widening data", () => {
   expect(consentKey("a", profile, {table_ids:["b","a"], mode:"delegate"}))

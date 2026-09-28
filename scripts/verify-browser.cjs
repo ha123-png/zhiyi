@@ -9,7 +9,6 @@ const project = path.resolve(__dirname, '..');
 const python = process.env.ZHIYI_TEST_PYTHON || path.join(project, 'apps/api/.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
 const root = path.join(project, '.local/browser-verification', `${new Date().toISOString().replaceAll(':','-')}-${randomUUID().slice(0,8)}`);
 fs.mkdirSync(root, { recursive: true });
-fs.writeFileSync(path.join(project,'.local/browser-verification/latest.json'),JSON.stringify({root}));
 const env = { ...process.env, PYTHONUTF8:'1', ZHIYI_OFFLINE:'1', ZHIYI_VISUAL_OUT:path.join(root,'visual') };
 delete env.ZHIYI_FAST;
 function run(executable, args, name) {

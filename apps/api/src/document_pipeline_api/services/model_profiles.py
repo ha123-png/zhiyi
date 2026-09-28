@@ -119,7 +119,9 @@ def classify_model_endpoint(base_url: str) -> tuple[str, bool]:
     return parsed.geturl(), not is_loopback
 
 
-def list_model_profiles(session: Session) -> list[ModelProfileRead]:
+def list_model_profiles(
+    session: Session, secret_store: ModelSecretStore | None = None,
+) -> list[ModelProfileRead]:
     state = session.get(ModelRuntimeStateRecord, 1)
     records = session.execute(
         select(ModelProfileRecord, ModelProfileVersionRecord)
@@ -131,7 +133,20 @@ def list_model_profiles(session: Session) -> list[ModelProfileRead]:
         .where(ModelProfileRecord.is_archived.is_(False))
         .order_by(ModelProfileRecord.created_at.asc())
     ).all()
-    return [_as_read(profile, version, state) for profile, version in records]
+    result = []
+    for profile, version in records:
+        has_api_key = False
+        if version.secret_ref is not None and secret_store is not None:
+            try:
+                # Backups retain references, not Windows credentials. A key
+                # deleted before restore must not appear as safely saved.
+                has_api_key = bool(secret_store.get(version.secret_ref))
+            except SecretStoreError:
+                pass
+        result.append(_as_read(profile, version, state).model_copy(
+            update={"has_api_key": has_api_key},
+        ))
+    return result
 
 
 def get_model_profile(session: Session, profile_id: str) -> ModelProfileRead:

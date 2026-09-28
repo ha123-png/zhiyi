@@ -59,6 +59,7 @@ class ClearHistoryRequest(BaseModel):
 
 class ClearHistoryResult(BaseModel):
     cleared_count: int
+    pending_cleanup: int = 0
 
 
 @router.get("/settings", response_model=SystemSettingsRead)
@@ -107,7 +108,8 @@ def clear_history_endpoint(
         raise HTTPException(status_code=422, detail="确认文字不匹配，未执行任何清理。")
     settings: Settings = request.app.state.settings
     cleared = clear_history(session, settings)
-    return ClearHistoryResult(cleared_count=cleared)
+    from document_pipeline_api.services.original_cleanup import pending_cleanup_count
+    return ClearHistoryResult(cleared_count=cleared, pending_cleanup=pending_cleanup_count(session))
 
 
 @router.get("/admin/clear-data")

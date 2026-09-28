@@ -26,6 +26,7 @@ import type { IntegrationSettings, McpRuntimeConfig } from "../api";
 import type { DataTableRead } from "../types";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { Icon } from "./Icon";
+import { Toast, useToast } from "./Toast";
 
 interface Endpoint {
   method: string;
@@ -139,6 +140,7 @@ function CollapsibleCard({
 }
 
 export function ConnectionsPage() {
+  const { toast, notify, clear } = useToast();
   const integrationBaseUrl = getIntegrationBaseUrl();
   const [status, setStatus] = useState<{
     enabled: boolean;
@@ -245,7 +247,9 @@ export function ConnectionsPage() {
       );
       await refreshSettings();
     } catch (err) {
-      setSettingsError(err instanceof Error ? err.message : "撤销密钥失败");
+      const message = err instanceof Error ? err.message : "撤销密钥失败";
+      setSettingsError(message);
+      notify(message, "error");
     } finally {
       setBusyKey(null);
     }
@@ -257,7 +261,7 @@ export function ConnectionsPage() {
       await navigator.clipboard.writeText(revealedToken.token);
       setCopied(true);
     } catch {
-      setSettingsError("复制失败，请手动选中复制。");
+      notify("复制失败，请手动选中密钥内容复制。", "error");
     }
   };
 
@@ -496,7 +500,7 @@ export function ConnectionsPage() {
               {([
                 ["taskRead", "读取任务", "允许 AI 查看任务列表、状态和文件名"],
                 ["templateRead", "读取模板", "允许 AI 查看模板、字段和校验规则"],
-                ["resultRead", "读取提取结果", "允许 AI 查看任务的结构化提取结果与校验问题"],
+                ["resultRead", "读取文件结果", "允许按文件读取当前数据、初始提取证据与校验问题；独立授权，不受下方所选数据表限制"],
                 ["dataRead", "读取数据仓库", "允许 AI 查看数据表、数据行、视图并执行聚合查询"],
               ] as const).map(([key, label, description]) => (
                 <div className="setting-row" key={key}>
@@ -560,7 +564,7 @@ export function ConnectionsPage() {
                     {!tableError && !tables.length && <p className="small muted">还没有可选的数据表。</p>}
                     <p className="small muted">已选 {tableIds.length} 张表。未选择时不允许访问任何数据表。</p>
                   </div>}
-                  <p className="small muted">同时约束读取、聚合、修改和导出。任务与原提取结果由上方独立开关控制。</p>
+                  <p className="small muted">此范围约束数据表工具的读取、聚合、修改和导出。“读取文件结果”独立授权，开启后可读取所选表之外的文件结果。</p>
                 </div>
               </div>}
               <div className="setting-row">
@@ -627,9 +631,13 @@ export function ConnectionsPage() {
               <div className="row" style={{ justifyContent: "space-between", gap: 12, marginTop: 12 }}>
                 <span className="small muted">默认不开放任何业务数据；按需授权后，请在客户端断开并重新连接。</span>
                 <button className="btn primary sm" type="button" onClick={async () => {
-                  await navigator.clipboard.writeText(JSON.stringify(mcpConfig.mcp_servers, null, 2));
-                  setMcpCopied(true);
-                  window.setTimeout(() => setMcpCopied(false), 1800);
+                  try {
+                    await navigator.clipboard.writeText(JSON.stringify(mcpConfig.mcp_servers, null, 2));
+                    setMcpCopied(true);
+                    window.setTimeout(() => setMcpCopied(false), 1800);
+                  } catch {
+                    notify("复制失败，请手动选中上方 MCP 配置复制。", "error");
+                  }
                 }}><Icon icon={mcpCopied ? CheckCircle2 : ClipboardCopy} size={13} /> {mcpCopied ? "已复制" : "复制配置"}</button>
               </div>
             </> : <div className="support">正在生成当前环境的 MCP 配置…</div>}
@@ -682,12 +690,13 @@ export function ConnectionsPage() {
       <ConfirmDialog
         open={revokeTarget !== null}
         title="撤销密钥"
-        description={`将撤销${revokeTarget === "read" ? "读" : "写"}密钥。撤销后使用该密钥的访问会失效（重启后生效）；已生成的密钥不可恢复。确认撤销吗？`}
+        description={`将撤销${revokeTarget === "read" ? "读" : "写"}密钥。使用该密钥的 HTTP API 请求立即失效，无需重启；已生成的密钥不可恢复。确认撤销吗？`}
         buttonLabel="确认撤销"
         busy={busyKey === revokeTarget}
         onConfirm={() => void handleRevokeKey()}
         onClose={() => setRevokeTarget(null)}
       />
+      <Toast toast={toast} onDismiss={clear} />
     </section>
   );
 }

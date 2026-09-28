@@ -1,3 +1,4 @@
+import { serverDate } from "../time";
 import { containsTemplateWrite, OperationPreview } from "./OperationPreview";
 import { assistantBase } from "./api";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
@@ -53,6 +54,7 @@ import { navigateAssistant, useAssistant } from "./AssistantProvider";
 import type { Analysis, BusinessContext, ToolRecord, Thread } from "./types";
 
 const toolNames: Record<string, string> = {
+  read_handbook: "查阅使用手册",
   get_operation_tools: "准备业务操作",
   enable_analysis_options: "准备条件分析",
   read_tool_result: "读取保存结果",
@@ -164,6 +166,8 @@ function ToolCardContent({
       )}
       {result.error && <p role="alert">{result.error}</p>}
       {tool.status === "stale" && !result.error && <p className="ask-plan-note">数据已变化或预览已过期。请重新提出修改，核对新的预览。</p>}
+      {tool.status === "pending" && ask.authorizationPending && <p className="ask-plan-note" role="status">正在同步授权；同步完成前不能确认此操作预览。</p>}
+      {tool.status === "pending" && ask.authorizationError && <p className="ask-plan-note" role="alert">授权同步失败。请先在对话设置中重试同步，再重新生成操作预览。</p>}
       {tool.status === "superseded" && <p className="ask-plan-note">后续请求已替代此提案，此处保留历史变更记录。</p>}
       {result.kind === "operation_plan" && <OperationPreview result={result} />}
       {result.kind === "export" && (
@@ -181,10 +185,11 @@ function ToolCardContent({
           {result.vision ? " · 已准备本页图像供所选模型读取" : " · 读取文字层"}
         </p>
       )}
+      {tool.name === "read_handbook" && !result.error && <p>{typeof result.title === "string" ? result.title : "使用手册目录"}</p>}
       {tool.status === "approved" && !templateWrite &&
         (result.execution as { can_undo?: boolean } | undefined)?.can_undo && (
           <button
-            disabled={ask.busy || deciding}
+            disabled={ask.busy || deciding || ask.authorizationPending || !!ask.authorizationError}
             onClick={async () => {
               setDeciding(true);
               try {
@@ -327,8 +332,9 @@ function ToolCardContent({
           <button
             type="button"
             className="ask-primary"
-            disabled={deciding || ask.busy}
+            disabled={deciding || ask.busy || ask.authorizationPending || !!ask.authorizationError}
             onClick={() => void decide(true)}
+            title={ask.authorizationError ? "授权同步失败，请先重试同步" : ask.authorizationPending ? "正在同步授权" : undefined}
           >
             <Check size={13} />
             {deciding ? "正在处理…" : "确认执行"}
@@ -339,6 +345,7 @@ function ToolCardContent({
         result.kind !== "operation_plan" &&
         ![
           "catalog",
+          "read_handbook",
           "enable_analysis_options",
           "get_operation_tools",
           "read_conversation_history",
@@ -364,6 +371,7 @@ function MessageView() {
     | undefined;
   const results = message.content.flatMap(part => part.type === "tool-call" ? [(part.result as ToolRecord)?.result] : []).filter(Boolean);
   const sameScope = (first: Analysis["source"], second: Analysis["source"]) => first.table_id === second.table_id &&
+    first.view_id === second.view_id && JSON.stringify(first.source_keys ?? null) === JSON.stringify(second.source_keys ?? null) &&
     ["row_ids", "filters", "search", "task_id", "grain"].every(key => JSON.stringify(first.request[key] ?? null) === JSON.stringify(second.request[key] ?? null));
   const intermediate = message.content.filter(part => {
     if (part.type !== "tool-call") return false;
@@ -371,7 +379,7 @@ function MessageView() {
     const r = t?.result;
     return r && !r.chart && !r.draft && !r.error && t.status === "completed"
       && r.kind !== "export" && r.kind !== "operation_plan"
-      && (!r.analysis_id || message.content.some(other => other.type === "tool-call"
+      && (!r.analysis_id || (r.rows && text.trim().length > 0) || message.content.some(other => other.type === "tool-call"
         && (other.result as ToolRecord)?.result?.chart?.analysis_id === r.analysis_id)
         || (r.rows && r.source && results.some(other => {
           const final = other.analysis || other;
@@ -392,7 +400,9 @@ function MessageView() {
         )}
       <div className="ask-message-body">
         {!!intermediate.length && <Fold title={intermediate.length === 1 && intermediate[0].type === "tool-call"
-          ? `${toolNames[(intermediate[0].result as ToolRecord).name] || "处理过程"} · 已完成`
+          ? (intermediate[0].result as ToolRecord).result.rows
+            ? "已读取的数据与来源"
+            : `${toolNames[(intermediate[0].result as ToolRecord).name] || "处理过程"} · 已完成`
           : `已查阅资料与处理过程 · ${intermediate.length} 步`} className="ask-process">
           {intermediate.map(part => part.type === "tool-call" ? <ToolCardContent key={part.toolCallId} tool={part.result as ToolRecord} nested={intermediate.length === 1} /> : null)}
         </Fold>}
@@ -861,7 +871,7 @@ export function AssistantPage() {
                 >
                   <span className="ask-thread-title-text">{t.title}</span>
                   <small>
-                    {new Date(t.updated_at).toLocaleDateString("zh-CN")}
+                    {serverDate(t.updated_at).toLocaleDateString("zh-CN")}
                   </small>
                 </button>
               )}

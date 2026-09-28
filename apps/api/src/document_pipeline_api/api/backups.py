@@ -29,7 +29,6 @@ from document_pipeline_api.public_errors import public_error_message
 router = APIRouter(prefix="/backups", tags=["backups"])
 
 BACKUP_SUFFIX = ".dpbak"
-BACKUP_RETENTION = 10  # 最多保留的备份份数，超出自动删除最旧
 
 
 class BackupRead(BaseModel):
@@ -41,7 +40,7 @@ class BackupRead(BaseModel):
 class BackupStatus(BaseModel):
     backup_dir: str
     count: int
-    retention: int
+    retention: int | None = None  # Manual backups are retained until explicitly deleted.
     free_bytes: int
     last_success_at: str | None = None
     database_size_bytes: int
@@ -142,7 +141,7 @@ def backup_status(request: Request) -> BackupStatus:
     return BackupStatus(
         backup_dir=str(backup_dir),
         count=len(backups),
-        retention=BACKUP_RETENTION,
+        retention=None,
         free_bytes=free_bytes,
         last_success_at=(
             (_parse_backup_name(last.name) or datetime.min).isoformat()
@@ -158,7 +157,7 @@ def backup_status(request: Request) -> BackupStatus:
 
 @router.post("", response_model=BackupRead, status_code=status.HTTP_201_CREATED)
 def create_backup(request: Request) -> BackupRead:
-    """创建备份：空间预检后生成一致快照；超出保留数量自动删除最旧备份。"""
+    """创建由用户管理的备份，不能淘汰其他手工备份。"""
     settings: Settings = request.app.state.settings
     backup_dir = _backup_dir(settings)
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -177,9 +176,6 @@ def create_backup(request: Request) -> BackupRead:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=public_error_message(error, "备份创建失败，请检查磁盘空间后重试。"),
         ) from error
-    backups = _list_backup_files(settings)
-    for old in backups[: max(0, len(backups) - BACKUP_RETENTION)]:
-        old.unlink(missing_ok=True)
     return BackupRead(
         name=name,
         size_bytes=output.stat().st_size,

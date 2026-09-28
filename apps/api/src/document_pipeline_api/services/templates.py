@@ -3,14 +3,11 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.models import (
-    DataTableRecord,
-    ExtractionRecord,
-    TaskRecord,
     TemplateRecord,
     TemplateRestorationRecord,
     TemplateVersionRecord,
@@ -97,6 +94,17 @@ BUILTIN_TEMPLATES = (
                 },
                 "right": {"op": "field", "path": "items[].amount"},
             },
+            {
+                "kind": "equation", "field": "header.amount_before_tax",
+                "left": {"op": "sum", "path": "items[].amount"},
+                "right": {"op": "field", "path": "header.amount_before_tax"},
+            },
+            {
+                "kind": "equation", "field": "header.total_amount",
+                "left": {"op": "add", "left": {"op": "field", "path": "header.amount_before_tax"},
+                         "right": {"op": "field", "path": "header.tax_amount"}},
+                "right": {"op": "field", "path": "header.total_amount"},
+            },
         ],
         "output_mapping": {},
     },
@@ -135,49 +143,68 @@ BUILTIN_TEMPLATES = (
             },
         ],
         "validation_rules": [],
-        "deterministic_rules": [],
+        "deterministic_rules": [
+            *[{"kind": "required", "field": f"header.{key}", "severity": "warning"}
+              for key in ("seller_name", "buyer_name", "document_number", "document_date", "total_amount")],
+            {
+                "kind": "equation", "field": "items[].amount",
+                "left": {"op": "multiply", "left": {"op": "field", "path": "items[].quantity"},
+                         "right": {"op": "field", "path": "items[].unit_price"}},
+                "right": {"op": "field", "path": "items[].amount"},
+            },
+            {
+                "kind": "equation", "field": "header.total_amount",
+                "left": {"op": "sum", "path": "items[].amount"},
+                "right": {"op": "field", "path": "header.total_amount"},
+            },
+        ],
         "output_mapping": {},
     },
 )
 
 
+def _ordinary_starter_body(body: TemplateBody) -> TemplateBody:
+    """Normalize legacy starter field identities once, preserving old versions."""
+    aliases = {"amount": "item_amount", "tax_amount": "item_tax_amount", "remarks": "item_remarks"}
+    def references(value):
+        if isinstance(value, dict):
+            return {key: references(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [references(item) for item in value]
+        if isinstance(value, str):
+            for prefix in ('items[].', 'item.'):
+                if value.startswith(prefix) and value[len(prefix):] in aliases:
+                    return prefix + aliases[value[len(prefix):]]
+        return value
+    values = references(body.model_dump(mode='json'))
+    for field in values['fields']:
+        if field['section'] == 'item':
+            old_key = field['key']
+            field['key'] = aliases.get(old_key, old_key)
+            if old_key in values['output_mapping']:
+                values['output_mapping'][field['key']] = values['output_mapping'][old_key]
+    return _normalize_body(TemplateBody.model_validate(values))
+
+
 def ensure_builtin_templates(session: Session) -> None:
+    from document_pipeline_api.services.system_settings import get_bool_setting, set_bool_setting
+    from document_pipeline_api.services.autonomous_extraction import ensure_autonomous_template
+    ensure_autonomous_template(session)
+    if get_bool_setting(session, 'starter_templates_initialized', False):
+        return
     for definition in BUILTIN_TEMPLATES:
-        existing = session.get(TemplateRecord, definition["id"])
+        if session.get(TemplateRecord, definition['id']) is not None:
+            continue
+        body = _ordinary_starter_body(TemplateBody.model_validate({
+            key:value for key,value in definition.items() if key not in {'id','builtin_key'}
+        }))
         now = utc_now()
-        expected_body = TemplateBody.model_validate(
-            {
-                key: value
-                for key, value in definition.items()
-                if key not in {"id", "builtin_key"}
-            }
-        )
-        if existing is None:
-            template = TemplateRecord(
-                id=definition["id"],
-                builtin_key=definition["builtin_key"],
-                is_system=True,
-                is_active=True,
-                current_version=1,
-                created_at=now,
-                updated_at=now,
-            )
-            session.add(template)
-            session.add(_version_record(template.id, 1, expected_body, now))
-            continue
-        # 内置模板定义有更新时，为已存在的内置模板创建新版本，旧版本快照仍可追溯
-        current = session.scalar(
-            select(TemplateVersionRecord).where(
-                TemplateVersionRecord.template_id == existing.id,
-                TemplateVersionRecord.version == existing.current_version,
-            )
-        )
-        if current is not None and _version_matches(current, expected_body):
-            continue
-        next_version = existing.current_version + 1
-        session.add(_version_record(existing.id, next_version, expected_body, now))
-        existing.current_version = next_version
-        existing.updated_at = now
+        template = TemplateRecord(id=definition['id'], builtin_key=definition['builtin_key'],
+            is_system=False, is_active=True, is_deleted=False, in_smart_pool=True,
+            current_version=1, created_at=now, updated_at=now)
+        session.add(template)
+        session.add(_version_record(template.id, 1, body, now))
+    set_bool_setting(session, 'starter_templates_initialized', True)
     session.commit()
 
 
@@ -199,6 +226,7 @@ def list_templates(
             TemplateRecord.created_at,
         )
     )
+    statement = statement.where(TemplateRecord.is_deleted.is_(False))
     if not include_inactive:
         statement = statement.where(TemplateRecord.is_active.is_(True))
     records = session.execute(statement).all()
@@ -207,7 +235,7 @@ def list_templates(
 
 def get_template(session: Session, template_id: str) -> TemplateRead:
     template = session.get(TemplateRecord, template_id)
-    if template is None:
+    if template is None or template.is_deleted:
         raise HTTPException(status_code=404, detail="没有找到这个模板。")
     version = session.scalar(
         select(TemplateVersionRecord).where(
@@ -264,8 +292,11 @@ def list_template_restorations(session: Session, template_id: str):
     ).order_by(TemplateRestorationRecord.id.desc()).limit(20)).all()
 
 
-def _check_template_timestamp(template: TemplateRecord, expected: datetime | None) -> None:
+def _check_template_timestamp(session: Session, template: TemplateRecord, expected: datetime | None) -> None:
     if expected is None:
+        from document_pipeline_api.services.system_settings import get_setting
+        if get_setting(session, "restored_template_write_fence"):
+            raise HTTPException(status_code=409, detail="数据已从备份恢复，请刷新模板并携带最新 updated_at 后重试。")
         return  # Older API clients still use expected_version.
     def utc_naive(value: datetime) -> datetime:
         return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
@@ -290,18 +321,27 @@ def restore_template_version(session: Session, template_id: str, version: int, e
                              expected_updated_at: datetime | None = None) -> TemplateRead:
     current = get_template(session, template_id)
     template = session.get(TemplateRecord, template_id)
-    if current.is_system:
+    if current.is_system and current.engine_kind != "autonomous":
         raise HTTPException(status_code=409, detail="内置模板不能直接修改，请先复制。")
     if not current.is_active:
         raise HTTPException(status_code=409, detail="这个模板已停用，请先恢复后再编辑。")
     if current.version != expected_version:
         raise HTTPException(status_code=409, detail="模板已经更新，请关闭历史并刷新模板后重试。")
-    _check_template_timestamp(template, expected_updated_at)
+    _check_template_timestamp(session, template, expected_updated_at)
     source = get_template_version(session, template_id, version)
     if version == current.version:
         raise HTTPException(status_code=409, detail="所选版本已经是当前版本。")
     _ensure_unique_name(session, source.name, exclude_id=template_id)
-    _normalize_body(TemplateBody.model_validate(source.model_dump(include=set(TemplateBody.model_fields))))
+    body = TemplateBody.model_validate(source.model_dump(include=set(TemplateBody.model_fields)))
+    if source.engine_kind == 'legacy':
+        return update_template(session,template_id,expected_version,_ordinary_starter_body(body),expected_updated_at)
+    if current.engine_kind == "autonomous":
+        from document_pipeline_api.services.autonomous_extraction import validate_settings
+        validate_settings(body, current)
+    else:
+        body = _normalize_body(body)
+        from document_pipeline_api.services.template_contract import sync_template_contract
+        sync_template_contract(session,template_id,body)
     now = utc_now()
     _switch_current_version(session, template, version, now)
     session.add(TemplateRestorationRecord(template_id=template_id, from_version=current.version,
@@ -334,6 +374,8 @@ def _active_name_exists(
 
 
 def _ensure_unique_name(session: Session, name: str, exclude_id: str | None = None) -> None:
+    from document_pipeline_api.services.read_snapshot import begin_write_snapshot
+    begin_write_snapshot(session)
     if _active_name_exists(session, name, exclude_id):
         raise HTTPException(
             status_code=422,
@@ -371,7 +413,11 @@ def create_template(session: Session, body: TemplateBody) -> TemplateRead:
 
 
 def copy_template(session: Session, template_id: str) -> TemplateRead:
+    from document_pipeline_api.services.read_snapshot import begin_write_snapshot
+    begin_write_snapshot(session)
     source = get_active_template(session, template_id)
+    if source.engine_kind == "autonomous":
+        raise HTTPException(409, "自主提取的设置可以直接修改，无需复制。")
     body = TemplateBody.model_validate(
         {
             **source.model_dump(
@@ -414,9 +460,9 @@ def update_template(
     expected_updated_at: datetime | None = None,
 ) -> TemplateRead:
     template = session.get(TemplateRecord, template_id)
-    if template is None:
+    if template is None or template.is_deleted:
         raise HTTPException(status_code=404, detail="没有找到这个模板。")
-    if template.is_system:
+    if template.is_system and _current_version(session, template).engine_kind != "autonomous":
         raise HTTPException(status_code=409, detail="内置模板不能直接修改，请先复制。")
     if not template.is_active:
         raise HTTPException(status_code=409, detail="这个模板已停用，请先恢复后再编辑。")
@@ -425,18 +471,27 @@ def update_template(
             status_code=409,
             detail="模板已经更新，请刷新后再保存。",
         )
-    _check_template_timestamp(template, expected_updated_at)
+    _check_template_timestamp(session, template, expected_updated_at)
     _ensure_unique_name(session, body.name, exclude_id=template_id)
     now = utc_now()
     next_version = (session.scalar(select(func.max(TemplateVersionRecord.version)).where(
         TemplateVersionRecord.template_id == template_id,
     )) or 0) + 1
+    current = _to_read(template, _current_version(session, template))
+    if current.engine_kind == "autonomous":
+        from document_pipeline_api.services.autonomous_extraction import validate_settings
+        normalized = validate_settings(body, current)
+    else:
+        normalized = _normalize_body(body)
+        from document_pipeline_api.services.template_contract import sync_template_contract
+        sync_template_contract(session,template_id,normalized)
     version = _version_record(
         template.id,
         next_version,
-        _normalize_body(body),
+        normalized,
         now,
     )
+    version.engine_kind = "autonomous" if current.engine_kind == "autonomous" else "template"
     _switch_current_version(session, template, next_version, now)
     session.add(version)
     _commit_or_conflict(session)
@@ -445,7 +500,7 @@ def update_template(
 
 def archive_template(session: Session, template_id: str) -> TemplateRead:
     template = session.get(TemplateRecord, template_id)
-    if template is None:
+    if template is None or template.is_deleted:
         raise HTTPException(status_code=404, detail="没有找到这个模板。")
     if template.is_system:
         raise HTTPException(status_code=409, detail="内置模板不能停用。")
@@ -458,11 +513,14 @@ def archive_template(session: Session, template_id: str) -> TemplateRead:
 
 
 def restore_template(session: Session, template_id: str) -> TemplateRead:
+    from document_pipeline_api.services.read_snapshot import begin_write_snapshot
+    begin_write_snapshot(session)
     template = session.get(TemplateRecord, template_id)
-    if template is None:
+    if template is None or template.is_deleted:
         raise HTTPException(status_code=404, detail="没有找到这个模板。")
     if template.is_active:
         return get_template(session, template_id)
+    _ensure_unique_name(session, _current_version(session, template).name, exclude_id=template_id)
     template.is_active = True
     template.updated_at = utc_now()
     session.commit()
@@ -470,50 +528,22 @@ def restore_template(session: Session, template_id: str) -> TemplateRead:
 
 
 def delete_template(session: Session, template_id: str) -> None:
-    """物理删除模板：只允许删除从未被任务/提取记录/数据表引用的模板；
-    内置模板一律拒绝；被引用的一律只能停用。"""
+    """Remove a rule from use; retain immutable snapshots for existing files."""
     template = session.get(TemplateRecord, template_id)
-    if template is None:
-        raise HTTPException(status_code=404, detail="没有找到这个模板。")
+    if template is None or template.is_deleted:
+        raise HTTPException(404, "没有找到这个模板。")
     if template.is_system:
-        raise HTTPException(status_code=409, detail="内置模板不能删除，只能复制。")
-    task_count = session.scalar(
-        select(func.count()).select_from(TaskRecord).where(
-            TaskRecord.template_id == template_id,
-        )
-    )
-    extraction_count = session.scalar(
-        select(func.count()).select_from(ExtractionRecord).where(
-            ExtractionRecord.template_id == template_id,
-        )
-    )
-    table_count = session.scalar(
-        select(func.count()).select_from(DataTableRecord).where(
-            DataTableRecord.template_key == template_id,
-        )
-    )
-    if task_count or extraction_count or table_count:
-        raise HTTPException(
-            status_code=409,
-            detail="该模板已被任务或数据表引用，不能删除，只能停用。",
-        )
-    session.execute(delete(TemplateRestorationRecord).where(TemplateRestorationRecord.template_id == template_id))
-    # 删除所有历史版本，再删模板；从它复制出来的模板解除溯源引用（副本本身仍独立可用）
-    session.execute(
-        delete(TemplateVersionRecord).where(
-            TemplateVersionRecord.template_id == template_id,
-        )
-    )
-    session.execute(
-        update(TemplateRecord)
-        .where(TemplateRecord.source_template_id == template_id)
-        .values(source_template_id=None)
-    )
-    session.delete(template)
+        raise HTTPException(409, "自主提取是知意的固定入口，不能删除；可将它移出智能选择池。")
+    template.is_deleted = True
+    template.is_active = False
+    template.in_smart_pool = False
+    template.updated_at = utc_now()
     session.commit()
 
 
 def _normalize_body(body: TemplateBody) -> TemplateBody:
+    if not body.fields:
+        raise HTTPException(422, "普通模板至少需要一个字段。")
     parts = [body.extra_instructions] if body.extra_instructions else []
     existing = {line.strip() for line in body.extra_instructions.splitlines()}
     for hint in body.validation_rules:
@@ -522,8 +552,8 @@ def _normalize_body(body: TemplateBody) -> TemplateBody:
             existing.add(hint.strip())
     fields = []
     # 表格最终是扁平列结构；无论抬头/明细，用户可见列名都必须唯一，避免建表、
-    # 导出和合并时两个同名字段互相覆盖。内部 key 在分区内仍独立校验。
-    keys: set[tuple[str, str]] = set()
+    # 导出和合并时两个同名字段互相覆盖。内部 key 在整份模板中必须唯一。
+    keys: set[str] = set()
     labels: set[str] = set()
     for field in body.fields:
         section = field.section or "header"
@@ -531,16 +561,25 @@ def _normalize_body(body: TemplateBody) -> TemplateBody:
         label_identity = " ".join(field.label.split()).casefold()
         if label_identity in labels:
             raise HTTPException(status_code=422, detail=f"字段名“{field.label.strip()}”重复。")
-        if (section, key) in keys:
-            raise HTTPException(status_code=422, detail=f"字段“{field.label}”重复。")
-        keys.add((section, key))
+        if key in keys:
+            raise HTTPException(status_code=422, detail=f"字段“{field.label}”与其他字段使用了相同标识。文件字段和明细字段必须各有独立标识。")
+        if key.startswith('__') or key in {'source_filename', 'item_index'} or any(char in key for char in '.[]\\"'):
+            raise HTTPException(422, "字段标识包含保留名称或路径字符，请重新创建该字段。")
+        keys.add(key)
         labels.add(label_identity)
         fields.append(field.model_copy(update={"key": key}))
     output_mapping = {
         key: value
         for key, value in body.output_mapping.items()
-        if key in {field_key for _section, field_key in keys} and value.strip()
+        if key in keys and value.strip()
     }
+    display_names: set[str] = set()
+    for field in fields:
+        display_name = output_mapping.get(field.key, field.label)
+        identity = " ".join(display_name.split()).casefold()
+        if identity in display_names:
+            raise HTTPException(422, f"输出列名“{display_name.strip()}”重复，请修改字段名称或输出映射。")
+        display_names.add(identity)
     field_types = {
         (field.section or "header", field.key): field.value_type
         for field in fields
@@ -593,6 +632,7 @@ def _version_record(
     return TemplateVersionRecord(
         template_id=template_id,
         version=version,
+        engine_kind="template",
         name=body.name,
         description=body.description,
         extra_instructions=body.extra_instructions,
@@ -645,9 +685,18 @@ def _to_read(
     template: TemplateRecord,
     version: TemplateVersionRecord,
 ) -> TemplateRead:
+    from document_pipeline_api.services.legacy_fields import normalize_template_payload
+    payload = dict(fields=json.loads(version.fields_json),
+                   deterministic_rules=json.loads(version.deterministic_rules_json),
+                   output_mapping=json.loads(version.output_mapping_json),
+                   behavior=json.loads(version.behavior_json))
+    if version.engine_kind != "legacy":
+        payload = normalize_template_payload(payload)
     return TemplateRead(
         id=template.id,
         version=version.version,
+        engine_kind=version.engine_kind,
+        is_deleted=template.is_deleted,
         is_system=template.is_system,
         is_active=template.is_active,
         in_smart_pool=template.in_smart_pool,
@@ -656,11 +705,8 @@ def _to_read(
         name=version.name,
         description=version.description,
         extra_instructions=version.extra_instructions,
-        fields=json.loads(version.fields_json),
+        **payload,
         validation_rules=json.loads(version.validation_rules_json),
-        deterministic_rules=json.loads(version.deterministic_rules_json),
-        output_mapping=json.loads(version.output_mapping_json),
-        behavior=json.loads(version.behavior_json),
         created_at=template.created_at,
         updated_at=template.updated_at,
     )
@@ -669,7 +715,7 @@ def _to_read(
 def set_smart_pool(session: Session, template_id: str, in_pool: bool) -> TemplateRead:
     """更新模板是否参与智能匹配预选池（停用/内置模板同样适用）。"""
     template = session.get(TemplateRecord, template_id)
-    if template is None:
+    if template is None or template.is_deleted:
         raise HTTPException(status_code=404, detail="没有找到这个模板。")
     template.in_smart_pool = in_pool
     template.updated_at = utc_now()

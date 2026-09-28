@@ -3,9 +3,11 @@ import mimetypes
 from functools import wraps
 from inspect import iscoroutinefunction, signature
 from pathlib import Path
+from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 from starlette.datastructures import Headers, UploadFile
 
 from document_pipeline_api.config import Settings
@@ -21,7 +23,7 @@ from document_pipeline_api.services.data_tables import (
     list_data_tables,
 )
 from document_pipeline_api.services.data_views import get_data_view, list_data_views
-from document_pipeline_api.services.extraction import get_extraction
+from document_pipeline_api.services.task_result_reads import read_task_result_page, read_task_result_value
 from document_pipeline_api.services.integration_queries import (
     aggregate_data_table,
     export_data_table_file,
@@ -55,7 +57,12 @@ def create_mcp_server(
     if file_access_enabled and not resolved_roots:
         raise RuntimeError("MCP 文件访问已启用，但没有配置允许目录。")
 
-    engine = build_engine(settings.database_url)
+    from document_pipeline_api.services.dataset_identity import dataset_generation, require_dataset_available
+    require_dataset_available(settings.storage_dir.parent)
+    # MCP may be a long-lived stdio child on Windows. Return every SQLite
+    # connection to the OS when a tool's session closes so an offline restore
+    # can replace the database while this client remains connected.
+    engine = build_engine(settings.database_url, poolclass=NullPool)
     upgrade_database(engine)
     session_factory = sessionmaker(engine, expire_on_commit=False)
     server = FastMCP(
@@ -78,6 +85,7 @@ def create_mcp_server(
             return b""
 
     initial_generation = generation()
+    initial_dataset = dataset_generation(settings.storage_dir.parent)
 
     from document_pipeline_api.services.integration_config import read_integration_config
 
@@ -92,6 +100,10 @@ def create_mcp_server(
 
     def check_access():
         nonlocal permissions_invalidated
+        from document_pipeline_api.business_backup import restore_journal_path
+        if restore_journal_path(settings.storage_dir.parent).exists() or dataset_generation(settings.storage_dir.parent) != initial_dataset:
+            engine.dispose()
+            raise ValueError("本地数据已恢复、清除或正在维护，请重新连接 MCP 并确认权限。")
         if clear_journal_path(settings).exists() or generation() != initial_generation:
             raise ValueError("本地数据已清除或正在清除，请重新连接 MCP 并确认权限。")
         permissions_invalidated = permissions_invalidated or permission_snapshot() != initial_permissions
@@ -199,10 +211,31 @@ def create_mcp_server(
     if result_read_enabled:
 
         @guarded_tool(name="get_task_result")
-        def mcp_get_task_result(task_id: str) -> dict[str, object]:
-            """读取一个任务的结构化提取结果和校验问题。"""
+        def mcp_get_task_result(
+            task_id: str, page: int = 1, page_size: int = 3, field_page: int = 1,
+            expected_version: int | None = None,
+        ) -> dict[str, object]:
+            """只读当前事实；默认3条、最多20条明细和12个字段，长值显式标记截断。用 next_page/next_field_page/next_issue_page 继续，后续传 expected_version=review_version，避免混用版本。不夹带初次结果。"""
             with session_factory() as session:
-                return get_extraction(session, task_id).model_dump(mode="json")
+                return read_task_result_page(session, task_id, page=page, page_size=page_size,
+                                             field_page=field_page, expected_version=expected_version)
+
+        @guarded_tool(name="get_task_evidence")
+        def mcp_get_task_evidence(task_id: str, page: int = 1, page_size: int = 3, field_page: int = 1) -> dict[str, object]:
+            """明确需要核对时才读初次提取证据，非当前事实、非原文件；默认3条明细、12个字段，可分页。用户修订和删除不改变此证据。"""
+            with session_factory() as session:
+                return read_task_result_page(session, task_id, view="initial", page=page,
+                                             page_size=page_size, field_page=field_page)
+
+        @guarded_tool(name="get_task_result_value")
+        def mcp_get_task_result_value(
+            task_id: str, path: list[str | int], view: Literal["current", "initial"] = "current",
+            offset: int = 0, limit: int = 2000, expected_version: int | None = None,
+        ) -> dict[str, object]:
+            """按需读单字段完整值，文本每次最多2000字符；path 使用返回的 truncated_paths，或 [header,key]/[items,从0开始的全文件位置,key]。校验字段用 [validation_issues,位置,key]。current 必须传 expected_version；initial 是历史证据。"""
+            with session_factory() as session:
+                return read_task_result_value(session, task_id, path, view=view, offset=offset,
+                                              limit=limit, expected_version=expected_version)
 
     if template_read_enabled:
 
@@ -352,8 +385,9 @@ def create_mcp_server(
             file_path: str,
             template_mode: str = "smart",
             template_id: str | None = None,
+            duplicate_policy: str = "reject",
         ) -> dict[str, object]:
-            """从用户明确允许的目录导入一个文件；不能访问目录外路径。"""
+            """从允许目录导入。重复默认拒绝；用户确认再次提取后传 duplicate_policy=allow。"""
             path = _resolve_allowed_file(file_path, resolved_roots, must_exist=True)
             media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
             handle = path.open("rb")
@@ -371,6 +405,7 @@ def create_mcp_server(
                         upload,
                         "manual" if template_id else template_mode,
                         template_id,
+                        duplicate_policy=duplicate_policy,
                     )
                     from document_pipeline_api.services.queue_pause import freeze_new_task_if_paused
 

@@ -15,12 +15,13 @@ from pathlib import Path
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from sqlalchemy import select
 
 from document_pipeline_api.config import Settings
 from document_pipeline_api.main import create_app
 from document_pipeline_api.models import DataRowRecord, DataTableRecord, TaskRecord
 from document_pipeline_api.schemas.extraction import DocumentExtraction, DocumentKind
-from document_pipeline_api.services.data_tables import confirm_task
+from document_pipeline_api.services.data_tables import confirm_task, materialize_task_result
 from image_test_data import PNG_BYTES
 from fastapi.testclient import TestClient
 from document_pipeline_api.services.extraction import process_task
@@ -119,17 +120,9 @@ def _seed_db(
             )
             session.add(table)
             session.flush()
-            row = DataRowRecord(
-                table_id=table_id,
-                task_id=task_id,
-                item_index=1,
-                row_json=__import__("json").dumps({"name": "商品A"}),
-            )
-            session.add(row)
-            session.flush()
-            row_id_out.append(row.id)
-            session.commit()
+            materialize_task_result(session, task_id)
             confirm_task(session, task_id, 0)
+            row_id_out.append(session.scalar(select(DataRowRecord.id).where(DataRowRecord.task_id == task_id)))
             session.add(
                 TaskRecord(
                     id=f"{task_id}-queued",
@@ -326,3 +319,103 @@ def test_mcp_full_file_progress_review_table_export_chain(tmp_path: Path):
                     assert (await mcp.call_tool("export_data_table", {**args, "output_path": str(tmp_path.parent / "outside.json")})).isError
                     assert source.read_bytes() == raw
         asyncio.run(journey())
+
+
+def test_mcp_live_connection_allows_restore_and_is_generation_fenced(tmp_path: Path) -> None:
+    """The launcher MCP child releases SQLite handles while retaining generation fencing."""
+    data_dir = tmp_path / "restore-data"
+    data_dir.mkdir()
+    settings = Settings(
+        database_url=f"sqlite:///{data_dir / 'document-pipeline.db'}",
+        storage_dir=data_dir / "uploads",
+        queue_enabled=False,
+    )
+    app = create_app(settings)
+    before_table = DataTableRecord(
+        id="restore-before",
+        name="Before restore",
+        template_key="restore-fixture",
+        template_version="1",
+        document_kind="manual",
+    )
+    later_table = DataTableRecord(
+        id="restore-later",
+        name="Added after backup",
+        template_key="restore-later-fixture",
+        template_version="1",
+        document_kind="manual",
+    )
+
+    with TestClient(app) as api:
+        with app.state.session_factory() as session:
+            session.add(before_table)
+            session.commit()
+
+        saved = api.post(
+            "/api/v1/integration/settings/permissions",
+            json={"data_read": True, "data_scope": "all"},
+        )
+        assert saved.status_code == 200
+        launcher_config = api.get("/api/v1/integration/settings/mcp-config").json()
+        server_config = launcher_config["server"]
+        safe_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key.upper()
+            in {
+                "PATH",
+                "SYSTEMROOT",
+                "WINDIR",
+                "COMSPEC",
+                "PATHEXT",
+                "TEMP",
+                "TMP",
+                "USERPROFILE",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "PROGRAMDATA",
+                "PROGRAMFILES",
+                "PROGRAMFILES(X86)",
+            }
+        }
+        safe_environment["UV_OFFLINE"] = "1"
+        params = StdioServerParameters(
+            command=server_config["command"],
+            args=server_config["args"],
+            env=safe_environment,
+            cwd=str(Path(__file__).resolve().parents[3]),
+        )
+
+        backup = api.post("/api/v1/backups")
+        assert backup.status_code == 201
+        backup_name = backup.json()["name"]
+        with app.state.session_factory() as session:
+            session.add(later_table)
+            session.commit()
+
+        async def restore_journey() -> None:
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as mcp:
+                    await mcp.initialize()
+                    before = _parse_result(await mcp.call_tool("list_data_tables", {}))
+                    assert {item["id"] for item in before} == {
+                        "restore-before",
+                        "restore-later",
+                    }
+
+                    # The preceding MCP read must have opened and returned its SQLite connection
+                    # before this route atomically replaces the database on Windows.
+                    restored = api.post(f"/api/v1/backups/{backup_name}/restore")
+                    assert restored.status_code == 200, restored.text
+                    assert restored.json()["restart_required"] is True
+
+                    old_connection = await mcp.call_tool("get_capabilities", {})
+                    assert old_connection.isError
+
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as mcp:
+                    await mcp.initialize()
+                    after = _parse_result(await mcp.call_tool("list_data_tables", {}))
+                    assert [item["id"] for item in after] == ["restore-before"]
+
+        asyncio.run(restore_journey())

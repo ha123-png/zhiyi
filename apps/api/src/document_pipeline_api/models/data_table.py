@@ -9,10 +9,11 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship, foreign
 
 from document_pipeline_api.db import Base
 from document_pipeline_api.models.task import utc_now
+from document_pipeline_api.models.file_data import FileCurrentDataRecord
 
 
 class DataTableRecord(Base):
@@ -30,6 +31,8 @@ class DataTableRecord(Base):
     template_key: Mapped[str] = mapped_column(String(128))
     template_version: Mapped[str] = mapped_column(String(64))
     document_kind: Mapped[str] = mapped_column(String(32))
+    collection_kind: Mapped[str] = mapped_column(String(16), default="table")
+    grouping_json: Mapped[str] = mapped_column(Text, default="[]")
     # 手动新建/合并表的列定义（[{"key","label","value_type"}]）；内置与模板表留空，
     # 列契约从内置映射或模板字段推导。仅用于无模板驱动的表。
     columns_json: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -58,6 +61,7 @@ class DataRowRecord(Base):
             "item_index",
             name="uq_data_row_task_item",
         ),
+        {"sqlite_autoincrement": True},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -73,6 +77,13 @@ class DataRowRecord(Base):
     )
     item_index: Mapped[int] = mapped_column(Integer)
     row_json: Mapped[str] = mapped_column(Text)
+    is_header_only: Mapped[bool] = mapped_column(Boolean, default=False)
+    file_current: Mapped[FileCurrentDataRecord | None] = relationship(
+        FileCurrentDataRecord,
+        primaryjoin=lambda: foreign(DataRowRecord.task_id) == FileCurrentDataRecord.task_id,
+        viewonly=True,
+        lazy="joined",
+    )
     input_scope_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     review_pending: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     row_version: Mapped[int] = mapped_column(Integer, default=1)

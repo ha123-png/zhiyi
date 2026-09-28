@@ -228,7 +228,19 @@ def main():
             response = client.get("/api/v1" + path)
             assert response.is_success, response.text
             return response
-        assert get(table_url).json()["rows"] == before_table["rows"]
+        restored_rows = get(table_url).json()["rows"]
+        # Restore deliberately fences old drafts with a new concurrency epoch.
+        # Every business value and identity must survive, but stale versions must not.
+        def business_rows(rows):
+            return [{key: value for key, value in row.items() if key != "version"} for row in rows]
+        assert business_rows(restored_rows) == business_rows(before_table["rows"])
+        before_versions = {row["id"]: row["version"] for row in before_table["rows"]}
+        assert all(row["version"] != before_versions[row["id"]] for row in restored_rows)
+        stale_write = client.patch("/api/v1" + f"{table_url}/rows/{first['id']}", json={
+            "expected_version": before_versions[first["id"]], "changes": {"amount": 999},
+        })
+        assert stale_write.status_code == 409
+        assert get(table_url).json()["rows"] == restored_rows
         assert [card["id"] for card in get("/stats/cards").json()["items"]] == [card["id"] for card in cards]
         for card in cards:
             assert get(f"/stats/cards/{card['id']}/result").json()["analysis"]["totals"] == values[card["id"]]

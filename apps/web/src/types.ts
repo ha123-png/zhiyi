@@ -87,6 +87,7 @@ export interface Task {
   page_count?: number;
   planned_scope?: InputScope | null;
   match_scope?: InputScope | null;
+  autonomous_fallback?: boolean;
   pending_reason?: string | null;
   archive_pending?: boolean;
   file_export?: FileExportState | null;
@@ -150,7 +151,7 @@ export interface BackupRead {
 export interface BackupStatus {
   backup_dir: string;
   count: number;
-  retention: number;
+  retention: number | null;
   free_bytes: number;
   last_success_at: string | null;
   database_size_bytes: number;
@@ -309,6 +310,9 @@ export interface TemplateResult {
 export type ExtractionResult = DocumentResult | TemplateResult;
 
 export interface Extraction {
+  current_schema?: TableColumnDef[];
+  detail_ids?: number[];
+  has_current_data?: boolean;
   file_name?: FileNameState | null;
   input_scope?: InputScope | null;
   task_id: string;
@@ -442,6 +446,7 @@ export interface ExtractionTemplate {
   id: string;
   version: number;
   is_system: boolean;
+  engine_kind?: "legacy" | "template" | "autonomous";
   is_active?: boolean;
   in_smart_pool?: boolean;
   builtin_key: string | null;
@@ -484,6 +489,9 @@ export interface DataRowRevision {
 }
 
 export interface DataTableRead {
+  grouping_fields?: string[];
+  file_count?: number;
+  collection_kind?: "table" | "files";
   id: string;
   name: string;
   template_key: string;
@@ -494,6 +502,8 @@ export interface DataTableRead {
 }
 
 export interface DataRowRead {
+  is_header_only?: boolean;
+  shared_header_keys?: string[] | null;
   review_pending?: boolean | null;
   input_scope?: InputScope | null;
   id: number;
@@ -503,6 +513,21 @@ export interface DataRowRead {
   values: Record<string, unknown>;
   created_at: string;
   updated_at: string;
+}
+
+export interface SourceCard {
+  id: string; kind: "file" | "group" | "row"; task_id: string | null; filename: string;
+  version: string; first_row_id: number; row_count: number; item_count: number;
+  matched_row_count: number; complete: boolean; review_pending: boolean; partial_input: boolean;
+  shared_header_keys: string[];
+  preview_header: {key: string; label: string; value: unknown; truncated: boolean}[];
+  preview_items: {id: number; item_index: number; fields: {key: string; label: string; value: unknown; truncated: boolean}[]}[];
+}
+export interface SourceCardPage {
+  table_id: string; page: number; page_size: number; total: number; row_count: number; groups: SourceCard[];
+}
+export interface SourceCardDetail extends SourceCard {
+  page: number; page_size: number; total: number; header: Record<string, unknown>; schema: TableColumnDef[]; rows: DataRowRead[];
 }
 
 export interface TableColumnDef {

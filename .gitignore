@@ -53,3 +53,9 @@ datasets/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Private source samples and release workspaces
+/数据集/
+/项目梳理报告/
+/qwen3.6-flash.txt
+/public-release/

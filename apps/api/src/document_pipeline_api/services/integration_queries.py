@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from document_pipeline_api.models import DataRowRecord, DataTableRecord
 from document_pipeline_api.services.data_tables import get_data_table, table_columns, _csv_safe
 from document_pipeline_api.services.assistant_analysis import AnalysisRequest, Metric, analyze
+from document_pipeline_api.services.atomic_output import new_text_file
 from document_pipeline_api.services.export_scope import REVIEW_KEY, REVIEW_LABEL, table_has_pending_reviews
 from document_pipeline_api.services.export_scope import SCOPE_LABEL, csv_scope_value, export_row_values, table_has_input_scopes
 
@@ -26,6 +27,8 @@ def aggregate_data_table(
     table = session.get(DataTableRecord, table_id)
     if table is None:
         raise HTTPException(status_code=404, detail="没有找到这个数据表。")
+    from document_pipeline_api.services.file_collections import require_tabular
+    require_tabular(table)
     allowed = {column.key for column in table_columns(session, table)}
     for field in (value_field, group_by):
         if field is not None and field not in allowed:
@@ -63,8 +66,18 @@ def export_data_table_file(
     path: Path,
     output_format: Literal["csv", "json"],
 ) -> int:
-    """流式导出事实表到新文件；调用者负责路径授权并保证不覆盖。"""
+    """流式导出并独占发布完整新文件；调用者负责路径授权。"""
     detail = get_data_table(session, table_id, page=1, page_size=1)
+    if detail.collection_kind == "files":
+        if output_format != "json":
+            raise HTTPException(409, "自主提取的字段按文件保存，请选择 JSON 完整结构导出，不能拼成统一 CSV。")
+        from io import TextIOWrapper
+        import shutil
+        from document_pipeline_api.services.file_exports import build_files_json
+        table = session.get(DataTableRecord, table_id)
+        with TextIOWrapper(build_files_json(session, table), encoding="utf-8") as source, new_text_file(path) as target:
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+        return detail.row_count
     columns = [column.key for column in detail.columns]
     scoped = table_has_input_scopes(session, table_id)
     pending = table_has_pending_reviews(session, table_id)
@@ -73,13 +86,13 @@ def export_data_table_file(
     if scoped and SCOPE_LABEL in [column.label for column in detail.columns]:
         raise ValueError("业务列名与知意范围说明列冲突，请重命名后导出。")
     if output_format == "csv":
-        with path.open("w", encoding="utf-8-sig", newline="") as stream:
+        with new_text_file(path, encoding="utf-8-sig", newline="") as stream:
             writer = csv.writer(stream)
             writer.writerow([_csv_safe(column.label) for column in detail.columns] + ([SCOPE_LABEL] if scoped else []) + ([REVIEW_LABEL] if pending else []))
             for values in _iter_table_values(session, table_id):
                 writer.writerow([_csv_safe(values.get(column)) for column in columns] + ([csv_scope_value(values)] if scoped else []) + (["待核对" if values.get(REVIEW_KEY) else ""] if pending else []))
     else:
-        with path.open("w", encoding="utf-8") as stream:
+        with new_text_file(path) as stream:
             stream.write("[")
             first = True
             for values in _iter_table_values(session, table_id):

@@ -1,3 +1,10 @@
+import { ConfirmDialog } from "./ConfirmDialog";
+import { useModalFocus } from "../useModalFocus";
+import { SmartPoolSettings } from "./SmartPoolSettings";
+import { DetailRowAction } from "./DetailRowAction";
+import { DetailPagination, useDetailPage } from "./DetailPagination";
+import { Disclosure } from "./Disclosure";
+import { FileRevisionHistory } from "./FileRevisionHistory";
 import { desktopApi, type NativeImportFile } from "../desktop";
 import { taskDisplayName } from "../taskNames";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -25,10 +32,10 @@ import {
   X,
 } from "lucide-react";
 import {
-  confirmTask,
+  ApiError,
+  DuplicateUploadError,
   getExtraction,
   getOriginalFileUrl,
-  getTables,
   getTasks,
   getTemplates,
   subscribeTaskEvents,
@@ -36,7 +43,6 @@ import {
   uploadTask,
 } from "../api";
 import type {
-  DataTableRead,
   DemoScenario,
   Extraction,
   ExtractionResult,
@@ -117,6 +123,7 @@ const documentItemLabels: Record<string, string> = {
  * 动态生成（平铺的内置单据结果），保证数据始终可读、不出现空白表。
  */
 function headerColumnsFor(extraction: Extraction | null): HeaderColumn[] {
+  if (extraction?.current_schema?.length) return extraction.current_schema.filter(field => field.section === "header").map(field => ({key: field.key, label: field.label}));
   const template = extraction?.template;
   if (template && template.fields.some((f) => f.section === "header" && f.key)) {
     return template.fields
@@ -142,6 +149,7 @@ function headerColumnsFor(extraction: Extraction | null): HeaderColumn[] {
 }
 
 function itemColumnsFor(extraction: Extraction | null): ItemColumn[] {
+  if (extraction?.current_schema?.length) return extraction.current_schema.filter(field => field.section === "item").map(field => ({key: field.key, label: field.label, numeric: field.value_type === "number"}));
   const template = extraction?.template;
   if (template && template.fields.some((f) => f.section === "item" && f.key)) {
     return template.fields
@@ -475,6 +483,7 @@ export function ExtractPage({
   const [previewPage, setPreviewPage] = useState(1);
   const [previewPageCount, setPreviewPageCount] = useState(1);
   const [previewFullscreen, setPreviewFullscreen] = useState(false);
+  const previewDialog = useModalFocus(previewFullscreen, () => setPreviewFullscreen(false));
   const [selectedEvidencePath, setSelectedEvidencePath] = useState<string | null>(
     null,
   );
@@ -486,18 +495,28 @@ export function ExtractPage({
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>(
     initialMode.templateId,
   );
-  const [tables, setTables] = useState<DataTableRead[]>([]);
-  const [targetTableId, setTargetTableId] = useState<string>("");
   const [task, setTask] = useState<Task | null>(null);
+  const loadSeqRef = useRef(0);
   useAssistantPageContext("extract", { task_id: task?.id ?? null, template_id: task?.template_id ?? null, template_version: task?.template_version ?? null });
   const [extraction, setExtraction] = useState<Extraction | null>(null);
   const [nameChoices, setNameChoices] = useState<Record<string, string>>({});
+  const [fileHistoryOpen, setFileHistoryOpen] = useState(false);
+  const [draftDetailIds, setDraftDetailIds] = useState<number[] | undefined>();
+  useEffect(() => { setDraftDetailIds(extraction?.detail_ids); }, [extraction]);
   const [draftResult, setDraftResult] = useState<ExtractionResult | null>(null);
   const [loading, setLoading] = useState(false);
+  const uploadInFlight = useRef(false);
+  const [duplicateUploads, setDuplicateUploads] = useState<Array<{
+    file: File | NativeImportFile; selection: string; conflict: DuplicateUploadError;
+  }>>([]);
+  const [duplicateBusy, setDuplicateBusy] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // 批量上传：本次放入队列的任务列表（状态随轮询刷新）
   const [batch, setBatch] = useState<BatchItem[]>([]);
+  // A new selection starts a new automatic-preview scope. Older tasks remain
+  // in the queue but their completed results must not hide this upload's failure.
+  const latestUploadIdsRef = useRef<Set<string> | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const resultSectionRef = useRef<HTMLDivElement | null>(null);
@@ -610,6 +629,8 @@ export function ExtractPage({
     // batch 任务都是刚上传的，必然在最新 200 条内；避免恢复逻辑全量拉历史（ISSUE-067）
     getTasks({ limit: 200 })
       .then((items) => {
+        // A delayed restoration must not replace files selected since mount.
+        if (latestUploadIdsRef.current !== null) return;
         const byId = new Map(items.map((t) => [t.id, t]));
         const restored = savedIds
           .map((id) => byId.get(id))
@@ -626,32 +647,33 @@ export function ExtractPage({
       });
   }, []);
 
-  // 记住"最后一个文件"的提取结果：刷新/切页不丢，服务重启才失效
+  // Remember which file was open, but reload its current facts from the service.
+  // Cached values may predate warehouse edits, deletion, or a backup restore.
   useEffect(() => {
-    if (demo) return;
+    if (demo || initialTask) return;
     const record = loadLastExtraction();
     if (!record) return;
+    const seq = ++loadSeqRef.current;
     setTask(record.task);
-    setExtraction(record.extraction);
-    setDraftResult(structuredClone(record.extraction.result));
-    setExtractValidationIssues(mapValidationIssues(record.extraction));
+    setExtraction(null);
+    setDraftResult(null);
+    setExtractValidationIssues([]);
+    setLoading(true);
     setPreviewPage(1);
     setPreviewPageCount(record.task.page_count ?? 1);
-    // 轮询一次确认任务仍存在：若已被删除则清掉本地记录
-    // （最后一次处理的文件必在最新 200 条内，避免全量拉历史）
-    getTasks({ limit: 200 })
-      .then((items) => {
-        if (!items.some((item) => item.id === record.task.id)) {
-          clearLastExtraction();
-          setTask(null);
-          setExtraction(null);
-          setDraftResult(null);
-          setExtractValidationIssues([]);
-        }
-      })
-      .catch(() => {
-        // 后端不可达时保留本地记录，展示上次结果
-      });
+    getExtraction(record.task.id).then((result) => {
+      if (seq !== loadSeqRef.current) return;
+      setExtraction(result);
+      setDraftResult(structuredClone(result.result));
+      setExtractValidationIssues(mapValidationIssues(result));
+      saveLastExtraction({ task: record.task, extraction: result });
+    }).catch((reason: unknown) => {
+      if (seq !== loadSeqRef.current) return;
+      if (reason instanceof ApiError && reason.status === 404) {
+        clearLastExtraction(); setTask(null);
+      }
+      setError(reason instanceof Error ? reason.message : "读取上次文件失败，请在文件历史中重新打开。");
+    }).finally(() => { if (seq === loadSeqRef.current) setLoading(false); });
   }, [demo]);
 
   useEffect(() => {
@@ -659,11 +681,6 @@ export function ExtractPage({
       .then((data) => setTemplates(data))
       .catch(() => {
         // 模板加载失败不阻塞主流程，下拉框保持为空
-      });
-    getTables()
-      .then((data) => setTables(data))
-      .catch(() => {
-        // 数据表加载失败不阻塞主流程
       });
   }, []);
 
@@ -682,8 +699,14 @@ export function ExtractPage({
   useEffect(() => {
     if (!initialTask) return;
     let cancelled = false;
+    const seq = ++loadSeqRef.current;
     setLoading(true);
+    setSaving(false);
     setError(null);
+    setExtraction(null);
+    setDraftResult(null);
+    setExtractValidationIssues([]);
+    setEditingExtractCell(null);
     setTask(initialTask);
     setPreviewPage(1);
     setPreviewPageCount(initialTask.page_count ?? 1);
@@ -695,18 +718,18 @@ export function ExtractPage({
     }
     getExtraction(initialTask.id)
       .then((result) => {
-        if (cancelled) return;
+        if (cancelled || seq !== loadSeqRef.current) return;
         setExtraction(result);
         setDraftResult(structuredClone(result.result));
         setExtractValidationIssues(mapValidationIssues(result));
       })
       .catch((err) => {
-        if (!cancelled) {
+        if (!cancelled && seq === loadSeqRef.current) {
           setError(err instanceof Error ? err.message : "读取提取结果失败");
         }
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled && seq === loadSeqRef.current) setLoading(false);
       });
     return () => {
       cancelled = true;
@@ -719,7 +742,7 @@ export function ExtractPage({
     resultSectionRef.current?.scrollIntoView({ block: "start", behavior: "auto" });
   }, [initialTask, extraction]);
 
-  const hasExtractData = extraction !== null && task !== null;
+  const hasExtractData = extraction !== null && task !== null && extraction.task_id === task.id;
   const extractedSourceName = task ? taskDisplayName(task) : "";
   const batchActive = batch.some((b) => BATCH_ACTIVE_STATUSES.has(b.task.status));
   // 批量处理中保留最近完成的结果，下一份完成后再平滑替换；不能因为队列仍活动
@@ -731,15 +754,18 @@ export function ExtractPage({
       BATCH_ACTIVE_STATUSES.has(b.task.status)
       || b.task.status === "waiting_for_template",
   );
+  const failedBatch = batch.filter(({ task: item }) => item.status === "failed"
+    && (latestUploadIdsRef.current === null || latestUploadIdsRef.current.has(item.id)));
 
-  const displayExtraction = extraction && draftResult
-    ? { ...extraction, result: draftResult }
-    : extraction;
+  const displayExtraction = hasExtractData && extraction
+    ? (draftResult ? { ...extraction, result: draftResult } : extraction)
+    : null;
   const headerColumns = headerColumnsFor(displayExtraction);
   const itemColumns = itemColumnsFor(displayExtraction);
   const extractedColumns = [...headerColumns, ...itemColumns];
   const headerValues = displayExtraction ? buildHeaderValues(displayExtraction, headerColumns) : {};
   const itemRows = displayExtraction ? buildItemRows(displayExtraction, itemColumns) : [];
+  const detailPage = useDetailPage(itemRows.length, task?.id);
   const selectedEvidence = extraction?.evidence?.find(
     (item) => item.field_path === selectedEvidencePath,
   );
@@ -771,7 +797,6 @@ export function ExtractPage({
   /** 读取并展示某个任务的提取结果（批量列表点击 / 轮询到完成时调用）。
    *  用自增序号守卫：并发多次 getExtraction 时只让最新一次写入状态，
    *  避免慢响应晚到把新结果覆盖成旧文件。 */
-  const loadSeqRef = useRef(0);
   // 记录当前自动展示的完成任务。同一轮轮询只选择 updated_at 最新的一份，
   // 避免多个请求争抢；后续任务完成时再替换。
   const autoDisplayedTaskIdRef = useRef<string | null>(null);
@@ -781,6 +806,7 @@ export function ExtractPage({
       const result = await getExtraction(loadedTask.id);
       if (seq !== loadSeqRef.current) return;
       setTask(loadedTask);
+      setSaving(false);
       setExtraction(result);
       setDraftResult(structuredClone(result.result));
       setExtractValidationIssues(mapValidationIssues(result));
@@ -796,11 +822,12 @@ export function ExtractPage({
   }, []);
 
   /** 批量上传：每个文件入队为一个任务，全部进入队列后由后端串行处理。 */
-  async function handleFiles(files: (File | NativeImportFile)[]) {
-    if (files.length === 0) return;
+  async function handleFiles(files: (File | NativeImportFile)[], duplicatePolicy: "reject" | "allow" = "reject", selectedTemplate?: string) {
+    if (files.length === 0 || uploadInFlight.current) return;
+    uploadInFlight.current = true;
     setError(null);
     setLoading(true);
-    const selection = templateSelection();
+    const selection = selectedTemplate ?? templateSelection();
     const startedAt = Date.now();
     // 上传请求发出前：前端立即把文件显示在全局任务条并开始计时，
     // 不等待后端创建任务的异步响应；上传完成后由真实任务无缝替换。
@@ -817,7 +844,8 @@ export function ExtractPage({
         const uploadedTask = await uploadTask(
           file,
           selection,
-          targetTableId || undefined,
+          undefined,
+          duplicatePolicy,
         );
         uploaded.push({ task: uploadedTask });
         completed.push({
@@ -825,19 +853,38 @@ export function ExtractPage({
           realId: uploadedTask.id,
           startedAt,
         });
-        if (files.length === 1) {
-          // 单文件立即显示任务占位，等待提取完成
+        if (uploaded.length === 1) {
+          // A new source must never be paired with the previous file's values.
+          latestUploadIdsRef.current = new Set();
+          loadSeqRef.current += 1;
+          setSaving(false);
+          setExtraction(null);
+          setDraftResult(null);
+          setExtractValidationIssues([]);
+          setEditingExtractCell(null);
+          setSelectedEvidencePath(null);
           setTask(uploadedTask);
+          setPreviewPage(1);
           setPreviewPageCount(uploadedTask.page_count ?? 1);
         }
+        latestUploadIdsRef.current!.add(uploadedTask.id);
       } catch (err) {
-        setError(err instanceof Error ? err.message : "上传失败");
+        if (err instanceof DuplicateUploadError) {
+          if ("token" in file && !err.retryToken) {
+            setError("这份文件已导入。如需再次提取，请重新选择文件。");
+          } else {
+            const retryFile = "token" in file ? { ...file, token: err.retryToken! } : file;
+            setDuplicateUploads((pending) => [...pending, { file: retryFile, selection, conflict: err }]);
+          }
+        } else {
+          setError(err instanceof Error ? err.message : "上传失败");
+        }
       }
     }
+    uploadInFlight.current = false;
     setLoading(false);
     onUploadsComplete?.(completed);
     if (uploaded.length === 0) return;
-    autoDisplayedTaskIdRef.current = null;
     setBatch((prev) => {
       const next = [...prev, ...uploaded];
       saveBatchIds(next.map((b) => b.task.id));
@@ -845,6 +892,16 @@ export function ExtractPage({
     });
     // 立即同步全局任务条：上传成功即刻显示"正在识别"，不等下一次轮询
     onTasksChange?.();
+  }
+
+  async function confirmDuplicateUpload() {
+    const pending = duplicateUploads[0];
+    if (!pending || duplicateBusy || uploadInFlight.current) return;
+    setDuplicateBusy(true);
+    try {
+      await handleFiles([pending.file], "allow", pending.selection);
+      setDuplicateUploads((current) => current.slice(1));
+    } finally { setDuplicateBusy(false); }
   }
 
   async function chooseFiles() {
@@ -892,6 +949,7 @@ export function ExtractPage({
           onTasksChange?.();
           const latestResult = refreshedBatch
             .map((item) => item.task)
+            .filter((item) => latestUploadIdsRef.current === null || latestUploadIdsRef.current.has(item.id))
             .filter((item) => item.status === "completed" || item.status === "needs_review")
             .sort((left, right) => parseServerTime(right.updated_at) - parseServerTime(left.updated_at))[0];
           if (latestResult && autoDisplayedTaskIdRef.current !== latestResult.id) {
@@ -916,7 +974,8 @@ export function ExtractPage({
   }, [batch, onTasksChange, loadResultForTask]);
 
   async function handleSave() {
-    if (!task || !extraction || !draftResult) return;
+    if (!task || !extraction || !draftResult || task.id !== extraction.task_id || saving) return;
+    const seq = ++loadSeqRef.current;
     setError(null);
     setSaving(true);
     try {
@@ -930,18 +989,16 @@ export function ExtractPage({
         draftResult,
         ignoredIndices,
         nameChoices[task.id],
+        draftDetailIds,
       );
+      if (seq !== loadSeqRef.current) return;
       setExtraction(updated);
       setDraftResult(structuredClone(updated.result));
       setExtractValidationIssues(mapValidationIssues(updated));
-      // 校验通过后，若用户显式选择了目标表，则确认入表（保存到表 = 镜像同步）
-      if (targetTableId) {
-        await confirmTask(task.id, updated.review_version, targetTableId);
-      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "保存修改失败");
+      if (seq === loadSeqRef.current) setError(err instanceof Error ? err.message : "保存修改失败");
     } finally {
-      setSaving(false);
+      if (seq === loadSeqRef.current) setSaving(false);
     }
   }
 
@@ -990,8 +1047,41 @@ export function ExtractPage({
     setEditingExtractCell(null);
   }
 
+  const demoPreview = demo && task ? (
+              <article className="document-text-preview demo-source-preview">
+                <div className="small muted">内置原文件预览 · {task.filename}</div>
+                <pre>{({
+                  sentiment: "某市发布公共交通优化方案，将新增夜间线路并降低换乘成本。多位市民表示期待，但也担心高峰期运力是否充足。",
+                  article: "# 本地大模型进入实用阶段\n作者：林知远\n\n文章讨论小型多模态模型如何在普通电脑上承担文档理解任务，并分析隐私、成本与准确率之间的取舍。",
+                  grading: "数学作业（八题）\n1. 12+8=20  2. 36÷6=5  3. 7×9=63  4. 45-17=28\n5. 3/4+1/4=1  6. 2.5×4=10  7. 18÷3=6  8. 6²=36\n\n模板额外提示词中的标准答案：1.20；2.6；3.63；4.28；5.1；6.10；7.6；8.36。",
+                  mistakes: "原题：一辆汽车 3 小时行驶 180 千米，平均每小时行驶多少千米？\n学生答案：180×3=540（千米）",
+                  business: "送货单 R-20260815\n供货方：知意科技有限公司\n收货方：示例客户\n\n打印纸 A4  10箱  单价128元  金额1280元",
+                  rule: "金额异常发票\n服务费：1000.00 元\n税额：60.00 元\n价税合计：1160.00 元",
+                } as const)[demo]}</pre>
+              </article>
+  ) : null;
+
   return (
     <div className="view">
+      <ConfirmDialog
+        open={duplicateUploads.length > 0}
+        tone="normal"
+        eyebrow="重复文件"
+        title="这份文件已经导入"
+        description={<>
+          <strong style={{ overflowWrap: "anywhere" }}>{duplicateUploads[0]?.file.name}</strong>
+          <p>{duplicateUploads[0]?.conflict.message}</p>
+          <p>已有任务：{BATCH_STATUS_LABEL[duplicateUploads[0]?.conflict.status ?? ""] ?? "已接收"}。可跳过并到文件历史查看。</p>
+          {duplicateUploads.length > 1 && <p>还有 {duplicateUploads.length - 1} 个重复文件待确认。</p>}
+        </>}
+        buttonLabel="再次提取"
+        cancelLabel="跳过此文件"
+        busy={duplicateBusy || loading}
+        onClose={() => setDuplicateUploads((pending) => pending.slice(1))}
+        onConfirm={() => void confirmDuplicateUpload()}
+      />
+      {fileHistoryOpen && task && <FileRevisionHistory taskId={task.id} filename={taskDisplayName(task)} onClose={() => setFileHistoryOpen(false)} />}
+      {extraction?.has_current_data === false && <p className="callout">当前数据已清空。原文件和历史版本仍可查看。</p>}
       <div className="page-header">
         <div className="eyebrow">提取</div>
         <h1>文件提取</h1>
@@ -1012,73 +1102,29 @@ export function ExtractPage({
           className="datastore-toolbar-left"
           style={{ gap: "calc(var(--space-4) * 2)" }}
         >
-          <label className="radio-label">
-            <input
-              type="radio"
-              value="auto"
-              checked={matchMode === "auto"}
-              onChange={(e) => {
-                const mode = e.target.value as "auto" | "manual";
-                setMatchMode(mode);
-                writeLastUploadMode(mode, selectedTemplateId);
-              }}
-              name="matchMode"
-            />
-            智能匹配
-          </label>
-          <label className="radio-label">
-            <input
-              type="radio"
-              value="manual"
-              checked={matchMode === "manual"}
-              onChange={(e) => {
-                const mode = e.target.value as "auto" | "manual";
-                setMatchMode(mode);
-                writeLastUploadMode(mode, selectedTemplateId);
-              }}
-              name="matchMode"
-            />
-            手动选择
-          </label>
-          {matchMode === "manual" && (
-            <select
-              aria-label="选择模板"
-              className="form-select"
-              style={{ maxWidth: "280px" }}
-              value={selectedTemplateId}
-              onChange={(e) => {
-                setSelectedTemplateId(e.target.value);
-                writeLastUploadMode("manual", e.target.value);
-              }}
-            >
-              <option value="">选择模板…</option>
-              {templates.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name}
-                </option>
-              ))}
-            </select>
-          )}
-          <select
-            aria-label="选择写入的数据表"
-            className="form-select"
-            style={{ maxWidth: "240px" }}
-            value={targetTableId}
-            onChange={(e) => setTargetTableId(e.target.value)}
-            title="选择提取结果写入的数据表；默认使用模板唯一表"
-          >
-            <option value="">默认表（按模板）</option>
-            {tables.map((t) => (
-              <option key={t.id} value={t.id}>
-                {t.name}（{t.row_count} 行）
-              </option>
-            ))}
+          <label className="form-label" htmlFor="extract-template">提取模板</label>
+          <select id="extract-template" aria-label="提取模板" className="form-select" style={{ maxWidth: "320px" }}
+            value={matchMode === "auto" ? "smart" : selectedTemplateId}
+            onChange={event => {
+              const value = event.target.value;
+              const mode = value === "smart" ? "auto" : "manual";
+              setMatchMode(mode);
+              if (mode === "manual") setSelectedTemplateId(value);
+              writeLastUploadMode(mode, mode === "manual" ? value : selectedTemplateId);
+            }}>
+            <option value="smart">智能选择 · 在匹配范围内选择</option>
+            {matchMode === "manual" && !selectedTemplateId && <option value="" disabled>请选择模板…</option>}
+            {templates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}
           </select>
         </div>
         <button className="btn ghost" onClick={onNavigateHistory}>
           <Icon icon={History} size={16} /> 文件历史
         </button>
       </div>
+
+      {matchMode === "auto" && <Disclosure className="template-advanced" title={`匹配范围 · ${templates.filter(template => template.in_smart_pool && template.engine_kind !== "autonomous").length} 个普通模板 · ${templates.some(template => template.in_smart_pool && template.engine_kind === "autonomous") ? "自主提取兜底" : "未启用兜底"}`}>
+        <SmartPoolSettings onUpdated={setTemplates} />
+      </Disclosure>}
 
       {/* 批量上传：队列预览常驻（无任务时显示空状态，避免任务出现时闪动）；
           只显示待处理任务，最多 3 个，其余省略；已完成去状态监控查看 */}
@@ -1112,6 +1158,17 @@ export function ExtractPage({
           </div>
         )}
       </div>
+
+      {failedBatch.length > 0 && <div className="callout danger" role="alert" style={{ marginBottom: 16 }}>
+        {failedBatch.slice(0, 3).map(({ task: failed }) => <p key={failed.id}>
+          <strong>{taskDisplayName(failed)} · 提取失败</strong><br />
+          {failed.failure_message || "未能完成提取，请到文件历史查看原因并重试。"}
+        </p>)}
+        {failedBatch.length > 3 && <p>另有 {failedBatch.length - 3} 个文件提取失败。</p>}
+        {onNavigateHistory && <button className="btn secondary sm" onClick={onNavigateHistory}>
+          查看文件历史并重试
+        </button>}
+      </div>}
 
       <div className="extract-layout">
         {/* 1. 拖入区 */}
@@ -1193,6 +1250,7 @@ export function ExtractPage({
                 <div className="support">
                   来源：<span>{extractedSourceName}</span> · 模板：
                   <span>{templateDisplayName}</span>
+                  {task?.autonomous_fallback && <span> · 本次未匹配普通模板，使用自主提取兜底</span>}
                   {extraction && (
                     <>
                       {" · "}本次提取耗时：
@@ -1215,18 +1273,19 @@ export function ExtractPage({
             </div>
             {showExtractData && !demo && (
               <div className="sheet-detail-actions">
+                <button className="btn secondary sm" onClick={() => setFileHistoryOpen(true)}><Icon icon={History} size={14} /> 历史版本</button>
                 <button
                   className="btn primary sm"
                   onClick={handleSave}
-                  disabled={saving}
-                  title="校验规则后写入数据表"
+                  disabled={saving || extraction?.has_current_data === false}
+                  title="提交本轮修改，形成一个文件修订版本"
                 >
                   <Icon
                     icon={saving ? Loader2 : Save}
                     size={14}
                     className={saving ? "spin" : undefined}
                   />{" "}
-                  保存到表
+                  修订到表
                 </button>
               </div>
             )}
@@ -1267,28 +1326,28 @@ export function ExtractPage({
               {/* 抬头卡片（单据头字段，一单一行） */}
               <div className="extract-header-card">
                 <div className="extract-header-title">
-                  <Icon icon={FileText} size={18} /> 抬头（单据头）
+                  <Icon icon={FileText} size={18} /> 文件级信息
                 </div>
                 <div className="extract-header-grid">
                   {headerColumns.map((col) => {
                     const evidencePath = headerEvidencePath(extraction, col.key);
                     return (
                     <div
-                      aria-label={`编辑字段 ${col.label}`}
+                      aria-label={`${demo ? "查看" : "编辑"}字段 ${col.label}`}
                       className={`extract-header-row evidence-selectable ${
                         evidencePath === selectedEvidencePath ? "is-evidence-selected" : ""
                       }`}
                       key={col.key}
                       onClick={() => {
                         selectEvidence(evidencePath);
-                        setEditingExtractCell(`h-${col.key}`);
+                        if (!demo) setEditingExtractCell(`h-${col.key}`);
                       }}
                       onKeyDown={(e) => {
                         if (e.target !== e.currentTarget) return;
                         if (e.key === "Enter" || e.key === " ") {
                           e.preventDefault();
                           selectEvidence(evidencePath);
-                          setEditingExtractCell(`h-${col.key}`);
+                          if (!demo) setEditingExtractCell(`h-${col.key}`);
                         }
                       }}
                       role="button"
@@ -1305,6 +1364,7 @@ export function ExtractPage({
                         }`}
                         editing={editingExtractCell === `h-${col.key}`}
                         value={headerValues[col.key]}
+                        onCancel={() => setEditingExtractCell(null)}
                         onCommit={(raw) => updateHeaderDraft(col.key, raw)}
                       />
                     </div>
@@ -1317,7 +1377,7 @@ export function ExtractPage({
               <div className="data-table-wrap extract-item-wrap">
                 <div className="extract-item-title">
                   <span>
-                    <Icon icon={List} size={18} /> 明细（item）
+                    <Icon icon={List} size={18} /> 明细
                   </span>
                   <span className="extract-item-count">
                     {itemRows.length + " 行"}
@@ -1327,6 +1387,7 @@ export function ExtractPage({
                   <table className="data-table">
                     <thead>
                       <tr>
+                        <th className="detail-row-gutter" scope="col" aria-label="明细序号">#</th>
                         {itemColumns.map((col) => (
                           <th
                             key={col.key}
@@ -1340,7 +1401,9 @@ export function ExtractPage({
                       </tr>
                     </thead>
                     <tbody>
-                      {itemRows.map((row, idx) => (
+                      {itemRows.slice(detailPage.start, detailPage.end).map((row, offset) => {
+                        const idx = detailPage.start + offset;
+                        return (
                         <tr
                           key={idx}
                           className={
@@ -1351,11 +1414,16 @@ export function ExtractPage({
                               : ""
                           }
                         >
+                          <td className="detail-row-gutter">{demo ? idx + 1 : <DetailRowAction index={idx + 1} disabled={saving} onDelete={() => {
+                            setDraftResult(current => current ? {...current, items: current.items.filter((_, index) => index !== idx)} as ExtractionResult : current);
+                            setDraftDetailIds(current => current?.filter((_, index) => index !== idx));
+                            setEditingExtractCell(null); setSelectedEvidencePath(null);
+                          }} />}</td>
                           {itemColumns.map((col) => {
                             const evidencePath = itemEvidencePath(extraction, idx, col.key);
                             return (
                             <td
-                              aria-label={`编辑 ${col.label}，当前值 ${row[col.key] || "空"}`}
+                              aria-label={`${demo ? "查看" : "编辑"} ${col.label}，当前值 ${row[col.key] || "空"}`}
                               key={col.key}
                               className={`${col.numeric ? "numeric" : ""} ${
                                 extractValidationIssues.some(
@@ -1372,14 +1440,14 @@ export function ExtractPage({
                               }`}
                               onClick={() => {
                                 selectEvidence(evidencePath);
-                                setEditingExtractCell(`${idx}-${col.key}`);
+                                if (!demo) setEditingExtractCell(`${idx}-${col.key}`);
                               }}
                               onKeyDown={(event) => {
                                 if (event.target !== event.currentTarget) return;
                                 if (event.key === "Enter" || event.key === "F2") {
                                   event.preventDefault();
                                   selectEvidence(evidencePath);
-                                  setEditingExtractCell(`${idx}-${col.key}`);
+                                  if (!demo) setEditingExtractCell(`${idx}-${col.key}`);
                                 }
                               }}
                               tabIndex={0}
@@ -1387,16 +1455,18 @@ export function ExtractPage({
                               <EditableText
                                 editing={editingExtractCell === `${idx}-${col.key}`}
                                 value={row[col.key]}
+                                onCancel={() => setEditingExtractCell(null)}
                                 onCommit={(raw) => updateItemDraft(idx, col.key, raw)}
                               />
                             </td>
                             );
                           })}
                         </tr>
-                      ))}
+                      ); })}
                     </tbody>
                   </table>
                 </div>
+                <DetailPagination paging={detailPage} count={itemRows.length} disabled={saving} />
               </div>
 
               {/* 校验问题面板（紧贴提取数据下方） */}
@@ -1464,6 +1534,7 @@ export function ExtractPage({
                         {issue.ignored && (
                           <span className="validation-ignored-tag">已忽略</span>
                         )}
+                        {!demo && <>
                         <button
                           className="btn ghost sm"
                           title={issue.ignored ? "恢复这条校验" : "忽略这条校验，保存后不再阻断确认"}
@@ -1475,7 +1546,8 @@ export function ExtractPage({
                         <button
                           className="btn ghost sm icon-only"
                           aria-label="编辑相关字段"
-                          onClick={() => {
+                          onClick={(event) => {
+                            event.stopPropagation();
                             const path = issue.row === 0
                               ? headerEvidencePath(extraction, issue.field)
                               : itemEvidencePath(extraction, issue.row - 1, issue.field);
@@ -1489,6 +1561,7 @@ export function ExtractPage({
                         >
                           <Icon icon={Pencil} size={13} />
                         </button>
+                        </>}
                       </div>
                     ))}
                   </div></div>
@@ -1550,6 +1623,8 @@ export function ExtractPage({
                 <Icon icon={Plus} size={14} />
               </button>
               <button
+                aria-label="打开原文件全屏预览"
+                title="全屏预览"
                 className="btn ghost sm"
                 onClick={() => setPreviewFullscreen(true)}
                 disabled={!hasExtractData}
@@ -1565,19 +1640,7 @@ export function ExtractPage({
                 <p>上传文件后，此处显示原文件预览</p>
               </div>
             )}
-            {hasExtractData && demo && (
-              <article className="document-text-preview demo-source-preview">
-                <div className="small muted">内置原文件预览 · {task.filename}</div>
-                <pre>{({
-                  sentiment: "某市发布公共交通优化方案，将新增夜间线路并降低换乘成本。多位市民表示期待，但也担心高峰期运力是否充足。",
-                  article: "# 本地大模型进入实用阶段\n作者：林知远\n\n文章讨论小型多模态模型如何在普通电脑上承担文档理解任务，并分析隐私、成本与准确率之间的取舍。",
-                  grading: "数学作业（八题）\n1. 12+8=20  2. 36÷6=5  3. 7×9=63  4. 45-17=28\n5. 3/4+1/4=1  6. 2.5×4=10  7. 18÷3=6  8. 6²=36\n\n模板额外提示词中的标准答案：1.20；2.6；3.63；4.28；5.1；6.10；7.6；8.36。",
-                  mistakes: "原题：一辆汽车 3 小时行驶 180 千米，平均每小时行驶多少千米？\n学生答案：180×3=540（千米）",
-                  business: "送货单 R-20260815\n供货方：知意科技有限公司\n收货方：示例客户\n\n打印纸 A4  10箱  单价128元  金额1280元",
-                  rule: "金额异常发票\n服务费：1000.00 元\n税额：60.00 元\n价税合计：1160.00 元",
-                } as const)[demo]}</pre>
-              </article>
-            )}
+            {hasExtractData && demoPreview}
             {hasExtractData && !demo && (task.size_bytes ?? 0) > 0 && (
               <div className="document-preview-shell">
                 <div
@@ -1625,6 +1688,10 @@ export function ExtractPage({
         >
           <div
             className="preview-fullscreen"
+            role="dialog"
+            aria-modal="true"
+            aria-label="原文件全屏预览"
+            {...previewDialog}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="preview-fullscreen-head">
@@ -1692,7 +1759,7 @@ export function ExtractPage({
                     ? evidenceDescription(selectedEvidence)
                     : "点击字段后可查看来源定位"}
                 </div>
-                <DocumentPreview
+                {demo ? demoPreview : <DocumentPreview
                   contentType={task?.content_type ?? ""}
                   filename={task?.filename ?? extractedSourceName}
                   onPageCount={setPreviewPageCount}
@@ -1705,7 +1772,7 @@ export function ExtractPage({
                   }
                   scale={previewScale}
                   url={task ? getOriginalFileUrl(task.id) : ""}
-                />
+                />}
               </div>
             </div>
           </div>

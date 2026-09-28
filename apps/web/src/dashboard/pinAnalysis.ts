@@ -4,7 +4,7 @@ import type { StatisticInput } from "./types";
 /** Only exact mappings are offered: a chat snapshot may never widen into an unrelated live query. */
 export function statisticFromAnalysis(analysis: Analysis, spec?: ChartSpec): StatisticInput | null {
   const query = analysis.source?.request;
-  if (!query || analysis.truncated || query.records || query.search || query.task_id || query.row_ids != null || (query.grain && query.grain !== "auto")) return null;
+  if (!query || analysis.truncated || analysis.source.view_id || analysis.source.source_keys != null || query.records || query.search || query.task_id || query.row_ids != null || (query.grain && query.grain !== "auto")) return null;
   if (Array.isArray(query.filters) && query.filters.length) return null;
   if (!Array.isArray(query.dimensions) || query.dimensions.length > 1 || !Array.isArray(query.metrics) || query.metrics.length !== 1) return null;
   const metric = query.metrics[0] as { op?: string; field?: string | null };

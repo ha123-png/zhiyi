@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtractionTemplate } from "../types";
 import { TemplatesPage } from "./TemplatesPage";
@@ -30,6 +30,55 @@ const invoice: ExtractionTemplate = {
 };
 
 describe("TemplatesPage", () => {
+  it("retains separately selected same-name samples and explains unsupported files", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/models/profiles")) return response([]);
+      if (url.endsWith("/local-export")) return response({ revision: 0, enabled: false });
+      return response([invoice]);
+    }));
+    render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: "发票" });
+    fireEvent.click(screen.getByRole("button", { name: "AI 生成模板" }));
+    const dialog = screen.getByRole("dialog");
+    const input = dialog.querySelector('input[type="file"]')!;
+    fireEvent.change(input, { target: { files: [new File(["page one"], "scan.png", { type: "image/png" })] } });
+    fireEvent.change(input, { target: { files: [new File(["different page two"], "scan.png", { type: "image/png" })] } });
+    expect(within(dialog).getByRole("button", { name: "移除样例 1 scan.png" })).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "移除样例 2 scan.png" })).toBeInTheDocument();
+    fireEvent.change(input, { target: { files: [new File(["text"], "source.txt", { type: "text/plain" })] } });
+    expect(within(dialog).getByText(/有 1 个样例未添加/)).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "移除样例 1 scan.png" }));
+    expect(within(dialog).getAllByRole("button", { name: /移除样例/ })).toHaveLength(1);
+  });
+
+  it("keeps keyboard focus in the AI dialog, closes with Escape, and restores its opener repeatedly", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/models/profiles")) return response([]);
+      if (url.endsWith("/local-export")) return response({ revision: 0, enabled: false });
+      return response([invoice]);
+    }));
+    render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: "发票" });
+    const opener = screen.getByRole("button", { name: "AI 生成模板" });
+    for (let round = 0; round < 3; round += 1) {
+      opener.focus();
+      fireEvent.click(opener);
+      const dialog = screen.getByRole("dialog", { name: "智能创建提取模板" });
+      const close = within(dialog).getByRole("button", { name: "关闭" });
+      const cancel = within(dialog).getByRole("button", { name: "取消" });
+      expect(close).toHaveFocus();
+      fireEvent.keyDown(close, { key: "Tab", shiftKey: true });
+      expect(cancel).toHaveFocus();
+      fireEvent.keyDown(cancel, { key: "Tab" });
+      expect(close).toHaveFocus();
+      fireEvent.keyDown(close, { key: "Escape" });
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(opener).toHaveFocus();
+    }
+  });
+
   it("protects an edited template on selection and navigation, with a working cancel path", async () => {
     const custom = { ...invoice, id: "custom", name: "验收模板", is_system: false, builtin_key: null };
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => String(input).endsWith("/local-export")
@@ -358,3 +407,266 @@ function response(body: unknown) {
     json: async () => body,
   });
 }
+
+describe("template action transactions", () => {
+  const template: ExtractionTemplate = { ...invoice, id: "editable-template", name: "编辑中模板", is_system: false, is_active: true };
+  const binding = { revision: 0, enabled: false, parent_path: null, destination: null };
+  const http = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+
+  it("cancels deletion without a request, keeps a failed confirmation open, and prevents duplicate requests while busy", async () => {
+    let resolveFirstDelete!: (response: Response) => void;
+    const firstDelete = new Promise<Response>(resolve => { resolveFirstDelete = resolve; });
+    let deleteCalls = 0;
+    let deleted = false;
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/local-export")) return http(binding);
+      if (init?.method === "DELETE") {
+        deleteCalls += 1;
+        if (deleteCalls === 1) return firstDelete;
+        deleted = true;
+        return new Response(null, { status: 204 });
+      }
+      return http(deleted ? [] : [template]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: template.name });
+
+    const openDelete = () => fireEvent.click(screen.getByTitle("删除模板入口，保留已有文件、当前数据和历史规则"));
+    openDelete();
+    const dialog = await screen.findByRole("dialog", { name: "确定删除这个模板吗？" });
+    expect(within(dialog).getByText(/已有数据表、文件和修订历史保留/)).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
+    expect(deleteCalls).toBe(0);
+    expect(screen.getByRole("heading", { name: template.name })).toBeInTheDocument();
+
+    openDelete();
+    const confirm = within(await screen.findByRole("dialog", { name: "确定删除这个模板吗？" })).getByRole("button", { name: "删除模板" });
+    fireEvent.click(confirm);
+    await waitFor(() => expect(deleteCalls).toBe(1));
+    expect(confirm).toBeDisabled();
+    expect(screen.getByRole("button", { name: "取消" })).toBeDisabled();
+    fireEvent.click(confirm);
+    expect(deleteCalls).toBe(1);
+
+    await act(async () => {
+      resolveFirstDelete(http({ detail: "暂时无法删除" }, 409));
+      await firstDelete;
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent("暂时无法删除");
+    expect(screen.getByRole("dialog", { name: "确定删除这个模板吗？" })).toBeInTheDocument();
+    expect(deleteCalls).toBe(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "删除模板" }));
+    await waitFor(() => expect(deleteCalls).toBe(2));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "确定删除这个模板吗？" })).not.toBeInTheDocument());
+    expect(await screen.findByText("模板已删除。")).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url, init]) => init?.method === "DELETE" && String(url).endsWith(`/templates/${template.id}`))).toBe(true);
+  });
+
+  it("lets the user keep an AI draft or explicitly discard it without a native confirm", async () => {
+    const generatedDraft = {
+      name: "本地模拟草稿",
+      description: "synthetic response",
+      fields: [{ key: "invoice_no", label: "发票号码", section: "header", example: "", value_type: "text" }],
+      rule_suggestions: [],
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/models/profiles")) return http([]);
+      if (url.endsWith("/local-export")) return http(binding);
+      if (url.endsWith("/templates/generate")) return http(generatedDraft);
+      return http([invoice]);
+    }));
+    render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: "发票" });
+    const opener = screen.getByRole("button", { name: "AI 生成模板" });
+    opener.focus();
+    fireEvent.click(opener);
+    let aiDialog = screen.getByRole("dialog", { name: "智能创建提取模板" });
+    fireEvent.change(within(aiDialog).getByLabelText("需求描述"), { target: { value: "只使用本地合成响应验收 UI" } });
+    fireEvent.click(within(aiDialog).getByRole("button", { name: "生成模板" }));
+    await within(aiDialog).findByRole("button", { name: "保存模板" });
+
+    let closeDraft = within(aiDialog).getByRole("button", { name: "关闭" });
+    closeDraft.focus();
+    fireEvent.click(closeDraft);
+    let discardDialog = await screen.findByRole("dialog", { name: "模板尚未保存" });
+    fireEvent.click(within(discardDialog).getByRole("button", { name: "取消" }));
+    expect(closeDraft).toHaveFocus();
+    expect(screen.getByRole("dialog", { name: "智能创建提取模板" })).toBeInTheDocument();
+    expect(within(aiDialog).getByRole("button", { name: "保存模板" })).toBeInTheDocument();
+
+    closeDraft = within(aiDialog).getByRole("button", { name: "关闭" });
+    closeDraft.focus();
+    fireEvent.click(closeDraft);
+    discardDialog = await screen.findByRole("dialog", { name: "模板尚未保存" });
+    fireEvent.click(within(discardDialog).getByRole("button", { name: "不保存并关闭" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "智能创建提取模板" })).not.toBeInTheDocument());
+    expect(opener).toHaveFocus();
+  });
+
+  it.each(["archive", "copy", "restore", "import"] as const)("protects dirty input before %s and cancels without a server mutation", async (action) => {
+    const inactive = { ...template, id: "inactive-template", name: "停用中模板", is_active: false };
+    let changed = false;
+    const result = { ...template, id: action === "copy" || action === "import" ? "created-template" : action === "restore" ? inactive.id : template.id,
+      name: action === "copy" || action === "import" ? "新模板" : action === "restore" ? inactive.name : template.name,
+      is_active: action !== "archive" };
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/local-export")) return http(binding);
+      if (init?.method === "POST") { changed = true; return http(result); }
+      return http(changed ? [result] : [template, inactive]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { container } = render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: template.name });
+    fireEvent.change(screen.getByLabelText("用途说明"), { target: { value: "必须保留的草稿" } });
+    const trigger = () => {
+      if (action === "archive") fireEvent.click(screen.getByTitle("停用模板"));
+      else if (action === "copy") fireEvent.click(within(container.querySelector<HTMLElement>(".tpl-detail-actions")!).getByRole("button", { name: "复制" }));
+      else if (action === "restore") fireEvent.click(screen.getByTitle("恢复"));
+      else {
+        const file = new File([], "audit.template.json", { type: "application/json" });
+        Object.defineProperty(file, "text", { value: async () => JSON.stringify({ template: { ...template, name: "新模板" } }) });
+        fireEvent.change(container.querySelector<HTMLInputElement>('input[type="file"]')!, { target: { files: [file] } });
+      }
+    };
+    trigger();
+    await screen.findByRole("heading", { name: "修改尚未保存" });
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(screen.getByLabelText("用途说明")).toHaveValue("必须保留的草稿");
+    expect(changed).toBe(false);
+    trigger();
+    fireEvent.click(await screen.findByRole("button", { name: "放弃修改并继续" }));
+    await waitFor(() => expect(screen.getByLabelText("用途说明")).toHaveValue(template.description));
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    expect(screen.queryByRole("heading", { name: "修改尚未保存" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the new definition baseline and binding input after a partial save, then saves further edits", async () => {
+    let current = { ...template };
+    const definitions: Array<{ expected_version: number; expected_updated_at: string; description: string }> = [];
+    let bindingWrites = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/local-export")) {
+        if (init?.method !== "PUT") return http(binding);
+        bindingWrites += 1;
+        return bindingWrites === 1 ? http({ detail: "目录暂时不可写" }, 422)
+          : http({ ...binding, revision: 1, enabled: true, mode: "move", parent_path: "D:\\已修复目录" });
+      }
+      if (init?.method === "PUT") {
+        const body = JSON.parse(String(init.body)); definitions.push(body);
+        if (body.expected_version !== current.version || body.expected_updated_at !== current.updated_at) return http({ detail: "模板已变化" }, 409);
+        current = { ...current, ...body, version: current.version + 1, updated_at: `2026-09-27T00:00:0${current.version}Z` };
+        return http(current);
+      }
+      return http([current]);
+    }));
+    render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: template.name });
+    fireEvent.change(screen.getByLabelText("用途说明"), { target: { value: "第一次定义更新" } });
+    fireEvent.click(screen.getByText("高级设置"));
+    const toggle = screen.getByRole("combobox", { name: "原文件处理" });
+    await waitFor(() => expect(toggle).toBeEnabled());
+    fireEvent.change(toggle, { target: { value: "move" } });
+    fireEvent.click(screen.getByRole("button", { name: "设置服务端目录" }));
+    fireEvent.change(screen.getByLabelText("知意服务所在电脑的绝对路径"), { target: { value: "D:\\暂不可写目录" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await screen.findAllByText("目录暂时不可写");
+    expect(screen.getByLabelText("知意服务所在电脑的绝对路径")).toHaveValue("D:\\暂不可写目录");
+    const savedAt = current.updated_at;
+    fireEvent.change(screen.getByLabelText("用途说明"), { target: { value: "继续补充的新说明" } });
+    fireEvent.change(screen.getByLabelText("知意服务所在电脑的绝对路径"), { target: { value: "D:\\已修复目录" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await screen.findByText("模板已保存（第 3 版）。");
+    expect(definitions).toHaveLength(2);
+    expect(definitions[1]).toMatchObject({ expected_version: 2, expected_updated_at: savedAt, description: "继续补充的新说明" });
+    expect(current.description).toBe("继续补充的新说明");
+    expect(bindingWrites).toBe(2);
+    const navigate = new CustomEvent("zhiyi:before-navigate", { cancelable: true, detail: { proceed: vi.fn() } });
+    fireEvent(window, navigate);
+    expect(navigate.defaultPrevented).toBe(false);
+    expect(screen.queryByRole("heading", { name: "修改尚未保存" })).not.toBeInTheDocument();
+  });
+
+  it("also protects unsaved local settings and retains them when a confirmed action fails", async () => {
+    let writes = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/local-export")) return http(binding);
+      if (init?.method === "POST") { writes += 1; return http({ detail: "暂时不能停用" }, 409); }
+      return http([template]);
+    }));
+    render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: template.name });
+    fireEvent.click(screen.getByText("高级设置"));
+    const toggle = screen.getByRole("combobox", { name: "原文件处理" });
+    await waitFor(() => expect(toggle).toBeEnabled());
+    fireEvent.change(toggle, { target: { value: "copy" } });
+    fireEvent.click(screen.getByTitle("停用模板"));
+    fireEvent.click(await screen.findByRole("button", { name: "取消" }));
+    expect(writes).toBe(0);
+    expect(toggle).toHaveValue("copy");
+    fireEvent.click(screen.getByTitle("停用模板"));
+    fireEvent.click(await screen.findByRole("button", { name: "放弃修改并继续" }));
+    await screen.findByText("暂时不能停用");
+    expect(writes).toBe(1);
+    expect(toggle).toHaveValue("copy");
+  });
+});
+
+describe("template pattern and naming regressions", () => {
+  it("keeps an invalid pattern out of the template and saves the corrected fifth rule", async () => {
+    let current: ExtractionTemplate = { ...invoice, id: "pattern-template", name: "格式模板", is_system: false, is_active: true,
+      deterministic_rules: Array.from({ length: 4 }, () => ({ kind: "required" as const, field: "header.seller_name" })) };
+    let savedRules: unknown;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/local-export")) return response({ revision: 0, enabled: false, parent_path: null, destination: null });
+      if (url.endsWith("/preview-pattern")) {
+        const body = JSON.parse(String(init?.body));
+        return response(body.pattern === "(" ? { valid: false, matches: false, message: "表达式无效；不支持分组。" }
+          : { valid: true, matches: false, message: "整段匹配不通过。" });
+      }
+      if (init?.method === "PUT") {
+        const body = JSON.parse(String(init.body)); savedRules = body.deterministic_rules;
+        current = { ...current, ...body, version: 2 };
+        return response(current);
+      }
+      return response([current]);
+    }));
+    render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: current.name });
+    fireEvent.click(screen.getByText("高级设置"));
+    fireEvent.change(screen.getByLabelText("规则类型"), { target: { value: "pattern" } });
+    fireEvent.change(screen.getByLabelText("检查字段"), { target: { value: "header.seller_name" } });
+    fireEvent.change(screen.getByLabelText("格式表达式（正则）"), { target: { value: "(" } });
+    fireEvent.click(screen.getByRole("button", { name: "添加校验规则" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("规则尚未添加");
+    expect(screen.getByText("4 条")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("格式表达式（正则）"), { target: { value: "PO-[0-9]{3}" } });
+    fireEvent.click(screen.getByRole("button", { name: "添加校验规则" }));
+    await screen.findByText("5 条");
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await screen.findByText("模板已保存（第 2 版）。");
+    expect(savedRules).toEqual([...Array.from({ length: 4 }, () => ({ kind: "required", field: "header.seller_name" })),
+      { kind: "pattern", field: "header.seller_name", pattern: "PO-[0-9]{3}", severity: "error" }]);
+  });
+
+  it("suggests a neutral numbered name for a blank template, skipping existing names", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => String(input).endsWith("/local-export")
+      ? response({ revision: 0, enabled: false, parent_path: null, destination: null })
+      : response([invoice, { ...invoice, id: "existing-numbered", name: "发票（2）" }])));
+    render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: "发票" });
+    fireEvent.click(screen.getByRole("button", { name: "新建空白模板" }));
+    fireEvent.change(screen.getByLabelText("模板名称"), { target: { value: "发票" } });
+    const suggestion = screen.getByRole("button", { name: "使用名称“发票（3）”" });
+    fireEvent.click(suggestion);
+    expect(screen.getByLabelText("模板名称")).toHaveValue("发票（3）");
+    expect(screen.queryByRole("button", { name: /使用名称.*AI 生成/ })).not.toBeInTheDocument();
+  });
+});

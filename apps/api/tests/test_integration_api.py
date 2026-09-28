@@ -76,11 +76,15 @@ def _seed_confirmed_task(client: TestClient) -> str:
                 validation_json="[]",
             )
         )
+        from document_pipeline_api.services.data_tables import materialize_task_result
+        session.flush()
+        materialize_task_result(session, "integration-task")
         session.commit()
     response = client.post(
         "/api/v1/tasks/integration-task/confirm",
         json={"expected_review_version": 0},
     )
+    assert response.status_code == 200, response.text
     return response.json()["table_id"]
 
 
@@ -197,14 +201,14 @@ def test_write_token_edits_same_versioned_fact_and_records_source(
             },
         )
         revisions = client.get(
-            f"/api/v1/tables/{table_id}/rows/{row['id']}/revisions"
-        ).json()
+            f"/api/v1/tasks/{row['task_id']}/revisions"
+        ).json()["revisions"]
 
     assert edited.status_code == 200
     assert edited.json()["values"]["name"] == "ERP 修正"
     assert stale.status_code == 409
-    assert revisions[-1]["operation"] == "table_edit"
-    assert revisions[-1]["editor"] == "integration-api"
+    assert revisions[0]["operation"] == "edit"
+    assert revisions[0]["editor"] == "integration-api"
 
 
 def test_write_token_can_upload_into_normal_task_pipeline(tmp_path: Path) -> None:

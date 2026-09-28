@@ -14,11 +14,13 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from starlette.background import BackgroundTask
-from sqlalchemy import delete, func, select, text, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import delete, func, or_, select, text, update
 from sqlalchemy.orm import Session
 
-from document_pipeline_api.domain.tasks import TaskState, TaskStatus
+from document_pipeline_api.services.current_data import row_values, row_values_expression, update_current_schema
+from document_pipeline_api.services.cell_values import import_cell, infer_import_type
+from document_pipeline_api.services.table_scope import prepare_export_selection
+from document_pipeline_api.domain.tasks import TaskStatus
 from document_pipeline_api.models import (
     TemplateRecord,
     ConfirmedDocumentRecord,
@@ -27,7 +29,7 @@ from document_pipeline_api.models import (
     DataTableRecord,
     DataViewRecord,
     ExtractionRecord,
-    ReviewRevisionRecord,
+    FileCurrentDataRecord,
     TaskRecord,
 )
 from document_pipeline_api.services.export_scope import SCOPE_KEY, SCOPE_LABEL, csv_scope_value, export_row_values, table_has_input_scopes
@@ -76,6 +78,8 @@ def _builtin_template_columns(
 ) -> list[ColumnDef] | None:
     """内置表列契约按对应内置模板的字段生成（中文列名与模板一致）；
     模板缺失时返回 None，由调用方回退到固定映射。"""
+    if session.get(TemplateRecord, f"builtin-{document_kind}") is None:
+        return None
     template = get_template(session, f"builtin-{document_kind}")
     if template is None or not template.fields:
         return None
@@ -125,180 +129,54 @@ COLUMN_LABELS = {
 
 
 def confirm_task(
-    session: Session,
-    task_id: str,
-    expected_review_version: int,
-    *,
-    expected_lease_token: str | None = None,
-    target_table_id: str | None = None,
+    session: Session, task_id: str, expected_review_version: int, *,
+    expected_lease_token: str | None = None, target_table_id: str | None = None,
     filename: str | None = None,
 ) -> ConfirmationRead:
-    existing = session.get(ConfirmedDocumentRecord, task_id)
-    if existing is not None and expected_lease_token is not None:
-        session.rollback()
-        session.expire_all()
-        raise TaskLeaseLostError("任务已由其他处理者完成，拒绝迟到的自动确认。")
-
+    from document_pipeline_api.models import FileCurrentDataRecord
     task = session.get(TaskRecord, task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="没有找到这个任务。")
-    if existing is None:
-        expected_status = (
-            TaskStatus.VALIDATING.value
-            if expected_lease_token is not None
-            else TaskStatus.NEEDS_REVIEW.value
-        )
-        if expected_lease_token is not None:
-            if task.status != expected_status:
-                raise HTTPException(
-                    status_code=409,
-                    detail="只有持有当前处理租约的任务可以自动入表。",
-                )
-        elif task.status not in {
-            TaskStatus.NEEDS_REVIEW.value,
-            TaskStatus.COMPLETED.value,
-            TaskStatus.WAITING_FOR_TEMPLATE.value,
-        }:
-            # 已完成任务可能在目标表被删除后（确认记录级联删除）重新保存到表
-            raise HTTPException(
-                status_code=409,
-                detail="只有待确认或已完成任务可以手动保存到表。",
-            )
-    else:
-        # 手动"重新保存到表"：任务已完成/待确认都可，镜像同步覆盖现有行
-        if task.status not in {
-            TaskStatus.COMPLETED.value,
-            TaskStatus.NEEDS_REVIEW.value,
-        }:
-            raise HTTPException(
-                status_code=409,
-                detail="这个任务当前不能保存到表。",
-            )
-
     extraction = session.get(ExtractionRecord, task_id)
-    if extraction is None:
-        raise HTTPException(status_code=404, detail="这个任务还没有提取结果。")
-    if target_table_id is not None:
-        target = session.get(DataTableRecord, target_table_id)
-        if target is None:
-            raise HTTPException(status_code=404, detail="没有找到指定的数据表。")
-        expected_key = (
-            extraction.template_id
-            if extraction.document_kind == DocumentKind.CUSTOM.value
-            else extraction.document_kind
-        )
-        expected_version = (
-            str(extraction.template_version)
-            if extraction.document_kind == DocumentKind.CUSTOM.value
-            else BUILTIN_TEMPLATE_VERSION
-        )
-        if target.template_key != expected_key or target.template_version != expected_version:
-            raise HTTPException(
-                status_code=409,
-                detail="提取出字段与指定表不符，请重新选择指定表。",
-            )
-    review = session.scalar(
-        select(ReviewRevisionRecord)
-        .where(ReviewRevisionRecord.task_id == task_id)
-        .order_by(ReviewRevisionRecord.version.desc())
-        .limit(1)
-    )
-    current_version = review.version if review is not None else 0
-    if existing is None and expected_review_version != current_version:
-        raise HTTPException(
-            status_code=409,
-            detail="审核结果已经更新，请刷新后再确认。",
-        )
-
-    validation_json = review.validation_json if review is not None else extraction.validation_json
-    issues = json.loads(validation_json)
+    if task is None or extraction is None:
+        raise HTTPException(404, "没有找到这份文件的提取结果。")
+    if expected_lease_token is not None and (task.status != TaskStatus.VALIDATING.value or task.lease_token != expected_lease_token):
+        raise TaskLeaseLostError("任务租约已被替换，拒绝迟到的自动确认。")
+    if expected_lease_token is None and task.status not in {"needs_review", "completed", "waiting_for_template"}:
+        raise HTTPException(409, "这份文件当前不能确认。")
+    current = session.get(FileCurrentDataRecord, task_id)
+    if current is None:
+        raise HTTPException(409, "这份文件尚未建立当前数据，请先完成提取；不能用历史快照重新创建当前数据。")
+    if not current.has_data or current.table_id is None:
+        raise HTTPException(409, "当前数据已清空，不能从旧提取结果恢复当前数据。")
+    if current.current_version != expected_review_version:
+        raise HTTPException(409, "当前数据已经更新，请刷新后再确认。")
+    if target_table_id is not None and target_table_id != current.table_id:
+        raise HTTPException(409, "文件已有唯一当前数据，确认不能将旧结果复制到另一张表。")
+    issues = json.loads(current.validation_json)
     if any(issue.get("severity") == "error" and not issue.get("ignored") for issue in issues):
-        raise HTTPException(
-            status_code=422,
-            detail="结果仍有阻断性错误，请修正或忽略后再确认。",
-        )
-    result_json = review.result_json if review is not None else extraction.result_json
-    result = (
-        TemplateExtraction.model_validate_json(result_json)
-        if extraction.document_kind == DocumentKind.CUSTOM.value
-        else DocumentExtraction.model_validate_json(result_json)
-    )
+        raise HTTPException(422, "结果仍有校验问题，请修正或忽略后再确认。")
     confirmed_at = utc_now()
-    if target_table_id is not None:
-        # 保存到表时显式指定目标表：记住用户的表选择，后续重新保存也进入该表
-        task.target_table_id = target_table_id
     if expected_lease_token is not None:
-        fenced_transition = session.execute(
-            update(TaskRecord)
-            .where(
-                TaskRecord.id == task_id,
-                TaskRecord.status == TaskStatus.VALIDATING.value,
-                TaskRecord.lease_token == expected_lease_token,
-            )
-            .values(
-                status=TaskStatus.COMPLETED.value,
-                completed_at=confirmed_at,
-                lease_token=None,
-                lease_expires_at=None,
-                failure_code=None,
-                failure_message=None,
-                updated_at=confirmed_at,
-            )
-        )
-        if fenced_transition.rowcount != 1:
+        fence = session.execute(update(TaskRecord).where(
+            TaskRecord.id == task_id, TaskRecord.status == TaskStatus.VALIDATING.value,
+            TaskRecord.lease_token == expected_lease_token,
+        ).values(status="completed", completed_at=confirmed_at, lease_token=None,
+                 lease_expires_at=None, failure_code=None, failure_message=None, updated_at=confirmed_at))
+        if fence.rowcount != 1:
             session.rollback()
-            session.expire_all()
             raise TaskLeaseLostError("任务租约已被替换，拒绝迟到的自动确认。")
-
-    table, rows = _materialize_rows(session, task, extraction, result)
-    session.execute(update(DataRowRecord).where(DataRowRecord.task_id == task.id).values(review_pending=False))
-    if existing is None:
-        confirmation = ConfirmedDocumentRecord(
-            task_id=task_id,
-            table_id=table.id,
-            review_version=current_version,
-            result_json=result_json,
-            confirmed_at=confirmed_at,
-        )
-        session.add(confirmation)
     else:
-        existing.table_id = table.id
-        existing.review_version = current_version
-        existing.result_json = result_json
-        existing.confirmed_at = confirmed_at
-    if expected_lease_token is None and existing is None:
-        if task.status != TaskStatus.COMPLETED.value:
-            task.status = (
-                TaskState(status=TaskStatus(task.status))
-                .transition_to(TaskStatus.COMPLETED)
-                .status.value
-            )
-            # 任务完成时间：仅在实际进入 completed 时写入；
-            # 已完成任务重新保存到表（镜像同步）保留首次完成时间。
-            task.completed_at = confirmed_at
+        task.status = "completed"
+        task.completed_at = task.completed_at or confirmed_at
         task.lease_token = None
         task.lease_expires_at = None
         task.failure_code = None
         task.failure_message = None
         task.updated_at = confirmed_at
+    session.execute(update(DataRowRecord).where(DataRowRecord.task_id == task_id).values(review_pending=False))
     from document_pipeline_api.services.file_names import confirm_file_name
     confirm_file_name(task, filename)
-    try:
-        session.commit()
-    except IntegrityError as error:
-        session.rollback()
-        existing = session.get(ConfirmedDocumentRecord, task_id)
-        if existing is not None:
-            return _confirmation_read(session, existing)
-        raise HTTPException(status_code=409, detail="确认冲突，请刷新后重试。") from error
-    return ConfirmationRead(
-        task_id=task_id,
-        table_id=table.id,
-        table_name=table.name,
-        review_version=current_version,
-        row_count=len(rows),
-        confirmed_at=confirmed_at,
-    )
+    session.commit()
+    return get_confirmation(session, task_id)
 
 
 def materialize_task_result(
@@ -324,13 +202,21 @@ def materialize_task_result(
 
 
 def get_confirmation(session: Session, task_id: str) -> ConfirmationRead:
-    confirmation = session.get(ConfirmedDocumentRecord, task_id)
-    if confirmation is None:
-        raise HTTPException(status_code=404, detail="这个任务还没有确认入表。")
-    return _confirmation_read(session, confirmation)
+    from document_pipeline_api.services.current_data import get_current
+    current = get_current(session, task_id)
+    task = session.get(TaskRecord, task_id)
+    table = session.get(DataTableRecord, current.table_id) if current.table_id else None
+    if not current.has_data or table is None:
+        raise HTTPException(404, "这份文件当前没有数据。")
+    return ConfirmationRead(task_id=task_id, table_id=table.id, table_name=table.name,
+                            review_version=current.current_version,
+                            row_count=session.scalar(select(func.count(DataRowRecord.id)).where(DataRowRecord.task_id == task_id)) or 0,
+                            confirmed_at=task.completed_at or current.updated_at)
 
 
 def list_data_tables(session: Session) -> list[DataTableRead]:
+    file_counts = dict(session.execute(select(FileCurrentDataRecord.table_id, func.count()).where(
+        FileCurrentDataRecord.has_data.is_(True)).group_by(FileCurrentDataRecord.table_id)).all())
     row_counts = (
         select(DataRowRecord.table_id, func.count(DataRowRecord.id).label("row_count"))
         .group_by(DataRowRecord.table_id)
@@ -343,6 +229,9 @@ def list_data_tables(session: Session) -> list[DataTableRead]:
     ).all()
     return [
         DataTableRead(
+            grouping_fields=json.loads(table.grouping_json or '[]'),
+            collection_kind=table.collection_kind,
+            file_count=file_counts.get(table.id, 0),
             id=table.id,
             name=table.name,
             template_key=table.template_key,
@@ -363,20 +252,27 @@ def get_data_table(
     page_size: int = 100,
     search: str | None = None,
 ) -> DataTableDetail:
+    from document_pipeline_api.services.read_snapshot import begin_read_snapshot
+    from document_pipeline_api.services.data_rows import data_rows_read
+    begin_read_snapshot(session)
     table = session.get(DataTableRecord, table_id)
     if table is None:
         raise HTTPException(status_code=404, detail="没有找到这个数据表。")
     row_query = select(DataRowRecord).where(DataRowRecord.table_id == table_id)
     count_query = select(func.count(DataRowRecord.id)).where(DataRowRecord.table_id == table_id)
     if search:
-        pattern = f"%{search}%"
-        row_query = row_query.where(DataRowRecord.row_json.ilike(pattern))
-        count_query = count_query.where(DataRowRecord.row_json.ilike(pattern))
-    rows = session.scalars(
+        from document_pipeline_api.services.current_data import row_search_predicate
+        row_query = row_query.where(row_search_predicate(search))
+        count_query = count_query.where(row_search_predicate(search))
+    rows = [] if table.collection_kind == "files" else session.scalars(
         row_query.order_by(*_row_order()).offset((page - 1) * page_size).limit(page_size)
     ).all()
     row_count = session.scalar(count_query)
     return DataTableDetail(
+        grouping_fields=json.loads(table.grouping_json or '[]'),
+        collection_kind=table.collection_kind,
+        file_count=session.scalar(select(func.count()).select_from(FileCurrentDataRecord).where(
+            FileCurrentDataRecord.table_id == table_id, FileCurrentDataRecord.has_data.is_(True))) or 0,
         presentation=table_presentation(session, table),
         id=table.id,
         name=table.name,
@@ -388,7 +284,7 @@ def get_data_table(
         columns=table_columns(session, table),
         page=page,
         page_size=page_size,
-        rows=[data_row_read(row) for row in rows],
+        rows=data_rows_read(session, table, rows) if table.collection_kind != "files" else [],
     )
 
 
@@ -415,6 +311,8 @@ def table_columns(session: Session, table: DataTableRecord) -> list[ColumnDef]:
     前端默认不显示，导出也不包含。
     columns_json 是表的结构契约，不得根据当前行是否有值裁剪。模板创建的字段即使
     暂时全空也必须保留，否则用户只填写字段 1 后字段 2 会从界面消失。"""
+    if table.collection_kind == "files":
+        return []
     if table.columns_json:
         return _current_field_order(session, table, [ColumnDef(**column) for column in json.loads(table.columns_json)])
     if table.document_kind != DocumentKind.CUSTOM.value:
@@ -454,7 +352,7 @@ def _current_field_order(session: Session, table: DataTableRecord, columns: list
     template/task snapshots remain unchanged.
     """
     record = session.get(TemplateRecord, table.template_key)
-    if record is None or record.is_system:
+    if record is None or record.is_system or record.is_deleted:
         return columns
     latest = get_template(session, record.id)
     ranks = {(field.key, field.section, field.value_type): index for index, field in enumerate(latest.fields)}
@@ -472,10 +370,17 @@ def add_custom_column(
     table_id: str,
     label: str,
     section: str,
+    value_type: str = "text",
 ) -> ColumnDef:
+    if value_type not in {"text", "number", "boolean", "date"}:
+        raise HTTPException(422, "不支持的字段类型。")
+    from document_pipeline_api.services.read_snapshot import begin_write_snapshot
+    begin_write_snapshot(session)
     table = session.get(DataTableRecord, table_id)
     if table is None:
         raise HTTPException(status_code=404, detail="没有找到这个数据表。")
+    from document_pipeline_api.services.file_collections import require_tabular
+    require_tabular(table)
     normalized = label.strip()
     columns = _persisted_columns(session, table)
     identity = " ".join(normalized.split()).casefold()
@@ -484,26 +389,51 @@ def add_custom_column(
     column = ColumnDef(
         key=f"custom_{uuid4().hex[:12]}",
         label=normalized,
-        value_type="text",
+        value_type=value_type,
         section=section,
         user_defined=True,
     )
     columns.append(column)
     table.columns_json = json.dumps([item.model_dump() for item in columns], ensure_ascii=False)
+    from document_pipeline_api.models import FileCurrentDataRecord
+    for current in session.scalars(select(FileCurrentDataRecord).where(FileCurrentDataRecord.table_id == table_id)):
+        update_current_schema(session, current, [*json.loads(current.schema_json), column.model_dump()])
     session.commit()
     return column
 
 
 def delete_custom_column(session: Session, table_id: str, column_key: str) -> None:
+    from document_pipeline_api.services.read_snapshot import begin_write_snapshot
+    begin_write_snapshot(session)
     table = session.get(DataTableRecord, table_id)
     if table is None:
         raise HTTPException(status_code=404, detail="没有找到这个数据表。")
+    from document_pipeline_api.services.file_collections import require_tabular
+    require_tabular(table)
     columns = _persisted_columns(session, table)
     target = next((column for column in columns if column.key == column_key), None)
     if target is None:
         raise HTTPException(status_code=404, detail="没有找到这一列。")
     if not target.user_defined:
         raise HTTPException(status_code=409, detail="模板字段不能删除。")
+    # Inspect the complete current scope, including hidden pages. 0 and false
+    # are values; neither a UI selection nor old history changes this rule.
+    path = '$."' + column_key.replace('"', '\\"') + '"'
+    values = session.scalars(select(func.json_extract(row_values_expression(), path))
+                              .where(DataRowRecord.table_id == table_id).execution_options(yield_per=500))
+    if any(value is not None and (not isinstance(value, str) or value.strip()) for value in values):
+        raise HTTPException(409, "这一列仍有当前数据，不能删除。请先处理完整数据表中的值。")
+    if column_key in json.loads(table.grouping_json or '[]') or session.scalar(select(DataViewRecord.id).where(
+        DataViewRecord.table_id == table_id, DataViewRecord.field_key == column_key,
+    ).limit(1)):
+        raise HTTPException(409, "这一列仍用于分组，请先移除对应分组后再删除。")
+    from document_pipeline_api.models.dashboard import DashboardCard
+    for card in session.scalars(select(DashboardCard)):
+        definition = json.loads(card.definition_json)
+        if definition.get("table_id") == table_id and column_key in {
+            definition.get("metric_field"), definition.get("group_field"), definition.get("date_field"),
+        }:
+            raise HTTPException(409, f"这一列仍用于仪表盘“{card.name}”，请先调整该统计卡片。")
     table.columns_json = json.dumps(
         [column.model_dump() for column in columns if column.key != column_key],
         ensure_ascii=False,
@@ -514,8 +444,15 @@ def delete_custom_column(session: Session, table_id: str, column_key: str) -> No
         if column_key in values:
             values.pop(column_key)
             row.row_json = json.dumps(values, ensure_ascii=False, sort_keys=True)
-            row.row_version += 1
+            if row.task_id is None:
+                row.row_version += 1
             row.updated_at = utc_now()
+    from document_pipeline_api.models import FileCurrentDataRecord
+    for current in session.scalars(select(FileCurrentDataRecord).where(FileCurrentDataRecord.table_id == table_id)):
+        update_current_schema(session, current, [column for column in json.loads(current.schema_json) if column["key"] != column_key])
+        header = json.loads(current.header_json)
+        header.pop(column_key, None)
+        current.header_json = json.dumps(header, ensure_ascii=False)
     session.commit()
 
 
@@ -525,7 +462,7 @@ def _present_row_keys(session: Session, table_id: str) -> set[str]:
         session.execute(
             text(
                 "SELECT DISTINCT json_each.key "
-                "FROM data_rows, json_each(data_rows.row_json) "
+                "FROM data_rows LEFT JOIN file_current_data ON file_current_data.task_id = data_rows.task_id, json_each(json_patch(coalesce(file_current_data.header_json, '{}'), data_rows.row_json)) "
                 "WHERE data_rows.table_id = :table_id"
             ),
             {"table_id": table_id},
@@ -534,8 +471,7 @@ def _present_row_keys(session: Session, table_id: str) -> set[str]:
 
 
 def _row_order() -> list[object]:
-    """数据行显示顺序：同任务明细按 item_index 原位排列（镜像同步保证删行重存回原位），
-    无溯源（手动行/任务已删）的行排最后。"""
+    """文件明细按稳定序号排列，独立数据保留自己的行顺序。"""
     return [
         DataRowRecord.task_id.is_(None),
         DataRowRecord.task_id,
@@ -544,92 +480,49 @@ def _row_order() -> list[object]:
     ]
 
 
-def export_data_table(session: Session, table_id: str) -> StreamingResponse:
-    table = session.get(DataTableRecord, table_id)
-    if table is None:
-        raise HTTPException(status_code=404, detail="没有找到这个数据表。")
+def export_data_table(session: Session, table_id: str, *, scope=None) -> StreamingResponse:
+    selection = prepare_export_selection(session, table_id, scope)
+    table = selection.table
+    if table.collection_kind == "files":
+        from document_pipeline_api.services.file_exports import export_files_excel
+        return export_files_excel(session, table, selection=selection)
+    from document_pipeline_api.services.file_collections import require_tabular
+    require_tabular(table)
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = _unique_sheet_name(table.name, set())
     keys, labels = _export_columns(session, table)
     from document_pipeline_api.services.export_scope import WorkbookInputScopes
     scopes = WorkbookInputScopes()
-    source_header_keys = {column.key for column in table_columns(session, table) if column.section == "header"}
-    # 与数据仓库淡绿表头保持一致：#f0fdf4 / #065f46 / #a7f3d0。
-    header_fill = PatternFill("solid", fgColor="F0FDF4")
-    for index, key in enumerate(keys, start=1):
-        cell = sheet.cell(row=1, column=index, value=labels[key])
-        cell.data_type = "s"
-        cell.font = Font(bold=True, color="065F46")
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-    row_count = 1
     rows = session.scalars(
-        select(DataRowRecord)
-        .where(DataRowRecord.table_id == table_id)
-        .order_by(*_row_order())
-        .execution_options(yield_per=1000)
+        select(DataRowRecord).where(*selection.predicates)
+        .order_by(*_row_order()).execution_options(yield_per=1000)
     )
-    max_widths = [_display_width(labels[key]) for key in keys]
-    task_spans: dict[str, list[int]] = {}
-    for record in rows:
-        row = json.loads(record.row_json)
-        values = [_excel_safe(row.get(key)) for key in keys]
-        sheet.append(values)
-        row_count += 1
-        scopes.record(sheet, row_count, record, keys, source_header_keys)
-        for index, value in enumerate(values):
-            max_widths[index] = max(max_widths[index], _display_width(value))
-        group_key = record.task_id or row.get("__row_group")
-        if group_key:
-            task_spans.setdefault(str(group_key), []).append(row_count)
-    sheet.freeze_panes = "A2"
-    if keys:
-        sheet.auto_filter.ref = f"A1:{get_column_letter(len(keys))}{row_count}"
     column_defs = {column.key: column for column in table_columns(session, table)}
-    header_keys = {
-        key for key in keys if key in column_defs and column_defs[key].section == "header"
-    }
-    # 数据仓库把同一单据的所有抬头字段纵向合并；XLSX 必须保持所见即所得，
-    # 不只合并用户新增的抬头列。
-    for key in header_keys:
-        column_index = keys.index(key) + 1
-        for span in task_spans.values():
-            if len(span) > 1:
-                sheet.merge_cells(
-                    start_row=span[0],
-                    start_column=column_index,
-                    end_row=span[-1],
-                    end_column=column_index,
-                )
-                sheet.cell(span[0], column_index).alignment = Alignment(
-                    vertical="center", wrap_text=True
-                )
-    for index, key in enumerate(keys, start=1):
-        sheet.column_dimensions[get_column_letter(index)].width = min(
-            max(max_widths[index - 1] + 2, 10),
-            48,
-        )
+    _populate_export_sheet(sheet, rows, keys, labels, column_defs, scopes)
 
     output = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
     scopes.finish(workbook)
     workbook.save(output)
     output.seek(0)
-    filename = f"{table.name}-{table.template_version}.xlsx"
+    filename = f"{table.name}{selection.suffix}.xlsx"
     disposition = f"attachment; filename=table-{table.id}.xlsx; filename*=UTF-8''{quote(filename)}"
     return StreamingResponse(
         output,
         media_type=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-        headers={"Content-Disposition": disposition},
+        headers={"Content-Disposition": disposition, **selection.headers()},
         background=BackgroundTask(output.close),
     )
 
 
-def export_data_table_views(session: Session, table_id: str) -> StreamingResponse:
-    """把当前表的全部分 Sheet 视图导出为一个多工作表 XLSX。"""
-    table = session.get(DataTableRecord, table_id)
-    if table is None:
-        raise HTTPException(status_code=404, detail="没有找到这个数据表。")
+def export_data_table_views(session: Session, table_id: str, *, scope=None) -> StreamingResponse:
+    """Apply the current selection inside each saved grouping, including unmatched rows."""
+    from document_pipeline_api.services.data_views import refresh_data_views
+    refresh_data_views(session, table_id)
+    selection = prepare_export_selection(session, table_id, scope)
+    table = selection.table
+    from document_pipeline_api.services.file_collections import require_tabular
+    require_tabular(table)
     views = session.scalars(
         select(DataViewRecord)
         .where(DataViewRecord.table_id == table_id)
@@ -637,11 +530,8 @@ def export_data_table_views(session: Session, table_id: str) -> StreamingRespons
     ).all()
     if not views:
         raise HTTPException(status_code=422, detail="当前数据表还没有分 Sheet 视图。")
-    all_rows = session.scalars(
-        select(DataRowRecord)
-        .where(DataRowRecord.table_id == table_id)
-        .order_by(*_row_order())
-    ).all()
+    if scope is not None and scope.view_id:
+        views = [view for view in views if view.id == scope.view_id]
     keys, labels = _export_columns(session, table)
     column_defs = {column.key: column for column in table_columns(session, table)}
     workbook = Workbook()
@@ -649,30 +539,38 @@ def export_data_table_views(session: Session, table_id: str) -> StreamingRespons
     from document_pipeline_api.services.export_scope import WorkbookInputScopes
     scopes = WorkbookInputScopes()
     used_names: set[str] = set()
-    matched_ids: set[int] = set()
+    matching = []
     for view in views:
-        expected = json.loads(view.field_value_json)
-        rows = [
-            row for row in all_rows
-            if (row.task_id if view.field_key == "" else json.loads(row.row_json).get(view.field_key)) == expected
-        ]
-        matched_ids.update(row.id for row in rows)
+        from document_pipeline_api.services.data_views import _view_predicate
+        predicate = _view_predicate(view)
+        if not session.scalar(select(DataRowRecord.id).where(*selection.predicates, predicate).limit(1)):
+            continue
+        matching.append(predicate)
+        if len(matching) > 100:
+            raise HTTPException(422, "当前范围超过 100 个分组，请选择具体分组导出，或导出单张 Excel、CSV、JSON。")
+        rows = session.scalars(select(DataRowRecord)
+            .where(*selection.predicates, predicate)
+            .order_by(*_row_order()).execution_options(yield_per=1000))
         sheet = workbook.create_sheet(_unique_sheet_name(view.name, used_names))
         _populate_export_sheet(sheet, rows, keys, labels, column_defs, scopes)
-    unmatched = [row for row in all_rows if row.id not in matched_ids]
-    if unmatched:
+    unmatched_predicate = ~func.coalesce(or_(*matching), False) if matching else True
+    if session.scalar(select(DataRowRecord.id).where(*selection.predicates, unmatched_predicate).limit(1)):
+        unmatched = session.scalars(select(DataRowRecord).where(*selection.predicates, unmatched_predicate)
+                                  .order_by(*_row_order()).execution_options(yield_per=1000))
         sheet = workbook.create_sheet(_unique_sheet_name("未分组", used_names))
         _populate_export_sheet(sheet, unmatched, keys, labels, column_defs, scopes)
+    if not workbook.worksheets:
+        _populate_export_sheet(workbook.create_sheet("无匹配数据"), [], keys, labels, column_defs, scopes)
     output = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
     scopes.finish(workbook)
     workbook.save(output)
     output.seek(0)
-    filename = f"{table.name}-分Sheet.xlsx"
+    filename = f"{table.name}{selection.suffix}-分Sheet.xlsx"
     disposition = f"attachment; filename=table-{table.id}-views.xlsx; filename*=UTF-8''{quote(filename)}"
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": disposition},
+        headers={"Content-Disposition": disposition, **selection.headers()},
         background=BackgroundTask(output.close),
     )
 
@@ -701,7 +599,7 @@ def _populate_export_sheet(sheet, rows, keys, labels, column_defs, scopes) -> No
     task_spans: dict[str, list[int]] = {}
     row_number = 1
     for record in rows:
-        values_map = json.loads(record.row_json)
+        values_map = row_values(record)
         values = [_excel_safe(values_map.get(key)) for key in keys]
         sheet.append(values)
         row_number += 1
@@ -718,9 +616,18 @@ def _populate_export_sheet(sheet, rows, keys, labels, column_defs, scopes) -> No
     for key in header_keys:
         column_index = keys.index(key) + 1
         for span in task_spans.values():
-            if len(span) > 1:
-                sheet.merge_cells(start_row=span[0], start_column=column_index, end_row=span[-1], end_column=column_index)
-                sheet.cell(span[0], column_index).alignment = Alignment(vertical="center", wrap_text=True)
+            # A/B/A must never merge across B. Preserve differing header values
+            # even if a legacy independent group contains inconsistent cells.
+            start = previous = span[0]
+            for current in [*span[1:], None]:
+                contiguous = current is not None and current == previous + 1
+                same = contiguous and _canonical_json(sheet.cell(current, column_index).value) == _canonical_json(sheet.cell(start, column_index).value)
+                if not same:
+                    if previous > start:
+                        sheet.merge_cells(start_row=start, start_column=column_index, end_row=previous, end_column=column_index)
+                        sheet.cell(start, column_index).alignment = Alignment(vertical="center", wrap_text=True)
+                    start = current
+                previous = current
     for index in range(1, len(keys) + 1):
         sheet.column_dimensions[get_column_letter(index)].width = min(max(max_widths[index - 1] + 2, 10), 48)
 
@@ -739,12 +646,10 @@ def _get_or_create_table(
     *,
     target_table_id: str | None = None,
 ) -> DataTableRecord:
-    # 指定目标表：存在则直接使用（任意表，行数据按字段并集写入，显示按表契约裁剪）；
-    # 指定表已被删除则回退到模板唯一表（重建），保证"保存到表 = 数据重新存在"。
-    if target_table_id:
-        target = session.get(DataTableRecord, target_table_id)
-        if target is not None:
-            return target
+    from document_pipeline_api.services.template_contract import destination_for_extraction
+    bound = destination_for_extraction(session,extraction,target_table_id)
+    if bound is not None:
+        return bound
     document_kind = extraction.document_kind
     is_custom = document_kind == DocumentKind.CUSTOM.value
     template_key = extraction.template_id if is_custom else document_kind
@@ -779,170 +684,55 @@ def _get_or_create_table(
 
 
 def _materialize_rows(
-    session: Session,
-    task: TaskRecord,
-    extraction: ExtractionRecord,
+    session: Session, task: TaskRecord, extraction: ExtractionRecord,
     result: DocumentExtraction | TemplateExtraction,
 ) -> tuple[DataTableRecord, list[dict[str, object | None]]]:
-    table = _get_or_create_table(
-        session,
-        extraction,
-        target_table_id=task.target_table_id,
-    )
-    rows = _flatten_result(task.filename, result)
-    existing = {
-        row.item_index: row
-        for row in session.scalars(
-            select(DataRowRecord).where(DataRowRecord.task_id == task.id)
-        ).all()
-    }
-    user_edited_row_ids = set(
-        session.scalars(
-            select(DataRowRevisionRecord.row_id)
-            .where(
-                DataRowRevisionRecord.task_id == task.id,
-                DataRowRevisionRecord.operation == "table_edit",
-            )
-            .distinct()
-        ).all()
-    )
-    changed_at = utc_now()
-    for values in rows:
-        after_json = _canonical_json(values)
-        index = values.get("item_index")
-        if not isinstance(index, int):
-            raise RuntimeError("提取结果缺少明细序号，无法写入数据表。")
-        current = existing.pop(index, None)
-        if current is None:
-            current = DataRowRecord(
-                table_id=table.id,
-                task_id=task.id,
-                item_index=index,
-                row_json=after_json,
-                input_scope_json=extraction.input_scope_json,
-                review_pending=task.status != TaskStatus.COMPLETED.value,
-                row_version=1,
-                created_at=changed_at,
-                updated_at=changed_at,
-            )
-            session.add(current)
-            session.flush()
-            session.add(
-                DataRowRevisionRecord(
-                    row_id=current.id,
-                    table_id=table.id,
-                    task_id=task.id,
-                    version=1,
-                    operation="materialize_create",
-                    before_json=None,
-                    after_json=after_json,
-                    editor="system",
-                    created_at=changed_at,
-                )
-            )
-            continue
-        current.review_pending = task.status != TaskStatus.COMPLETED.value
-        if current.id in user_edited_row_ids:
-            # 用户改过的事实值优先，重新物化不得覆盖；但“保存到另一张表”是明确的
-            # 路由操作，仍必须移动该行，否则确认记录指向新表、用户行却滞留旧表。
-            if current.table_id != table.id:
-                preserved_json = current.row_json
-                current.table_id = table.id
-                current.row_version += 1
-                current.updated_at = changed_at
-                session.add(
-                    DataRowRevisionRecord(
-                        row_id=current.id,
-                        table_id=table.id,
-                        task_id=current.task_id,
-                        version=current.row_version,
-                        operation="materialize_move",
-                        before_json=preserved_json,
-                        after_json=preserved_json,
-                        editor="system",
-                        created_at=changed_at,
-                    )
-                )
-            continue
-        current.input_scope_json = extraction.input_scope_json
-        if current.row_json == after_json and current.table_id == table.id:
-            continue
-        before_json = current.row_json
-        current.table_id = table.id
-        current.row_json = after_json
-        current.row_version += 1
-        current.updated_at = changed_at
-        session.add(
-            DataRowRevisionRecord(
-                row_id=current.id,
-                table_id=table.id,
-                task_id=task.id,
-                version=current.row_version,
-                operation="materialize_update",
-                before_json=before_json,
-                after_json=after_json,
-                editor="system",
-                created_at=changed_at,
-            )
-        )
-    for removed in existing.values():
-        if removed.id in user_edited_row_ids:
-            continue
-        session.add(
-            DataRowRevisionRecord(
-                row_id=removed.id,
-                table_id=removed.table_id,
-                task_id=removed.task_id,
-                version=removed.row_version + 1,
-                operation="materialize_delete",
-                before_json=removed.row_json,
-                after_json=None,
-                editor="system",
-                created_at=changed_at,
-            )
-        )
-        session.delete(removed)
-    session.flush()
-    return table, rows
+    from document_pipeline_api.models import FileCurrentDataRecord
+    from document_pipeline_api.services.current_data import initialize_current
+    from document_pipeline_api.services.data_baseline_audit import split_legacy_result
+
+    current = session.get(FileCurrentDataRecord, task.id)
+    if current is not None:
+        table = session.get(DataTableRecord, current.table_id) if current.table_id else None
+        if table is None or not current.has_data:
+            raise HTTPException(409, "当前数据已清空或所属表已删除，不能重新保存旧提取结果。")
+        rows = session.scalars(select(DataRowRecord).where(DataRowRecord.task_id == task.id)
+                               .order_by(DataRowRecord.item_index)).all()
+        return table, [row_values(row) for row in rows]
+    table = _get_or_create_table(session, extraction, target_table_id=task.target_table_id)
+    header, items = split_legacy_result(result.model_dump_json(), custom=extraction.document_kind == "custom")
+    columns = (json.loads(extraction.output_schema_json) if extraction.output_schema_json is not None
+               else file_data_schema(session, table, header, items, legacy=extraction.document_kind != "custom"))
+    if table.collection_kind == "files" and not columns:
+        raise HTTPException(409, "这份自主提取结果缺少文件字段结构，不能建立当前数据。")
+    initialize_current(session, task_id=task.id, table_id=table.id, header=header, items=items,
+                       schema=columns, validation_json=extraction.validation_json)
+    session.execute(update(DataRowRecord).where(DataRowRecord.task_id == task.id).values(
+        input_scope_json=extraction.input_scope_json, review_pending=task.status != TaskStatus.COMPLETED.value,
+    ))
+    rows = session.scalars(select(DataRowRecord).where(DataRowRecord.task_id == task.id)
+                           .order_by(DataRowRecord.item_index)).all()
+    return table, [row_values(row) for row in rows]
 
 
-def _flatten_result(
-    filename: str,
-    result: DocumentExtraction | TemplateExtraction,
-) -> list[dict[str, object | None]]:
-    if isinstance(result, TemplateExtraction):
-        items = result.items or [None]
-        return [
-            {
-                "source_filename": filename,
-                **result.header,
-                "item_index": index if item is not None else 1,
-                **(item or {}),
-            }
-            for index, item in enumerate(items, start=1)
-        ]
-    header = result.model_dump(exclude={"items"})
-    items = result.items or [None]
-    rows: list[dict[str, object | None]] = []
-    for index, item in enumerate(items, start=1):
-        item_values = item.model_dump() if item is not None else {}
-        rows.append(
-            {
-                "source_filename": filename,
-                **header,
-                "item_index": index if item is not None else 1,
-                "name": item_values.get("name"),
-                "specification": item_values.get("specification"),
-                "unit": item_values.get("unit"),
-                "quantity": item_values.get("quantity"),
-                "unit_price": item_values.get("unit_price"),
-                "item_amount": item_values.get("amount"),
-                "tax_rate": item_values.get("tax_rate"),
-                "item_tax_amount": item_values.get("tax_amount"),
-                "item_remarks": item_values.get("remarks"),
-            }
-        )
-    return rows
+def file_data_schema(session: Session, table: DataTableRecord, header: dict, items: list[dict], *, legacy: bool) -> list[dict]:
+    columns = [column.model_dump() for column in table_columns(session, table)]
+    if legacy:
+        # Old built-in extraction contracts include optional fields not selected
+        # in the starter template. Preserve their identities during migration.
+        known = {column["key"] for column in columns}
+        numeric = {"amount_before_tax", "tax_amount", "total_amount", "total_quantity",
+                   "quantity", "unit_price", "item_amount", "item_tax_amount"}
+        for section, keys in (("header", set(header)), ("item", {key for item in items for key in item})):
+            for key in sorted(keys - known):
+                columns.append({"key": key, "label": COLUMN_LABELS.get(key, key), "section": section,
+                                "value_type": "number" if key in numeric else "date" if key == "document_date" else "text"})
+        for column in columns:
+            if column["key"] in numeric:
+                column["value_type"] = "number"
+            elif column["key"] == "document_date":
+                column["value_type"] = "date"
+    return columns
 
 
 def _export_columns(
@@ -979,26 +769,6 @@ def _export_columns(
     return keys, labels
 
 
-def _confirmation_read(
-    session: Session,
-    confirmation: ConfirmedDocumentRecord,
-) -> ConfirmationRead:
-    table = session.get(DataTableRecord, confirmation.table_id)
-    if table is None:
-        raise RuntimeError("已确认文档引用的数据表不存在。")
-    row_count = session.scalar(
-        select(func.count(DataRowRecord.id)).where(DataRowRecord.task_id == confirmation.task_id)
-    )
-    return ConfirmationRead(
-        task_id=confirmation.task_id,
-        table_id=confirmation.table_id,
-        table_name=table.name,
-        review_version=confirmation.review_version,
-        row_count=row_count or 0,
-        confirmed_at=confirmation.confirmed_at,
-    )
-
-
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,
@@ -1027,6 +797,11 @@ def _table_read(
             or 0
         )
     return DataTableRead(
+        grouping_fields=json.loads(table.grouping_json or '[]'),
+        collection_kind=table.collection_kind,
+        file_count=session.scalar(select(func.count()).select_from(FileCurrentDataRecord).where(
+            FileCurrentDataRecord.table_id == table.id, FileCurrentDataRecord.has_data.is_(True),
+        )) or 0,
         id=table.id,
         name=table.name,
         template_key=table.template_key,
@@ -1047,21 +822,21 @@ def rename_table(session: Session, table_id: str, name: str) -> DataTableRead:
 
 
 def delete_table(session: Session, table_id: str) -> None:
+    from document_pipeline_api.models import FileCurrentDataRecord
     table = session.get(DataTableRecord, table_id)
     if table is None:
-        raise HTTPException(status_code=404, detail="没有找到这个数据表。")
-    row_ids = session.scalars(
-        select(DataRowRecord.id).where(DataRowRecord.table_id == table_id)
-    ).all()
+        raise HTTPException(404, "没有找到这个数据表。")
+    row_ids = session.scalars(select(DataRowRecord.id).where(DataRowRecord.table_id == table_id)).all()
     if row_ids:
-        session.execute(
-            delete(DataRowRevisionRecord).where(DataRowRevisionRecord.row_id.in_(row_ids))
-        )
-        session.execute(delete(DataRowRecord).where(DataRowRecord.table_id == table_id))
+        delete_rows(session, table_id, list(row_ids), commit=False)
+    # Deleting the data container preserves evidence and file revisions. Empty
+    # current parents are tombstones: reopening cannot replay an old snapshot.
+    session.execute(update(FileCurrentDataRecord).where(FileCurrentDataRecord.table_id == table_id).values(table_id=None))
+    session.execute(delete(DataRowRevisionRecord).where(DataRowRevisionRecord.table_id == table_id, DataRowRevisionRecord.task_id.is_(None)))
     session.execute(delete(DataViewRecord).where(DataViewRecord.table_id == table_id))
-    session.execute(
-        delete(ConfirmedDocumentRecord).where(ConfirmedDocumentRecord.table_id == table_id)
-    )
+    session.execute(delete(ConfirmedDocumentRecord).where(ConfirmedDocumentRecord.table_id == table_id))
+    from document_pipeline_api.models import TemplateTableBindingRecord
+    session.execute(delete(TemplateTableBindingRecord).where(TemplateTableBindingRecord.table_id==table_id))
     session.delete(table)
     session.commit()
 
@@ -1074,6 +849,8 @@ def create_table(session: Session, name: str, template_key: str) -> DataTableRea
     表名/列名都可显示中文且与模板后续改动解耦。
     """
     template = get_template(session, template_key)
+    if template.engine_kind == "autonomous":
+        raise HTTPException(409, "自主提取按文件决定字段，不能用来创建空白数据表。")
     columns = [
         {
             "key": field.key,
@@ -1106,19 +883,11 @@ def add_row(
     table = session.get(DataTableRecord, table_id)
     if table is None:
         raise HTTPException(status_code=404, detail="没有找到这个数据表。")
-    # 与 update_data_row 一致：只允许写入列契约内的字段，契约外字段（如被裁剪的幽灵列）
-    # 静默丢弃，避免手动行携带未知键污染列裁剪与导出。
-    valid_keys = {column.key for column in table_columns(session, table)}
-    cleaned: dict[str, object | None] = {}
-    for key, value in values.items():
-        if key not in valid_keys:
-            continue
-        if isinstance(value, (dict, list)):
-            raise HTTPException(
-                status_code=422,
-                detail=f"字段 {key} 只能保存文字、数字、真假值或空值。",
-            )
-        cleaned[key] = value
+    from document_pipeline_api.services.file_collections import require_tabular
+    require_tabular(table)
+    from document_pipeline_api.services.current_data import check_column_values
+    check_column_values(values, [column.model_dump() for column in table_columns(session, table)])
+    cleaned = dict(values)
     max_index = session.scalar(
         select(func.max(DataRowRecord.item_index)).where(DataRowRecord.table_id == table_id)
     )
@@ -1150,27 +919,37 @@ def add_row(
     return data_row_read(created)
 
 
-def delete_rows(session: Session, table_id: str, row_ids: list[int]) -> int:
+def delete_rows(session: Session, table_id: str, row_ids: list[int], *,
+                edit_session_id: str | None = None, commit: bool = True, expected_versions: dict[int, int] | None = None) -> int:
+    from document_pipeline_api.services.current_data import get_current, revise_current
+    from document_pipeline_api.services.read_snapshot import begin_write_snapshot
+    begin_write_snapshot(session)
     table = session.get(DataTableRecord, table_id)
     if table is None:
-        raise HTTPException(status_code=404, detail="没有找到这个数据表。")
-    rows = session.scalars(
-        select(DataRowRecord).where(
-            DataRowRecord.table_id == table_id,
-            DataRowRecord.id.in_(row_ids),
-        )
-    ).all()
-    found = {row.id for row in rows}
-    missing = set(row_ids) - found
-    if missing:
-        raise HTTPException(
-            status_code=404,
-            detail="部分数据行不存在或不属于这张表。",
-        )
+        raise HTTPException(404, "没有找到这个数据表。")
+    rows = session.scalars(select(DataRowRecord).where(DataRowRecord.table_id == table_id, DataRowRecord.id.in_(row_ids))).all()
+    if set(row_ids) != {row.id for row in rows}:
+        raise HTTPException(404, "部分数据行不存在或不属于这张表。")
+    if expected_versions is not None and (set(expected_versions) != set(row_ids) or any(
+            expected_versions.get(row.id) != row.row_version for row in rows)):
+        raise HTTPException(409, "选中明细已经变化，请重新查看后再删除。")
+    files: dict[str, list[int]] = {}
     for row in rows:
-        session.execute(delete(DataRowRevisionRecord).where(DataRowRevisionRecord.row_id == row.id))
-        session.delete(row)
-    session.commit()
+        if row.task_id is not None:
+            files.setdefault(row.task_id, []).append(row.id)
+        else:
+            session.add(DataRowRevisionRecord(row_id=row.id, table_id=table_id, task_id=None,
+                        version=row.row_version + 1, operation="delete", before_json=row.row_json,
+                        after_json=None, editor="user"))
+            session.delete(row)
+    for task_id, ids in files.items():
+        current = get_current(session, task_id)
+        revise_current(session, task_id, expected_version=current.current_version,
+                       deleted_ids=ids, edit_session_id=edit_session_id, operation="delete")
+    if commit:
+        session.commit()
+    else:
+        session.flush()
     return len(rows)
 
 
@@ -1179,17 +958,18 @@ def merge_tables(
     table_ids: list[str],
     name: str,
 ) -> DataTableRead:
-    """把多张表的行合并成一张新表。
-
-    列契约取各表列定义的并集（先出现的列优先）；行按来源表顺序依次追加，
-    保留原 task_id 以便溯源，item_index 重新编号。合并表是独立表，
-    template_key 用唯一标记，列契约快照进 columns_json。
-    """
+    """Create an independent snapshot with a fixed, compatible column union."""
+    from document_pipeline_api.services.read_snapshot import begin_write_snapshot
+    begin_write_snapshot(session)
+    if len(set(table_ids)) != len(table_ids):
+        raise HTTPException(422, "合并时同一张表只能选择一次。")
     tables: list[DataTableRecord] = []
     for table_id in table_ids:
         table = session.get(DataTableRecord, table_id)
         if table is None:
             raise HTTPException(status_code=404, detail="没有找到数据表。")
+        from document_pipeline_api.services.file_collections import require_tabular
+        require_tabular(table)
         tables.append(table)
     # 字段并集按用户看到的列名判断，而不是内部 key，也不按“第几次出现”
     # 再拆列。同名字段无论来自内置模板、导入表还是历史表，都只能成为一列。
@@ -1210,6 +990,8 @@ def merge_tables(
                 )
             source_labels.add(normalized_label)
             canonical = columns_by_label.get(normalized_label)
+            if canonical is not None and (canonical.value_type != column.value_type or canonical.section != column.section):
+                raise HTTPException(409, f"同名字段“{column.label}”的类型或文件/明细归属不同，请先明确字段含义并重命名，再合并。")
             if canonical is None:
                 # 合并表拥有自己的列身份。不同来源表可能碰巧复用同一内部 key，
                 # 若直接沿用就会让两个不同列互相串值。
@@ -1234,13 +1016,24 @@ def merge_tables(
     session.add(merged)
     session.flush()
     index = 1
+    created_batch = []
+
+    def persist_batch():
+        session.flush()
+        session.add_all([DataRowRevisionRecord(
+            row_id=created.id, table_id=merged.id, task_id=None, version=1,
+            operation="merge_create", before_json=None, after_json=created.row_json, editor="merge",
+        ) for created in created_batch])
+        session.flush()
+        created_batch.clear()
+
     for table in tables:
         for row in session.scalars(
             select(DataRowRecord)
             .where(DataRowRecord.table_id == table.id)
-            .order_by(DataRowRecord.id)
-        ).all():
-            source_values = json.loads(row.row_json)
+            .order_by(DataRowRecord.id).execution_options(yield_per=500)
+        ):
+            source_values = row_values(row)
             source_group = row.task_id or source_values.get("__row_group") or f"row-{row.id}"
             merged_row: dict[str, object | None] = {}
             # 只复制这张来源表列契约内的值。历史行 JSON 可能残留旧模板内部键，
@@ -1259,35 +1052,30 @@ def merge_tables(
                 review_pending=row.review_pending,
                 row_version=1,
             )
-            merged_values = json.loads(created.row_json)
-            merged_values["__row_group"] = f"{table.id}:{source_group}"
+            merged_values = row_values(created)
+            # This is an independent identity, not a growing chain of parents.
+            import hashlib
+            merged_values["__row_group"] = hashlib.sha256(json.dumps(
+                [table.id, source_group], ensure_ascii=False).encode()).hexdigest()
             created.row_json = json.dumps(merged_values, ensure_ascii=False)
             session.add(created)
-            session.flush()
-            session.add(
-                DataRowRevisionRecord(
-                    row_id=created.id,
-                    table_id=merged.id,
-                    task_id=created.task_id,
-                    version=1,
-                    operation="merge_create",
-                    before_json=None,
-                    after_json=created.row_json,
-                    editor="merge",
-                )
-            )
+            created_batch.append(created)
+            if len(created_batch) >= 500:
+                persist_batch()
             index += 1
+    persist_batch()
     session.commit()
     return _table_read(session, merged)
 
 
-def export_data_table_csv(session: Session, table_id: str) -> StreamingResponse:
-    table = session.get(DataTableRecord, table_id)
-    if table is None:
-        raise HTTPException(status_code=404, detail="没有找到这个数据表。")
+def export_data_table_csv(session: Session, table_id: str, *, scope=None) -> StreamingResponse:
+    selection = prepare_export_selection(session, table_id, scope)
+    table = selection.table
+    from document_pipeline_api.services.file_collections import require_tabular
+    require_tabular(table)
     keys, labels = _export_columns(session, table)
-    scoped = table_has_input_scopes(session, table_id)
-    pending = table_has_pending_reviews(session, table_id)
+    scoped = table_has_input_scopes(session, table_id, predicates=selection.predicates)
+    pending = table_has_pending_reviews(session, table_id, predicates=selection.predicates)
     if pending and REVIEW_LABEL in labels.values():
         raise HTTPException(422, "业务列名与知意来源状态说明列冲突，请重命名该业务列后导出。")
     if scoped and SCOPE_LABEL in labels.values():
@@ -1306,7 +1094,7 @@ def export_data_table_csv(session: Session, table_id: str) -> StreamingResponse:
     write_csv_row([_csv_safe(labels[key]) for key in keys] + ([SCOPE_LABEL] if scoped else []) + ([REVIEW_LABEL] if pending else []))
     row_jsons = session.scalars(
         select(DataRowRecord)
-        .where(DataRowRecord.table_id == table_id)
+        .where(*selection.predicates)
         .order_by(*_row_order())
         .execution_options(yield_per=1000)
     )
@@ -1314,26 +1102,30 @@ def export_data_table_csv(session: Session, table_id: str) -> StreamingResponse:
         row = export_row_values(row_json)
         write_csv_row([_csv_safe(row.get(key)) for key in keys] + ([csv_scope_value(row)] if scoped else []) + (["待核对" if row.get(REVIEW_KEY) else ""] if pending else []))
     output.seek(0)
-    filename = f"{table.name}.csv"
+    filename = f"{table.name}{selection.suffix}.csv"
     disposition = f"attachment; filename=table-{table.id}.csv; filename*=UTF-8''{quote(filename)}"
     return StreamingResponse(
         output,
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": disposition},
+        headers={"Content-Disposition": disposition, **selection.headers()},
         background=BackgroundTask(output.close),
     )
 
 
-def export_data_table_json(session: Session, table_id: str) -> StreamingResponse:
-    table = session.get(DataTableRecord, table_id)
-    if table is None:
-        raise HTTPException(status_code=404, detail="没有找到这个数据表。")
+def export_data_table_json(session: Session, table_id: str, *, scope=None) -> StreamingResponse:
+    selection = prepare_export_selection(session, table_id, scope)
+    table = selection.table
+    if table.collection_kind == "files":
+        from document_pipeline_api.services.file_exports import export_files_json
+        return export_files_json(session, table, selection=selection)
+    from document_pipeline_api.services.file_collections import require_tabular
+    require_tabular(table)
     output = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
     output.write(b"[")
     first = True
     row_jsons = session.scalars(
         select(DataRowRecord)
-        .where(DataRowRecord.table_id == table_id)
+        .where(*selection.predicates)
         .order_by(*_row_order())
         .execution_options(yield_per=1000)
     )
@@ -1344,12 +1136,12 @@ def export_data_table_json(session: Session, table_id: str) -> StreamingResponse
         first = False
     output.write(b"]")
     output.seek(0)
-    filename = f"{table.name}.json"
+    filename = f"{table.name}{selection.suffix}.json"
     disposition = f"attachment; filename=table-{table.id}.json; filename*=UTF-8''{quote(filename)}"
     return StreamingResponse(
         output,
         media_type="application/json",
-        headers={"Content-Disposition": disposition},
+        headers={"Content-Disposition": disposition, **selection.headers()},
         background=BackgroundTask(output.close),
     )
 
@@ -1362,6 +1154,12 @@ class ImportFileError(ValueError):
     """导入文件不安全、损坏或超出结构限制。"""
 
 
+class ImportSheetSelection(ImportFileError):
+    def __init__(self, sheets):
+        super().__init__("工作簿有多个业务工作表，请选择本次导入的一页。")
+        self.sheets = sheets
+
+
 def parse_import_rows(
     content: bytes,
     filename: str,
@@ -1369,10 +1167,21 @@ def parse_import_rows(
     max_rows: int = 100_000,
     max_columns: int = 512,
     max_uncompressed_bytes: int = 256 * 1024 * 1024,
+    sheet_name: str | None = None,
 ) -> list[dict[str, object]]:
     """把 xlsx/csv 内容解析成行字典（第一行为表头）。空行跳过。"""
     if filename.lower().endswith(".csv"):
-        text = content.decode("utf-8-sig", errors="replace")
+        if sheet_name is not None:
+            raise ImportFileError("CSV 不包含工作表，无需指定 Sheet。")
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                text = content.decode("gb18030")
+            except UnicodeDecodeError as error:
+                raise ImportFileError("CSV 编码无法识别，请另存为 UTF-8 或 GB18030（GBK）后导入。") from error
+        if "\x00" in text:
+            raise ImportFileError("CSV 包含无效文字，请另存为 UTF-8 CSV 后导入。")
         rows_iter = csv.reader(StringIO(text))
         header_row = next(rows_iter, None)
         if header_row is None:
@@ -1389,10 +1198,24 @@ def parse_import_rows(
             expanded_size = sum(info.file_size for info in archive.infolist())
             if expanded_size > max_uncompressed_bytes:
                 raise ImportFileError("Excel 文件解压后过大，已拒绝导入。")
+            from document_pipeline_api.services.xlsx_budget import check_workbook_budget
+            try:
+                check_workbook_budget(archive, max_rows=max_rows, max_columns=max_columns)
+            except ValueError as error:
+                raise ImportFileError(str(error)) from error
         workbook = load_workbook(BytesIO(content), read_only=False, data_only=True)
         try:
-            sheet = workbook.active
-            from document_pipeline_api.services.export_scope import read_workbook_scopes
+            if workbook.properties.subject == "zhiyi:per-file-export:v1":
+                raise ImportFileError("这是按文件阅读的导出工作簿，不能作为统一字段表直接导入。请先整理需要的数据为单行表头的普通工作表。")
+            from document_pipeline_api.services.export_scope import read_workbook_scopes, workbook_business_sheets
+            sheets = workbook_business_sheets(workbook)
+            if sheet_name is None and len(sheets) > 1:
+                raise ImportSheetSelection(sheets)
+            if sheet_name is not None and sheet_name not in sheets:
+                raise ImportFileError("指定的业务工作表不存在，或属于来源说明页，请重新选择。")
+            if not sheets:
+                return []
+            sheet = workbook[sheet_name or sheets[0]]
             try:
                 row_scopes = read_workbook_scopes(workbook, sheet)
             except ValueError as error:
@@ -1493,9 +1316,13 @@ def import_table_rows(
     rows: list[dict[str, object]],
 ) -> int:
     """按字段并集追加导入行；新字段扩展当前表列契约，不丢弃。"""
+    from document_pipeline_api.services.read_snapshot import begin_write_snapshot
+    begin_write_snapshot(session)
     table = session.get(DataTableRecord, table_id)
     if table is None:
         raise HTTPException(status_code=404, detail="没有找到这个数据表。")
+    from document_pipeline_api.services.file_collections import require_tabular
+    require_tabular(table)
     columns = table_columns(session, table)
     imported_header_labels = set(rows[0].get("__header_labels") or []) if rows else set()
     duplicate_headers = [
@@ -1537,21 +1364,18 @@ def import_table_rows(
                     ColumnDef(
                         key=key,
                         label=base_label,
-                        value_type="text",
+                        value_type=infer_import_type(row.get(raw_header) for row in rows),
                         section="header" if base_label in imported_header_labels else "item",
                         user_defined=True,
                     )
                 )
             header_to_key[header] = key
-            if base_label in imported_header_labels:
-                for index, column in enumerate(columns):
-                    if column.key == key and column.section != "header":
-                        columns[index] = column.model_copy(update={"section": "header"})
-        table.columns_json = json.dumps(
-            [column.model_dump() for column in columns], ensure_ascii=False
-        )
+            if base_label in imported_header_labels and any(column.key == key and column.section != "header" for column in columns):
+                raise HTTPException(422, f"字段“{base_label}”在目标表中是明细字段，导入不能将它改成文件级字段。")
+    column_by_key = {column.key: column for column in columns}
     normalized: list[tuple[dict[str, object | None], str | None, bool | None]] = []
-    for raw in rows:
+    import_batch = uuid4().hex
+    for row_index, raw in enumerate(rows, 1):
         from document_pipeline_api.schemas.input_scope import InputScope
         imported_scope = None
         try:
@@ -1574,19 +1398,20 @@ def import_table_rows(
             if header in {SCOPE_KEY, REVIEW_KEY}:
                 continue
             if header in {"__row_group", "__header_labels"}:
-                if value:
-                    values[header] = value
                 continue
             if header not in header_to_key:
                 raise HTTPException(422, "导入文件包含无法识别的内部字段，请检查表头。")
             key = header_to_key[header]
-            if isinstance(value, str) and value.strip() == "":
-                value = None
-            if isinstance(value, (dict, list)):
-                continue
-            values[key] = value
+            values[key] = import_cell(value, column_by_key[key].value_type, label=column_by_key[key].label, row_index=row_index)
         if values:
+            group = raw.get("__row_group")
+            if group is not None and not isinstance(group, str):
+                raise HTTPException(422, "导入文件的来源分组无效。")
+            values["__row_group"] = f"import:{import_batch}:group:{group}" if group else f"import:{import_batch}:row:{row_index}"
             normalized.append((values, imported_scope, review_pending))
+    table.columns_json = json.dumps([column.model_dump() for column in columns], ensure_ascii=False)
+    from document_pipeline_api.services.template_contract import _update_file_schemas
+    _update_file_schemas(session, table_id, [column.model_dump() for column in columns])
     max_index = (
         session.scalar(
             select(func.max(DataRowRecord.item_index)).where(DataRowRecord.table_id == table_id)
@@ -1648,7 +1473,7 @@ def create_table_from_import(
             {
                 "key": f"import_{index}",
                 "label": label,
-                "value_type": "text",
+                "value_type": infer_import_type(row.get(header) for row in rows),
                 "section": "header" if header in header_labels else "item",
             }
         )
