@@ -167,11 +167,25 @@ def main():
             save()
             source = root / filename
             source.write_bytes(raw)
+            upload_data = {"template_id": template["id"]}
+            if filename == "large.md":
+                # This format fixture intentionally has the exact same bytes as
+                # large.txt. Exercise rejection first, then explicitly consent
+                # to a second extraction so both readers still get coverage.
+                duplicate = client.post(
+                    "/api/v1/tasks",
+                    files={"file": (filename, raw, mime)},
+                    data=upload_data,
+                )
+                assert duplicate.status_code == 409, duplicate.text
+                assert duplicate.json()["detail"]["code"] == "duplicate_upload"
+                upload_data["duplicate_policy"] = "allow"
+                case["duplicate_rejected_then_confirmed"] = True
             task = req(
                 "POST",
                 "/tasks",
                 files={"file": (filename, raw, mime)},
-                data={"template_id": template["id"]},
+                data=upload_data,
             ).json()
             case["task_id"] = task["id"]
             save()
