@@ -281,6 +281,45 @@ class FakeApi:
 
 
 class BusinessOracleTests(unittest.TestCase):
+    def test_windows_short_image_path_matches_its_existing_long_path(self):
+        import os
+        if os.name != "nt":
+            self.skipTest("Windows 8.3 executable aliases only")
+        import ctypes
+        from ctypes import wintypes
+        with tempfile.TemporaryDirectory(prefix="release executable path ") as temporary:
+            executable = Path(temporary) / "candidate application.exe"
+            executable.write_bytes(b"candidate executable")
+            get_short_path = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
+            get_short_path.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+            get_short_path.restype = wintypes.DWORD
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = get_short_path(str(executable), buffer, len(buffer))
+            self.assertGreater(length, 0)
+            self.assertLess(length, len(buffer))
+            short = buffer.value
+            long = str(executable.resolve(strict=True))
+            if os.path.normcase(short) == os.path.normcase(long):
+                self.skipTest("Filesystem did not provide a distinct 8.3 alias")
+            self.assertEqual(helper._normalized_executable_path(short),
+                             helper._normalized_executable_path(long))
+
+    def test_prepare_refuses_another_existing_executable_before_api_writes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "Zhiyi.exe"
+            foreign = root / "other" / "Zhiyi.exe"
+            foreign.parent.mkdir()
+            candidate.write_bytes(b"candidate executable")
+            foreign.write_bytes(b"another executable")
+            state_path = root / "data" / "runtime" / "supervisor.json"
+            api = FakeApi(root / "data", state_path)
+            snapshot = self._runtime_snapshot(foreign)
+            with self.assertRaisesRegex(helper.VerificationError, "does not match candidate executable"):
+                helper.prepare_business(api, "0.6.0", state_path, 4567, candidate,
+                                        root / "checkpoint.json", runtime_snapshot=snapshot)
+            self.assertEqual(api.api_calls, [])
+
     @staticmethod
     def _runtime_snapshot(candidate_executable: Path, *, port_owner=5678, api_parent=4567):
         return {

@@ -419,7 +419,12 @@ $processes = @(
 def _normalized_executable_path(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise VerificationError("Windows process executable path is unavailable")
-    path = os.path.normcase(os.path.abspath(value.strip()))
+    # Windows process metadata and TEMP can use 8.3 aliases. Resolve both sides
+    # through the filesystem before comparison, while rejecting missing images.
+    try:
+        path = os.path.normcase(str(Path(value.strip()).resolve(strict=True)))
+    except OSError as error:
+        raise VerificationError("Windows process executable path cannot be resolved") from error
     if path.startswith("\\\\?\\"):
         path = path[4:]
     return path
