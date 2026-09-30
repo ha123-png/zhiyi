@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from PIL import Image
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.config import Settings
@@ -28,6 +29,7 @@ from document_pipeline_api.models import (
 from document_pipeline_api.models.task import utc_now
 from document_pipeline_api.public_errors import public_error_message
 from document_pipeline_api.services.model_context import default_context_budget, profile_context_budget
+from document_pipeline_api.services.read_snapshot import begin_write_snapshot
 from document_pipeline_api.schemas.model_profiles import (
     ModelProfileBody,
     ModelProfileCreate,
@@ -102,8 +104,17 @@ def leave_experimental_one_click_profile(session: Session) -> None:
 
 
 def classify_model_endpoint(base_url: str) -> tuple[str, bool]:
-    parsed = urlsplit(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    try:
+        if any(ord(char) < 32 or ord(char) == 127 for char in base_url) or "\\" in base_url:
+            raise ValueError("invalid URL characters")
+        parsed = urlsplit(base_url)
+        hostname = parsed.hostname
+        port = parsed.port
+        if not hostname or any(char.isspace() for char in hostname) or port == 0:
+            raise ValueError("invalid URL authority")
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="AI 服务地址必须是有效的 http 或 https URL。") from error
+    if parsed.scheme not in {"http", "https"}:
         raise HTTPException(status_code=422, detail="AI 服务地址必须是有效的 http 或 https URL。")
     if parsed.username is not None or parsed.password is not None:
         raise HTTPException(status_code=422, detail="AI 服务地址不能包含用户名、密码或 API key。")
@@ -117,6 +128,23 @@ def classify_model_endpoint(base_url: str) -> tuple[str, bool]:
         except ValueError:
             is_loopback = False
     return parsed.geturl(), not is_loopback
+
+
+def _same_credential_target(previous: ModelProfileVersionRecord, provider: str, base_url: str) -> bool:
+    """Never silently forward a saved credential to a different service/tenant."""
+    if previous.provider != provider:
+        return False
+
+    def identity(value: str):
+        parsed = urlsplit(classify_model_endpoint(value)[0])
+        return (parsed.scheme, parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80),
+                parsed.path.rstrip("/"))
+
+    try:
+        return identity(previous.base_url) == identity(base_url)
+    except HTTPException:
+        # A legacy malformed endpoint cannot authorize credential reuse.
+        return False
 
 
 def list_model_profiles(
@@ -182,6 +210,9 @@ def update_model_profile(
     body: ModelProfileUpdate,
     secret_store: ModelSecretStore | None,
 ) -> ModelProfileRead:
+    # Serialize the expected-version read with its insert/update on SQLite.
+    # The version uniqueness constraint remains the final fence on other DBs.
+    begin_write_snapshot(session)
     profile = session.get(ModelProfileRecord, profile_id)
     if profile is None:
         raise HTTPException(status_code=404, detail="没有找到这个 AI 服务方案。")
@@ -192,7 +223,8 @@ def update_model_profile(
     previous = _get_version(session, profile.id, profile.current_version)
     base_url, is_remote = _validated_endpoint(body)
     new_secret_ref = _store_new_secret(body.api_key, secret_store)
-    secret_ref = None if body.clear_api_key else new_secret_ref or previous.secret_ref
+    inherited_secret = previous.secret_ref if _same_credential_target(previous, body.provider, base_url) else None
+    secret_ref = None if body.clear_api_key else new_secret_ref or inherited_secret
     next_version = profile.current_version + 1
     version = _version_record(
         profile.id,
@@ -207,6 +239,10 @@ def update_model_profile(
     try:
         session.add(version)
         session.commit()
+    except IntegrityError as error:
+        session.rollback()
+        _discard_new_secret(new_secret_ref, secret_store)
+        raise HTTPException(status_code=409, detail="AI 服务方案已更新，请刷新后重试。") from error
     except Exception:
         session.rollback()
         _discard_new_secret(new_secret_ref, secret_store)
@@ -220,6 +256,7 @@ def activate_model_profile(
     version_number: int,
     acknowledge: bool = False,
 ) -> ModelProfileRead:
+    begin_write_snapshot(session)
     profile = session.get(ModelProfileRecord, profile_id)
     if profile is None:
         raise HTTPException(status_code=404, detail="没有找到这个 AI 服务方案。")
@@ -245,6 +282,7 @@ def activate_model_profile(
 
 
 def archive_model_profile(session: Session, profile_id: str) -> ModelProfileRead:
+    begin_write_snapshot(session)
     profile = session.get(ModelProfileRecord, profile_id)
     if profile is None:
         raise HTTPException(status_code=404, detail="没有找到这个 AI 服务方案。")
@@ -430,12 +468,12 @@ def probe_model_profile(
     """连通性 + 多模态探测（不落库）：配置页“测试连接”使用。
 
     连通性：请求 /models 列表并检查配置的模型名是否在列。
-    多模态：发送一张 1x1 测试图走视觉请求；服务端拒绝图片请求（4xx）视为仅文本，
+    多模态：发送一张 64x64 合成测试图走视觉请求；服务端明确拒绝图片视为仅文本，
     请求成功视为支持图片，其余错误（超时/服务不可用）视为“无法验证”。
-    表单未填 API Key 但指定了已保存密钥的方案时，自动使用其已保存密钥。
+    表单未填 API Key 时，仅在供应方和规范化服务地址不变时复用已保存密钥。
     """
     try:
-        base_url, _ = classify_model_endpoint(body.base_url)
+        base_url, _ = _validated_endpoint(body)
     except HTTPException as error:
         return ModelProbeResult(
             connected=False,
@@ -450,7 +488,8 @@ def probe_model_profile(
             version = get_model_profile_version(session, profile_id)
         except HTTPException:
             version = None
-        if version is not None and version.secret_ref is not None and secret_store is not None:
+        if (version is not None and version.secret_ref is not None and secret_store is not None
+                and _same_credential_target(version, body.provider, base_url)):
             try:
                 api_key = secret_store.get(version.secret_ref)
             except SecretStoreError as error:

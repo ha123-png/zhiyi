@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import * as axe from "axe-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { BackupPage } from "./BackupPage";
@@ -121,5 +121,37 @@ describe("BackupPage", () => {
       ).toBe(true);
     });
     expect(await screen.findByText("备份已删除。")).toBeInTheDocument();
+  });
+
+  it.each(["restore", "delete"] as const)("shows a failed %s inside its open dialog and permits retry", async (action) => {
+    let failed = false;
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/backups") && !init?.method) return response(backups);
+      if (url.endsWith("/backups/status")) return response(backupStatus);
+      if (action === "restore" && url.endsWith("/restore") && init?.method === "POST") {
+        if (!failed) { failed = true; return response({ detail: "备份校验失败，请选择另一份备份。" }, 409); }
+        return response({ rollback_dir: "C:\\data\\before-retry", restart_required: false });
+      }
+      if (action === "delete" && url.endsWith(".dpbak") && init?.method === "DELETE") {
+        if (!failed) { failed = true; return response({ detail: "备份文件已移走，请刷新列表。" }, 404); }
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`Unexpected request: ${url} ${init?.method ?? ""}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<BackupPage />);
+    fireEvent.click(await screen.findByRole("button", { name: action === "restore" ? /^恢复$/ : /删除/ }));
+    const dialog = screen.getByRole("dialog", { name: action === "restore" ? "恢复备份" : "删除备份" });
+    fireEvent.click(within(dialog).getByRole("button", { name: action === "restore" ? "确认恢复" : "确认删除" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(action === "restore" ? "备份校验失败" : "备份文件已移走");
+    expect(dialog).toBeInTheDocument();
+    const retry = within(dialog).getByRole("button", { name: action === "restore" ? "确认恢复" : "确认删除" });
+    expect(retry).toBeEnabled();
+    fireEvent.click(retry);
+    if (action === "restore") expect(await screen.findByText("已恢复到备份时的状态。")).toBeInTheDocument();
+    else expect(await screen.findByText("备份已删除。")).toBeInTheDocument();
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === (action === "restore" ? "POST" : "DELETE"))).toHaveLength(2);
   });
 });

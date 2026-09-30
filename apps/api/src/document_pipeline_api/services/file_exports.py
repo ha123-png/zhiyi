@@ -1,5 +1,6 @@
 """Per-file exports. Shared field keys never imply a cross-file schema."""
 import json
+import logging
 from tempfile import SpooledTemporaryFile
 from urllib.parse import quote
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -8,15 +9,16 @@ from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from openpyxl.cell import WriteOnlyCell
-from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Font
 from sqlalchemy import select
 from starlette.background import BackgroundTask
 
 from document_pipeline_api.models import DataRowRecord, ExtractionRecord
 from document_pipeline_api.services.table_scope import prepare_export_selection
+from document_pipeline_api.services.excel_values import safe_excel_value
 
 FILES_PER_WORKBOOK = 100
+logger = logging.getLogger(__name__)
 
 
 def _response(output, name, media_type, selection):
@@ -27,8 +29,7 @@ def _response(output, name, media_type, selection):
 
 
 def _cell(sheet, value, *, bold=False):
-    if isinstance(value, str) and (len(value) > 32767 or ILLEGAL_CHARACTERS_RE.search(value)):
-        raise HTTPException(422, "有字段内容超出 Excel 单元格的支持范围，请导出 JSON 以保留完整内容。")
+    value = safe_excel_value(value)
     cell = WriteOnlyCell(sheet, value=value)
     if isinstance(value, str):
         cell.data_type = "s"  # Untrusted text is never an Excel formula.
@@ -55,14 +56,14 @@ def _workbook(session, files, output):
             sheet.column_dimensions["A"].width = 28
             sheet.column_dimensions["B"].width = 55
             sheet.append([_cell(sheet, "文件", bold=True), _cell(sheet, filename)])
-            sheet.append(["文件标识", current.task_id])
+            sheet.append([_cell(sheet, "文件标识"), _cell(sheet, current.task_id)])
             sheet.append(["上传原名", _cell(sheet, current.source.filename)])
-            sheet.append(["当前数据版本", current.current_version])
+            sheet.append([_cell(sheet, "当前数据版本"), _cell(sheet, current.current_version)])
             extraction = session.get(ExtractionRecord, current.task_id)
             if extraction and extraction.input_scope_json:
                 sheet.append(["提取读取范围", _cell(sheet, extraction.input_scope_json)])
             if json.loads(current.validation_json):
-                sheet.append(["校验状态", "仍有待处理问题，请在文件历史中查看"])
+                sheet.append([_cell(sheet, "校验状态"), _cell(sheet, "仍有待处理问题，请在文件历史中查看")])
             sheet.append([])
             sheet.append([_cell(sheet, "文件级字段", bold=True), _cell(sheet, "内容", bold=True)])
             for column in schema:
@@ -78,12 +79,31 @@ def _workbook(session, files, output):
                 if count + len(schema) + 20 >= 1048576:
                     raise HTTPException(422, "单份文件的明细超出 Excel 工作表上限，请导出 JSON。")
                 values = json.loads(row.row_json)
-                sheet.append([row.item_index, *[_cell(sheet, values.get(column["key"])) for column in details]])
+                sheet.append([_cell(sheet, row.item_index), *[_cell(sheet, values.get(column["key"])) for column in details]])
                 count += 1
             link = _cell(directory, title)
             link.hyperlink = "#'" + title.replace("'", "''") + "'!A1"
-            directory.append([_cell(directory, filename), link, count, current.task_id])
+            directory.append([_cell(directory, filename), link, _cell(directory, count), _cell(directory, current.task_id)])
         workbook.save(output)
+    except Exception:
+        # Workbook.close() alone does not finish write-only sheet generators or
+        # remove their temporary XML. Rejected cells must not leak files on each
+        # retry; preserve the original validation/storage error if cleanup fails.
+        for sheet in workbook.worksheets:
+            try:
+                if not sheet.closed:
+                    sheet.close()
+            except Exception:
+                logger.warning("Could not close a rejected Excel worksheet", exc_info=True)
+            try:
+                writer = sheet._writer
+                if writer is not None:
+                    writer.cleanup()
+            except FileNotFoundError:
+                pass  # A partially completed save may have removed this file.
+            except Exception:
+                logger.warning("Could not clean up a rejected Excel worksheet", exc_info=True)
+        raise
     finally:
         workbook.close()
 

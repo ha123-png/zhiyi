@@ -192,6 +192,8 @@ def preview_plan(session, context, body: Plan):
     )
 
     items, guards, changed = [], {}, {}
+    planned_row_updates: set[tuple[str, int]] = set()
+    planned_row_deletes: set[tuple[str, int]] = set()
 
     def watch(kind, identifier):
         guards[f"{kind}:{identifier}"] = guard(session, kind, identifier)
@@ -258,6 +260,13 @@ def preview_plan(session, context, body: Plan):
                         Changes(table_id=op.table_id, row_id=row_id, changes=changes),
                     )
                     for row in preview["affected"]:
+                        identity = (op.table_id, row["row_id"])
+                        if identity in planned_row_deletes:
+                            raise HTTPException(
+                                422,
+                                "同一记录不能同时安排修改和删除，请拆分为一次明确操作。",
+                            )
+                        planned_row_updates.add(identity)
                         for key, value in row["after"].items():
                             identity = (row["row_id"], key)
                             if identity in changed and changed[identity] != value:
@@ -275,9 +284,16 @@ def preview_plan(session, context, body: Plan):
                             existing["after"].update(row["after"])
             elif op.kind == "delete_rows":
                 for row_id in dict.fromkeys(root_ids):
+                    identity = (op.table_id, row_id)
+                    if identity in planned_row_updates or identity in planned_row_deletes:
+                        raise HTTPException(
+                            422,
+                            "同一记录不能同时安排修改和删除，请拆分为一次明确操作。",
+                        )
                     ensure_row_scope(session, context, op.table_id, row_id)
                     row = session.get(DataRowRecord, row_id)
                     watch("row", row_id)
+                    planned_row_deletes.add(identity)
                     item["affected"].append(
                         {"row_id": row.id, "before": row_values(row), "after": None}
                     )

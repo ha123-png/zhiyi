@@ -240,7 +240,7 @@ export function BackupPage() {
                           className="btn secondary xs"
                           type="button"
                           disabled={busy}
-                          onClick={() => setRestoreTarget(backup)}
+                          onClick={() => { setError(null); setRestoreTarget(backup); }}
                           title="恢复到这个备份时间点的数据"
                         >
                           <Icon icon={ArchiveRestore} style={{ width: "12px", height: "12px" }} /> 恢复
@@ -249,7 +249,7 @@ export function BackupPage() {
                           className="btn ghost xs danger-btn"
                           type="button"
                           disabled={busy}
-                          onClick={() => setDeleteTarget(backup)}
+                          onClick={() => { setError(null); setDeleteTarget(backup); }}
                           title="删除这个备份文件"
                         >
                           <Icon icon={Trash2} style={{ width: "12px", height: "12px" }} /> 删除
@@ -270,6 +270,7 @@ export function BackupPage() {
         description={`将把当前数据替换为「${formatDateTime(restoreTarget?.created_at ?? "")}」的备份内容。系统会自动把当前数据移到回滚目录（失败时自动还原，不覆盖当前数据）。建议先创建一份新备份，再执行恢复。恢复完成后建议重启应用。此操作不可撤销。`}
         buttonLabel="确认恢复"
         busy={busy}
+        error={error}
         onConfirm={() => void handleRestore()}
         onClose={() => setRestoreTarget(null)}
       />
@@ -280,6 +281,7 @@ export function BackupPage() {
         description={`将删除「${formatDateTime(deleteTarget?.created_at ?? "")}」的备份文件。删除后无法用它恢复数据。此操作不可恢复。`}
         buttonLabel="确认删除"
         busy={busy}
+        error={error}
         onConfirm={() => void handleDelete()}
         onClose={() => setDeleteTarget(null)}
       />

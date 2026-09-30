@@ -955,7 +955,9 @@ def run_conversation(
                     ),
                 ):
                     for event in (
-                        [] if direct_catalog else tracked_stream(usage, provider, messages, specs)
+                        [] if direct_catalog else tracked_stream(
+                            usage, provider, messages, specs, on_checkpoint=writer.checkpoint
+                        )
                     ):
                         if cancel.is_set():
                             raise InterruptedError("已停止生成。")
@@ -1544,6 +1546,7 @@ def undo_preview(tool_id: str, request: Request, session=Depends(get_session)):
 def download_snapshot(tool_id: str, session=Depends(get_session)):
     from io import BytesIO
     from openpyxl import Workbook
+    from document_pipeline_api.services.excel_values import safe_excel_value
 
     call = session.get(AssistantToolCall, tool_id)
     saved = json.loads(call.result_json) if call else {}
@@ -1562,14 +1565,14 @@ def download_snapshot(tool_id: str, session=Depends(get_session)):
         sheet.append([snapshot.get("metric_labels", {}).get(k, k) for k in keys])
         values = snapshot.get("data", [])
     for row in values:
-        sheet.append(
-            [
+        sheet.append([
+            safe_excel_value(
                 row.get(key)
                 if isinstance(row.get(key), (str, int, float, bool, type(None)))
                 else encoded(row.get(key))
-                for key in keys
-            ]
-        )
+            )
+            for key in keys
+        ])
     # Untrusted data is text, never executable spreadsheet formulas.
     for row in sheet:
         for cell in row:
@@ -1578,12 +1581,12 @@ def download_snapshot(tool_id: str, session=Depends(get_session)):
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
     metadata = workbook.create_sheet("范围与口径")
-    metadata.append(["来源", snapshot["source"]["table_name"]])
-    metadata.append(["生成时间", snapshot["source"]["generated_at"]])
-    metadata.append(["范围", encoded(snapshot["source"]["request"])])
-    metadata.append(["是否部分结果", bool(snapshot.get("truncated"))])
+    metadata.append([safe_excel_value("来源"), safe_excel_value(snapshot["source"]["table_name"])])
+    metadata.append([safe_excel_value("生成时间"), safe_excel_value(snapshot["source"]["generated_at"])])
+    metadata.append([safe_excel_value("范围"), safe_excel_value(encoded(snapshot["source"]["request"]))])
+    metadata.append([safe_excel_value("是否部分结果"), bool(snapshot.get("truncated"))])
     for warning in snapshot.get("warnings", []):
-        metadata.append(["提示", warning])
+        metadata.append([safe_excel_value("提示"), safe_excel_value(warning)])
     for row in metadata:
         for cell in row:
             if isinstance(cell.value, str):

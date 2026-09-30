@@ -1,5 +1,6 @@
 import { summarizeRule } from "../ruleDescriptions";
 import { PatternRulePreview } from "./PatternRulePreview";
+import { parseNumericInput } from "../numericInput";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { previewTemplatePattern } from "../api";
 import type {
@@ -88,18 +89,25 @@ export function DeterministicRulesEditor({ disabled, fields, rules, onChange, co
       }
       if (rule.kind === "enum") {
         const type = available.find(field => pathFor(field) === fieldPath)?.value_type;
-        rule.values = rule.values.map(value => type === "number" ? Number(value) : type === "boolean" ? value === "true" : value);
+        rule.values = rule.values.map(value => type === "number" ? parseRuleNumber(String(value)) as number : type === "boolean" ? value === "true" : value);
       }
-      onChange([...rules, { ...rule, severity, ...(rule.kind === "equation" ? { tolerance: Number(tolerance) } : {}) }]);
+      onChange([...rules, { ...rule, severity, ...(rule.kind === "equation" ? { tolerance: parseRuleNumber(tolerance) as number } : {}) }]);
     }
   }
 
   const selectedType = available.find(field => pathFor(field) === fieldPath)?.value_type;
+  const parsedMinimum = parseRuleNumber(minimum);
+  const parsedMaximum = parseRuleNumber(maximum);
   const validChoice = kind === "range" ? selectedType === "number"
-    : kind === "enum" ? splitValues(values).every(value => selectedType === "number" ? Number.isFinite(Number(value)) : selectedType === "boolean" ? ["true", "false"].includes(value) : true)
+    : kind === "enum" ? splitValues(values).every(value => selectedType === "number" ? parseRuleNumber(value) !== null : selectedType === "boolean" ? ["true", "false"].includes(value) : true)
     : kind === "pattern" ? labels.has(fieldPath) : true;
-  const validTolerance = !["row_multiply", "sum"].includes(kind) || (tolerance.trim() !== "" && Number.isFinite(Number(tolerance)) && Number(tolerance) >= 0 && Number(tolerance) <= 1000000);
-  const canAdd = validChoice && validTolerance && canBuildRule({
+  const parsedTolerance = parseRuleNumber(tolerance);
+  const validTolerance = !["row_multiply", "sum"].includes(kind) || (parsedTolerance !== null && parsedTolerance >= 0 && parsedTolerance <= 1000000);
+  const validRange = kind !== "range" || (selectedType === "number"
+    && (minimum === "" || parsedMinimum !== null)
+    && (maximum === "" || parsedMaximum !== null)
+    && !(minimum !== "" && maximum !== "" && parsedMinimum! > parsedMaximum!));
+  const canAdd = validChoice && validTolerance && validRange && canBuildRule({
     kind,
     fieldPath,
     minimum,
@@ -179,11 +187,11 @@ export function DeterministicRulesEditor({ disabled, fields, rules, onChange, co
             <div className="deterministic-rule-pair">
               <label>
                 <span>最小值（可空）</span>
-                <input className="form-input" disabled={disabled} onChange={(e) => setMinimum(e.target.value)} type="number" value={minimum} />
+                <input className="form-input" disabled={disabled} inputMode="decimal" onChange={(e) => setMinimum(e.target.value)} type="text" value={minimum} />
               </label>
               <label>
                 <span>最大值（可空）</span>
-                <input className="form-input" disabled={disabled} onChange={(e) => setMaximum(e.target.value)} type="number" value={maximum} />
+                <input className="form-input" disabled={disabled} inputMode="decimal" onChange={(e) => setMaximum(e.target.value)} type="text" value={maximum} />
               </label>
             </div>
           ) : null}
@@ -221,9 +229,9 @@ export function DeterministicRulesEditor({ disabled, fields, rules, onChange, co
             </div>
           ) : null}
 
-          {["row_multiply", "sum"].includes(kind) ? <label><span>允许误差</span><input className="form-input" disabled={disabled} type="number" min="0" max="1000000" step="0.01" value={tolerance} onChange={event => setTolerance(event.target.value)} /><span className="support">两侧数值差的绝对值不超过此值即通过，不会改变或四舍五入原结果。</span></label> : null}
+          {["row_multiply", "sum"].includes(kind) ? <label><span>允许误差</span><input aria-label="允许误差" className="form-input" disabled={disabled} inputMode="decimal" type="text" value={tolerance} onChange={event => setTolerance(event.target.value)} /><span className="support">两侧数值差的绝对值不超过此值即通过，不会改变或四舍五入原结果。</span></label> : null}
           <label><span>发现问题时</span><select className="form-select" disabled={disabled} value={severity} onChange={event => setSeverity(event.target.value as "error" | "warning")}><option value="error">错误：需要核对</option><option value="warning">提醒：建议核对</option></select></label>
-          {!validChoice || !validTolerance || (kind === "range" && minimum !== "" && maximum !== "" && Number(minimum) > Number(maximum)) ? <p className="support" role="alert">请检查字段类型、允许值、范围上下限或允许误差。</p> : null}
+          {!validChoice || !validTolerance || !validRange ? <p className="support" role="alert">请检查字段类型、允许值、范围上下限或允许误差。</p> : null}
           {addError && <p className="support" role="alert">{addError}</p>}
           <button className="btn secondary sm" disabled={disabled || checking || !canAdd} onClick={() => void addRule()} type="button">
             {checking ? "检查格式中…" : "添加校验规则"}
@@ -278,8 +286,8 @@ interface BuilderState {
 function canBuildRule(state: BuilderState): boolean {
   if (state.kind === "required") return Boolean(state.fieldPath);
   if (state.kind === "range") return Boolean(state.fieldPath && (state.minimum || state.maximum))
-    && [state.minimum, state.maximum].every(value => value === "" || Number.isFinite(Number(value)))
-    && !(state.minimum !== "" && state.maximum !== "" && Number(state.minimum) > Number(state.maximum));
+    && [state.minimum, state.maximum].every(value => value === "" || parseRuleNumber(value) !== null)
+    && !(state.minimum !== "" && state.maximum !== "" && parseRuleNumber(state.minimum)! > parseRuleNumber(state.maximum)!);
   if (state.kind === "enum") return Boolean(state.fieldPath && splitValues(state.values).length);
   if (state.kind === "pattern") return Boolean(state.fieldPath && state.pattern);
   if (state.kind === "row_multiply") return Boolean(state.leftField && state.rightField && state.resultField);
@@ -293,8 +301,8 @@ function buildRule(state: BuilderState): DeterministicRule | null {
     return {
       kind: "range",
       field: state.fieldPath,
-      minimum: state.minimum ? Number(state.minimum) : null,
-      maximum: state.maximum ? Number(state.maximum) : null,
+      minimum: state.minimum ? parseRuleNumber(state.minimum) : null,
+      maximum: state.maximum ? parseRuleNumber(state.maximum) : null,
     };
   }
   if (state.kind === "enum") return { kind: "enum", field: state.fieldPath, values: splitValues(state.values) };
@@ -323,4 +331,14 @@ function equation(left: RuleExpression, right: RuleExpression, field: string): D
 
 function splitValues(value: string): string[] {
   return value.split(/[，,]/).map((item) => item.trim()).filter(Boolean);
+}
+
+function parseRuleNumber(value: string): number | null {
+  if (value === "") return null;
+  try {
+    const parsed = parseNumericInput(value, "规则数值");
+    return typeof parsed === "number" ? parsed : null;
+  } catch {
+    return null;
+  }
 }

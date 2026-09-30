@@ -10,6 +10,9 @@ const python = process.env.ZHIYI_TEST_PYTHON || path.join(project, 'apps/api/.ve
 const root = path.join(project, '.local/browser-verification', `${new Date().toISOString().replaceAll(':','-')}-${randomUUID().slice(0,8)}`);
 fs.mkdirSync(root, { recursive: true });
 const env = { ...process.env, PYTHONUTF8:'1', ZHIYI_OFFLINE:'1', ZHIYI_VISUAL_OUT:path.join(root,'visual') };
+env.DOCUMENT_PIPELINE_DATA_DIR=path.join(root,'data');
+env.DOCUMENT_PIPELINE_QUEUE_DB=path.join(root,'data','queue.db');
+env.DOCUMENT_PIPELINE_WORKER_HEARTBEAT=path.join(root,'data','worker-heartbeat.json');
 delete env.ZHIYI_FAST;
 function run(executable, args, name) {
   return new Promise((resolve,reject) => {
@@ -51,6 +54,7 @@ function run(executable, args, name) {
     await run(python,['scripts/prepare-card-acceptance.py'],'pressure');
     await run(process.execPath,['scripts/check-design-layout.cjs'],'existing-journey');
     await run(process.execPath,['scripts/check-trust-layout.cjs'],'trust-journey');
+    await run(process.execPath,['scripts/check-v060-audit.cjs'],'v060-audit-journey');
     fs.writeFileSync(path.join(root,'passed.json'),JSON.stringify({passed:true,realModelCalls:0}));
     console.log(`Browser verification passed. Evidence: ${root}`);
   } finally {

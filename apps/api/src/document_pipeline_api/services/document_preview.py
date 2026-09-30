@@ -15,12 +15,13 @@ from xml.parsers import expat
 from threading import Event
 from typing import BinaryIO
 
-from PIL import Image, ImageOps
+from PIL import Image
 
 from .file_formats import (
     UnsupportedTextFileError,
     _docx_rels_map,
     _excel_column_name,
+    _image_frame_to_rgb,
     _validate_zip_budget,
 )
 
@@ -37,16 +38,25 @@ W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 def text_window(path: Path, offset: int = 0, *, cancelled: Event | None = None) -> dict:
     """Offsets are byte boundaries returned by this function, not character counts."""
-    _deadline(time.monotonic(), cancelled)
+    started = time.monotonic()
+    _deadline(started, cancelled)
     size = path.stat().st_size
     with path.open("rb") as source:
-        # Detect from a bounded prefix. UTF-8 BOM and UTF-16 remain readable too.
+        # An ASCII-only prefix cannot distinguish UTF-8 from GB18030. Validate
+        # the stream with bounded buffers before choosing one encoding for all
+        # windows; never retain the original's contents in a preview cache.
         prefix = source.read(TEXT_WINDOW_BYTES)
         if prefix.startswith((b"\xff\xfe", b"\xfe\xff")):
             encoding = "utf-16-le" if prefix.startswith(b"\xff\xfe") else "utf-16-be"
         else:
             try:
-                codecs.getincrementaldecoder("utf-8")().decode(prefix, final=False)
+                probe = codecs.getincrementaldecoder("utf-8")()
+                chunk = prefix
+                while chunk:
+                    _deadline(started, cancelled)
+                    probe.decode(chunk, final=False)
+                    chunk = source.read(TEXT_WINDOW_BYTES)
+                probe.decode(b"", final=True)
                 encoding = "utf-8"
             except UnicodeDecodeError:
                 encoding = "gb18030"
@@ -143,6 +153,8 @@ def docx_window(path: Path, offset: int, *, max_uncompressed_bytes: int,
                 row_cells = []
             elif tag == "tc" and cell_text is None:
                 cell_text = ""
+            elif tag in ("tab", "br", "cr"):
+                append_text("\t" if tag == "tab" else "\n")
             elif paragraph is not None:
                 if tag == "pStyle":
                     style = attrs.get(f"{W_NS}}}val", "").lower()
@@ -157,10 +169,8 @@ def docx_window(path: Path, offset: int, *, max_uncompressed_bytes: int,
                     if image is not None and len(paragraph_images) < 50:
                         paragraph_images.append(image)
 
-        def characters(value: str) -> None:
+        def append_text(value: str) -> None:
             nonlocal paragraph_text, cell_text, clipped
-            if not stack or stack[-1] != "t":
-                return
             if cell_text is not None:
                 clipped = clipped or len(cell_text) + len(value) > CELL_CHARS
                 cell_text = (cell_text + value[:CELL_CHARS])[:CELL_CHARS]
@@ -169,6 +179,10 @@ def docx_window(path: Path, offset: int, *, max_uncompressed_bytes: int,
                 while len(paragraph_text) >= PARAGRAPH_CHARS:
                     emit({**paragraph, "text": paragraph_text[:PARAGRAPH_CHARS]})
                     paragraph_text = paragraph_text[PARAGRAPH_CHARS:]
+
+        def characters(value: str) -> None:
+            if stack and stack[-1] == "t":
+                append_text(value)
 
         def end(name: str) -> None:
             nonlocal paragraph, paragraph_text, paragraph_images, cell_text, row_cells
@@ -180,7 +194,7 @@ def docx_window(path: Path, offset: int, *, max_uncompressed_bytes: int,
                     emit({"type": "image", "image_index": image, "caption": f"图片 {image}"})
                 paragraph, paragraph_text, paragraph_images = None, "", []
             elif tag == "p" and cell_text is not None and cell_text:
-                cell_text = (cell_text + " ")[:CELL_CHARS]
+                cell_text = (cell_text + "\n")[:CELL_CHARS]
             elif tag == "tc" and cell_text is not None and row_cells is not None:
                 row_cells.append(cell_text.rstrip())
                 cell_text = None
@@ -283,7 +297,7 @@ def image_thumbnail(path: Path | BinaryIO, *, max_pixels: int,
             raise UnsupportedTextFileError("这张图片超出安全预览大小，请在原件中查看。")
         original.thumbnail((1600, 1600))
         _deadline(started, cancelled)
-        preview = ImageOps.exif_transpose(original).convert("RGB")
+        preview = _image_frame_to_rgb(original)
         output = BytesIO()
         preview.save(output, format="JPEG", quality=85)
         return output.getvalue()

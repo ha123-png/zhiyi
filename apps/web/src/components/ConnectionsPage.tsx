@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Boxes,
   CheckCircle2,
@@ -24,6 +24,7 @@ import {
 } from "../api";
 import type { IntegrationSettings, McpRuntimeConfig } from "../api";
 import type { DataTableRead } from "../types";
+import { useUnsavedChanges } from "../useUnsavedChanges";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { Icon } from "./Icon";
 import { Toast, useToast } from "./Toast";
@@ -95,6 +96,37 @@ curl -X PATCH -H "Authorization: Bearer WRITE_TOKEN" \\
   ${baseUrl}/tables/TABLE_ID/rows/ROW_ID`;
 }
 
+function normalizeFileRoots(value: string | string[] | undefined): string[] {
+  const roots = Array.isArray(value) ? value : (value ?? "").split(/\r?\n|;/);
+  return roots.map((item) => item.trim()).filter(Boolean);
+}
+
+function permissionSnapshot(value: {
+  data_scope?: "all" | "selected";
+  table_ids?: string[];
+  task_read?: boolean;
+  template_read?: boolean;
+  result_read?: boolean;
+  data_read?: boolean;
+  task_control?: boolean;
+  write_enabled?: boolean;
+  file_access?: boolean;
+  file_roots?: string | string[];
+}) {
+  return JSON.stringify({
+    data_scope: value.data_scope ?? "all",
+    table_ids: [...new Set(value.table_ids ?? [])].sort(),
+    task_read: Boolean(value.task_read),
+    template_read: Boolean(value.template_read),
+    result_read: Boolean(value.result_read),
+    data_read: Boolean(value.data_read),
+    task_control: Boolean(value.task_control),
+    write_enabled: Boolean(value.write_enabled),
+    file_access: Boolean(value.file_access),
+    file_roots: normalizeFileRoots(value.file_roots),
+  });
+}
+
 interface CollapsibleCardProps {
   icon: typeof Boxes;
   title: string;
@@ -149,7 +181,12 @@ export function ConnectionsPage() {
 
   // 集成配置（密钥状态 + MCP 权限）
   const [settings, setSettings] = useState<IntegrationSettings | null>(null);
+  const [settingsLoading, setSettingsLoading] = useState(true);
+  const settingsRequest = useRef(0);
   const [mcpConfig, setMcpConfig] = useState<McpRuntimeConfig | null>(null);
+  const [mcpConfigLoading, setMcpConfigLoading] = useState(true);
+  const [mcpConfigError, setMcpConfigError] = useState<string | null>(null);
+  const mcpConfigRequest = useRef(0);
   const [mcpCopied, setMcpCopied] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
@@ -180,6 +217,34 @@ export function ConnectionsPage() {
   const [tableError, setTableError] = useState<string | null>(null);
   const [dataScope, setDataScope] = useState<"all" | "selected">("all");
   const [tableIds, setTableIds] = useState<string[]>([]);
+  const unsavedChanges = useUnsavedChanges(() => settings !== null && permissionSnapshot({
+    data_scope: dataScope,
+    table_ids: tableIds,
+    task_read: permDraft.taskRead,
+    template_read: permDraft.templateRead,
+    result_read: permDraft.resultRead,
+    data_read: permDraft.dataRead,
+    task_control: permDraft.taskControl,
+    write_enabled: permDraft.writeEnabled,
+    file_access: permDraft.fileAccess,
+    file_roots: permDraft.fileRoots,
+  }) !== permissionSnapshot(settings));
+
+  const applySettings = useCallback((next: IntegrationSettings) => {
+    setSettings(next);
+    setDataScope(next.data_scope ?? "all");
+    setTableIds(next.table_ids ?? []);
+    setPermDraft({
+      taskRead: next.task_read,
+      templateRead: next.template_read,
+      resultRead: next.result_read,
+      dataRead: next.data_read,
+      taskControl: next.task_control,
+      writeEnabled: next.write_enabled,
+      fileAccess: next.file_access,
+      fileRoots: (next.file_roots ?? []).join("\n"),
+    });
+  }, []);
   useEffect(() => {
     if (!permDraft.dataRead && !permDraft.writeEnabled) return;
     let current = true;
@@ -188,36 +253,53 @@ export function ConnectionsPage() {
     return () => { current = false; };
   }, [permDraft.dataRead, permDraft.writeEnabled]);
 
-  const refreshSettings = useCallback(() => {
-    getIntegrationSettings()
-      .then(setSettings)
-      .catch((err) =>
-        setSettingsError(err instanceof Error ? err.message : "读取集成配置失败"),
-      );
-  }, []);
+  const refreshSettings = useCallback(async (syncPermissions = false) => {
+    const request = ++settingsRequest.current;
+    setSettingsLoading(true);
+    try {
+      const next = await getIntegrationSettings();
+      if (request !== settingsRequest.current) return;
+      if (syncPermissions) applySettings(next);
+      else setSettings(next);
+      setSettingsError(null);
+    } catch (err) {
+      if (request === settingsRequest.current) {
+        setSettingsError(err instanceof Error ? err.message : "读取集成配置失败");
+      }
+    } finally {
+      if (request === settingsRequest.current) setSettingsLoading(false);
+    }
+  }, [applySettings]);
+
+  useEffect(() => () => { settingsRequest.current += 1; }, []);
 
   useEffect(() => {
     void getIntegrationStatus().then(setStatus);
-    refreshSettings();
-    void getMcpRuntimeConfig().then(setMcpConfig).catch(() => setMcpConfig(null));
+    void refreshSettings(true);
   }, [refreshSettings]);
 
-  // 权限草稿与当前配置同步
+  const refreshMcpConfig = useCallback(async () => {
+    const request = ++mcpConfigRequest.current;
+    setMcpConfigLoading(true);
+    setMcpConfigError(null);
+    setMcpCopied(false);
+    try {
+      const config = await getMcpRuntimeConfig();
+      if (request === mcpConfigRequest.current) setMcpConfig(config);
+    } catch (error) {
+      if (request === mcpConfigRequest.current) {
+        setMcpConfig(null);
+        setMcpConfigError(`读取 MCP 配置失败：${error instanceof Error ? error.message : "请检查连接后重试。"}`);
+      }
+    } finally {
+      if (request === mcpConfigRequest.current) setMcpConfigLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
-    if (!settings) return;
-    setDataScope(settings.data_scope ?? "all");
-    setTableIds(settings.table_ids ?? []);
-    setPermDraft({
-      taskRead: settings.task_read,
-      templateRead: settings.template_read,
-      resultRead: settings.result_read,
-      dataRead: settings.data_read,
-      taskControl: settings.task_control,
-      writeEnabled: settings.write_enabled,
-      fileAccess: settings.file_access,
-      fileRoots: settings.file_roots.join("\n"),
-    });
-  }, [settings]);
+    void refreshMcpConfig();
+    return () => { mcpConfigRequest.current += 1; };
+  }, [refreshMcpConfig]);
 
   const handleGenerateKey = async (kind: "read" | "write") => {
     setBusyKey(kind);
@@ -270,11 +352,7 @@ export function ConnectionsPage() {
     setMcpError(null);
     setMcpNotice(null);
     try {
-      const fileRoots = permDraft.fileRoots
-        .split(/\r?\n|;/)
-        .map((item) => item.trim())
-        .filter(Boolean);
-      await saveIntegrationPermissions({
+      const payload = {
         data_scope: dataScope,
         table_ids: tableIds,
         task_read: permDraft.taskRead,
@@ -284,10 +362,14 @@ export function ConnectionsPage() {
         task_control: permDraft.taskControl,
         write_enabled: permDraft.writeEnabled,
         file_access: permDraft.fileAccess,
-        file_roots: fileRoots,
-      });
+        file_roots: normalizeFileRoots(permDraft.fileRoots),
+      };
+      await saveIntegrationPermissions(payload);
+      // Treat the successful submitted payload as the new baseline immediately.
+      // If the follow-up GET fails, the saved form still remains clean and usable.
+      applySettings({ ...settings!, ...payload });
       setMcpNotice("MCP 权限已保存；旧连接将拒绝继续操作，请在客户端重新连接以使用最新权限。");
-      await refreshSettings();
+      await refreshSettings(true);
     } catch (err) {
       setMcpError(err instanceof Error ? err.message : "保存权限失败");
     } finally {
@@ -412,7 +494,7 @@ export function ConnectionsPage() {
                   <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
                     <button
                       className="btn secondary sm"
-                      disabled={busyKey !== null}
+                      disabled={busyKey !== null || savingPerms || settings === null}
                       onClick={() => void handleGenerateKey("read")}
                     >
                       <Icon icon={busyKey === "read" ? Loader2 : RefreshCw} size={13} className={busyKey === "read" ? "spin" : undefined} />
@@ -420,7 +502,7 @@ export function ConnectionsPage() {
                     </button>
                     <button
                       className="btn secondary sm"
-                      disabled={busyKey !== null}
+                      disabled={busyKey !== null || savingPerms || settings === null}
                       onClick={() => void handleGenerateKey("write")}
                     >
                       <Icon icon={busyKey === "write" ? Loader2 : RefreshCw} size={13} className={busyKey === "write" ? "spin" : undefined} />
@@ -428,7 +510,7 @@ export function ConnectionsPage() {
                     </button>
                     <button
                       className="btn ghost sm danger-btn"
-                      disabled={busyKey !== null || !settings?.read_token_set}
+                      disabled={busyKey !== null || savingPerms || settings === null || !settings.read_token_set}
                       onClick={() => setRevokeTarget("read")}
                       title="撤销读密钥"
                     >
@@ -436,7 +518,7 @@ export function ConnectionsPage() {
                     </button>
                     <button
                       className="btn ghost sm danger-btn"
-                      disabled={busyKey !== null || !settings?.write_token_set}
+                      disabled={busyKey !== null || savingPerms || settings === null || !settings.write_token_set}
                       onClick={() => setRevokeTarget("write")}
                       title="撤销写密钥"
                     >
@@ -486,7 +568,17 @@ export function ConnectionsPage() {
             support="每种 AI 使用独立 MCP 进程；未开启的能力不会出现在工具列表中"
             title="MCP 权限"
           >
-            <div className="settings-toggles">
+            <div className="settings-toggles" aria-busy={savingPerms}>
+              {settings === null && (
+                <div className="small muted" role="status">
+                  {settingsError ? `暂时无法读取权限配置：${settingsError}` : "正在读取 MCP 权限配置…"}
+                  {settingsError && (
+                    <button className="btn secondary sm" type="button" disabled={settingsLoading} onClick={() => void refreshSettings(true)}>
+                      {settingsLoading ? "正在读取…" : "重新读取"}
+                    </button>
+                  )}
+                </div>
+              )}
               {mcpError && (
                 <div className="callout danger" style={{ marginBottom: 12 }}>
                   {mcpError}
@@ -512,6 +604,7 @@ export function ConnectionsPage() {
                     aria-label={label}
                     className={`toggle ${permDraft[key] ? "on" : "off"}`}
                     type="button"
+                    disabled={savingPerms || settings === null}
                     onClick={() => setPermDraft((d) => ({ ...d, [key]: !d[key] }))}
                   >
                     <span />
@@ -527,6 +620,7 @@ export function ConnectionsPage() {
                   aria-label="任务控制"
                   className={`toggle ${permDraft.taskControl ? "on" : "off"}`}
                   type="button"
+                  disabled={savingPerms || settings === null}
                   onClick={() =>
                     setPermDraft((d) => ({ ...d, taskControl: !d.taskControl }))
                   }
@@ -543,6 +637,7 @@ export function ConnectionsPage() {
                   aria-label="写事实"
                   className={`toggle ${permDraft.writeEnabled ? "on" : "off"}`}
                   type="button"
+                  disabled={savingPerms || settings === null}
                   onClick={() =>
                     setPermDraft((d) => ({ ...d, writeEnabled: !d.writeEnabled }))
                   }
@@ -553,13 +648,13 @@ export function ConnectionsPage() {
               {(permDraft.dataRead || permDraft.writeEnabled) && <div className="setting-row align-top">
                 <div style={{ width: "100%" }}>
                   <label className="settings-name" htmlFor="mcp-data-scope">允许访问的数据表</label>
-                  <select id="mcp-data-scope" value={dataScope} onChange={e => setDataScope(e.target.value as "all" | "selected")}>
+                  <select id="mcp-data-scope" value={dataScope} disabled={savingPerms || settings === null} onChange={e => setDataScope(e.target.value as "all" | "selected")}>
                     <option value="all">全部数据表（包括以后新建的表）</option>
                     <option value="selected">只允许选中的表</option>
                   </select>
                   {dataScope === "selected" && <div className="mcp-table-scope">
                     {tableError ? <p role="alert">{tableError}</p> : tables.map(table => <label key={table.id}>
-                      <input type="checkbox" checked={tableIds.includes(table.id)} onChange={e => setTableIds(ids => e.target.checked ? [...ids, table.id] : ids.filter(id => id !== table.id))} />{table.name}
+                      <input type="checkbox" disabled={savingPerms || settings === null} checked={tableIds.includes(table.id)} onChange={e => setTableIds(ids => e.target.checked ? [...ids, table.id] : ids.filter(id => id !== table.id))} />{table.name}
                     </label>)}
                     {!tableError && !tables.length && <p className="small muted">还没有可选的数据表。</p>}
                     <p className="small muted">已选 {tableIds.length} 张表。未选择时不允许访问任何数据表。</p>
@@ -576,6 +671,7 @@ export function ConnectionsPage() {
                   aria-label="文件访问"
                   className={`toggle ${permDraft.fileAccess ? "on" : "off"}`}
                   type="button"
+                  disabled={savingPerms || settings === null}
                   onClick={() =>
                     setPermDraft((d) => ({ ...d, fileAccess: !d.fileAccess }))
                   }
@@ -595,6 +691,7 @@ export function ConnectionsPage() {
                       className="form-input"
                       rows={3}
                       value={permDraft.fileRoots}
+                      disabled={savingPerms || settings === null}
                       onChange={(e) =>
                         setPermDraft((d) => ({ ...d, fileRoots: e.target.value }))
                       }
@@ -610,11 +707,11 @@ export function ConnectionsPage() {
                 </div>
                 <button
                   className="btn primary sm"
-                  disabled={savingPerms || busyKey !== null}
+                  disabled={savingPerms || busyKey !== null || settings === null}
                   onClick={() => void handleSavePermissions()}
                 >
                   <Icon icon={savingPerms ? Loader2 : CheckCircle2} size={13} className={savingPerms ? "spin" : undefined} />
-                  保存权限
+                  {savingPerms ? "正在保存…" : "保存权限"}
                 </button>
               </div>
             </div>
@@ -626,7 +723,13 @@ export function ConnectionsPage() {
             support={mcpConfig?.runtime === "installed" ? "已按当前知意安装位置生成，直接复制到 MCP 客户端即可。" : "当前是开发环境，已按本项目实际路径生成。"}
             title="可直接使用的 MCP 配置"
           >
-            {mcpConfig ? <>
+            {mcpConfigLoading ? <div className="support" role="status">正在生成当前环境的 MCP 配置…</div>
+              : mcpConfigError ? <>
+                <div className="callout danger" role="alert">{mcpConfigError}</div>
+                <button className="btn secondary sm" type="button" onClick={() => void refreshMcpConfig()}>
+                  <Icon icon={RefreshCw} size={13} /> 重新读取配置
+                </button>
+              </> : mcpConfig ? <>
               <pre className="code-block">{JSON.stringify(mcpConfig.mcp_servers, null, 2)}</pre>
               <div className="row" style={{ justifyContent: "space-between", gap: 12, marginTop: 12 }}>
                 <span className="small muted">默认不开放任何业务数据；按需授权后，请在客户端断开并重新连接。</span>
@@ -640,7 +743,7 @@ export function ConnectionsPage() {
                   }
                 }}><Icon icon={mcpCopied ? CheckCircle2 : ClipboardCopy} size={13} /> {mcpCopied ? "已复制" : "复制配置"}</button>
               </div>
-            </> : <div className="support">正在生成当前环境的 MCP 配置…</div>}
+            </> : null}
           </CollapsibleCard>
         </div>
       </div>
@@ -696,6 +799,7 @@ export function ConnectionsPage() {
         onConfirm={() => void handleRevokeKey()}
         onClose={() => setRevokeTarget(null)}
       />
+      {unsavedChanges.dialog}
       <Toast toast={toast} onDismiss={clear} />
     </section>
   );

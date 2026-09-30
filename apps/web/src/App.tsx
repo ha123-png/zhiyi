@@ -7,18 +7,11 @@ import { AssistantDrawer, AssistantPage, AssistantTrigger } from "./assistant/As
 import { assistantApi } from "./assistant/api";
 import type { Reference } from "./assistant/types";
 import type { TemplateDraft } from "./types";
-import { BackupPage } from "./components/BackupPage";
-import { ConnectionsPage } from "./components/ConnectionsPage";
-import { DataTablePage } from "./components/DataTablePage";
-import { ExtractPage } from "./components/ExtractPage";
 import { GlobalTaskCard } from "./components/TaskActivity";
-import { HistoryPage } from "./components/HistoryPage";
-import { GuidePage } from "./components/GuidePage";
+import { PageLoadBoundary } from "./components/PageLoadBoundary";
 import { Onboarding, ONBOARDING_VERSION, onboardingDone } from "./components/Onboarding";
-import { SettingsPage } from "./components/SettingsPage";
 import { Sidebar } from "./components/Sidebar";
 import { TaskQueuePage } from "./components/TaskQueuePage";
-import { TemplatesPage } from "./components/TemplatesPage";
 import { Toast, useToast } from "./components/Toast";
 import {
   deleteTask,
@@ -38,6 +31,14 @@ import type { DemoScenario, ModelStatus, NavigationKey, SystemStatus, Task, Task
 
 const DashboardPage = lazy(() => import("./components/DashboardPage").then(module => ({ default: module.DashboardPage })));
 const StatisticBridge = lazy(() => import("./dashboard/StatisticBridge").then(module => ({ default: module.StatisticBridge })));
+const BackupPage = lazy(() => import("./components/BackupPage").then(module => ({ default: module.BackupPage })));
+const ConnectionsPage = lazy(() => import("./components/ConnectionsPage").then(module => ({ default: module.ConnectionsPage })));
+const DataTablePage = lazy(() => import("./components/DataTablePage").then(module => ({ default: module.DataTablePage })));
+const ExtractPage = lazy(() => import("./components/ExtractPage").then(module => ({ default: module.ExtractPage })));
+const HistoryPage = lazy(() => import("./components/HistoryPage").then(module => ({ default: module.HistoryPage })));
+const GuidePage = lazy(() => import("./components/GuidePage").then(module => ({ default: module.GuidePage })));
+const SettingsPage = lazy(() => import("./components/SettingsPage").then(module => ({ default: module.SettingsPage })));
+const TemplatesPage = lazy(() => import("./components/TemplatesPage").then(module => ({ default: module.TemplatesPage })));
 
 function applyTheme(theme: "auto" | "light" | "dark") {
   const root = document.documentElement;
@@ -330,13 +331,14 @@ function AppContent() {
     }
   }, [loadTasks, notify]);
 
-  const navigateTo = useCallback((page: NavigationKey) => {
+  const navigateTo = useCallback((page: NavigationKey, afterProceed?: () => void) => {
     const proceed = () => {
       navSeqRef.current += 1;
       pageScrollPositionsRef.current[activePage] = pageWrapRef.current?.scrollTop ?? 0;
+      afterProceed?.();
       setActivePage(page);
     };
-    if (page === activePage || window.dispatchEvent(new CustomEvent("zhiyi:before-navigate", { cancelable: true, detail: { proceed } }))) proceed();
+    if (window.dispatchEvent(new CustomEvent("zhiyi:before-navigate", { cancelable: true, detail: { proceed } }))) proceed();
   }, [activePage]);
 
   useLayoutEffect(() => {
@@ -378,17 +380,18 @@ function AppContent() {
   }, [activePage]);
 
   const handleNavigate = useCallback((page: NavigationKey) => {
-    if (page === "history") setHistoryEntry("completed");
-    setExtractionDemo(null);
-    if (page === "extract") setSelectedTask(null);
-    if (page === "tables") {
-      setSelectedTableTemplateId(null);
-      setSelectedTableId(null);
-      setTableJumpNotice(null);
-    } else {
-      setHighlightTaskId(null);
-    }
-    navigateTo(page);
+    navigateTo(page, () => {
+      if (page === "history") setHistoryEntry("completed");
+      setExtractionDemo(null);
+      if (page === "extract") setSelectedTask(null);
+      if (page === "tables") {
+        setSelectedTableTemplateId(null);
+        setSelectedTableId(null);
+        setTableJumpNotice(null);
+      } else {
+        setHighlightTaskId(null);
+      }
+    });
   }, [navigateTo]);
 
   const refreshModelStatus = useCallback(() => {
@@ -397,38 +400,38 @@ function AppContent() {
   }, []);
 
   const openTask = useCallback((task: Task) => {
-    pageScrollPositionsRef.current[activePage] = pageWrapRef.current?.scrollTop ?? 0;
-    setSelectedTask(task);
-    setActivePage("extract");
-  }, [activePage]);
+    navigateTo("extract", () => {
+      setSelectedTask(task);
+      setExtractionDemo(null);
+    });
+  }, [navigateTo]);
 
   // 跳转到数据表：优先用确认记录精确定位（含手动指定表），确认已删则提示数据不存在
   const openTaskData = useCallback(
     async (task: Task) => {
-      setSelectedTableTemplateId(task.template_id);
-      setSelectedTableId(null);
-      setTableJumpNotice(null);
-      setHighlightTaskId(task.id);
       // 导航守卫：getConfirmation 期间用户可能已切到别的页，只在仍停留时跳转
       const navSeq = ++navSeqRef.current;
+      let selectedId: string | null = null;
+      let jumpNotice: string | null = null;
       try {
         const confirmation = await getConfirmation(task.id);
         if (navSeq !== navSeqRef.current) return;
         if (confirmation.row_count === 0) {
-          setTableJumpNotice(
-            `该文件的当前数据已清空；原文件和修订历史仍保留在文件历史中。`,
-          );
+          jumpNotice = "该文件的当前数据已清空；原文件和修订历史仍保留在文件历史中。";
         } else {
-          setSelectedTableId(confirmation.table_id);
+          selectedId = confirmation.table_id;
         }
       } catch {
         if (navSeq !== navSeqRef.current) return;
         // 无确认记录：按模板定位（可能从未确认或目标表已删）
-        setTableJumpNotice(
-          "这份文件当前没有表内数据；可在文件历史查看原文件与修订记录。",
-        );
+        jumpNotice = "这份文件当前没有表内数据；可在文件历史查看原文件与修订记录。";
       }
-      navigateTo("tables");
+      navigateTo("tables", () => {
+        setSelectedTableTemplateId(task.template_id);
+        setSelectedTableId(selectedId);
+        setTableJumpNotice(jumpNotice);
+        setHighlightTaskId(task.id);
+      });
     },
     [navigateTo],
   );
@@ -438,12 +441,26 @@ function AppContent() {
       const ref = (event as CustomEvent<Reference & { draft?: TemplateDraft }>).detail;
       assistant.setDrawerOpen(false);
       if (ref.kind === "assistant") { navigateTo("assistant"); return; }
-      if (ref.kind === "draft" && ref.draft) { setAssistantDraft(ref.draft); setAssistantTemplate(null); setAssistantTemplateVersion(null); navigateTo("templates"); return; }
-      if (ref.kind === "template") { setAssistantTemplate(ref.id); setAssistantTemplateVersion(ref.version ?? null); setAssistantDraft(null); navigateTo("templates"); return; }
-      if (ref.kind === "table" || ref.kind === "revisions") { setSelectedTableId(ref.id); setSelectedTableTemplateId(null); setHighlightTaskId(null); setAssistantRow(ref.row_id ?? null); setTableJumpNotice(ref.row_id ? `来自问知意：定位记录 #${ref.row_id}` : "来自问知意的资料引用"); navigateTo("tables"); return; }
+      if (ref.kind === "draft" && ref.draft) {
+        navigateTo("templates", () => { setAssistantDraft(ref.draft!); setAssistantTemplate(null); setAssistantTemplateVersion(null); });
+        return;
+      }
+      if (ref.kind === "template") {
+        navigateTo("templates", () => { setAssistantTemplate(ref.id); setAssistantTemplateVersion(ref.version ?? null); setAssistantDraft(null); });
+        return;
+      }
+      if (ref.kind === "table" || ref.kind === "revisions") {
+        navigateTo("tables", () => {
+          setSelectedTableId(ref.id); setSelectedTableTemplateId(null); setHighlightTaskId(null);
+          setAssistantRow(ref.row_id ?? null); setTableJumpNotice(ref.row_id ? `来自问知意：定位记录 #${ref.row_id}` : "来自问知意的资料引用");
+        });
+        return;
+      }
       if (ref.kind === "task" || ref.kind === "original") {
         const seq = ++navSeqRef.current;
-        void assistantApi<Task>(`/references/tasks/${encodeURIComponent(ref.id)}`).then(task => { if (seq === navSeqRef.current) { setSelectedTask(task); navigateTo("extract"); } }).catch(e => notify(e.message, "error"));
+        void assistantApi<Task>(`/references/tasks/${encodeURIComponent(ref.id)}`).then(task => {
+          if (seq === navSeqRef.current) navigateTo("extract", () => { setSelectedTask(task); setExtractionDemo(null); });
+        }).catch(e => notify(e.message, "error"));
       }
     }
     window.addEventListener("zhiyi:assistant-navigate", onReference);
@@ -490,6 +507,8 @@ function AppContent() {
           </div>
 
           <div className={`app-page-wrap ${activePage === "assistant" ? "ask-page-wrap" : ""}`} ref={pageWrapRef}>
+            <PageLoadBoundary key={activePage}>
+            <Suspense fallback={<div className="view muted" role="status">正在打开页面…</div>}>
             {activePage === "workspace" ? (
               <TaskQueuePage
                 logs={taskLogs}
@@ -536,6 +555,8 @@ function AppContent() {
             ) : activePage === "guide" ? (
               <GuidePage onNavigate={handleNavigate} />
             ) : null}
+            </Suspense>
+            </PageLoadBoundary>
           </div>
         </main>
       </div>
@@ -546,9 +567,10 @@ function AppContent() {
         modelStatus={modelStatus}
         onNavigate={handleNavigate}
         onShowDemo={(scenario) => {
-          setSelectedTask(null);
-          setExtractionDemo(scenario);
-          navigateTo("extract");
+          navigateTo("extract", () => {
+            setSelectedTask(null);
+            setExtractionDemo(scenario);
+          });
         }}
         onClose={() => setOnboardingOpen(false)}
       />

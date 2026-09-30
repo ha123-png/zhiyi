@@ -1,9 +1,10 @@
 from pathlib import Path
+from datetime import date
 import json
-from types import UnionType
+from typing import Annotated, Any
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, Field, create_model
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, WithJsonSchema, create_model
 from pydantic.fields import FieldInfo
 
 from document_pipeline_api.model_providers import ModelProvider
@@ -14,10 +15,29 @@ from document_pipeline_api.schemas.templates import (
 )
 
 
-VALUE_TYPES: dict[str, type[str] | type[float] | type[bool]] = {
+def _validate_template_date(value: object) -> object:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("日期必须使用 YYYY-MM-DD 字符串。")
+    try:
+        date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError("日期必须使用有效的 YYYY-MM-DD 日期。") from error
+    return value
+
+
+TemplateDate = Annotated[
+    str,
+    BeforeValidator(_validate_template_date),
+    WithJsonSchema({"type": "string", "format": "date"}),
+]
+
+
+VALUE_TYPES: dict[str, Any] = {
     "text": str,
     "number": float,
-    "date": str,
+    "date": TemplateDate,
     "boolean": bool,
 }
 
@@ -106,7 +126,7 @@ def build_template_extraction_model(template: TemplateRead) -> type[BaseModel]:
     )
 
 
-TEMPLATE_PROMPT_VERSION = "template-extraction-v2"
+TEMPLATE_PROMPT_VERSION = "template-extraction-v3"
 
 
 def build_template_extraction_prompt(template: TemplateRead, *, include_filename: bool = False) -> str:
@@ -119,6 +139,7 @@ def build_template_extraction_prompt(template: TemplateRead, *, include_filename
     fields = "\n".join(
         f"- {field.key}: {field.label}；"
         f"{'每份文件一次' if field.section == 'header' else '每条明细重复'}；类型 {field.value_type}"
+        + ("；日期必须使用 YYYY-MM-DD，有效日期无法确认时使用 null" if field.value_type == "date" else "")
         + (f"；{field.instructions}" if field.instructions else "")
         + (f"；示例：{field.example}" if field.example else "")
         for field in template.fields
@@ -143,7 +164,7 @@ def build_template_extraction_prompt(template: TemplateRead, *, include_filename
     )
 
 
-def _model_field(field: TemplateFieldRead) -> tuple[UnionType, FieldInfo]:
+def _model_field(field: TemplateFieldRead) -> tuple[Any, FieldInfo]:
     value_type = VALUE_TYPES[field.value_type]
     description = field.label
     if field.instructions:

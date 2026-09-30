@@ -1,11 +1,12 @@
 from enum import StrEnum
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 from document_pipeline_api.schemas.templates import TemplateRead
 from document_pipeline_api.schemas.input_scope import InputScope, SourceRange
 from document_pipeline_api.schemas.file_name import FileNameRead
+from document_pipeline_api.schemas.json_numbers import stringify_unsafe_integers
 
 
 class DocumentKind(StrEnum):
@@ -27,11 +28,11 @@ class LineItem(BaseModel):
     name: str | None
     specification: str | None
     unit: str | None
-    quantity: float | None
-    unit_price: float | None
-    amount: float | None
+    quantity: int | float | None
+    unit_price: int | float | None
+    amount: int | float | None
     tax_rate: str | None
-    tax_amount: float | None
+    tax_amount: int | float | None
     remarks: str | None = None
 
 
@@ -48,15 +49,15 @@ class DocumentExtraction(BaseModel):
     buyer_address: str | None = None
     document_number: str | None
     document_date: str | None
-    amount_before_tax: float | None
-    tax_amount: float | None
-    total_amount: float | None
-    total_quantity: float | None = None
+    amount_before_tax: int | float | None
+    tax_amount: int | float | None
+    total_amount: int | float | None
+    total_quantity: int | float | None = None
     remarks: str | None = None
     items: list[LineItem]
 
 
-TemplateScalar = str | float | bool | None
+TemplateScalar = str | int | float | bool | None
 
 
 class TemplateExtraction(BaseModel):
@@ -117,6 +118,10 @@ class ExtractionRead(BaseModel):
     evidence: list[FieldEvidence]
     input_scope: InputScope | None = None
 
+    @field_serializer("original_result", "result", when_used="json")
+    def preserve_unsafe_integer_tokens(self, value):
+        return stringify_unsafe_integers(value.model_dump(mode="python"))
+
 
 class ReviewUpdate(BaseModel):
     # Stable identities survive deletion/reordering; null entries mean new details.
@@ -127,4 +132,6 @@ class ReviewUpdate(BaseModel):
     expected_version: int = Field(ge=0)
     result: DocumentExtraction | TemplateExtraction
     # 用户选择忽略的校验问题下标（对应本次评估的 issues 列表）
-    ignored_issue_indices: list[int] = Field(default_factory=list, max_length=100)
+    ignored_issue_indices: list[Annotated[int, Field(ge=0, strict=True)]] = Field(
+        default_factory=list, max_length=100
+    )

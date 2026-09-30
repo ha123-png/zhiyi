@@ -40,7 +40,7 @@ class ModelProfileActivate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: int = Field(ge=1)
-    # 云端方案首次激活时的数据离开本机确认；确认后写回方案，后续激活不再询问
+    # 每次激活云端方案都需要确认文件离开本机，不沿用旧激活的确认。
     acknowledge_remote_data_transfer: bool = False
 
 

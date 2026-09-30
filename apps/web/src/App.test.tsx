@@ -66,9 +66,9 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "文件提取" }));
 
-    expect(screen.getByRole("heading", { name: "文件提取" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "文件提取" })).toBeInTheDocument();
     expect(
-      screen.getByText("拖入文件并匹配模板后，提取结果表与校验问题将显示在此"),
+      await screen.findByText("拖入文件并匹配模板后，提取结果表与校验问题将显示在此"),
     ).toBeInTheDocument();
   });
 
@@ -129,7 +129,7 @@ describe("App", () => {
     // 设置页已接入：配置卡可见
     fireEvent.click(screen.getByRole("button", { name: "设置" }));
     expect(
-      screen.getByRole("heading", { name: "系统设置" }),
+      await screen.findByRole("heading", { name: "系统设置" }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("heading", { name: /AI 服务配置/ }),
@@ -142,7 +142,7 @@ describe("App", () => {
     // 接口页已接入：集成 API 与 MCP 文档
     fireEvent.click(screen.getByRole("button", { name: "接口" }));
     expect(
-      screen.getByRole("heading", { name: "接口与 MCP" }),
+      await screen.findByRole("heading", { name: "接口与 MCP" }),
     ).toBeInTheDocument();
     expect(screen.getByText("读写密钥")).toBeInTheDocument();
   });
@@ -192,6 +192,7 @@ describe("App", () => {
 
     const { container } = render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "文件提取" }));
+    await screen.findByRole("heading", { name: "文件提取" });
     const fileInput = container.querySelector(
       'input[type="file"]',
     ) as HTMLInputElement;

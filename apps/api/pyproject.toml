@@ -1,6 +1,6 @@
 [project]
 name = "document-pipeline-api"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local-first multimodal document data pipeline API"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -39,6 +39,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/document_pipeline_api"]
+
+[tool.uv]
+# MCP brings PyJWT transitively; keep fresh resolutions above the reviewed
+# security fixes and the follow-up compact-token compatibility correction.
+constraint-dependencies = ["pyjwt>=2.15.1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

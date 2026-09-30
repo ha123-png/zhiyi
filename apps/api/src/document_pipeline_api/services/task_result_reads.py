@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from document_pipeline_api.models import DataRowRecord, ExtractionRecord, FileCurrentDataRecord, TaskRecord
 from document_pipeline_api.services.file_collections import file_details
 from document_pipeline_api.services.read_snapshot import begin_read_snapshot
+from document_pipeline_api.schemas.json_numbers import stringify_unsafe_integers
 
 ResultView = Literal["current", "initial"]
 FIELD_PAGE_SIZE = 12
@@ -142,7 +143,7 @@ def read_task_result_page(
                 issue[key] = value[:length]
                 remaining -= len(issue[key])
         issues.append(issue)
-    return {
+    return stringify_unsafe_integers({
         "task_id": task_id, "filename": task.display_filename, "view": view,
         "document_kind": record.document_kind, "template_id": record.template_id,
         "template_version": record.template_version, "model_name": record.model_name,
@@ -161,7 +162,7 @@ def read_task_result_page(
         "note": ("当前事实。按页和字段页读取；后续读取带 review_version 作为 expected_version。"
                  if view == "current" else "初次提取证据，非当前数据；用户修订和删除不会改变这份证据。")
                 + "truncated_paths 中的值不是完整值，用 get_task_result_value 按 offset 读取；items 路径的数字是从 0 开始的全文件位置。",
-    }
+    })
 
 
 def read_task_result_value(
@@ -205,7 +206,7 @@ def read_task_result_value(
         value = None if kind == "null" else kind == "true" if kind in {"true", "false"} else value
     length = length or 0
     more = kind == "text" and offset + limit < length
-    return {"task_id": task_id, "view": view, "path": path, "value": value, "value_type": kind,
+    return stringify_unsafe_integers({"task_id": task_id, "view": view, "path": path, "value": value, "value_type": kind,
             "version": current.current_version if view == "current" else None,
             "offset": offset, "total_characters": length, "next_offset": offset + limit if more else None,
-            "complete": not more and offset == 0}
+            "complete": not more and offset == 0})

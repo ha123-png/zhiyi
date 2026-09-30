@@ -1,5 +1,7 @@
 import { ConfirmDialog } from "./ConfirmDialog";
 import { useModalFocus } from "../useModalFocus";
+import { useUnsavedChanges } from "../useUnsavedChanges";
+import { parseNumericInput } from "../numericInput";
 import { SmartPoolSettings } from "./SmartPoolSettings";
 import { DetailRowAction } from "./DetailRowAction";
 import { DetailPagination, useDetailPage } from "./DetailPagination";
@@ -70,6 +72,7 @@ function formatDateTime(iso: string): string {
 interface HeaderColumn {
   key: string;
   label: string;
+  numeric: boolean;
 }
 
 interface ItemColumn {
@@ -123,7 +126,7 @@ const documentItemLabels: Record<string, string> = {
  * 动态生成（平铺的内置单据结果），保证数据始终可读、不出现空白表。
  */
 function headerColumnsFor(extraction: Extraction | null): HeaderColumn[] {
-  if (extraction?.current_schema?.length) return extraction.current_schema.filter(field => field.section === "header").map(field => ({key: field.key, label: field.label}));
+  if (extraction?.current_schema?.length) return extraction.current_schema.filter(field => field.section === "header").map(field => ({key: field.key, label: field.label, numeric: field.value_type === "number"}));
   const template = extraction?.template;
   if (template && template.fields.some((f) => f.section === "header" && f.key)) {
     return template.fields
@@ -131,19 +134,22 @@ function headerColumnsFor(extraction: Extraction | null): HeaderColumn[] {
       .map((f) => ({
         key: f.key as string,
         label: template.output_mapping?.[f.key as string] || f.label,
+        numeric: f.value_type === "number",
       }));
   }
   if (extraction && isTemplateResult(extraction.result)) {
-    return Object.keys(extraction.result.header).map((key) => ({
+    const result = extraction.result;
+    return Object.keys(result.header).map((key) => ({
       key,
       label: key,
+      numeric: typeof result.header[key] === "number",
     }));
   }
   if (extraction) {
     const result = extraction.result as unknown as Record<string, unknown>;
     return Object.keys(result)
       .filter((key) => key !== "items")
-      .map((key) => ({ key, label: documentHeaderLabels[key] ?? key }));
+      .map((key) => ({ key, label: documentHeaderLabels[key] ?? key, numeric: typeof result[key] === "number" }));
   }
   return [];
 }
@@ -401,13 +407,13 @@ function itemEvidencePath(extraction: Extraction, row: number, key: string): str
   return `items[${row}].${documentItemKeys[key] ?? key}`;
 }
 
-function editedValue(raw: string, previous: TemplateValue | undefined): TemplateValue {
+function editedValue(raw: string, previous: TemplateValue | undefined, numeric: boolean, label: string): TemplateValue {
+  if (numeric) {
+    if (raw === "—") return null;
+    return parseNumericInput(raw, label);
+  }
   const value = raw.trim();
   if (!value || value === "—") return null;
-  if (typeof previous === "number") {
-    const parsed = Number(value.replaceAll(",", ""));
-    return Number.isFinite(parsed) ? parsed : previous;
-  }
   if (typeof previous === "boolean") return value === "是" || value.toLowerCase() === "true";
   return value;
 }
@@ -490,6 +496,9 @@ export function ExtractPage({
   const [extractValidationIssues, setExtractValidationIssues] = useState<
     ValidationIssue[]
   >([]);
+  const invalidReviewDraftsRef = useRef<Record<string, string>>({});
+  const [invalidReviewDrafts, setInvalidReviewDrafts] = useState<Record<string, string>>({});
+  const [numericInputError, setNumericInputError] = useState<string | null>(null);
 
   const [templates, setTemplates] = useState<ExtractionTemplate[]>([]);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>(
@@ -502,7 +511,12 @@ export function ExtractPage({
   const [nameChoices, setNameChoices] = useState<Record<string, string>>({});
   const [fileHistoryOpen, setFileHistoryOpen] = useState(false);
   const [draftDetailIds, setDraftDetailIds] = useState<number[] | undefined>();
-  useEffect(() => { setDraftDetailIds(extraction?.detail_ids); }, [extraction]);
+  useEffect(() => {
+    setDraftDetailIds(extraction?.detail_ids);
+    invalidReviewDraftsRef.current = {};
+    setInvalidReviewDrafts({});
+    setNumericInputError(null);
+  }, [extraction]);
   const [draftResult, setDraftResult] = useState<ExtractionResult | null>(null);
   const [loading, setLoading] = useState(false);
   const uploadInFlight = useRef(false);
@@ -769,6 +783,24 @@ export function ExtractPage({
   const selectedEvidence = extraction?.evidence?.find(
     (item) => item.field_path === selectedEvidencePath,
   );
+  const unsavedReview = useUnsavedChanges(() => {
+    if (demo || !task || !extraction || extraction.task_id !== task.id || !draftResult) return false;
+    const baselineIgnored = extraction.validation_issues
+      .map((issue, index) => issue.ignored === true ? index : -1)
+      .filter((index) => index >= 0);
+    const draftIgnored = extractValidationIssues
+      .filter((issue) => issue.ignored)
+      .map((issue) => issue.index);
+    const baselineName = extraction.file_name?.confirmed_filename
+      ?? extraction.file_name?.suggested_filename
+      ?? task.filename;
+    const chosenName = nameChoices[task.id] ?? baselineName;
+    return JSON.stringify(draftResult) !== JSON.stringify(extraction.result)
+      || JSON.stringify(draftDetailIds) !== JSON.stringify(extraction.detail_ids)
+      || JSON.stringify(draftIgnored) !== JSON.stringify(baselineIgnored)
+      || chosenName !== baselineName
+      || Object.keys(invalidReviewDrafts).length > 0;
+  });
 
   const templateDisplayName = (() => {
     // Upload controls describe the next file, never how a historical result was produced.
@@ -821,8 +853,36 @@ export function ExtractPage({
     }
   }, []);
 
+  function discardCurrentReviewDraft() {
+    if (extraction) {
+      setDraftResult(structuredClone(extraction.result));
+      setDraftDetailIds(extraction.detail_ids);
+      setExtractValidationIssues(mapValidationIssues(extraction));
+    }
+    invalidReviewDraftsRef.current = {};
+    setInvalidReviewDrafts({});
+    setNumericInputError(null);
+    if (task) {
+      setNameChoices((current) => {
+        if (!(task.id in current)) return current;
+        const next = { ...current };
+        delete next[task.id];
+        return next;
+      });
+    }
+  }
+
+  /** A new upload replaces the active result, so it must pass the same discard guard as navigation. */
+  function handleFiles(files: (File | NativeImportFile)[], duplicatePolicy: "reject" | "allow" = "reject", selectedTemplate?: string) {
+    if (files.length === 0) return;
+    unsavedReview.protect(() => {
+      discardCurrentReviewDraft();
+      void processFiles(files, duplicatePolicy, selectedTemplate);
+    });
+  }
+
   /** 批量上传：每个文件入队为一个任务，全部进入队列后由后端串行处理。 */
-  async function handleFiles(files: (File | NativeImportFile)[], duplicatePolicy: "reject" | "allow" = "reject", selectedTemplate?: string) {
+  async function processFiles(files: (File | NativeImportFile)[], duplicatePolicy: "reject" | "allow" = "reject", selectedTemplate?: string) {
     if (files.length === 0 || uploadInFlight.current) return;
     uploadInFlight.current = true;
     setError(null);
@@ -894,14 +954,17 @@ export function ExtractPage({
     onTasksChange?.();
   }
 
-  async function confirmDuplicateUpload() {
+  function confirmDuplicateUpload() {
     const pending = duplicateUploads[0];
     if (!pending || duplicateBusy || uploadInFlight.current) return;
-    setDuplicateBusy(true);
-    try {
-      await handleFiles([pending.file], "allow", pending.selection);
-      setDuplicateUploads((current) => current.slice(1));
-    } finally { setDuplicateBusy(false); }
+    unsavedReview.protect(() => {
+      discardCurrentReviewDraft();
+      setDuplicateBusy(true);
+      void processFiles([pending.file], "allow", pending.selection)
+        .then(() => setDuplicateUploads((current) => current.slice(1)))
+        .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "上传失败"))
+        .finally(() => setDuplicateBusy(false));
+    });
   }
 
   async function chooseFiles() {
@@ -974,6 +1037,10 @@ export function ExtractPage({
   }, [batch, onTasksChange, loadResultForTask]);
 
   async function handleSave() {
+    if (Object.keys(invalidReviewDraftsRef.current).length > 0) {
+      setNumericInputError((current) => current ?? "请先修正所有标记为无效的数字字段，再保存核对结果。");
+      return;
+    }
     if (!task || !extraction || !draftResult || task.id !== extraction.task_id || saving) return;
     const seq = ++loadSeqRef.current;
     setError(null);
@@ -1010,17 +1077,48 @@ export function ExtractPage({
     );
   }
 
+  function rememberInvalidReviewDraft(key: string, raw: string, reason: unknown) {
+    const next = { ...invalidReviewDraftsRef.current, [key]: raw };
+    invalidReviewDraftsRef.current = next;
+    setInvalidReviewDrafts(next);
+    setNumericInputError(reason instanceof Error ? reason.message : "数字格式无效");
+  }
+
+  function clearInvalidReviewDraft(key: string) {
+    if (!(key in invalidReviewDraftsRef.current)) return;
+    const next = { ...invalidReviewDraftsRef.current };
+    delete next[key];
+    invalidReviewDraftsRef.current = next;
+    setInvalidReviewDrafts(next);
+    if (Object.keys(next).length === 0) setNumericInputError(null);
+  }
+
   function updateHeaderDraft(key: string, raw: string) {
+    if (!draftResult) return;
+    const column = headerColumns.find((item) => item.key === key);
+    let previous: TemplateValue | undefined;
+    if (isTemplateResult(draftResult)) previous = draftResult.header[key];
+    else {
+      const target = documentHeaderKeys[key];
+      if (target) previous = draftResult[target] as TemplateValue;
+    }
+    let value: TemplateValue;
+    try {
+      value = editedValue(raw, previous, column?.numeric ?? typeof previous === "number", column?.label ?? key);
+    } catch (reason) {
+      rememberInvalidReviewDraft(`h-${key}`, raw, reason);
+      return;
+    }
+    clearInvalidReviewDraft(`h-${key}`);
     setDraftResult((current) => {
       if (!current) return current;
       const next = structuredClone(current);
       if (isTemplateResult(next)) {
-        next.header[key] = editedValue(raw, next.header[key]);
+        next.header[key] = value;
       } else {
         const target = documentHeaderKeys[key];
         if (target) {
-          const previous = next[target];
-          next[target] = editedValue(raw, previous as TemplateValue) as never;
+          next[target] = value as never;
         }
       }
       return next;
@@ -1029,17 +1127,33 @@ export function ExtractPage({
   }
 
   function updateItemDraft(row: number, key: string, raw: string) {
+    if (!draftResult) return;
+    const column = itemColumns.find((item) => item.key === key);
+    let previous: TemplateValue | undefined;
+    if (isTemplateResult(draftResult)) previous = draftResult.items[row]?.[key];
+    else {
+      const target = documentItemKeys[key];
+      if (target) previous = draftResult.items[row]?.[target] as TemplateValue | undefined;
+    }
+    let value: TemplateValue;
+    try {
+      value = editedValue(raw, previous, column?.numeric ?? typeof previous === "number", column?.label ?? key);
+    } catch (reason) {
+      rememberInvalidReviewDraft(`${row}-${key}`, raw, reason);
+      return;
+    }
+    clearInvalidReviewDraft(`${row}-${key}`);
     setDraftResult((current) => {
       if (!current) return current;
       const next = structuredClone(current);
       if (isTemplateResult(next)) {
         const item = next.items[row];
-        if (item) item[key] = editedValue(raw, item[key]);
+        if (item) item[key] = value;
       } else {
         const item = next.items[row];
         const target = documentItemKeys[key];
         if (item && target) {
-          item[target] = editedValue(raw, item[target] as TemplateValue) as never;
+          item[target] = value as never;
         }
       }
       return next;
@@ -1080,6 +1194,7 @@ export function ExtractPage({
         onClose={() => setDuplicateUploads((pending) => pending.slice(1))}
         onConfirm={() => void confirmDuplicateUpload()}
       />
+      {unsavedReview.dialog}
       {fileHistoryOpen && task && <FileRevisionHistory taskId={task.id} filename={taskDisplayName(task)} onClose={() => setFileHistoryOpen(false)} />}
       {extraction?.has_current_data === false && <p className="callout">当前数据已清空。原文件和历史版本仍可查看。</p>}
       <div className="page-header">
@@ -1092,8 +1207,13 @@ export function ExtractPage({
       </div>
 
       {error && (
-        <div className="callout danger" style={{ marginBottom: 16 }}>
+        <div className="callout danger" role="alert" style={{ marginBottom: 16 }}>
           {error}
+        </div>
+      )}
+      {numericInputError && (
+        <div className="callout danger" role="alert" style={{ marginBottom: 16 }}>
+          {numericInputError}
         </div>
       )}
 
@@ -1363,7 +1483,7 @@ export function ExtractPage({
                             : ""
                         }`}
                         editing={editingExtractCell === `h-${col.key}`}
-                        value={headerValues[col.key]}
+                        value={invalidReviewDrafts[`h-${col.key}`] ?? headerValues[col.key]}
                         onCancel={() => setEditingExtractCell(null)}
                         onCommit={(raw) => updateHeaderDraft(col.key, raw)}
                       />
@@ -1415,6 +1535,17 @@ export function ExtractPage({
                           }
                         >
                           <td className="detail-row-gutter">{demo ? idx + 1 : <DetailRowAction index={idx + 1} disabled={saving} onDelete={() => {
+                            const shifted: Record<string, string> = {};
+                            for (const [key, raw] of Object.entries(invalidReviewDraftsRef.current)) {
+                              const match = key.match(/^(\d+)-/);
+                              if (!match) { shifted[key] = raw; continue; }
+                              const invalidRow = Number(match[1]);
+                              if (invalidRow < idx) shifted[key] = raw;
+                              else if (invalidRow > idx) shifted[`${invalidRow - 1}${key.slice(match[1].length)}`] = raw;
+                            }
+                            invalidReviewDraftsRef.current = shifted;
+                            setInvalidReviewDrafts(shifted);
+                            if (Object.keys(shifted).length === 0) setNumericInputError(null);
                             setDraftResult(current => current ? {...current, items: current.items.filter((_, index) => index !== idx)} as ExtractionResult : current);
                             setDraftDetailIds(current => current?.filter((_, index) => index !== idx));
                             setEditingExtractCell(null); setSelectedEvidencePath(null);
@@ -1454,7 +1585,7 @@ export function ExtractPage({
                             >
                               <EditableText
                                 editing={editingExtractCell === `${idx}-${col.key}`}
-                                value={row[col.key]}
+                                value={invalidReviewDrafts[`${idx}-${col.key}`] ?? row[col.key]}
                                 onCancel={() => setEditingExtractCell(null)}
                                 onCommit={(raw) => updateItemDraft(idx, col.key, raw)}
                               />

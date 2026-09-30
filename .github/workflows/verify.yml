@@ -44,9 +44,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Check Python and whitespace
         run: |
-          uv run --project apps/api --no-sync ruff check apps/api/src apps/api/tests scripts/prepare-acceptance.py scripts/smoke-upgrade.py scripts/smoke-smart.py scripts/smoke-invoice.py scripts/prepare-source-acceptance.py scripts/smoke-prefix.py scripts/prepare-card-acceptance.py scripts/serve-verification.py scripts/smoke-design-journey.py scripts/smoke-template-contract.py scripts/verify-release-model.py scripts/verify-release-pressure.py
+          uv run --project apps/api --no-sync ruff check apps/api/src apps/api/tests scripts/prepare-acceptance.py scripts/smoke-upgrade.py scripts/smoke-smart.py scripts/smoke-invoice.py scripts/prepare-source-acceptance.py scripts/smoke-prefix.py scripts/prepare-card-acceptance.py scripts/serve-verification.py scripts/smoke-design-journey.py scripts/smoke-template-contract.py scripts/verify-release-model.py scripts/verify-release-pressure.py scripts/collect-third-party-notices.py scripts/verify-packaged-business.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git diff --check
+      - name: Check public release helper contracts
+        run: uv run --project apps/api --no-sync python -m unittest discover -s scripts/tests -p "test_*.py"
       - name: Web tests
         run: npm run test:web
       - name: Web build
@@ -112,6 +114,7 @@ jobs:
       - name: Check packaged install and uninstall with isolated data
         run: ./scripts/smoke-release-lifecycle.ps1
       - name: Keep Windows candidate
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-candidate-${{ github.sha }}
@@ -121,4 +124,8 @@ jobs:
             .local/release/dist/installer/*-win-x64-setup.exe
             .local/release/dist/RELEASE_MANIFEST.json
             .local/release/dist/SHA256SUMS.txt
+            .local/release/dist/PAYLOAD_MANIFEST.json
             .local/release/dist/resources/**
+            .local/release/audit/**
+            .local/evidence/v0.6.0/*-production-lifecycle/**/*.json
+            .local/evidence/v0.6.0/*-production-lifecycle/**/*.log

@@ -7,6 +7,7 @@ from sqlalchemy.orm import load_only
 
 from document_pipeline_api.models import FileRevisionDetailRecord, FileRevisionRecord, TaskRecord
 from document_pipeline_api.services.read_snapshot import begin_read_snapshot
+from document_pipeline_api.schemas.json_numbers import stringify_unsafe_integers
 
 
 def revision_summary(record: FileRevisionRecord) -> dict:
@@ -50,6 +51,7 @@ def revision_details(session, task_id: str, revision_id: str, *, page: int = 1, 
         FileRevisionDetailRecord.revision_id == revision_id,
     ).order_by(FileRevisionDetailRecord.item_index, FileRevisionDetailRecord.row_id)
       .offset((page - 1) * page_size).limit(page_size)).all()
-    return {**revision_summary(record), "schema": json.loads(record.schema_json),
+    return stringify_unsafe_integers({**revision_summary(record), "schema": json.loads(record.schema_json),
             "header": changes["header"], "items": [json.loads(item) for item in items],
-            "page": page, "page_size": page_size, "total_details": record.total_details}
+            "validation": changes.get("validation"),
+            "page": page, "page_size": page_size, "total_details": record.total_details})

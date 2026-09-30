@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Loader2, ListChecks } from "lucide-react";
 import { getTemplates, updateTemplateSmartPool } from "../api";
 import type { ExtractionTemplate } from "../types";
@@ -7,27 +7,50 @@ import { Icon } from "./Icon";
 /** 智能匹配预选池：只有勾选的模板才会被智能匹配选中（设置 → 左侧）。 */
 export function SmartPoolSettings({ onUpdated }: { onUpdated?: (templates: ExtractionTemplate[]) => void } = {}) {
   const [templates, setTemplates] = useState<ExtractionTemplate[]>([]);
-  const [busyId, setBusyId] = useState<string | null>(null);
+  const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+  const templatesRef = useRef<ExtractionTemplate[]>([]);
+  const requestSeqRef = useRef(new Map<string, number>());
 
   useEffect(() => {
+    let current = true;
     getTemplates(true)
-      .then((items) => setTemplates(items.filter((t) => t.is_active !== false)))
-      .catch((reason) => setError(reason instanceof Error ? reason.message : "模板读取失败。"));
+      .then((items) => {
+        if (!current) return;
+        const active = items.filter((t) => t.is_active !== false);
+        templatesRef.current = active;
+        setTemplates(active);
+      })
+      .catch((reason) => {
+        if (current) setError(reason instanceof Error ? reason.message : "模板读取失败。");
+      });
+    return () => { current = false; };
   }, []);
 
   async function toggle(template: ExtractionTemplate, checked: boolean) {
-    setBusyId(template.id);
+    const seq = (requestSeqRef.current.get(template.id) ?? 0) + 1;
+    requestSeqRef.current.set(template.id, seq);
+    setBusyIds((current) => new Set(current).add(template.id));
     setError(null);
     try {
       const updated = await updateTemplateSmartPool(template.id, checked);
-      const next = templates.map((item) => (item.id === updated.id ? updated : item));
+      if (requestSeqRef.current.get(template.id) !== seq) return;
+      const next = templatesRef.current.map((item) => (item.id === updated.id ? updated : item));
+      templatesRef.current = next;
       setTemplates(next);
       onUpdated?.(next);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "保存预选池失败。");
+      if (requestSeqRef.current.get(template.id) === seq) {
+        setError(reason instanceof Error ? reason.message : "保存预选池失败。");
+      }
     } finally {
-      setBusyId(null);
+      if (requestSeqRef.current.get(template.id) === seq) {
+        setBusyIds((current) => {
+          const next = new Set(current);
+          next.delete(template.id);
+          return next;
+        });
+      }
     }
   }
 
@@ -49,7 +72,7 @@ export function SmartPoolSettings({ onUpdated }: { onUpdated?: (templates: Extra
               <input
                 type="checkbox"
                 checked={template.in_smart_pool !== false}
-                disabled={busyId === template.id}
+                disabled={busyIds.has(template.id)}
                 onChange={(event) => void toggle(template, event.target.checked)}
               />
               <span className="smart-pool-name">
@@ -59,7 +82,7 @@ export function SmartPoolSettings({ onUpdated }: { onUpdated?: (templates: Extra
               <span className="small muted smart-pool-desc">
                 {template.engine_kind === "autonomous" ? "可选兜底 · 普通模板均不适用时才使用" : template.description || "尚未填写用途"}
               </span>
-              {busyId === template.id && (
+              {busyIds.has(template.id) && (
                 <Icon icon={Loader2} size={13} className="spin" />
               )}
             </label>

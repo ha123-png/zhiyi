@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Archive, Check, ChevronDown, Eye, EyeOff, Loader2, Pencil, Plus, Zap } from "lucide-react";
 import {
   activateModelProfile,
@@ -9,6 +9,7 @@ import {
   updateModelProfile,
 } from "../api";
 import type { ModelProfile, ModelProfileDraft, ModelProbeResult, ModelProviderName } from "../types";
+import { useUnsavedChanges } from "../useUnsavedChanges";
 import { Icon } from "./Icon";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { Toast, useToast } from "./Toast";
@@ -52,6 +53,37 @@ function inferPreset(draft: Pick<ModelProfileDraft, "provider" | "base_url">): S
   return "custom";
 }
 
+function draftFingerprint(draft: ModelProfileDraft): string {
+  return JSON.stringify({
+    name: draft.name,
+    provider: draft.provider,
+    base_url: draft.base_url,
+    model_name: draft.model_name,
+    reasoning_effort: draft.reasoning_effort,
+    timeout_seconds: draft.timeout_seconds,
+    context_length: draft.context_length,
+    temperature: draft.temperature,
+    multimodal: draft.multimodal,
+    api_key: draft.api_key?.trim() || "",
+    acknowledge_remote_data_transfer: draft.acknowledge_remote_data_transfer,
+  });
+}
+
+function profileDraft(profile: ModelProfile): ModelProfileDraft {
+  return {
+    name: profile.name,
+    provider: profile.provider,
+    base_url: profile.base_url,
+    model_name: profile.model_name,
+    reasoning_effort: profile.reasoning_effort,
+    timeout_seconds: profile.timeout_seconds,
+    context_length: profile.context_policy === "auto" ? null : profile.context_length,
+    temperature: profile.temperature,
+    multimodal: profile.multimodal,
+    acknowledge_remote_data_transfer: false,
+  };
+}
+
 export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProfileChanged?: () => void } = {}) {
   const [profiles, setProfiles] = useState<ModelProfile[]>([]);
   const [archiveTarget, setArchiveTarget] = useState<ModelProfile | null>(null);
@@ -71,41 +103,80 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
   // 云端方案首次激活的确认：参考原型，创建/编辑时不弹，使用（激活）时才确认
   const [confirmActivate, setConfirmActivate] = useState<ModelProfile | null>(null);
   const [servicePreset, setServicePreset] = useState<ServicePreset>("lm_studio");
+  const selectionEpochRef = useRef(0);
+  const draftRevisionRef = useRef(0);
+  const reloadSeqRef = useRef(0);
+  const probeSeqRef = useRef(0);
+  const savedDraftRef = useRef(draftFingerprint(EXAMPLE_DRAFT));
+  const unsaved = useUnsavedChanges(() => draftFingerprint(draft) !== savedDraftRef.current);
 
   useEffect(() => {
     void reload();
   }, []);
 
-  async function reload(preferredId?: string) {
+  async function reload(preferredId?: string, guard?: { epoch: number; revision: number }): Promise<boolean> {
+    const seq = ++reloadSeqRef.current;
+    const epoch = selectionEpochRef.current;
+    const revision = draftRevisionRef.current;
     setLoading(true);
     try {
       const items = await getModelProfiles();
+      if (seq !== reloadSeqRef.current) return false;
       setProfiles(items);
       const selected = items.find((item) => item.id === preferredId)
         ?? items.find((item) => item.is_active)
         ?? items.find((item) => !item.is_archived);
-      if (selected) selectProfile(selected);
+      const maySelect = selectionEpochRef.current === epoch
+        && draftRevisionRef.current === revision
+        && (!guard || (guard.epoch === epoch && guard.revision === revision));
+      // This reload follows an explicit server operation. The epoch/revision guard
+      // guarantees a newer local edit cannot be replaced by its response.
+      if (selected && maySelect) {
+        applyProfile(selected);
+        return true;
+      }
+      return false;
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "AI 服务方案加载失败。");
+      if (seq === reloadSeqRef.current && selectionEpochRef.current === epoch
+        && draftRevisionRef.current === revision) {
+        setError(reason instanceof Error ? reason.message : "AI 服务方案加载失败。");
+      }
+      return false;
     } finally {
-      setLoading(false);
+      if (seq === reloadSeqRef.current) setLoading(false);
     }
   }
 
-  function selectProfile(profile: ModelProfile) {
-    setSelectedId(profile.id);
-    setDraft({
-      name: profile.name,
-      provider: profile.provider,
-      base_url: profile.base_url,
-      model_name: profile.model_name,
-      reasoning_effort: profile.reasoning_effort,
-      timeout_seconds: profile.timeout_seconds,
-      context_length: profile.context_policy === "auto" ? null : profile.context_length,
-      temperature: profile.temperature,
-      multimodal: profile.multimodal,
-      acknowledge_remote_data_transfer: false,
+  function updateDraft(patch: Partial<ModelProfileDraft>) {
+    draftRevisionRef.current += 1;
+    probeSeqRef.current += 1;
+    setProbeState({ loading: false, result: null });
+    setError(null);
+    setMessage(null);
+    setDraft((current) => {
+      const modelIdentityChanged = (patch.provider !== undefined && patch.provider !== current.provider)
+        || (patch.base_url !== undefined && patch.base_url !== current.base_url)
+        || (patch.model_name !== undefined && patch.model_name !== current.model_name);
+      return {
+        ...current,
+        ...patch,
+        ...(modelIdentityChanged && !("multimodal" in patch) ? { multimodal: null } : {}),
+      };
     });
+  }
+
+  function selectProfile(profile: ModelProfile) {
+    unsaved.protect(() => applyProfile(profile));
+  }
+
+  function applyProfile(profile: ModelProfile) {
+    selectionEpochRef.current += 1;
+    draftRevisionRef.current += 1;
+    probeSeqRef.current += 1;
+    const nextDraft = profileDraft(profile);
+    savedDraftRef.current = draftFingerprint(nextDraft);
+    setSelectedId(profile.id);
+    setDraft(nextDraft);
     setServicePreset(inferPreset(profile));
     setMessage(null);
     setError(null);
@@ -113,6 +184,14 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
   }
 
   function newProfile() {
+    unsaved.protect(applyNewProfile);
+  }
+
+  function applyNewProfile() {
+    selectionEpochRef.current += 1;
+    draftRevisionRef.current += 1;
+    probeSeqRef.current += 1;
+    savedDraftRef.current = draftFingerprint(EMPTY_DRAFT);
     setSelectedId(null);
     setDraft(EMPTY_DRAFT);
     setServicePreset("lm_studio");
@@ -126,20 +205,36 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
       setError("请填写方案名称、服务地址和模型名称。");
       return;
     }
+    const epoch = selectionEpochRef.current;
+    const revision = draftRevisionRef.current;
+    const selectedAtStart = selectedId;
+    const submittedDraft = { ...draft };
     setSaving(true);
     setError(null);
     setMessage(null);
     try {
       const current = profiles.find((item) => item.id === selectedId);
-      const body = { ...draft, api_key: draft.api_key?.trim() || undefined };
+      const body = { ...submittedDraft, api_key: submittedDraft.api_key?.trim() || undefined };
       const saved = current
         ? await updateModelProfile(current.id, current.version, body)
         : await createModelProfile(body);
-      setDraft((value) => ({ ...value, api_key: "" }));
-      await reload(saved.id);
-      setMessage(current ? "已保存为新版本；排队中的旧任务不会改变。" : "方案已创建，请确认后激活。");
+      if (selectionEpochRef.current === epoch) {
+        // A late save from a profile that the user has since switched away from
+        // must not redefine the current profile's clean baseline.
+        savedDraftRef.current = draftFingerprint(profileDraft(saved));
+      }
+      let reloadGuard = { epoch, revision };
+      if (selectionEpochRef.current === epoch && draftRevisionRef.current === revision && selectedId === selectedAtStart) {
+        setDraft((value) => ({ ...value, api_key: "" }));
+        draftRevisionRef.current += 1;
+        reloadGuard = { epoch, revision: draftRevisionRef.current };
+      }
+      const selectedAfterSave = await reload(saved.id, reloadGuard);
+      if (selectedAfterSave) setMessage(current ? "已保存为新版本；排队中的旧任务不会改变。" : "方案已创建，请确认后激活。");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "保存失败。");
+      if (selectionEpochRef.current === epoch && draftRevisionRef.current === revision) {
+        setError(reason instanceof Error ? reason.message : "保存失败。");
+      }
     } finally {
       setSaving(false);
     }
@@ -150,24 +245,37 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
       setError("请先填写服务地址和模型名称，再测试连接。");
       return;
     }
+    const epoch = selectionEpochRef.current;
+    const revision = draftRevisionRef.current;
+    const selectedAtStart = selectedId;
+    const seq = ++probeSeqRef.current;
     setProbeState({ loading: true, result: null });
     setError(null);
     setMessage(null);
     try {
       const body = { ...draft, api_key: draft.api_key?.trim() || undefined };
       const result = await probeModelProfile(body, selectedId ?? undefined);
+      if (seq !== probeSeqRef.current || epoch !== selectionEpochRef.current
+        || revision !== draftRevisionRef.current || selectedAtStart !== selectedId) return;
       setProbeState({ loading: false, result });
       // 探测到明确的多模态结论时，固定写入方案（保存后不再跟随表单变化）
       if (result.multimodal !== null) {
+        draftRevisionRef.current += 1;
         setDraft((value) => ({ ...value, multimodal: result.multimodal }));
       }
     } catch (reason) {
+      if (seq !== probeSeqRef.current || epoch !== selectionEpochRef.current
+        || revision !== draftRevisionRef.current || selectedAtStart !== selectedId) return;
       setProbeState({ loading: false, result: null });
       setError(reason instanceof Error ? reason.message : "测试连接失败。");
     }
   }
 
   function requestActivate(profile: ModelProfile) {
+    unsaved.protect(() => beginActivate(profile));
+  }
+
+  function beginActivate(profile: ModelProfile) {
     // 每次切换到云端方案都必须确认，防止用户不小心切到了云端方案
     if (profile.is_remote) {
       setConfirmActivate(profile);
@@ -177,37 +285,43 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
   }
 
   async function doActivate(profile: ModelProfile, acknowledge: boolean) {
+    const guard = { epoch: selectionEpochRef.current, revision: draftRevisionRef.current };
     setSaving(true);
     setError(null);
     setMessage(null);
     try {
       await activateModelProfile(profile.id, profile.version, acknowledge);
       setConfirmActivate(null);
-      await reload(profile.id);
+      const selectedAfterActivation = await reload(profile.id, guard);
       // 方案切换是全局状态：通知顶部状态栏和本地模型卡片立即重新探测，
       // 不等下一次进入页面或刷新浏览器。
       onActiveProfileChanged?.();
-      setMessage("已激活；之后新上传的文件会使用这套方案。");
+      if (selectedAfterActivation) setMessage("已激活；之后新上传的文件会使用这套方案。");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "激活失败。");
+      if (selectionEpochRef.current === guard.epoch && draftRevisionRef.current === guard.revision) {
+        setError(reason instanceof Error ? reason.message : "激活失败。");
+      }
     } finally {
       setSaving(false);
     }
   }
 
   async function archive(profile: ModelProfile) {
+    const guard = { epoch: selectionEpochRef.current, revision: draftRevisionRef.current };
     setSaving(true);
     setError(null);
     setMessage(null);
     try {
       await archiveModelProfile(profile.id);
       setArchiveTarget(null);
-      await reload();
-      setMessage("方案已停用；停用后不能再激活，但历史任务快照不受影响。");
+      const selectedAfterArchive = await reload(undefined, guard);
+      if (selectedAfterArchive) setMessage("方案已停用；停用后不能再激活，但历史任务快照不受影响。");
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : "停用失败。";
-      setError(message);
-      notify(message, "error");
+      if (selectionEpochRef.current === guard.epoch && draftRevisionRef.current === guard.revision) {
+        setError(message);
+        notify(message, "error");
+      }
     } finally {
       setSaving(false);
     }
@@ -222,6 +336,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
         本地方案的请求预算应与模型实际加载容量一致；云端方案独立设置。新设置用于后续请求，已有任务保留原方案快照。
         云端方案的"文件离开本机"确认会在激活（使用）时弹出。
       </div>
+      {unsaved.dialog}
       {error && <div className="callout danger">{error}</div>}
       {message && <div className="callout success">{message}</div>}
       {probeState.result && (
@@ -244,7 +359,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
       <div className="settings-row-2">
         <div className="form-field">
           <label className="form-label" htmlFor="model-profile-name">方案名称</label>
-          <input id="model-profile-name" className="form-input" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
+          <input id="model-profile-name" className="form-input" value={draft.name} onChange={(event) => updateDraft({ name: event.target.value })} />
         </div>
         <div className="form-field">
           <label className="form-label" htmlFor="model-profile-provider">服务类型</label>
@@ -256,7 +371,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
               const preset = event.target.value as ServicePreset;
               const config = SERVICE_PRESETS[preset];
               setServicePreset(preset);
-              setDraft({ ...draft, provider: config.provider, base_url: config.baseUrl || draft.base_url, multimodal: null });
+              updateDraft({ provider: config.provider, base_url: config.baseUrl || draft.base_url, multimodal: null });
               setProbeState({ loading: false, result: null });
             }}
           >
@@ -267,22 +382,22 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
       </div>
       <div className="form-field">
         <label className="form-label" htmlFor="model-profile-url">服务地址</label>
-        <input id="model-profile-url" className="form-input" value={draft.base_url} onChange={(event) => setDraft({ ...draft, base_url: event.target.value, multimodal: null })} placeholder="https://服务商地址/v1" />
+        <input id="model-profile-url" className="form-input" value={draft.base_url} onChange={(event) => updateDraft({ base_url: event.target.value, multimodal: null })} placeholder="https://服务商地址/v1" />
       </div>
       <div className="settings-row-2">
         <div className="form-field">
           <label className="form-label" htmlFor="model-profile-model">模型名称</label>
-          <input id="model-profile-model" className="form-input" value={draft.model_name} onChange={(event) => setDraft({ ...draft, model_name: event.target.value })} placeholder="qwen3.5-4b" />
+          <input id="model-profile-model" className="form-input" value={draft.model_name} onChange={(event) => updateDraft({ model_name: event.target.value })} placeholder="qwen3.5-4b" />
         </div>
         <div className="form-field">
           <label className="form-label" htmlFor="model-profile-timeout">超时（秒）</label>
-          <input id="model-profile-timeout" className="form-input" type="number" min={1} max={3600} value={draft.timeout_seconds} onChange={(event) => setDraft({ ...draft, timeout_seconds: Number(event.target.value) })} />
+          <input id="model-profile-timeout" className="form-input" type="number" min={1} max={3600} value={draft.timeout_seconds} onChange={(event) => updateDraft({ timeout_seconds: Number(event.target.value) })} />
         </div>
       </div>
       <div className="settings-row-2">
         <div className="form-field">
           <label className="form-label" htmlFor="model-profile-reasoning">推理强度</label>
-          <select id="model-profile-reasoning" className="form-input" value={draft.reasoning_effort ?? ""} onChange={(event) => setDraft({ ...draft, reasoning_effort: event.target.value || null })}>
+          <select id="model-profile-reasoning" className="form-input" value={draft.reasoning_effort ?? ""} onChange={(event) => updateDraft({ reasoning_effort: event.target.value || null })}>
             <option value="">由服务决定</option>
             <option value="none">关闭额外推理</option>
             <option value="low">低</option>
@@ -293,7 +408,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
         <div className="form-field">
           <label className="form-label" htmlFor="model-profile-key">API Key（可选）</label>
           <div className="api-key-wrap">
-            <input id="model-profile-key" className="form-input" type={showApiKey ? "text" : "password"} value={draft.api_key ?? ""} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} placeholder={selected?.has_api_key ? "已安全保存；留空则保持不变" : "本地服务通常留空"} />
+            <input id="model-profile-key" className="form-input" type={showApiKey ? "text" : "password"} value={draft.api_key ?? ""} onChange={(event) => updateDraft({ api_key: event.target.value })} placeholder={selected?.has_api_key ? "同一服务留空可保留；更换服务请填写新密钥" : "本地服务通常留空"} />
             <button className="api-key-toggle" type="button" aria-label={showApiKey ? "隐藏 API Key" : "显示 API Key"} onClick={() => setShowApiKey((value) => !value)}>
               <Icon icon={showApiKey ? EyeOff : Eye} size={14} />
             </button>
@@ -320,7 +435,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
             className="btn secondary sm"
             disabled={probeState.loading || saving}
             onClick={() => void probe()}
-            title="检查服务是否可访问，并用一张 1x1 测试图确认模型是否接受图片输入；已保存密钥的云端方案会自动使用"
+            title="检查服务是否可访问，并用一张合成测试图确认模型是否接受图片输入；只有服务地址和提供方式未改变时才沿用已保存密钥"
           >
             <Icon icon={probeState.loading ? Loader2 : Zap} size={13} className={probeState.loading ? "spin" : undefined} />
             {probeState.loading ? "测试中…" : "测试连接"}
@@ -343,7 +458,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
               <label className="form-label" htmlFor="model-profile-context">上下文预算（Token）</label>
               <input id="model-profile-context" className="form-input" type="number" min={1024} max={2000000}
                 value={draft.context_length ?? ""} placeholder="自动选择，可填写服务实际容量"
-                onChange={event => setDraft({ ...draft, context_length: event.target.value === "" ? null : Number(event.target.value) })} />
+                onChange={event => updateDraft({ context_length: event.target.value === "" ? null : Number(event.target.value) })} />
               <div className="small muted">这是知意的请求预算，不会改变本地模型加载设置。留空时，已知云端参考模型容量；未知远端默认 32,768，本机默认 8,192。可按服务实际容量调整。
                 {selected?.context_policy === "auto" && <span> 当前自动预算：{selected.context_length.toLocaleString()}。</span>}</div>
             </div>
@@ -358,10 +473,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
                 step={0.1}
                 value={draft.temperature ?? ""}
                 onChange={(event) =>
-                  setDraft({
-                    ...draft,
-                    temperature: event.target.value === "" ? null : Number(event.target.value),
-                  })
+                  updateDraft({ temperature: event.target.value === "" ? null : Number(event.target.value) })
                 }
                 placeholder="留空使用默认 0.1"
               />
@@ -379,7 +491,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
           <button className="btn secondary sm" type="button" disabled={saving} onClick={() => requestActivate(selected)}><Icon icon={Check} size={13} /> 激活方案</button>
         )}
         {selected && !selected.is_archived && !selected.is_active && (
-          <button className="btn danger-soft sm" type="button" disabled={saving} onClick={() => setArchiveTarget(selected)}><Icon icon={Archive} size={13} /> 停用方案</button>
+          <button className="btn danger-soft sm" type="button" disabled={saving} onClick={() => unsaved.protect(() => setArchiveTarget(selected))}><Icon icon={Archive} size={13} /> 停用方案</button>
         )}
       </div>
 

@@ -742,6 +742,7 @@ export async function generateTemplateDraft(
   profileId?: string,
   withExamples = true,
   withRules = false,
+  signal?: AbortSignal,
 ): Promise<AiTemplateDraft> {
   const form = new FormData();
   for (const file of files) {
@@ -757,6 +758,7 @@ export async function generateTemplateDraft(
     await apiFetch(`${API_BASE_URL}/templates/generate`, {
       method: "POST",
       body: form,
+      signal,
     }),
   );
 }
@@ -1004,15 +1006,6 @@ export async function getTableViews(
 export async function clearTableViews(tableId: string): Promise<void> {
   const response = await apiFetch(`${API_BASE_URL}/tables/${tableId}/views`, {method: "DELETE"});
   if (!response.ok) throw new Error(await responseErrorMessage(response, "取消分组"));
-}
-
-export async function getRowRevisions(
-  tableId: string,
-  rowId: number,
-): Promise<DataRowRevision[]> {
-  return readResponse<DataRowRevision[]>(
-    await apiFetch(`${API_BASE_URL}/tables/${tableId}/rows/${rowId}/revisions`),
-  );
 }
 
 export async function getIndependentHistory(tableId: string, page = 1, rowId?: number): Promise<{revisions: DataRowRevision[]; page: number; page_size: number; total: number}> {

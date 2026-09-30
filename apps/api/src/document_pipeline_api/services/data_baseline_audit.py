@@ -14,10 +14,6 @@ from pathlib import Path
 from typing import Any
 
 
-BUILTIN_ITEM_KEYS = {
-    "name", "specification", "unit", "quantity", "unit_price", "tax_rate",
-    "item_amount", "item_tax_amount", "item_remarks",
-}
 METADATA_KEYS = {"source_filename", "item_index", "__row_group"}
 ITEM_ALIASES = {"amount": "item_amount", "tax_amount": "item_tax_amount", "remarks": "item_remarks"}
 

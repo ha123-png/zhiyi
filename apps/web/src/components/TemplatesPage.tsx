@@ -109,6 +109,9 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
   const [aiFiles, setAiFiles] = useState<File[]>([]);
   const [aiRequirement, setAiRequirement] = useState("");
   const [aiGenerating, setAiGenerating] = useState(false);
+  const [aiNotice, setAiNotice] = useState<string | null>(null);
+  const aiGenerateEpoch = useRef(0);
+  const aiGenerateAbort = useRef<AbortController | null>(null);
   const [aiElapsed, setAiElapsed] = useState(0);
   const [aiDraft, setAiDraft] = useState<AiTemplateDraft | null>(null);
   const [aiError, setAiError] = useState<string | null>(null);
@@ -164,6 +167,12 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
     }, 1000);
     return () => window.clearInterval(timer);
   }, [aiGenerating]);
+
+  useEffect(() => () => {
+    aiGenerateEpoch.current += 1;
+    aiGenerateAbort.current?.abort();
+    aiGenerateAbort.current = null;
+  }, []);
 
   async function refreshTemplates(preferredId?: string, replaceDraft = false) {
     try {
@@ -319,9 +328,13 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
   // ---- AI 生成模板弹窗 ----
 
   function resetAiState() {
+    aiGenerateEpoch.current += 1;
+    aiGenerateAbort.current?.abort();
+    aiGenerateAbort.current = null;
     setAiFiles([]);
     setAiRequirement("");
     setAiGenerating(false);
+    setAiNotice(null);
     setAiElapsed(0);
     setAiDraft(null);
     setAiError(null);
@@ -368,7 +381,11 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
       setAiError("请先填写需求描述。");
       return;
     }
+    const requestEpoch = ++aiGenerateEpoch.current;
+    const controller = new AbortController();
+    aiGenerateAbort.current = controller;
     setAiError(null);
+    setAiNotice(null);
     setAiGenerating(true);
     try {
       const draft = await generateTemplateDraft(
@@ -377,7 +394,9 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
         aiProfileId || undefined,
         aiWithExamples,
         aiWithRules,
+        controller.signal,
       );
+      if (requestEpoch !== aiGenerateEpoch.current) return;
       setAiDraft(draft);
       setAiDraftName(draft.name || "");
       setAiDraftDescription(draft.description || "");
@@ -390,10 +409,25 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
           .filter((index) => index >= 0),
       );
     } catch (error) {
-      setAiError(error instanceof Error ? error.message : "AI 生成失败，请重试。");
+      if (requestEpoch === aiGenerateEpoch.current) {
+        setAiError(error instanceof Error ? error.message : "AI 生成失败，请重试。");
+      }
     } finally {
-      setAiGenerating(false);
+      if (requestEpoch === aiGenerateEpoch.current) {
+        aiGenerateAbort.current = null;
+        setAiGenerating(false);
+      }
     }
+  }
+
+  function stopWaitingForAiGeneration() {
+    if (!aiGenerating) return;
+    aiGenerateEpoch.current += 1;
+    aiGenerateAbort.current?.abort();
+    aiGenerateAbort.current = null;
+    setAiGenerating(false);
+    setAiError(null);
+    setAiNotice("模型服务可能仍在处理刚才的请求，再次生成会提交新请求。本页会忽略旧请求的结果。");
   }
 
   function updateAiField(index: number, patch: Partial<AiDraftField>) {
@@ -1072,13 +1106,16 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
               {aiError ? (
                 <div className="callout danger" style={{ marginBottom: 14 }}>{aiError}</div>
               ) : null}
+              {aiNotice ? (
+                <div className="callout info" role="status" style={{ marginBottom: 14 }}>{aiNotice}</div>
+              ) : null}
               {aiGenerating ? (
                 <div className="ai-generating">
                   <Icon icon={Loader2} size={22} className="spin" />
                   <div>
                     <div className="ai-generating-title">正在分析样例文件，请稍候…</div>
                     <div className="ai-generating-sub">
-                      已等待 <strong>{aiElapsed}</strong> 秒 · 生成过程中请勿关闭窗口
+                      已等待 <strong>{aiElapsed}</strong> 秒 · 可停止等待并返回编辑；模型服务可能仍在处理当前请求
                     </div>
                   </div>
                 </div>
@@ -1346,9 +1383,14 @@ export function TemplatesPage({ initialTemplateId = null, initialVersion = null,
             </div>
             <div className="modal-foot">
               {aiGenerating ? (
-                <span className="small muted" style={{ marginLeft: "auto" }}>
-                  生成中，请稍候…
-                </span>
+                <>
+                  <span className="small muted" style={{ marginRight: "auto" }}>
+                    生成中，请稍候…
+                  </span>
+                  <button className="btn ghost" onClick={stopWaitingForAiGeneration} type="button">
+                    停止等待并返回编辑
+                  </button>
+                </>
               ) : aiDraft ? (
                 <>
                   <button

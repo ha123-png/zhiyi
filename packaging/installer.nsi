@@ -7,7 +7,7 @@ SetCompressor /SOLID zlib
 !include "FileFunc.nsh"
 
 !ifndef APP_VERSION
-  !define APP_VERSION "0.5.0"
+  !define APP_VERSION "0.6.0"
 !endif
 !ifndef BUILD_ROOT
   !error "BUILD_ROOT must point to the PyInstaller dist directory"
@@ -49,8 +49,8 @@ ShowInstDetails show
 ShowUninstDetails show
 
 !define MUI_ABORTWARNING
-!define MUI_ICON "${BUILD_ROOT}\..\..\..\packaging\app.ico"
-!define MUI_UNICON "${BUILD_ROOT}\..\..\..\packaging\uninstall.ico"
+!define MUI_ICON "${__FILEDIR__}\app.ico"
+!define MUI_UNICON "${__FILEDIR__}\uninstall.ico"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
 !define MUI_FINISHPAGE_RUN_TEXT "启动${APP_NAME}"
 !insertmacro MUI_PAGE_WELCOME
@@ -73,12 +73,17 @@ FunctionEnd
 Section "主程序" SEC_MAIN
   ; Only ask the exact executable from the previous installation to stop.
   ; The supervisor validates its own local control token and child processes.
-  IfFileExists "$INSTDIR\${APP_CLI_EXE}" 0 +2
+  IfFileExists "$INSTDIR\${APP_CLI_EXE}" 0 previous_stop_done
 !ifdef SMOKE_MODE
-    ExecWait '"$INSTDIR\${APP_CLI_EXE}" stop --data-dir "${SMOKE_DATA_DIR}"'
+    nsExec::ExecToLog /TIMEOUT=30000 '"$INSTDIR\${APP_CLI_EXE}" stop --data-dir "${SMOKE_DATA_DIR}"'
 !else
-    ExecWait '"$INSTDIR\${APP_CLI_EXE}" stop'
+    nsExec::ExecToLog /TIMEOUT=30000 '"$INSTDIR\${APP_CLI_EXE}" stop'
 !endif
+  Pop $0
+  ; No running supervisor also returns nonzero. The scoped stop below is
+  ; authoritative; retain this result without flashing a console window.
+  DetailPrint "Previous supervisor stop result: $0"
+  previous_stop_done:
   ; The native window host can outlive its already-stopped supervisor. End
   ; Stage the new runtime so upgrades from older versions can use the scoped
   ; stop helper. NSIS deduplicates these files against the installed payload.
@@ -161,12 +166,15 @@ Function un.onInit
     StrCpy $DeleteUserData "1"
   ${EndIf}
 !endif
-  IfFileExists "$INSTDIR\${APP_CLI_EXE}" 0 +2
+  IfFileExists "$INSTDIR\${APP_CLI_EXE}" 0 uninstall_stop_done
 !ifdef SMOKE_MODE
-    ExecWait '"$INSTDIR\${APP_CLI_EXE}" stop --data-dir "${SMOKE_DATA_DIR}"'
+    nsExec::ExecToLog /TIMEOUT=30000 '"$INSTDIR\${APP_CLI_EXE}" stop --data-dir "${SMOKE_DATA_DIR}"'
 !else
-    nsExec::ExecToLog '"$INSTDIR\${APP_CLI_EXE}" stop'
+    nsExec::ExecToLog /TIMEOUT=30000 '"$INSTDIR\${APP_CLI_EXE}" stop'
 !endif
+  Pop $0
+  DetailPrint "Previous supervisor stop result: $0"
+  uninstall_stop_done:
   nsExec::ExecToLog '"$INSTDIR\${APP_CLI_EXE}" stop-installation --installation-dir "$INSTDIR"'
   Pop $0
   ${If} $0 != 0

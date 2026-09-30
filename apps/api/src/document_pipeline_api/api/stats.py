@@ -112,9 +112,11 @@ def dashboard_summary(session: SessionDependency, days: DashboardRange | None = 
 
 
 def _range_start(days: int) -> datetime:
-    return (datetime.now().astimezone() - timedelta(days=days - 1)).replace(
+    # astimezone() without a target yields a fixed offset. Apply it after local
+    # calendar arithmetic so the target midnight gets its own DST offset.
+    return (datetime.now().astimezone().replace(tzinfo=None) - timedelta(days=days - 1)).replace(
         hour=0, minute=0, second=0, microsecond=0,
-    )
+    ).astimezone()
 
 
 def _trend_calendar(session, days: DashboardRange):

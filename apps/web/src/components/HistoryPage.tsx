@@ -49,6 +49,8 @@ import { TaskExportDetails } from "./TaskExportDetails";
 import { EditableText } from "./EditableText";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { Icon } from "./Icon";
+import { parseNumericInput } from "../numericInput";
+import { useUnsavedChanges } from "../useUnsavedChanges";
 
 function formatDateTime(iso: string): string {
   const d = serverDate(iso);
@@ -123,6 +125,10 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
   const [completedPage, setCompletedPage] = useState(1);
   const [problemsPage, setProblemsPage] = useState(1);
   const [jumpPageInput, setJumpPageInput] = useState("");
+  const listRequest = useRef(0);
+  const listQuery = JSON.stringify([historyTab, completedPage, problemsPage, fileSearch, templateFilter, timeFilter]);
+  const latestListQuery = useRef(listQuery);
+  latestListQuery.current = listQuery;
 
   // 原文件 tab 内编辑：草稿模式，点“修订到表”才触发校验并保存
   const [editingCell, setEditingCell] = useState<string | null>(null);
@@ -144,6 +150,28 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
   } | null>(null);
   // 删除整个文件前确认：原件、当前数据及修订历史一起删除
   const [deleteTarget, setDeleteTarget] = useState<Task | null>(null);
+  const unsavedReview = useUnsavedChanges(() => !!extraction && !!draft && (
+    editingCell !== null
+    || JSON.stringify(draft) !== JSON.stringify(extraction.result)
+    || JSON.stringify(draftDetailIds) !== JSON.stringify(extraction.detail_ids)
+    || JSON.stringify([...ignoredIssueIndices].sort()) !== JSON.stringify(ignoredIndices(extraction))
+  ));
+
+  function ignoredIndices(result: Extraction): number[] {
+    return result.validation_issues.flatMap((issue, index) => issue.ignored ? [index] : []).sort();
+  }
+
+  function changeTab(tab: HistoryTab) {
+    if (tab === historyTab) return;
+    unsavedReview.protect(() => {
+      setDraft(extraction ? structuredClone(extraction.result) : null);
+      setDraftDetailIds(extraction?.detail_ids);
+      setIgnoredIssueIndices(extraction ? ignoredIndices(extraction) : []);
+      setEditingCell(null);
+      setError(null);
+      setHistoryTab(tab);
+    });
+  }
 
   async function downloadOriginalFile(task: Task) {
     const bridge = desktopApi();
@@ -185,7 +213,9 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
   // 服务端分页 + 筛选（ISSUE-067）：只拉当前页，不把万级历史载入前端内存。
   // 校验问题 = 提取结果已出来但规则不通过（needs_review）；处理失败（failed）不属于校验问题，去状态监控重试。
   const load = async () => {
-    if (historyTab === "original") return;
+    if (historyTab === "original" || listQuery !== latestListQuery.current) return;
+    const request = ++listRequest.current;
+    const current = () => request === listRequest.current && listQuery === latestListQuery.current;
     const isProblems = historyTab === "problems";
     const status = isProblems ? "needs_review" : "completed";
     const rawPage = isProblems ? problemsPage : completedPage;
@@ -211,13 +241,14 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
         getTaskSummary(),
         getTaskSummary(common),
       ]);
+      if (!current()) return;
       setPageTasks(list);
       setSummary(globalSummary);
       setFilteredSummary(filtered);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "加载失败");
+      if (current()) setError(err instanceof Error ? err.message : "加载失败");
     } finally {
-      setLoading(false);
+      if (current()) setLoading(false);
     }
   };
 
@@ -231,7 +262,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     }
     setLoading(true);
     const timer = setTimeout(() => void load(), 250);
-    return () => clearTimeout(timer);
+    return () => { clearTimeout(timer); listRequest.current += 1; };
     // 显式列出触发条件：load 使用最新渲染闭包，避免 filteredSummary 变化引发重复加载
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [historyTab, completedPage, problemsPage, fileSearch, templateFilter, timeFilter]);
@@ -254,10 +285,15 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
   }
 
   function openOriginal(task: Task) {
+    unsavedReview.protect(() => loadOriginal(task));
+  }
+
+  function loadOriginal(task: Task) {
     setSelectedTask(task);
     setHistoryTab("original");
     setExtraction(null);
     setDraft(null);
+    setSaving(false);
     setEditingCell(null);
     setExtractionLoading(true);
     setError(null);
@@ -282,60 +318,82 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
       });
   }
 
-  function editedValue(raw: string, previous: TemplateValue | undefined): TemplateValue {
+  function numericField(section: "header" | "item", key: string, previous: unknown): boolean {
+    const field = (extraction?.current_schema ?? extraction?.template?.fields ?? [])
+      .find((entry) => entry.section === section && entry.key === key);
+    return field ? field.value_type === "number" : typeof previous === "number";
+  }
+
+  function editedValue(raw: string, previous: TemplateValue | undefined, numeric: boolean, key: string): TemplateValue {
+    if (numeric) return raw === "—" ? null : parseNumericInput(raw, labelFor(key));
     const value = raw.trim();
     if (!value || value === "—") return null;
-    if (typeof previous === "number") {
-      const parsed = Number(value.replaceAll(",", ""));
-      return Number.isFinite(parsed) ? parsed : previous;
-    }
     if (typeof previous === "boolean") return value === "是" || value.toLowerCase() === "true";
     return value;
   }
 
   function updateHeaderDraft(key: string, raw: string) {
-    setDraft((current) => {
-      if (!current) return current;
-      const next = structuredClone(current);
-      if ("header" in next) {
-        next.header[key] = editedValue(raw, next.header[key]);
-      } else {
-        (next as unknown as Record<string, unknown>)[key] = editedValue(
-          raw,
-          (next as unknown as Record<string, unknown>)[key] as TemplateValue | undefined,
-        );
-      }
-      return next;
-    });
+    if (!draft || saving) return;
+    const next = structuredClone(draft);
+    const header = ("header" in next ? next.header : next) as Record<string, TemplateValue>;
+    try {
+      header[key] = editedValue(raw, header[key], numericField("header", key, header[key]), key);
+      setError(null);
+    } catch (reason) {
+      header[key] = raw;
+      setError(reason instanceof Error ? reason.message : "数字格式无效");
+    }
+    setDraft(next);
     setEditingCell(null);
   }
 
   function updateItemDraft(idx: number, key: string, raw: string) {
-    setDraft((current) => {
-      if (!current) return current;
-      const next = structuredClone(current);
-      const items = (next as { items: Array<Record<string, TemplateValue>> }).items;
-      if (items[idx]) {
-        items[idx][key] = editedValue(raw, items[idx][key]);
-      }
-      return next;
-    });
+    if (!draft || saving) return;
+    const next = structuredClone(draft);
+    const item = (next as { items: Array<Record<string, TemplateValue>> }).items[idx];
+    if (!item) return;
+    try {
+      item[key] = editedValue(raw, item[key], numericField("item", key, item[key]), key);
+      setError(null);
+    } catch (reason) {
+      item[key] = raw;
+      setError(reason instanceof Error ? reason.message : "数字格式无效");
+    }
+    setDraft(next);
     setEditingCell(null);
   }
 
+  function validatedDraft(): ExtractionResult {
+    const next = structuredClone(draft!);
+    // Validate the whole draft: editing another cell must not hide an earlier
+    // invalid numeric input or submit that input as a textual number.
+    const validate = (record: Record<string, TemplateValue>, section: "header" | "item") => {
+      for (const [key, value] of Object.entries(record)) {
+        if (numericField(section, key, value) && typeof value === "string") {
+          record[key] = parseNumericInput(value, labelFor(key));
+        }
+      }
+    };
+    validate(("header" in next ? next.header : next) as Record<string, TemplateValue>, "header");
+    for (const item of next.items) validate(item as Record<string, TemplateValue>, "item");
+    return next;
+  }
+
   async function handleSaveToTable() {
-    if (!selectedTask || !extraction || !draft) return;
+    if (!selectedTask || !extraction || !draft || saving || selectedTask.id !== extraction.task_id) return;
+    const seq = originalSeqRef.current;
     setSaving(true);
     setError(null);
     try {
       const updated = await updateReview(
         selectedTask.id,
         extraction.review_version,
-        draft,
+        validatedDraft(),
         ignoredIssueIndices,
         undefined,
         draftDetailIds,
       );
+      if (seq !== originalSeqRef.current) return;
       setExtraction(updated);
       setDraft(structuredClone(updated.result));
       setEditingCell(null);
@@ -347,13 +405,14 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
       // 保存后刷新列表：任务可能从"校验问题"变"已完成"，列表状态不滞后
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "保存失败");
+      if (seq === originalSeqRef.current) setError(err instanceof Error ? err.message : "保存失败");
     } finally {
-      setSaving(false);
+      if (seq === originalSeqRef.current) setSaving(false);
     }
   }
 
   function toggleIssueIgnored(index: number) {
+    if (saving) return;
     setIgnoredIssueIndices((current) =>
       current.includes(index)
         ? current.filter((i) => i !== index)
@@ -609,7 +668,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
       </div>
 
       {error && (
-        <div className="callout danger" style={{ marginBottom: 16 }}>{error}</div>
+        <div className="callout danger" role="alert" style={{ marginBottom: 16 }}>{error}</div>
       )}
       {notice && (
         <div className="callout success" style={{ marginBottom: 16 }}>{notice}</div>
@@ -637,19 +696,19 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
       <div className="history-tabs">
         <button
           className={`hist-tab ${historyTab === "completed" ? "active" : ""}`}
-          onClick={() => setHistoryTab("completed")}
+          onClick={() => changeTab("completed")}
         >
           已完成 <span className="hist-tab-count">{filteredSummary?.completed ?? 0}</span>
         </button>
         <button
           className={`hist-tab ${historyTab === "problems" ? "active" : ""}`}
-          onClick={() => setHistoryTab("problems")}
+          onClick={() => changeTab("problems")}
         >
           校验问题 <span className="hist-tab-count">{filteredSummary?.needs_review ?? 0}</span>
         </button>
         <button
           className={`hist-tab ${historyTab === "original" ? "active" : ""}`}
-          onClick={() => setHistoryTab("original")}
+          onClick={() => changeTab("original")}
         >
           原文件
           {selectedTask ? <span className="hist-tab-count">1</span> : null}
@@ -906,7 +965,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                               <div
                                 className="extract-header-row"
                                 key={key}
-                                onClick={() => setEditingCell(`h-${key}`)}
+                                onClick={() => { if (!saving) setEditingCell(`h-${key}`); }}
                                 title="单击编辑"
                               >
                                 <span className="extract-header-label">{labelFor(key)}</span>
@@ -915,6 +974,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                                   editing={editingCell === `h-${key}`}
                                   value={headerValueOf(key)}
                                   onCommit={(raw) => updateHeaderDraft(key, raw)}
+                                  onCancel={() => setEditingCell(null)}
                                 />
                               </div>
                             ))}
@@ -970,9 +1030,9 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                                         <td
                                           aria-label={`编辑 ${labelFor(key)}，当前值 ${String(item[key] ?? "") || "空"}`}
                                           key={key}
-                                          onClick={() => setEditingCell(`i-${idx}-${key}`)}
+                                          onClick={() => { if (!saving) setEditingCell(`i-${idx}-${key}`); }}
                                           onKeyDown={(event) => {
-                                            if (event.target !== event.currentTarget) return;
+                                            if (saving || event.target !== event.currentTarget) return;
                                             if (event.key === "Enter" || event.key === "F2") {
                                               event.preventDefault();
                                               setEditingCell(`i-${idx}-${key}`);
@@ -985,6 +1045,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                                             editing={editingCell === `i-${idx}-${key}`}
                                             value={String(item[key] ?? "")}
                                             onCommit={(raw) => updateItemDraft(idx, key, raw)}
+                                            onCancel={() => setEditingCell(null)}
                                           />
                                         </td>
                                       ))}
@@ -1051,6 +1112,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                                   className="btn ghost sm"
                                   title={ignoredIssueIndices.includes(idx) ? "恢复这条校验" : "忽略这条校验，修订到表时不再阻断"}
                                   onClick={() => toggleIssueIgnored(idx)}
+                                  disabled={saving}
                                   type="button"
                                 >
                                   <Icon icon={EyeOff} size={13} />
@@ -1138,6 +1200,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
               )}
       </div>
 
+      {unsavedReview.dialog}
       {/* 删除确认：删除记录不删表数据，需输入文件名确认 */}
       <ConfirmDialog
         open={deleteTarget !== null}

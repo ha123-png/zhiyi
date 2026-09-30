@@ -87,6 +87,13 @@ class AutonomousExtraction(TemplateExtraction):
             for row in rows:
                 if field.key in row:
                     row[field.key] = _model_number(row[field.key])
+                    # Unsafe-integer strings are accepted at the user edit/API
+                    # boundary to round-trip browser values losslessly. Model
+                    # output has a different contract: a numeric string that
+                    # cannot be safely adapted must not be reinterpreted as an
+                    # exact Python int by the shared current-data validator.
+                    if isinstance(row[field.key], str) and row[field.key] != '':
+                        raise ValueError("number 字段必须是可无损解析的 JSON 数字。")
         schema = self.columns()
         try:
             _check_values(self.header, schema, 'header')

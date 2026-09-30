@@ -507,6 +507,79 @@ describe("template action transactions", () => {
     expect(opener).toHaveFocus();
   });
 
+  it("stops waiting without claiming to cancel remote work and ignores a late result after a newer generation starts", async () => {
+    const generatedA = {
+      name: "旧请求草稿",
+      description: "late synthetic response",
+      fields: [{ key: "old_field", label: "旧字段", section: "header", example: "", value_type: "text" }],
+      rule_suggestions: [],
+    };
+    const generatedB = {
+      name: "新请求草稿",
+      description: "current synthetic response",
+      fields: [{ key: "new_field", label: "新字段", section: "header", example: "", value_type: "text" }],
+      rule_suggestions: [],
+    };
+    const pendingGenerations: Array<(result: Response) => void> = [];
+    const generationCalls: Array<{ requirement: string; signal: AbortSignal | null }> = [];
+    let createCalls = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models/profiles")) return http([]);
+      if (url.endsWith("/local-export")) return http(binding);
+      if (url.endsWith("/templates/generate")) {
+        const form = init?.body as FormData;
+        generationCalls.push({ requirement: String(form.get("requirement")), signal: init?.signal ?? null });
+        // Deliberately ignore abort: a response already in flight may still arrive.
+        return new Promise<Response>((resolve) => pendingGenerations.push(resolve));
+      }
+      if (init?.method === "POST") createCalls += 1;
+      return http([template]);
+    }));
+
+    render(<TemplatesPage />);
+    await screen.findByRole("heading", { name: template.name });
+    fireEvent.click(screen.getByRole("button", { name: "AI 生成模板" }));
+    const dialog = screen.getByRole("dialog", { name: "智能创建提取模板" });
+    const requirement = within(dialog).getByLabelText("需求描述");
+    fireEvent.change(requirement, { target: { value: "第一次合成请求" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "生成模板" }));
+    await waitFor(() => expect(pendingGenerations).toHaveLength(1));
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "停止等待并返回编辑" }));
+    const requirementAfterStop = within(dialog).getByLabelText("需求描述");
+    expect(requirementAfterStop).toHaveValue("第一次合成请求");
+    expect(await within(dialog).findByRole("status")).toHaveTextContent("模型服务可能仍在处理刚才的请求");
+    expect(generationCalls[0].requirement).toBe("第一次合成请求");
+    expect(generationCalls[0].signal?.aborted).toBe(true);
+
+    fireEvent.change(requirementAfterStop, { target: { value: "第二次合成请求" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "生成模板" }));
+    await waitFor(() => expect(pendingGenerations).toHaveLength(2));
+    expect(generationCalls.map((call) => call.requirement)).toEqual(["第一次合成请求", "第二次合成请求"]);
+    expect(generationCalls[1].signal?.aborted).toBe(false);
+    expect(generationCalls[1].signal).not.toBe(generationCalls[0].signal);
+
+    await act(async () => {
+      pendingGenerations[0](http(generatedA));
+    });
+    expect(within(dialog).getByText("正在分析样例文件，请稍候…")).toBeInTheDocument();
+    expect(within(dialog).queryByLabelText("模板名称")).not.toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "停止等待并返回编辑" })).toBeEnabled();
+
+    await act(async () => {
+      pendingGenerations[1](http(generatedB));
+    });
+    await waitFor(() => expect(within(dialog).getByLabelText("模板名称")).toHaveValue("新请求草稿"));
+    expect(within(dialog).queryByText("旧请求草稿")).not.toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "关闭" }));
+    const discard = await screen.findByRole("dialog", { name: "模板尚未保存" });
+    fireEvent.click(within(discard).getByRole("button", { name: "不保存并关闭" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "智能创建提取模板" })).not.toBeInTheDocument());
+    expect(createCalls).toBe(0);
+  });
+
   it.each(["archive", "copy", "restore", "import"] as const)("protects dirty input before %s and cancels without a server mutation", async (action) => {
     const inactive = { ...template, id: "inactive-template", name: "停用中模板", is_active: false };
     let changed = false;

@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from document_pipeline_api.models import DataRowRecord, DataTableRecord, FileCurrentDataRecord, TaskRecord
 from document_pipeline_api.services.current_data import get_current, row_search_predicate
 from document_pipeline_api.services.read_snapshot import begin_read_snapshot
+from document_pipeline_api.schemas.json_numbers import stringify_unsafe_integers
 
 
 def require_tabular(table: DataTableRecord) -> None:
@@ -49,7 +50,7 @@ def list_files(session: Session, table_id: str, *, page: int = 1, page_size: int
               "version": record.current_version, "header": json.loads(record.header_json),
               "schema": json.loads(record.schema_json), "item_count": counts.get(record.task_id, 0),
               "items": previews[record.task_id], "updated_at": record.updated_at} for record in records]
-    return {"table_id": table_id, "page": page, "page_size": page_size, "total": total, "files": files}
+    return stringify_unsafe_integers({"table_id": table_id, "page": page, "page_size": page_size, "total": total, "files": files})
 
 
 def file_details(session: Session, task_id: str, *, page: int = 1, page_size: int = 50, row_ids=None) -> dict:
@@ -61,7 +62,7 @@ def file_details(session: Session, task_id: str, *, page: int = 1, page_size: in
     total = session.scalar(select(func.count()).select_from(DataRowRecord).where(*predicate)) or 0
     rows = session.scalars(select(DataRowRecord).where(*predicate).order_by(DataRowRecord.item_index, DataRowRecord.id)
         .offset((page - 1) * page_size).limit(page_size)).all()
-    return {"task_id": task_id, "filename": current.source.display_filename,
+    return stringify_unsafe_integers({"task_id": task_id, "filename": current.source.display_filename,
             "header": json.loads(current.header_json), "schema": json.loads(current.schema_json),
             "version": current.current_version, "page": page,
-            "page_size": page_size, "total": total, "items": [detail_read(row) for row in rows]}
+            "page_size": page_size, "total": total, "items": [detail_read(row) for row in rows]})

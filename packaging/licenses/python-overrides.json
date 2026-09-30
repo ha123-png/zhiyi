@@ -1,0 +1,10 @@
+{
+  "proxy-tools==0.1.0": {
+    "file": "proxy-tools-0.1.0-LICENSE.txt",
+    "sha256": "a428fb8a2e762af3eb0a6edbbb88e9b42ccfee80fd9b423958bcacf9b9abbfe4",
+    "license": "BSD (upstream LICENSE.txt; distribution metadata declares MIT)",
+    "source": "https://raw.githubusercontent.com/jtushman/proxy_tools/ccd35a569b95bec271a59890780c7821756c548a/LICENSE.txt",
+    "reason": "Locked 0.1.0 sdist and installed distribution omit LICENSE.txt; preserve upstream license verbatim and disclose metadata discrepancy.",
+    "sdist_sha256": "ccb3751f529c047e2d8a58440d86b205303cf0fe8146f784d1cbcd94f0a28010"
+  }
+}

@@ -39,17 +39,6 @@ BUILTIN_HEADER_KEYS = {
     "total_quantity",
     "remarks",
 }
-BUILTIN_ITEM_KEYS = {
-    "name",
-    "specification",
-    "unit",
-    "quantity",
-    "unit_price",
-    "item_amount",
-    "tax_rate",
-    "item_tax_amount",
-    "item_remarks",
-}
 
 
 def data_row_read(row: DataRowRecord) -> DataRowRead:

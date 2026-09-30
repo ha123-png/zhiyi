@@ -68,6 +68,9 @@ def _recover_interrupted_tasks() -> None:
         return
     engine = build_engine(settings.database_url)
     try:
+        from document_pipeline_api.services.upload_recovery import recover_pending_uploads
+
+        recover_pending_uploads(lambda: Session(engine), settings)
         with Session(engine) as session:
             recover_expired_task_leases(session)
             recover_missing_queued_tasks(session)

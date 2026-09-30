@@ -282,6 +282,22 @@ def _prepare_staged_database(
             upgrade_database(engine)
         except Exception as error:
             raise BusinessBackupError("备份数据库升级失败，当前数据没有改变。") from error
+        # Checksums establish byte integrity, not a usable business state. Read
+        # task-facing schemas while still staged so malformed state cannot turn
+        # a successful replacement into an unreadable task list.
+        from sqlalchemy import select
+        from sqlalchemy.orm import Session
+        from document_pipeline_api.models import TaskRecord
+        from document_pipeline_api.schemas.tasks import TaskRead
+        from document_pipeline_api.schemas.input_scope import InputPolicy
+        try:
+            with Session(engine) as session:
+                for task in session.scalars(select(TaskRecord).execution_options(yield_per=100)):
+                    TaskRead.model_validate(task)
+                    if task.input_policy_json:
+                        InputPolicy.model_validate_json(task.input_policy_json)
+        except (ValueError, TypeError) as error:
+            raise BusinessBackupError("备份中的任务业务结构无效，当前数据没有改变。") from error
     finally:
         engine.dispose()
     expected = {item["task_id"]: item for item in manifest["files"]}
@@ -344,6 +360,24 @@ def _install_staged_restore(
     stage_database: Path,
     stage_uploads: Path,
 ) -> Path:
+    # Journal v2 records a managed staging basename. Validate that contract
+    # before publishing intent or moving any of the current business files.
+    from document_pipeline_api.services.clear_data import ClearDataError, _checked
+
+    try:
+        stage = stage_database.parent
+        if (stage != stage_uploads.parent or stage.parent != data_dir / "runtime"
+                or not stage.name.startswith("restore-")):
+            raise ValueError("unmanaged restore staging directory")
+        for path in (stage, stage_database, stage_uploads):
+            _checked(data_dir, path)
+            if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+                raise ValueError("linked restore staging path")
+        if not stage_database.is_file() or not stage_uploads.is_dir():
+            raise ValueError("incomplete restore staging directory")
+    except (OSError, ValueError, ClearDataError) as error:
+        raise BusinessBackupError("恢复暂存路径异常，未替换当前数据。") from error
+
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     rollback = data_dir / "backups" / f"before-restore-{timestamp}"
     rollback.mkdir(parents=True, exist_ok=False)
@@ -364,7 +398,8 @@ def _install_staged_restore(
         if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
             raise BusinessBackupError("恢复路径包含外部链接，未替换当前数据。")
     journal = restore_journal_path(data_dir)
-    state = {"version": 1, "rollback": rollback.name, "phase": "installing",
+    state = {"version": 2, "rollback": rollback.name, "staging": stage_database.parent.name,
+             "phase": "installing",
              "originals": [path.name for path in current_items if path.exists()]}
     # Write intent before any move. Recovery uses the journal plus atomic path
     # existence; it does not depend on a post-move update having reached disk.
@@ -397,7 +432,12 @@ def _install_staged_restore(
         raise BusinessBackupError(
             "恢复替换失败，当前数据已回滚，请检查文件占用和磁盘空间。"
         ) from error
-    journal.unlink()
+    try:
+        journal.unlink()
+    except OSError:
+        # The durable committed marker is authoritative. Startup can finish
+        # cleanup; reporting a failed restore here would contradict live data.
+        logger.warning("备份恢复已完成，恢复日志清理将在下次启动重试。", exc_info=True)
     return rollback
 
 
@@ -407,28 +447,42 @@ def restore_journal_path(data_dir: Path) -> Path:
 
 def recover_interrupted_restore(data_dir: Path) -> None:
     """Run before opening any database. Never start against a half-installed set."""
-    if restore_journal_path(data_dir).exists():
+    data_dir = data_dir.resolve()
+    journal = restore_journal_path(data_dir)
+    if journal.is_symlink() or (hasattr(journal, "is_junction") and journal.is_junction()):
+        raise BusinessBackupError("恢复记录路径异常，已停止启动。")
+    if journal.exists():
         from document_pipeline_api.services.file_operation_lock import file_operation_lock
         with file_operation_lock(data_dir / "uploads"):
-            _recover_interrupted_restore(data_dir.resolve())
+            _recover_interrupted_restore(data_dir)
 
 
 def _recover_interrupted_restore(data_dir: Path) -> None:
     journal = restore_journal_path(data_dir)
+    if journal.is_symlink() or (hasattr(journal, "is_junction") and journal.is_junction()):
+        raise BusinessBackupError("恢复记录路径异常，已停止启动。")
     if not journal.exists():
         return
     from document_pipeline_api.services.clear_data import _checked
     _checked(data_dir, journal)
-    if journal.is_symlink():
-        raise BusinessBackupError("恢复记录路径异常，已停止启动。")
     try:
         state = json.loads(journal.read_text(encoding="utf-8"))
         name = state["rollback"]
         allowed = {"document-pipeline.db", "uploads", "queue.db"}
         allowed |= {base + suffix for base in ("document-pipeline.db", "queue.db") for suffix in ("-wal", "-shm", "-journal")}
-        if (state.get("version") != 1 or not isinstance(name, str) or Path(name).name != name
+        version = state.get("version")
+        staging_name = state.get("staging") if version == 2 else None
+        if (type(version) is not int or version not in {1, 2}
+                or not isinstance(name, str) or Path(name).name != name
                 or not name.startswith("before-restore-") or state.get("phase") not in {"installing", "committed"}
                 or not isinstance(state.get("originals"), list) or not set(state["originals"]) <= allowed):
+            raise ValueError
+        if version == 2 and (
+            not isinstance(staging_name, str)
+            or Path(staging_name).name != staging_name
+            or Path(staging_name).is_absolute()
+            or not staging_name.startswith("restore-")
+        ):
             raise ValueError
         rollback = _checked(data_dir, data_dir / "backups" / name)
         if not rollback.is_dir() or rollback.is_symlink() or (hasattr(rollback, "is_junction") and rollback.is_junction()):
@@ -436,6 +490,9 @@ def _recover_interrupted_restore(data_dir: Path) -> None:
         if state["phase"] == "committed":
             if not (data_dir / "document-pipeline.db").is_file() or not (data_dir / "uploads").is_dir():
                 raise ValueError
+            _settle_interrupted_restore_staging(
+                data_dir, rollback, staging_name, committed=True,
+            )
             journal.unlink()
             return
         discarded = _checked(data_dir, rollback / "interrupted-install")
@@ -459,9 +516,76 @@ def _recover_interrupted_restore(data_dir: Path) -> None:
             elif active.exists():
                 discarded.mkdir(exist_ok=True)
                 _move_path(active, discarded / name)
+        _settle_interrupted_restore_staging(
+            data_dir, rollback, staging_name, committed=False,
+        )
         journal.unlink()
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise BusinessBackupError("上次恢复尚未完成，已停止启动以保护数据。请检查恢复前备份与数据目录权限后重试。") from error
+
+
+def _settle_interrupted_restore_staging(
+    data_dir: Path,
+    rollback: Path,
+    staging_name: str | None,
+    *,
+    committed: bool,
+) -> None:
+    """Keep crash-left staging beside the retained rollback instead of in runtime."""
+    if staging_name is None:
+        # Version 1 journals predate durable staging identity. Do not guess which
+        # runtime temporary directory belongs to them.
+        return
+    from document_pipeline_api.services.clear_data import _checked
+
+    staging = _checked(data_dir, data_dir / "runtime" / staging_name)
+    preserved = _checked(data_dir, rollback / "interrupted-staging")
+    if staging.is_symlink() or (hasattr(staging, "is_junction") and staging.is_junction()):
+        raise ValueError("restore staging path is not a managed directory")
+    if preserved.is_symlink() or (hasattr(preserved, "is_junction") and preserved.is_junction()):
+        raise ValueError("preserved staging path is not a managed directory")
+    has_preserved = preserved.exists()
+    if has_preserved and not preserved.is_dir():
+        raise ValueError("preserved staging path is not a managed directory")
+    if staging.exists():
+        if not staging.is_dir():
+            raise ValueError("restore staging path is not a managed directory")
+        if committed and not any(staging.iterdir()):
+            staging.rmdir()
+            return
+        if has_preserved:
+            raise ValueError("interrupted staging preservation target already exists")
+        _move_path(staging, preserved)
+        has_preserved = True
+    if not has_preserved:
+        return
+
+    # The rollback folder is retained. Make the extra space use visible when a
+    # staged copy is kept after a hard stop, and make this step idempotent if a
+    # second stop occurs after the directory move but before journal removal.
+    from document_pipeline_api.services.clear_data import _write_json
+
+    note_path = _checked(data_dir, rollback / "restore-recovery.json")
+    if note_path.is_symlink() or (hasattr(note_path, "is_junction") and note_path.is_junction()):
+        raise ValueError("restore recovery note is not a managed file")
+    note = {
+        "schema_version": 1,
+        "state": "restore_committed" if committed else "previous_data_restored",
+        "rollback_directory": rollback.name,
+        "source_staging_directory": staging_name,
+        "preserved_directory": "interrupted-staging",
+        "explanation": (
+            "恢复已提交；中断时暂存目录仍有文件，已保留在此检查。"
+            if committed
+            else "恢复中断；当前数据已回滚为恢复前状态。此目录保留了恢复包暂存副本，供检查或重试，仍占用磁盘空间。"
+        ),
+    }
+    if note_path.exists():
+        existing = json.loads(note_path.read_text(encoding="utf-8"))
+        if existing != note:
+            raise ValueError("restore recovery note does not match the journal")
+    else:
+        _write_json(note_path, note)
 
 
 def _fence_restored_versions(database: Path, epoch: int) -> None:

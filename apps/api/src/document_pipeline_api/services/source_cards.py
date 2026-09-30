@@ -9,6 +9,7 @@ from document_pipeline_api.models import DataRowRecord, FileCurrentDataRecord
 from document_pipeline_api.services.data_groups import source_identity_expression, parse_source_key, shared_header_values
 from document_pipeline_api.services.data_rows import data_row_read
 from document_pipeline_api.services.table_scope import prepare_export_selection
+from document_pipeline_api.schemas.json_numbers import stringify_unsafe_integers
 
 
 def _headers(session, table_id, keys, columns):
@@ -94,8 +95,8 @@ def list_source_cards(session, table_id, *, scope=None, page=1, page_size=6):
     groups = session.execute(select(grouped).order_by(grouped.c.first_id)
         .offset((page - 1) * page_size).limit(page_size)).all()
     if not groups:
-        return {'table_id': table_id, 'page': page, 'page_size': page_size, 'total': total,
-                'row_count': selection.row_count, 'groups': []}
+        return stringify_unsafe_integers({'table_id': table_id, 'page': page, 'page_size': page_size, 'total': total,
+                'row_count': selection.row_count, 'groups': []})
     keys = [group.source_key for group in groups]
     cards = _headers(session, table_id, keys, table_columns(session, selection.table))
     ranked = select(DataRowRecord.id, func.row_number().over(partition_by=identity,
@@ -114,8 +115,8 @@ def list_source_cards(session, table_id, *, scope=None, page=1, page_size=6):
         card['preview_items'] = previews[group.source_key]
         card['preview_header'] = _preview_fields([column for column in card['schema'] if column['section'] == 'header'], card['header'], scope.search if scope else '')
         del card['header'], card['schema']
-    return {'table_id': table_id, 'page': page, 'page_size': page_size, 'total': total,
-            'row_count': selection.row_count, 'groups': [cards[key] for key in keys]}
+    return stringify_unsafe_integers({'table_id': table_id, 'page': page, 'page_size': page_size, 'total': total,
+            'row_count': selection.row_count, 'groups': [cards[key] for key in keys]})
 
 
 def source_card_details(session, table_id, source_key, *, scope=None, page=1, page_size=20):
@@ -131,9 +132,9 @@ def source_card_details(session, table_id, source_key, *, scope=None, page=1, pa
     # Header-only carrier rows are editable source records, not fake details.
     rows = session.scalars(select(DataRowRecord).where(*predicates).order_by(DataRowRecord.item_index, DataRowRecord.id)
         .offset((page - 1) * page_size).limit(page_size)).all()
-    return {**card, 'page': page, 'page_size': page_size, 'total': total,
+    return stringify_unsafe_integers({**card, 'page': page, 'page_size': page_size, 'total': total,
             'matched_row_count': total, 'complete': total == card['row_count'],
-            'rows': [data_row_read(row).model_dump(mode='json') for row in rows]}
+            'rows': [data_row_read(row).model_dump(mode='json') for row in rows]})
 
 
 def clear_source_cards(session, table_id, sources, *, scope=None, edit_session_id=None):

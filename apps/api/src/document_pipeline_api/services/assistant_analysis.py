@@ -76,7 +76,9 @@ def matches(value, rule):
     if rule.op == "empty":
         return value is None or value == ""
     if rule.op == "contains":
-        return str(rule.value or "").casefold() in str(value or "").casefold()
+        needle = "" if rule.value is None else str(rule.value)
+        haystack = "" if value is None else str(value)
+        return needle.casefold() in haystack.casefold()
     if rule.op in {"eq", "ne"}:
         equal = value == rule.value or (value is not None and str(value) == str(rule.value))
         return equal if rule.op == "eq" else not equal
@@ -351,7 +353,7 @@ def analyze(session, request: AnalysisRequest):
         buckets[tuple(dims)].append((r, v))
     if not request.dimensions and not buckets:
         buckets[()] = []
-    invalid = defaultdict(int)
+    invalid = defaultdict(set)
     inferred = set()
 
     def calculate(entries, metric):
@@ -379,14 +381,21 @@ def analyze(session, request: AnalysisRequest):
             return sum(v is not None and v != "" for v in values) if metric.field else len(values)
         if metric.op == "missing":
             return sum(v is None or v == "" for v in values)
-        nonempty = [v for v in values if v is not None and v != ""]
+        nonempty_rows = [
+            (r, v[metric.field])
+            for r, v in entries
+            if v.get(metric.field) is not None and v.get(metric.field) != ""
+        ]
+        nonempty = [value for _, value in nonempty_rows]
         distinct = {json.dumps(v, sort_keys=True, ensure_ascii=False) for v in nonempty}
         if metric.op == "distinct":
             return len(distinct)
         if metric.op == "duplicates":
             return len(nonempty) - len(distinct)
         nums = [number(v) for v in nonempty]
-        invalid[metric.field] += sum(n is None for n in nums)
+        invalid[metric.field].update(
+            row.id for (row, _), parsed in zip(nonempty_rows, nums) if parsed is None
+        )
         nums = [n for n in nums if n is not None]
         if columns[metric.field].value_type != "number" and nums:
             inferred.add(metric.field)
@@ -422,7 +431,7 @@ def analyze(session, request: AnalysisRequest):
         reverse=request.descending if request.sort or not request.time_bucket else False,
     )
     warnings += [
-        f"{columns[k].label}：有 {v} 个非空值无法作为数字，已排除；未按零计算。"
+        f"{columns[k].label}：有 {len(v)} 个非空值无法作为数字，已排除；未按零计算。"
         for k, v in invalid.items()
         if v
     ]

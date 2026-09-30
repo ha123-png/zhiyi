@@ -16,7 +16,7 @@ import zipfile
 import warnings
 from xml.etree import ElementTree
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # 需要归一化的图片类型（jpeg/png 是模型原生可读，无需转换）
 CONVERTIBLE_IMAGE_TYPES = {
@@ -181,6 +181,13 @@ def render_image_frames(
 
 
 def _image_frame_to_rgb(source: Image.Image) -> Image.Image:
+    source = ImageOps.exif_transpose(source)
+    if source.mode.startswith("I;16"):
+        # Pillow's direct RGB conversion clips samples above 255. Use the full
+        # unsigned 16-bit range, with rounding, rather than image-dependent gain.
+        source = source.convert("F").point(lambda value: value * (255 / 65535) + 0.5).convert("L")
+    elif source.mode in ("I", "F"):
+        raise UnsupportedImageError("暂不支持此图片的整数或浮点灰度格式，请先转换为 8 位或 16 位灰度图片。")
     if source.mode in ("RGBA", "LA", "P"):
         rgba = source.convert("RGBA")
         background = Image.new("RGB", rgba.size, (255, 255, 255))

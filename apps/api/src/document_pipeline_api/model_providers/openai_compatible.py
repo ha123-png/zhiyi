@@ -299,7 +299,10 @@ class OpenAICompatibleProvider:
             if not isinstance(response_body, dict):
                 raise ValueError("Invalid completion envelope")
             self.last_usage = response_body.get("usage") or {}
-            choice = response_body["choices"][0]
+            choices = response_body.get("choices")
+            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                raise ValueError("Invalid completion choices")
+            choice = choices[0]
             if choice.get("finish_reason") in {"length", "content_filter"}:
                 raise ModelResponseError("模型输出未完成，结果没有保存为成功。原件仍保留，请调整模型输出设置或缩小处理范围后重试。")
             content = choice["message"]["content"]

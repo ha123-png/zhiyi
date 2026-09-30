@@ -45,7 +45,10 @@ def stop_worker_heartbeat() -> None:
     thread = _heartbeat_thread
     if thread is not None:
         thread.join(timeout=3)
-    heartbeat_path().unlink(missing_ok=True)
+    try:
+        heartbeat_path().unlink(missing_ok=True)
+    except OSError:
+        pass  # Staleness makes an inaccessible old heartbeat offline anyway.
 
 
 def read_worker_health(
@@ -67,7 +70,6 @@ def read_worker_health(
 
 def _heartbeat_loop(interval_seconds: float) -> None:
     path = heartbeat_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     while not _heartbeat_stop.is_set():
         _write_heartbeat(
             path,
@@ -81,6 +83,7 @@ def _write_heartbeat(path: Path, payload: dict[str, float | int]) -> bool:
         f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
     )
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         temporary.write_text(
             json.dumps(payload, ensure_ascii=True),
             encoding="utf-8",
@@ -96,5 +99,8 @@ def _write_heartbeat(path: Path, payload: dict[str, float | int]) -> bool:
     except OSError:
         return False
     finally:
-        temporary.unlink(missing_ok=True)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass  # A transient cleanup lock must not stop future heartbeats.
     return False

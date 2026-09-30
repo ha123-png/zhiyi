@@ -1,6 +1,8 @@
 param(
     [string]$Version = "",
     [switch]$BuildInstaller,
+    [string]$OutputDirectory = "",
+    [string]$NsisExecutable = "",
     [switch]$AllowDirty,
     [switch]$RequireSignature,
     [string]$CertificateThumbprint = "",
@@ -55,7 +57,7 @@ try {
     # PowerShell 5.1 wraps any native stderr output in NativeCommandError when
     # ErrorActionPreference is Stop. uv writes harmless build progress there.
     $ErrorActionPreference = "Continue"
-    $migrationHead = (& uv --cache-dir (Join-Path $projectRoot ".uv-cache") run --project (Join-Path $projectRoot "apps/api") python -c "from alembic.config import Config; from alembic.script import ScriptDirectory; print(ScriptDirectory.from_config(Config('$alembicIni')).get_current_head())" 2>$null)
+    $migrationHead = (& uv --cache-dir (Join-Path $projectRoot ".uv-cache") run --locked --project (Join-Path $projectRoot "apps/api") python -c "from alembic.config import Config; from alembic.script import ScriptDirectory; print(ScriptDirectory.from_config(Config('$alembicIni')).get_current_head())" 2>$null)
 } finally {
     $ErrorActionPreference = $savedErrorActionPreference
 }
@@ -82,23 +84,76 @@ function Sign-ReleaseArtifact([string]$Path) {
     }
 }
 
-$releaseRoot = Join-Path $projectRoot ".local\release"
+function Read-ToolVersion([string]$Command, [string[]]$Arguments) {
+    $value = (& $Command @Arguments | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $value) {
+        throw "Cannot record the toolchain version for $Command."
+    }
+    return $value
+}
+
+$localRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot ".local"))
+$releaseRoot = if ($OutputDirectory) { [IO.Path]::GetFullPath($OutputDirectory) } else { Join-Path $localRoot "release" }
+if (-not $releaseRoot.StartsWith($localRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Release output must be a new directory inside this workspace's .local directory."
+}
+if (Test-Path -LiteralPath $releaseRoot) {
+    throw "Release output already exists; preserve it and pass a new -OutputDirectory."
+}
+$parent = Split-Path -Parent $releaseRoot
+while ($parent -and $parent.StartsWith($projectRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    if ((Test-Path -LiteralPath $parent) -and ((Get-Item -LiteralPath $parent).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Release output ancestors must not be links."
+    }
+    $parent = Split-Path -Parent $parent
+}
 $distRoot = Join-Path $releaseRoot "dist"
 $workRoot = Join-Path $releaseRoot "build"
 $resourceRoot = Join-Path $releaseRoot "resources"
 $auditRoot = Join-Path $releaseRoot "audit"
 $specPath = Join-Path $projectRoot "packaging\DocumentPipeline.spec"
-
-if (-not $releaseRoot.StartsWith((Join-Path $projectRoot ".local\release"))) {
-    throw "Refusing to clean a release directory outside the workspace."
-}
-if (Test-Path -LiteralPath $releaseRoot) {
-    Remove-Item -LiteralPath $releaseRoot -Recurse -Force
-}
 New-Item -ItemType Directory -Path $resourceRoot, $auditRoot -Force | Out-Null
 
+$makensis = $null
+if ($BuildInstaller) {
+    if ($NsisExecutable) {
+        $makensis = (Resolve-Path -LiteralPath $NsisExecutable).Path
+        if (-not (Test-Path -LiteralPath $makensis -PathType Leaf)) { throw "NSIS executable is missing." }
+    }
+    foreach ($candidate in @((Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"), (Join-Path $projectRoot ".local\tools\nsis\makensis.exe"))) {
+        if (-not $makensis -and (Test-Path -LiteralPath $candidate)) { $makensis = $candidate }
+    }
+    if (-not $makensis) {
+        $makensisCommand = Get-Command makensis.exe -CommandType Application -ErrorAction SilentlyContinue
+        if ($makensisCommand) { $makensis = $makensisCommand.Source }
+    }
+    if (-not $makensis) { throw "NSIS compiler makensis.exe was not found." }
+}
+
+$previousApiBase = [Environment]::GetEnvironmentVariable("VITE_API_BASE_URL", "Process")
 Push-Location $projectRoot
 try {
+    # A desktop candidate always calls its own API. Ignore ambient developer
+    # overrides and .env files for this compile-time setting.
+    $env:VITE_API_BASE_URL = "/api/v1"
+    $sourceManifest = Join-Path $resourceRoot "SOURCE_INPUTS.json"
+    uv --cache-dir .uv-cache run --locked --project apps/api python scripts/release_evidence.py source --root $projectRoot --manifest $sourceManifest
+    if ($LASTEXITCODE -ne 0) { throw "Cannot capture source inputs." }
+    $sourceInputs = Get-Content -Raw -Encoding utf8 -LiteralPath $sourceManifest | ConvertFrom-Json
+    if ($sourceInputs.git_revision -ne $revision -or $sourceInputs.source_dirty -ne $isDirty) {
+        throw "Source identity changed during build preparation."
+    }
+    $toolchain = [ordered]@{
+        node = Read-ToolVersion "node" @("--version")
+        npm = Read-ToolVersion "npm.cmd" @("--version")
+        uv = Read-ToolVersion "uv" @("--version")
+        python = Read-ToolVersion "uv" @("run", "--locked", "--project", "apps/api", "python", "--version")
+        pyinstaller = Read-ToolVersion "uv" @("run", "--locked", "--project", "apps/api", "pyinstaller", "--version")
+        nsis_path = $makensis
+        nsis_version = if ($makensis) { Read-ToolVersion $makensis @("/VERSION") } else { $null }
+        upx_enabled = $false
+        frontend_api_base = "/api/v1"
+    }
     $npmCache = Join-Path $projectRoot ".npm-cache"
     New-Item -ItemType Directory -Path $npmCache -Force | Out-Null
     # Reproducible build: npm ci installs exactly from the lockfile (it fails
@@ -125,12 +180,14 @@ try {
     # Use pip-audit's default cache (no --cache-dir): pointing it at an empty
     # local dir forces a full OSV vulnerability-database download on every build,
     # which stalls behind slow CDN connectivity; the default cache is reused.
-    uv --cache-dir .uv-cache run --project apps/api pip-audit --disable-pip --require-hashes -r $requirements --format json --output $pythonAudit
+    uv --cache-dir .uv-cache run --locked --project apps/api pip-audit --disable-pip --require-hashes -r $requirements --format json --output $pythonAudit
     if ($LASTEXITCODE -ne 0) { throw "Python production dependency audit failed." }
 
-    uv --cache-dir .uv-cache run --project apps/api python scripts/collect-third-party-notices.py --root $projectRoot --output $resourceRoot --version $Version --revision $revision --fail-on-policy
+    $noticeArgs = @("--root", $projectRoot, "--output", $resourceRoot, "--version", $Version, "--revision", $revision, "--fail-on-policy", "--python-requirements", $requirements, "--python-audit", $pythonAudit)
+    if ($makensis) { $noticeArgs += @("--nsis-executable", $makensis) }
+    uv --cache-dir .uv-cache run --locked --project apps/api python scripts/collect-third-party-notices.py @noticeArgs
     if ($LASTEXITCODE -ne 0) { throw "Third-party license/SBOM policy failed." }
-    Copy-Item -LiteralPath $npmAudit, $pythonAudit -Destination $resourceRoot
+    Copy-Item -LiteralPath $npmAudit, $pythonAudit, $requirements -Destination $resourceRoot
 
     $buildMetadata = [ordered]@{
         product = "Document Pipeline"
@@ -138,6 +195,7 @@ try {
         git_revision = $revision
         source_dirty = $isDirty
         migration_head = $migrationHead
+        toolchain = $toolchain
         builder_os = [System.Environment]::OSVersion.VersionString
         architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
     }
@@ -145,7 +203,7 @@ try {
 
     $env:DOCUMENT_PIPELINE_RELEASE_RESOURCES = $resourceRoot
     $env:DOCUMENT_PIPELINE_BUILD_VERSION = $Version
-    uv --cache-dir .uv-cache run --project apps/api pyinstaller --noconfirm --clean --distpath $distRoot --workpath $workRoot $specPath
+    uv --cache-dir .uv-cache run --locked --project apps/api pyinstaller --noconfirm --clean --distpath $distRoot --workpath $workRoot $specPath
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
 
     $executable = Join-Path $distRoot "Zhiyi\ZhiyiCLI.exe"
@@ -162,17 +220,6 @@ try {
     Sign-ReleaseArtifact (Join-Path $distRoot "Zhiyi\ZhiyiCLI.exe")
 
     if ($BuildInstaller) {
-        $makensisCommand = Get-Command makensis.exe -CommandType Application -ErrorAction SilentlyContinue
-        $makensis = if ($makensisCommand) { $makensisCommand.Source } else { $null }
-        if (-not $makensis) {
-            $standardMakensis = Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"
-            if (Test-Path -LiteralPath $standardMakensis) { $makensis = $standardMakensis }
-        }
-        if (-not $makensis) {
-            $workspaceMakensis = Join-Path $projectRoot ".local\tools\nsis\makensis.exe"
-            if (Test-Path -LiteralPath $workspaceMakensis) { $makensis = $workspaceMakensis }
-        }
-        if (-not $makensis) { throw "NSIS compiler makensis.exe was not found." }
         $installerOutput = Join-Path $distRoot "installer"
         New-Item -ItemType Directory -Path $installerOutput -Force | Out-Null
         & $makensis "/INPUTCHARSET" "UTF8" "/DAPP_VERSION=$Version" "/DBUILD_ROOT=$distRoot" "/DOUTPUT_DIR=$installerOutput" (Join-Path $projectRoot "packaging\installer.nsi")
@@ -196,21 +243,47 @@ try {
     if ($RequireSignature -and @($artifacts | Where-Object signature_status -ne "Valid").Count -gt 0) {
         throw "Release signature gate failed. Every EXE and installer must have a valid Authenticode signature."
     }
+    uv --cache-dir .uv-cache run --locked --project apps/api python scripts/release_evidence.py verify-source --root $projectRoot --manifest $sourceManifest
+    if ($LASTEXITCODE -ne 0) { throw "Candidate source drifted during build." }
+    $payloadManifest = Join-Path $distRoot "PAYLOAD_MANIFEST.json"
+    uv --cache-dir .uv-cache run --locked --project apps/api python scripts/release_evidence.py payload --root (Join-Path $distRoot "Zhiyi") --manifest $payloadManifest
+    if ($LASTEXITCODE -ne 0) { throw "Cannot bind complete release payload." }
     $manifest = [ordered]@{
-        schema_version = 1
+        schema_version = 2
         product = "Document Pipeline"
         version = $Version
         git_revision = $revision
         source_dirty = $isDirty
-        releasable = (-not $isDirty) -and (@($artifacts | Where-Object signature_status -ne "Valid").Count -eq 0)
+        releasable = $false
+        candidate_kind = "local-engineering-candidate"
+        gates = [ordered]@{
+            build_and_dependency_audit = "passed"
+            source_unchanged = "passed"
+            signature = if (@($artifacts | Where-Object signature_status -ne "Valid").Count -eq 0) { "passed" } else { "not_satisfied" }
+            software_acceptance = "unverified"
+            packaged_lifecycle = "unverified"
+            model_quality = "unverified"
+        }
+        release_decision = "Build alone does not approve a release; bind independent acceptance to these hashes."
+        toolchain = $toolchain
+        source_manifest_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceManifest).Hash.ToLowerInvariant()
+        payload_manifest_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadManifest).Hash.ToLowerInvariant()
         migration_head = $migrationHead
         artifacts = @($artifacts)
-        evidence = @("resources/SBOM.cdx.json", "resources/LICENSE_POLICY.json", "resources/npm-audit.json", "resources/pip-audit.json")
+        evidence = @(Get-ChildItem -LiteralPath $resourceRoot -File -Recurse | Sort-Object FullName | ForEach-Object {
+            [ordered]@{
+                path = "resources/" + $_.FullName.Substring($resourceRoot.Length + 1).Replace('\', '/')
+                sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            }
+        })
     }
     $manifest | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $distRoot "RELEASE_MANIFEST.json")
     Copy-Item -LiteralPath $resourceRoot -Destination (Join-Path $distRoot "resources") -Recurse
-    $artifacts | ForEach-Object { "$($_.sha256)  $($_.path)" } | Set-Content -Encoding ascii -LiteralPath (Join-Path $distRoot "SHA256SUMS.txt")
+    $checksumTargets = @($artifacts) + @([ordered]@{ path = "PAYLOAD_MANIFEST.json"; sha256 = $manifest.payload_manifest_sha256 }) + @($manifest.evidence)
+    $checksumLines = @($checksumTargets | ForEach-Object { "$($_.sha256)  $($_.path)" })
+    [IO.File]::WriteAllLines((Join-Path $distRoot "SHA256SUMS.txt"), [string[]]$checksumLines, [Text.UTF8Encoding]::new($false))
 } finally {
+    [Environment]::SetEnvironmentVariable("VITE_API_BASE_URL", $previousApiBase, "Process")
     Remove-Item Env:DOCUMENT_PIPELINE_RELEASE_RESOURCES -ErrorAction SilentlyContinue
     Remove-Item Env:DOCUMENT_PIPELINE_BUILD_VERSION -ErrorAction SilentlyContinue
     Pop-Location

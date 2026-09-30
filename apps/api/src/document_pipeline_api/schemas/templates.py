@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from document_pipeline_api.schemas.rules import ValidationRule
 
@@ -15,6 +15,11 @@ class TemplateField(BaseModel):
     example: str = Field(default="", max_length=256)
     instructions: str = Field(default="", max_length=512)
     value_type: Literal["text", "number", "date", "boolean"] = "text"
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def strip_label(cls, value):
+        return value.strip() if isinstance(value, str) else value
 
 
 class TemplatePresentation(BaseModel):
@@ -52,6 +57,11 @@ class TemplateBody(BaseModel):
     deterministic_rules: list[ValidationRule] = Field(default_factory=list, max_length=50)
     output_mapping: dict[str, str] = Field(default_factory=dict)
     behavior: TemplateBehavior = Field(default_factory=TemplateBehavior)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def strip_name(cls, value):
+        return value.strip() if isinstance(value, str) else value
 
 
 class TemplateCreate(TemplateBody):

@@ -27,8 +27,9 @@ def validate_integration_tokens(settings: Settings) -> None:
         )
         if token
     ]
-    if any(len(token) < 32 for token in configured):
-        raise RuntimeError("外部集成密钥至少需要 32 个字符。")
+    if any(len(token) < 32 or not token.isascii() or not token.isprintable()
+           or any(char.isspace() for char in token) for token in configured):
+        raise RuntimeError("外部集成密钥至少需要 32 个非空白可打印 ASCII 字符。")
     if (
         settings.integration_read_token
         and settings.integration_read_token == settings.integration_write_token
@@ -58,12 +59,16 @@ def require_integration_read(
         raise _invalid_credentials()
 
     token = credentials.credentials
-    if write_token and compare_digest(
+    # HTTP headers may contain latin-1 bytes. compare_digest(str, str) only
+    # accepts ASCII: malformed credentials must remain a 401, never a 500.
+    if not token.isascii():
+        raise _invalid_credentials()
+    if write_token and write_token.isascii() and compare_digest(
         token,
         write_token,
     ):
         return IntegrationPrincipal(scope="write")
-    if read_token and compare_digest(
+    if read_token and read_token.isascii() and compare_digest(
         token,
         read_token,
     ):

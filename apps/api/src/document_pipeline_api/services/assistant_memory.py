@@ -336,7 +336,7 @@ def model_result(result, tool_id, budget=6000):
     value = {"tool_id": tool_id, **summary}
     if len(encode(value)) <= budget:
         return value
-    small = {"tool_id": tool_id, "context_limited": True,
+    small = {"tool_id": summary.get("tool_id", tool_id), "context_limited": True,
         "notice": "有界预览；完整结果保存在本机，可用 read_tool_result 按字段和偏移读取。预览不能代表全部记录。"}
     # Preserve facts/identifiers first. Even error messages, column lists and
     # user-controlled names must obey the transport budget.

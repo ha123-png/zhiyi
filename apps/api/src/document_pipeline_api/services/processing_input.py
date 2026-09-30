@@ -10,7 +10,8 @@ from document_pipeline_api.config import Settings
 from document_pipeline_api.schemas.input_scope import InputPolicy
 from document_pipeline_api.schemas.input_scope import InputScope
 from document_pipeline_api.services.file_formats import (
-    TEXT_CONTENT_TYPES, _image_frame_to_rgb, inspect_image_frame_count, render_image_frames,
+    TEXT_CONTENT_TYPES, UnsupportedImageError, _image_frame_to_rgb,
+    inspect_image_frame_count, render_image_frames,
 )
 from document_pipeline_api.services.input_scope import (
     InputBudgetError, PreparedInput, native_units, select_input, select_prefix, visual_units,
@@ -85,16 +86,25 @@ def render_input_images(path: Path, content_type: str, prepared: PreparedInput, 
         for unit in visual:
             if not unit.image_member:
                 raise InputBudgetError("所选 Word 图片没有可验证的内部引用。")
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(BytesIO(archive.read(unit.image_member))) as image:
-                    if getattr(image, "n_frames", 1) != 1:
-                        raise InputBudgetError("所选 Word 内嵌图片含多帧，当前无法完整读取该图片。")
-                    pixels += image.width * image.height
-                    if pixels > settings.max_image_total_pixels:
-                        raise InputBudgetError("Word 内嵌图片超过像素安全上限。")
-                    image.load()
-                    target = output / f"{task_id}-docx-image-{unit.location.start}.png"
-                    _image_frame_to_rgb(image).save(target, "PNG")
-                    paths.append(target)
+            image_bytes = archive.read(unit.image_member)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", Image.DecompressionBombWarning)
+                    with Image.open(BytesIO(image_bytes)) as image:
+                        if getattr(image, "n_frames", 1) != 1:
+                            raise InputBudgetError("所选 Word 内嵌图片含多帧，当前无法完整读取该图片。")
+                        pixels += image.width * image.height
+                        if pixels > settings.max_image_total_pixels:
+                            raise InputBudgetError("Word 内嵌图片超过像素安全上限。")
+                        image.load()
+                        normalized = _image_frame_to_rgb(image)
+            except (Image.DecompressionBombError, Image.DecompressionBombWarning) as error:
+                raise UnsupportedImageError("Word 内嵌图片超过像素安全上限。") from error
+            except OSError as error:
+                raise UnsupportedImageError("Word 内嵌图片损坏或无法读取，请更换图片后重试。") from error
+            # Disk writes are outside the decode handler: a real storage error
+            # must retain its storage diagnosis.
+            target = output / f"{task_id}-docx-image-{unit.location.start}.png"
+            normalized.save(target, "PNG")
+            paths.append(target)
     return paths

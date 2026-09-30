@@ -1,12 +1,17 @@
 from pathlib import Path
 import io
+import time
 
 from PIL import Image
+import pytest
+from pydantic import ValidationError
 
 from document_pipeline_api.evaluation.quality import (
     GoldenDataset,
+    MetricSlice,
     QualityReport,
     QualityThresholds,
+    SampleScore,
     compare_quality_reports,
     dataset_fingerprint,
     evaluate_release_gate,
@@ -65,6 +70,41 @@ class MultiPageQualityProvider:
                 "document_type": "发票",
                 "seller_name": "正确卖方",
                 "buyer_name": "正确买方",
+                "document_number": None,
+                "document_date": None,
+                "amount_before_tax": None,
+                "tax_amount": None,
+                "total_amount": 10,
+                "items": [],
+            }
+        )
+
+
+class StageTimingQualityProvider(StubQualityProvider):
+    def extract_image(self, path: Path, prompt: str, result_type):
+        time.sleep(0.15 if result_type.__name__ == "TemplateMatchDecision" else 0.03)
+        return super().extract_image(path, prompt, result_type)
+
+
+class ReleaseGateContractProvider:
+    model_name = "test-only-contract-stub"
+
+    def __init__(self, *, wrong_buyer_file: str | None = None) -> None:
+        self.wrong_buyer_file = wrong_buyer_file
+
+    def extract_image(self, path: Path, _prompt: str, result_type):
+        if result_type.__name__ == "TemplateMatchDecision":
+            return result_type.model_validate(
+                {"outcome": "matched", "template_ids": ["builtin-invoice"]}
+            )
+        buyer_name = f"买方{path.stem.rsplit('-', maxsplit=1)[-1]}"
+        if path.name == self.wrong_buyer_file:
+            buyer_name = "错误买方"
+        return result_type.model_validate(
+            {
+                "document_type": "发票",
+                "seller_name": f"卖方{path.stem.rsplit('-', maxsplit=1)[-1]}",
+                "buyer_name": buyer_name,
                 "document_number": None,
                 "document_date": None,
                 "amount_before_tax": None,
@@ -256,6 +296,245 @@ def test_release_gate_enforces_hard_and_user_defined_thresholds() -> None:
     assert any("关键字段准确率" in blocker for blocker in gate.blockers)
     assert any("明细漏行率" in blocker for blocker in gate.blockers)
     assert any("P95" in blocker for blocker in gate.blockers)
+
+
+def test_release_gate_does_not_sign_off_legacy_unreviewed_metadata(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "发票"
+    directory.mkdir()
+    (directory / "invoice.png").write_bytes(PNG_BYTES)
+    golden = GoldenDataset.model_validate(
+        {
+            "schema_version": 1,
+            "review_status": "synthetic_known_values",
+            "samples": {
+                "invoice.png": {
+                    "category": "发票",
+                    "fields": {"seller_name": "正确卖方"},
+                    "item_count": 0,
+                }
+            },
+        }
+    )
+    report = run_quality_evaluation(
+        StubQualityProvider(),
+        provider_name="lm_studio",
+        dataset_dir=tmp_path,
+        golden=golden,
+    )
+
+    gate = evaluate_release_gate(
+        report,
+        QualityThresholds(),
+    )
+
+    assert gate.passed is False
+    assert report.samples[0].source_kind == "unverified"
+    assert any("签收" in blocker for blocker in gate.blockers)
+    assert any("关键字段" in blocker for blocker in gate.blockers)
+    assert any("可选质量阈值" in blocker for blocker in gate.blockers)
+
+
+def test_quality_gate_thresholds_cannot_weaken_hard_gates_or_accept_bad_rates() -> None:
+    with pytest.raises(ValidationError):
+        QualityThresholds(min_sample_count=29)
+    with pytest.raises(ValidationError):
+        QualityThresholds(min_real_private_samples=0)
+    with pytest.raises(ValidationError):
+        QualityThresholds(min_parse_success_rate=0.99)
+    with pytest.raises(ValidationError):
+        QualityThresholds(max_latency_p95_seconds=float("inf"))
+    with pytest.raises(ValidationError):
+        QualityThresholds(min_key_field_accuracy=1.01)
+
+
+def test_quality_gate_rejects_nonfinite_or_out_of_range_report_metrics() -> None:
+    report = QualityReport.model_validate(
+        {
+            "generated_at": "2026-08-02T00:00:00Z",
+            "dataset_fingerprint": "a" * 64,
+            "golden_schema_version": 2,
+            "model_provider": "lm_studio",
+            "model_name": "model-a",
+            "prompt_version": "v1",
+            "overall": {
+                "sample_count": 0,
+                "parse_success_rate": 1,
+                "classification_accuracy": 1,
+                "field_accuracy": 1,
+                "item_count_accuracy": 1,
+                "document_exact_rate": 1,
+            },
+            "by_category": {},
+            "by_source_kind": {},
+            "latency_p50_seconds": 1,
+            "latency_p95_seconds": 2,
+            "samples": [],
+        }
+    )
+    malformed = report.model_copy(
+        update={"overall": report.overall.model_copy(update={"field_accuracy": float("nan")})}
+    )
+
+    gate = evaluate_release_gate(malformed, QualityThresholds())
+
+    assert gate.passed is False
+    assert "无效字段" in gate.blockers[0]
+
+
+def test_release_gate_never_counts_synthetic_samples_as_real_private() -> None:
+    summary = MetricSlice(
+        sample_count=30,
+        parse_success_rate=1,
+        classification_accuracy=1,
+        field_accuracy=1,
+        item_count_accuracy=1,
+        document_exact_rate=1,
+        key_field_accuracy=1,
+        detail_row_omission_rate=0,
+        human_correction_rate=0,
+        page_completeness_rate=1,
+    )
+    samples = [
+        SampleScore(
+            sample_id=f"synthetic-{index}",
+            category="发票",
+            source_kind="synthetic",
+            parseable=True,
+            classification_match=True,
+            elapsed_seconds=0.01,
+            field_matches={"seller_name": True},
+            key_field_matches={"seller_name": True},
+            item_count_match=True,
+            document_exact=True,
+        )
+        for index in range(30)
+    ]
+    report = QualityReport(
+        report_version=4,
+        latency_scope="extraction_only",
+        golden_review_approved=True,
+        key_field_coverage_complete=True,
+        generated_at="2026-09-30T04:00:00Z",
+        dataset_fingerprint="a" * 64,
+        golden_schema_version=2,
+        model_provider="fixture",
+        model_name="fixture-model",
+        prompt_version="v1",
+        overall=summary,
+        by_category={"发票": summary},
+        by_source_kind={"synthetic": summary},
+        by_clarity={"clear": summary},
+        by_page_count={"1": summary},
+        latency_p50_seconds=0.01,
+        latency_p95_seconds=0.01,
+        samples=samples,
+    )
+    thresholds = QualityThresholds(
+        min_classification_accuracy=0.8,
+        min_field_accuracy=0.8,
+        min_key_field_accuracy=0.8,
+        min_document_exact_rate=0.8,
+        max_detail_row_omission_rate=0.1,
+        max_human_correction_rate=0.1,
+        max_latency_p95_seconds=1,
+        approved_by="quality-owner",
+        approved_at="2026-09-30T12:00:00+08:00",
+    )
+
+    gate = evaluate_release_gate(report, thresholds)
+
+    assert gate.passed is False
+    assert any("真实脱敏样本数 0" in blocker for blocker in gate.blockers)
+
+
+def test_release_gate_passes_complete_structural_fixture_and_blocks_field_accuracy(
+    tmp_path: Path,
+) -> None:
+    # Structural contract fixture only: it exercises the qualifying source metadata
+    # branch without containing private business documents or calling a real model.
+    directory = tmp_path / "发票"
+    directory.mkdir()
+    samples = {}
+    for index in range(30):
+        suffix = f"{index:02d}"
+        filename = f"invoice-{suffix}.png"
+        (directory / filename).write_bytes(PNG_BYTES)
+        samples[filename] = {
+            "category": "发票",
+            "source_kind": "real_private",
+            "fields": {
+                "seller_name": f"卖方{suffix}",
+                "buyer_name": f"买方{suffix}",
+            },
+            "key_fields": ["seller_name"],
+            "item_count": 0,
+        }
+    golden = GoldenDataset.model_validate(
+        {
+            "schema_version": 2,
+            "review_status": "approved",
+            "reviewed_by": "test-only-reviewer",
+            "reviewed_at": "2026-09-30T12:00:00+08:00",
+            "samples": samples,
+        }
+    )
+    thresholds = QualityThresholds(
+        min_classification_accuracy=0.95,
+        min_field_accuracy=0.99,
+        min_key_field_accuracy=0.99,
+        min_document_exact_rate=0.95,
+        max_detail_row_omission_rate=0.05,
+        max_human_correction_rate=0.05,
+        max_latency_p95_seconds=5,
+        approved_by="test-only-approver",
+        approved_at="2026-09-30T12:00:00+08:00",
+    )
+    common = {
+        "provider_name": "stub",
+        "dataset_dir": tmp_path,
+        "golden": golden,
+    }
+    passing_report = run_quality_evaluation(
+        ReleaseGateContractProvider(), **common
+    )
+    failed_report = run_quality_evaluation(
+        ReleaseGateContractProvider(wrong_buyer_file="invoice-00.png"), **common
+    )
+
+    assert evaluate_release_gate(passing_report, thresholds).passed is True
+    failed_gate = evaluate_release_gate(failed_report, thresholds)
+    assert failed_gate.passed is False
+    assert len(failed_gate.blockers) == 1
+    assert "字段准确率" in failed_gate.blockers[0]
+
+
+def test_quality_latency_measures_extraction_only_and_legacy_scope_is_not_comparable(
+    tmp_path: Path,
+) -> None:
+    golden = _golden().model_copy(
+        update={"samples": {"invoice.png": _golden().samples["invoice.png"]}}
+    )
+    directory = tmp_path / "发票"
+    directory.mkdir()
+    (directory / "invoice.png").write_bytes(PNG_BYTES)
+
+    report = run_quality_evaluation(
+        StageTimingQualityProvider(),
+        provider_name="lm_studio",
+        dataset_dir=tmp_path,
+        golden=golden,
+    )
+
+    assert report.latency_scope == "extraction_only"
+    assert 0.02 <= report.samples[0].elapsed_seconds < 0.10
+    legacy = report.model_copy(
+        update={"report_version": 3, "latency_scope": "legacy_pipeline_mixed"}
+    )
+    comparison = compare_quality_reports(legacy, report)
+    assert comparison.comparable is False
+    assert comparison.regressions == ["报告版本或耗时阶段口径不同，不能直接比较。"]
 
 
 def test_quality_evaluation_uses_all_frames_and_checks_page_completeness(

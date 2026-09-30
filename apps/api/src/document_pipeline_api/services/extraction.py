@@ -29,7 +29,10 @@ from document_pipeline_api.schemas.extraction import (
 from document_pipeline_api.services.file_formats import (
     CONVERTIBLE_IMAGE_TYPES,
     TEXT_CONTENT_TYPES,
+    UnsupportedImageError,
+    UnsupportedTextFileError,
 )
+from document_pipeline_api.services.pdf_rendering import UnsupportedPdfError
 from document_pipeline_api.services.processing_input import prepare_input, policy_for_context, render_input_images, input_scope_issues
 from document_pipeline_api.services.input_scope import InputBudgetError, select_input, visual_units
 from document_pipeline_api.schemas.input_scope import InputPolicy, InputScope
@@ -179,17 +182,50 @@ def save_review(
     if extraction is None:
         raise HTTPException(status_code=404, detail="这个任务还没有提取结果。")
 
-    from document_pipeline_api.services.current_data import get_current, current_snapshot, revise_current
+    from document_pipeline_api.services.current_data import (
+        get_current, current_snapshot, revise_current, parse_unsafe_integer_string,
+    )
     from document_pipeline_api.services.data_baseline_audit import split_legacy_result
     current = get_current(session, task_id)
     if update.expected_version != current.current_version:
         raise HTTPException(409, "结果已在其他位置更新，请刷新后再修改。")
+    prior_issues = [
+        ValidationIssue.model_validate(issue)
+        for issue in json.loads(current.validation_json)
+    ]
+    ignored_indices = update.ignored_issue_indices
+    if len(set(ignored_indices)) != len(ignored_indices):
+        raise HTTPException(422, "忽略的校验问题索引不能重复。")
+    if any(index >= len(prior_issues) for index in ignored_indices):
+        raise HTTPException(422, "忽略的校验问题索引已失效，请刷新后重试。")
+    # The client selects issues shown for this current_version. Resolve its
+    # indices to stable rule identities before evaluating the edited result,
+    # whose issue list may have changed order or length in this same request.
+    ignored_identities = {
+        (prior_issues[index].code, prior_issues[index].field)
+        for index in ignored_indices
+    }
     from document_pipeline_api.services.current_data import validation_result
     if isinstance(update.result, DocumentExtraction):
         header, items = split_legacy_result(update.result.model_dump_json(), custom=False)
         saved_result = TemplateExtraction(header=header, items=items)
     else:
         saved_result = update.result
+        schema = json.loads(current.schema_json)
+        numeric_fields = {
+            (column.get("section"), column.get("key"))
+            for column in schema if column.get("value_type") in {"number", "integer"}
+        }
+        header = dict(saved_result.header)
+        items = [dict(item) for item in saved_result.items]
+        for key in header:
+            if ("header", key) in numeric_fields and isinstance(header[key], str):
+                header[key] = parse_unsafe_integer_string(header[key])
+        for item in items:
+            for key in item:
+                if ("item", key) in numeric_fields and isinstance(item[key], str):
+                    item[key] = parse_unsafe_integer_string(item[key])
+        saved_result = saved_result.model_copy(update={"header": header, "items": items})
     evaluation = evaluate_rules(
         session,
         document_kind=DocumentKind(extraction.document_kind),
@@ -199,10 +235,11 @@ def save_review(
     )
     issues = evaluation.issues + input_scope_issues(extraction.input_scope_json)
     # 用户可显式忽略部分校验问题：仍记录（审计语义不变），但不再阻断保存/确认
-    ignored_set = set(update.ignored_issue_indices)
     stored_issues = [
-        issue.model_copy(update={"ignored": index in ignored_set})
-        for index, issue in enumerate(issues)
+        issue.model_copy(update={
+            "ignored": (issue.code, issue.field) in ignored_identities,
+        })
+        for issue in issues
     ]
     blocking_issues = [issue for issue in stored_issues if not issue.ignored]
     snapshot = current_snapshot(session, task_id)
@@ -672,7 +709,7 @@ def process_task(
             else error.code
             if isinstance(error, ModelServiceError)
             else "input_preprocessing_failed"
-            if isinstance(error, InputBudgetError)
+            if isinstance(error, (InputBudgetError, UnsupportedImageError, UnsupportedTextFileError, UnsupportedPdfError))
             else "invalid_original_reference"
             if isinstance(error, InvalidOriginalReference)
             else "storage_unavailable"
@@ -683,7 +720,7 @@ def process_task(
             "智能匹配未能确定这份文件的用途，可重试，或在历史记录里手动选择模板。"
             if is_match_error
             else str(error)
-            if isinstance(error, (ModelServiceError, InputBudgetError))
+            if isinstance(error, (ModelServiceError, InputBudgetError, UnsupportedImageError, UnsupportedTextFileError, UnsupportedPdfError))
             else "内部原件引用无效，已停止处理。请重新导入原文件。"
             if isinstance(error, InvalidOriginalReference)
             else "文件存储不可用，请检查磁盘空间和文件权限后重试。"

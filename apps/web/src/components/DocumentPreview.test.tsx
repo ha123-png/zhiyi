@@ -133,6 +133,37 @@ describe("DocumentPreview", () => {
     await screen.findByText("首段核对内容");
   });
 
+  it("returns correctly after more than 64 text windows while keeping bookmark history bounded", async () => {
+    const totalBytes = 2_326_528;
+    const offsets: number[] = [];
+    const bookmarkSizes: number[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const offset = Number(new URL(url, "http://localhost").searchParams.get("offset") ?? 0);
+      offsets.push(offset);
+      const next = offset + 32_768 < totalBytes ? offset + 32_768 : null;
+      return { ok: true, json: async () => ({ kind: "text", text: `byte offset ${offset}`, offset,
+        next_offset: next, truncated: next != null, total_bytes: totalBytes }) };
+    }));
+    const props = { contentType: "text/plain", filename: "长文.txt", pageNumber: 1, scale: 1,
+      url: "/api/v1/tasks/long-window-history/file",
+      onBookmarkChange: (bookmark: { previousOffsets?: number[] }) => bookmarkSizes.push(bookmark.previousOffsets?.length ?? 0) };
+    render(<DocumentPreview {...props} />);
+    await screen.findByText("byte offset 0");
+
+    for (let page = 1; page <= 66; page++) {
+      fireEvent.click(screen.getByRole("button", { name: "下一段" }));
+      await screen.findByText(`byte offset ${page * 32_768}`);
+    }
+    for (let page = 65; page >= 1; page--) {
+      fireEvent.click(screen.getByRole("button", { name: "上一段" }));
+      await screen.findByText(`byte offset ${page * 32_768}`);
+    }
+
+    expect(screen.getByText("byte offset 32768")).toBeInTheDocument();
+    expect(Math.max(...bookmarkSizes)).toBeLessThanOrEqual(64);
+    expect(offsets.length).toBeGreaterThan(132);
+  }, 15_000);
+
   it("keeps the last scroll position when its preview pane is removed immediately", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,

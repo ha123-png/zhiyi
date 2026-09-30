@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from datetime import date
 from uuid import uuid4
 
@@ -20,6 +21,7 @@ from document_pipeline_api.models import (
 )
 from document_pipeline_api.models.task import utc_now
 from document_pipeline_api.services.revision_changes import detail_counts
+from document_pipeline_api.schemas.json_numbers import MAX_SAFE_JSON_INTEGER
 
 
 def encode(value: object) -> str:
@@ -59,6 +61,7 @@ def row_search_predicate(search: str):
     # Decode JSON strings first: escaped Unicode and literal Unicode describe
     # the same business text. Raw JSON LIKE would miss older/imported records.
     return select(1).select_from(values).where(
+        values.c.key.not_in({"__row_group", "__header_labels"}),
         cast(values.c.value, Text).ilike(f"%{escaped}%", escape="\\"),
     ).correlate(DataRowRecord).exists()
 
@@ -97,9 +100,12 @@ def check_column_values(values: dict, schema: list[dict]) -> None:
     if unknown:
         raise HTTPException(422, f"不存在的字段：{', '.join(sorted(unknown))}。")
     for key, value in values.items():
+        kind = fields[key].get("value_type", "text")
+        if kind in {"number", "integer"} and isinstance(value, str):
+            value = parse_unsafe_integer_string(value)
+            values[key] = value
         if value is None or value == "":
             continue
-        kind = fields[key].get("value_type", "text")
         valid = not isinstance(value, (dict, list))
         if kind in {"number", "integer"}:
             try:
@@ -119,6 +125,16 @@ def check_column_values(values: dict, schema: list[dict]) -> None:
             valid = isinstance(value, str)
         if not valid:
             raise HTTPException(422, f"字段“{fields[key].get('label', key)}”的值不符合类型要求。")
+
+
+def parse_unsafe_integer_string(value: str):
+    """Recover an exact decimal integer sent as a string by browser clients."""
+    if not re.fullmatch(r"-?(?:0|[1-9][0-9]*)", value):
+        return value
+    if len(value.lstrip("-")) > 4300:
+        raise HTTPException(422, "整数字符串超出当前可接受长度。")
+    parsed = int(value)
+    return parsed if abs(parsed) > MAX_SAFE_JSON_INTEGER else value
 
 
 def create_edit_session(session: Session, *, owner: str, editor: str = "user") -> DataEditSessionRecord:
@@ -205,6 +221,8 @@ def _record_change(
                 stored.item_index, stored.change_json = item["item_index"], encode(updated)
     if before.get("has_data", False) != after.get("has_data", False):
         _merge_change(changes, "presence", before.get("has_data", False), after.get("has_data", False))
+    if before.get("validation") != after.get("validation"):
+        _merge_change(changes, "validation", before.get("validation", []), after.get("validation", []))
     pending.changes_json = encode(changes)
     if edit_session_id is None:
         _seal_revision(session, pending)
@@ -212,7 +230,7 @@ def _record_change(
 
 def _seal_revision(session: Session, revision: FileRevisionRecord) -> None:
     changes = json.loads(revision.changes_json)
-    if not changes["header"] and not revision.total_details and "presence" not in changes:
+    if not changes["header"] and not revision.total_details and "presence" not in changes and "validation" not in changes:
         # An open draft fully reverted before sealing never becomes a version.
         if revision in session.new:
             session.expunge(revision)
@@ -324,6 +342,7 @@ def revise_current(
     for values in list(detail_changes.values()) + (new_items or []):
         _check_values(values, schema, "item")
     before = {"header": json.loads(current.header_json), "has_data": current.has_data,
+              "validation": json.loads(current.validation_json),
               "items": [{"id": row.id, "item_index": row.item_index, "values": json.loads(row.row_json)}
                         for row in rows.values() if not row.is_header_only]}
     header = {**before["header"], **header_changes}
@@ -343,9 +362,26 @@ def revise_current(
          "values": {**json.loads(row.row_json), **detail_changes.get(row.id, {})}}
         for row in rows.values() if row.id not in deleted and not row.is_header_only
     ]
+    validation_after = json.loads(validation_json) if validation_json is not None else before["validation"]
+    validation_changed = validation_after != before["validation"]
     if header == before["header"] and prospective == before["items"] and not new_items and not deleted:
-        if validation_json is not None:
-            current.validation_json = validation_json
+        if not validation_changed:
+            return current
+        result = session.execute(update(FileCurrentDataRecord).where(
+            FileCurrentDataRecord.task_id == task_id,
+            FileCurrentDataRecord.current_version == expected_version,
+        ).values(current_version=expected_version + 1))
+        if result.rowcount != 1:
+            raise HTTPException(409, "这份文件的数据已经更新，请刷新后再修改。")
+        current.current_version = expected_version + 1
+        current.updated_at = utc_now()
+        current.validation_json = encode(validation_after)
+        session.execute(update(DataRowRecord).where(DataRowRecord.task_id == task_id)
+                        .values(row_version=current.current_version, updated_at=current.updated_at))
+        after = {**before, "validation": validation_after}
+        _record_change(session, current, before, after,
+                       editor=editor, operation=operation, edit_session_id=edit_session_id)
+        session.flush()
         return current
     # Acquire the write fence before changing rows. SQLite serializes writers;
     # the conditional update also rejects stale sessions on other SQL engines.
@@ -391,7 +427,8 @@ def revise_current(
     if validation_json is None:
         refresh_validation(session, current)
     after = {"header": header, "has_data": current.has_data, "items": prospective + [
-        {"id": row.id, "item_index": row.item_index, "values": json.loads(row.row_json)} for row in added_rows]}
+        {"id": row.id, "item_index": row.item_index, "values": json.loads(row.row_json)} for row in added_rows],
+        "validation": json.loads(current.validation_json)}
     _record_change(session, current, before, after,
                    editor=editor, operation=operation, edit_session_id=edit_session_id)
     session.flush()

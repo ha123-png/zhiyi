@@ -155,11 +155,12 @@ def _database(path, marker):
         connection.execute("INSERT INTO marker VALUES (?)", (marker,))
 
 
-@pytest.mark.parametrize("kill_after", [1, 2, 3, 4, 5])
-def test_restore_hard_exit_recovers_complete_old_set(tmp_path, kill_after):
-    root, stage = tmp_path / "data", tmp_path / "stage"
+@pytest.mark.parametrize("kill_after,journal_version", [(1, 2), (2, 2), (3, 2), (4, 2), (5, 2), (3, 1)])
+def test_restore_hard_exit_recovers_complete_old_set(tmp_path, kill_after, journal_version):
+    root = tmp_path / "data"
+    stage = root / "runtime" / "restore-fixture"
     root.mkdir()
-    stage.mkdir()
+    stage.mkdir(parents=True)
     for folder, marker in ((root, "old"), (stage, "new")):
         _database(folder / "document-pipeline.db", marker)
         (folder / "uploads").mkdir()
@@ -183,6 +184,11 @@ backup._install_staged_restore(root, root / 'document-pipeline.db', root / 'uplo
     result = subprocess.run([sys.executable, "-c", script, str(root), str(stage), str(kill_after)], capture_output=True, timeout=30)
     assert result.returncode == 73, result.stderr.decode(errors="replace")
     assert restore_journal_path(root).exists()
+    if journal_version == 1:
+        state = json.loads(restore_journal_path(root).read_text(encoding="utf-8"))
+        state["version"] = 1
+        state.pop("staging")
+        restore_journal_path(root).write_text(json.dumps(state), encoding="utf-8")
     recover_interrupted_restore(root)
     recover_interrupted_restore(root)  # repeated startup must be idempotent
     assert not restore_journal_path(root).exists()
@@ -190,6 +196,36 @@ backup._install_staged_restore(root, root / 'document-pipeline.db', root / 'uplo
         assert connection.execute("SELECT value FROM marker").fetchone() == ("old",)
     assert (root / "uploads" / "evidence.txt").read_text() == "old"
     assert (root / "queue.db").read_bytes() == b"old queue"
+    if journal_version == 1:
+        assert stage.is_dir()  # Legacy journals never identify or guess staging.
+    else:
+        assert not stage.exists()
+
+
+@pytest.mark.parametrize("layout", ["external", "unmanaged_name", "split"])
+def test_restore_rejects_invalid_staging_before_mutating_data(tmp_path, layout):
+    from document_pipeline_api.business_backup import BusinessBackupError, _install_staged_restore
+
+    root = tmp_path / "data"
+    root.mkdir()
+    _database(root / "document-pipeline.db", "old")
+    (root / "uploads").mkdir()
+    (root / "uploads" / "original.txt").write_bytes(b"old original")
+    stage = (tmp_path / "restore-external" if layout == "external" else
+             root / "runtime" / ("wrong-name" if layout == "unmanaged_name" else "restore-fixture"))
+    stage.mkdir(parents=True)
+    _database(stage / "database.db", "new")
+    uploads = stage / "uploads" if layout != "split" else root / "runtime" / "restore-other" / "uploads"
+    uploads.mkdir(parents=True)
+    (uploads / "new.txt").write_bytes(b"new original")
+    old_database = (root / "document-pipeline.db").read_bytes()
+    with pytest.raises(BusinessBackupError, match="暂存路径"):
+        _install_staged_restore(root, root / "document-pipeline.db", root / "uploads", stage / "database.db", uploads)
+    assert (root / "document-pipeline.db").read_bytes() == old_database
+    assert (root / "uploads" / "original.txt").read_bytes() == b"old original"
+    assert (uploads / "new.txt").read_bytes() == b"new original"
+    assert not restore_journal_path(root).exists()
+    assert not (root / "backups").exists()
 
 
 @pytest.mark.parametrize("layout", ["equal", "parent", "child", "mixed"])

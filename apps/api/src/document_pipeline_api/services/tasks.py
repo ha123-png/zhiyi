@@ -1,6 +1,6 @@
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -41,6 +41,10 @@ from document_pipeline_api.services.system_settings import get_bool_setting, upl
 from document_pipeline_api.services.templates import get_active_template
 from document_pipeline_api.storage_paths import task_storage_name
 from document_pipeline_api.services.file_operation_lock import guard_file_operation
+from document_pipeline_api.services.upload_recovery import (
+    begin_upload_intent,
+    finish_upload_intent,
+)
 
 
 ALLOWED_CONTENT_TYPES = {
@@ -119,8 +123,16 @@ async def create_task_from_upload(
     final_path = settings.storage_dir / f"{task_id}{suffix}"
     digest = hashlib.sha256()
     size = 0
+    upload_intent = None
+    remove_upload_intent = False
+    commit_attempted = False
+    committed = False
 
     try:
+        # Publish a durable per-ID marker before creating either the staging
+        # or final file. A startup/worker recovery pass can then distinguish
+        # an interrupted upload from a task-owned original.
+        upload_intent = begin_upload_intent(settings.storage_dir.parent, task_id)
         settings.storage_dir.mkdir(parents=True, exist_ok=True)
         with temporary_path.open("wb") as target:
             while chunk := await upload.read(1024 * 1024):
@@ -183,32 +195,59 @@ async def create_task_from_upload(
         if selected_template is not None:
             from document_pipeline_api.services.local_exports import snapshot_task_export
             snapshot_task_export(session, task, selected_template)
+        commit_attempted = True
         session.commit()
+        committed = True
+        remove_upload_intent = True
         task = session.get(TaskRecord, task_id)
         if task is None:
             raise RuntimeError("已入队任务没有成功写入数据库。")
         return task
     except OSError as error:
         session.rollback()
-        _discard_upload_paths(temporary_path, final_path)
+        if commit_attempted:
+            # A failed COMMIT can be ambiguous. Keep the marker and let the
+            # recovery pass decide from a fresh database read whether the row
+            # owns this original.
+            remove_upload_intent = committed
+        else:
+            remove_upload_intent = _discard_upload_paths(temporary_path, final_path)
         raise HTTPException(
             status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
             detail="无法保存上传文件，请检查磁盘空间和文件夹权限后重试。",
         ) from error
     except Exception:
         session.rollback()
-        _discard_upload_paths(temporary_path, final_path)
+        if commit_attempted:
+            remove_upload_intent = committed
+        else:
+            remove_upload_intent = _discard_upload_paths(temporary_path, final_path)
         raise
     finally:
-        await upload.close()
+        try:
+            await upload.close()
+        finally:
+            if upload_intent is not None:
+                finish_upload_intent(
+                    upload_intent,
+                    remove_marker=remove_upload_intent,
+                )
 
 
-def _discard_upload_paths(*paths) -> None:
+def _discard_upload_paths(*paths) -> bool:
+    removed = True
     for path in paths:
         try:
             path.unlink(missing_ok=True)
         except OSError:
-            pass
+            removed = False
+    for path in paths:
+        try:
+            if path.exists():
+                removed = False
+        except OSError:
+            removed = False
+    return removed
 
 
 def _insert_task_if_capacity_available(
@@ -414,6 +453,11 @@ def task_name_matches(search: str):
     )
 
 
+def normalize_task_since(value: datetime) -> datetime:
+    """Task timestamps are stored as UTC; timezone-less API values mean UTC."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
 def list_tasks(
     session: Session,
     *,
@@ -455,7 +499,7 @@ def list_tasks(
     if template_id:
         statement = statement.where(TaskRecord.template_id == template_id)
     if since is not None:
-        statement = statement.where(TaskRecord.updated_at >= since)
+        statement = statement.where(TaskRecord.updated_at >= normalize_task_since(since))
     if offset:
         statement = statement.offset(offset)
     statement = statement.limit(limit)
@@ -503,6 +547,8 @@ def retry_task(
     task = session.get(TaskRecord, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="没有找到这个任务。")
+    if task.status != TaskStatus.FAILED.value:
+        raise HTTPException(status_code=409, detail="只有失败任务可以重试。")
     try:
         next_state = TaskState(status=TaskStatus(task.status)).transition_to(
             TaskStatus.QUEUED
@@ -546,6 +592,9 @@ def retry_task(
     )
     if result.rowcount != 1:
         session.rollback()
+        current = session.get(TaskRecord, task_id)
+        if current is None or current.status != TaskStatus.FAILED.value:
+            raise HTTPException(status_code=409, detail="任务状态已变化，请刷新后重试。")
         raise _capacity_error(settings)
     session.commit()
     updated_task = session.get(TaskRecord, task_id)
@@ -715,6 +764,8 @@ def resume_task(
     task = session.get(TaskRecord, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="没有找到这个任务。")
+    if task.status != TaskStatus.PAUSED.value:
+        raise HTTPException(status_code=409, detail="只有已暂停任务可以恢复。")
     try:
         TaskState(status=TaskStatus(task.status)).transition_to(TaskStatus.QUEUED)
     except InvalidTaskTransition as error:
@@ -742,6 +793,9 @@ def resume_task(
     )
     if result.rowcount != 1:
         session.rollback()
+        current = session.get(TaskRecord, task_id)
+        if current is None or current.status != TaskStatus.PAUSED.value:
+            raise HTTPException(status_code=409, detail="任务状态已变化，请刷新后重试。")
         raise _capacity_error(settings)
     session.commit()
     resumed = session.get(TaskRecord, task_id)

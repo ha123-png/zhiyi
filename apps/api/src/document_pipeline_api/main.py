@@ -114,6 +114,14 @@ def create_app(
             from document_pipeline_api.services.file_names import adopt_pending_file_names
             adopt_pending_file_names(session)
         from document_pipeline_api.services.clear_data import clear_journal_path
+        from document_pipeline_api.business_backup import restore_journal_path
+        if (
+            not clear_journal_path(active_settings).exists()
+            and not restore_journal_path(active_settings.storage_dir.parent).exists()
+        ):
+            from document_pipeline_api.services.upload_recovery import recover_pending_uploads
+
+            recover_pending_uploads(application.state.session_factory, active_settings)
         if active_settings.queue_enabled and not clear_journal_path(active_settings).exists():
             from document_pipeline_api.services.queueing import recover_missing_queued_tasks
             from document_pipeline_api.services.task_leases import (
@@ -133,7 +141,6 @@ def create_app(
         import logging
         from starlette.concurrency import run_in_threadpool
         from document_pipeline_api.services.original_cleanup import recover_original_deletions
-        from document_pipeline_api.business_backup import restore_journal_path
         cleanup_stop = asyncio.Event()
 
         async def cleanup_originals():
@@ -141,6 +148,12 @@ def create_app(
                 if (not application.state.maintenance_active and not clear_journal_path(active_settings).exists()
                         and not restore_journal_path(active_settings.storage_dir.parent).exists()):
                     try:
+                        from document_pipeline_api.services.upload_recovery import recover_pending_uploads
+                        await run_in_threadpool(
+                            recover_pending_uploads,
+                            application.state.session_factory,
+                            active_settings,
+                        )
                         await run_in_threadpool(recover_original_deletions, application.state.session_factory, active_settings)
                     except Exception as error:
                         # The durable queue stays intact; a lock does not fail app startup.

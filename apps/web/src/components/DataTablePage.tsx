@@ -81,6 +81,7 @@ import { ImportSheetDialog } from "./ImportSheetDialog";
 import { InputScopeDetails } from "./InputScopeDetails";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { Toast, useToast } from "./Toast";
+import { parseNumericInput } from "../numericInput";
 
 // --- Types ---
 
@@ -184,9 +185,12 @@ export function DataTablePage({
   }, [currentTableId]);
   const [views, setViews] = useState<DataViewRead[]>([]);
   const [moreViews, setMoreViews] = useState(false);
+  const [viewsRefreshing, setViewsRefreshing] = useState(false);
   const [loadingMoreViews, setLoadingMoreViews] = useState(false);
   const viewsGeneration = useRef(0);
   const [currentViewId, setCurrentViewId] = useState<string | null>(null);
+  const currentViewIdRef = useRef<string | null>(null);
+  currentViewIdRef.current = currentViewId;
   const [splitFieldKey, setSplitFieldKey] = useState("");
   const [groupBy, setGroupBy] = useState<"none" | "file" | "field">("field");
   const [splitting, setSplitting] = useState(false);
@@ -316,18 +320,48 @@ export function DataTablePage({
     setMoreViews(false); setLoadingMoreViews(false);
     if (!currentTableId) {
       setViews([]);
+      setViewsRefreshing(false);
       return;
     }
     let cancelled = false;
-    getTableViews(currentTableId)
-      .then((nextViews) => {
-        if (!cancelled && generation === viewsGeneration.current) { setViews(nextViews); setMoreViews(nextViews.length === 200); }
-      })
-      .catch((err) => {
+    setViewsRefreshing(true);
+    void (async () => {
+      try {
+        const nextViews: DataViewRead[] = [];
+        let offset = 0;
+        let lastPageSize = 0;
+        do {
+          const pageViews = await getTableViews(currentTableId, offset);
+          if (cancelled || generation !== viewsGeneration.current) return;
+          offset += pageViews.length;
+          nextViews.push(...pageViews.filter(view => !nextViews.some(existing => existing.id === view.id)));
+          lastPageSize = pageViews.length;
+          const selectedViewId = currentViewIdRef.current;
+          if (!selectedViewId || nextViews.some(view => view.id === selectedViewId) || lastPageSize < 200) break;
+        }
+        while (lastPageSize === 200);
+
+        if (cancelled || generation !== viewsGeneration.current) return;
+        setViews(nextViews);
+        setMoreViews(lastPageSize === 200);
+        const selectedViewId = currentViewIdRef.current;
+        if (selectedViewId && !nextViews.some(view => view.id === selectedViewId)) {
+          // The selected dynamic group has lost its final member. Return the
+          // whole surface to the table so its label, rows, page and export agree.
+          setCurrentViewId(null);
+          setPage(1);
+          setSelectedRows([]);
+          setSelectedSources([]);
+          setTableError(null);
+        }
+      } catch (err) {
         if (!cancelled && generation === viewsGeneration.current) {
           setTableError(err instanceof Error ? err.message : "加载分 Sheet 失败");
         }
-      });
+      } finally {
+        if (!cancelled && generation === viewsGeneration.current) setViewsRefreshing(false);
+      }
+    })();
     return () => {
       cancelled = true;
     };
@@ -460,6 +494,8 @@ export function DataTablePage({
     if (id === currentTableId && !currentViewId) return;
     setCurrentTableId(id);
     setCurrentViewId(null);
+    setViews([]);
+    setMoreViews(false);
     setPage(1);
     setSearchText("");
     setSelectedRows([]);
@@ -581,7 +617,15 @@ export function DataTablePage({
   }
 
   async function handleExport(format: "xlsx" | "csv" | "json" | "views" | "zip") {
-    if (!currentTableId) return;
+    const activeDetailMatches = Boolean(tableDetail && detailMatches && (
+      currentViewId
+        ? "table_id" in tableDetail && tableDetail.table_id === currentTableId && tableDetail.id === currentViewId
+        : !("table_id" in tableDetail) && tableDetail.id === currentTableId
+    ));
+    if (!currentTableId || tableLoading || viewsRefreshing || !activeDetailMatches) {
+      setExportMenuOpen(false);
+      return;
+    }
     setExportMenuOpen(false);
     if (format === "views" && views.length === 0) {
       setTableError(null);
@@ -673,11 +717,7 @@ export function DataTablePage({
     try {
       let value: unknown = newValue === "" ? null : newValue;
       if (value !== null && column?.valueType === "number") {
-        const normalized = Number(newValue.replace(/,/g, "").trim());
-        if (!Number.isFinite(normalized)) {
-          throw new Error(`「${column.label}」需要填写有效数字。`);
-        }
-        value = normalized;
+        value = parseNumericInput(newValue, column.label);
       } else if (value !== null && column?.valueType === "boolean") {
         const normalized = newValue.trim().toLowerCase();
         if (["true", "是", "1"].includes(normalized)) value = true;
@@ -967,7 +1007,7 @@ export function DataTablePage({
               )}
             </div>
             <div className="toolbar-menu-wrap">
-              <button className="btn secondary sm" onClick={() => setExportMenuOpen(!exportMenuOpen)}>
+              <button className="btn secondary sm" disabled={tableLoading || viewsRefreshing || !detailMatches} onClick={() => setExportMenuOpen(!exportMenuOpen)}>
                 <Icon icon={Download} size={15} /> 导出
                 <Icon icon={ChevronDown} size={13} style={{ opacity: 0.6 }} />
               </button>
@@ -1019,7 +1059,7 @@ export function DataTablePage({
 
         <div className="datastore-compact-navigation">
           <label className="visually-hidden" htmlFor="compact-table">选择数据表或分组</label>
-          <select id="compact-table" className="form-select" value={currentViewId ? `view:${currentViewId}` : `table:${currentTableId ?? ""}`}
+          <select id="compact-table" className="form-select" value={currentViewId && views.some(view => view.id === currentViewId) ? `view:${currentViewId}` : `table:${currentTableId ?? ""}`}
             onChange={(event) => { const value = event.target.value; if (value.startsWith("view:")) selectView(value.slice(5)); else selectTable(value.slice(6)); }}>
             <optgroup label="数据表">{tables.map((table) => <option key={table.id} value={`table:${table.id}`}>{table.name} · {table.collection_kind === "files" ? `${table.file_count ?? 0} 份文件` : `${table.row_count} 行`}</option>)}</optgroup>
             {views.length > 0 && <optgroup label="当前表的分组">{views.map((view) => <option key={view.id} value={`view:${view.id}`}>{view.name}</option>)}</optgroup>}

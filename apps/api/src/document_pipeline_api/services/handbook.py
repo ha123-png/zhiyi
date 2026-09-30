@@ -169,8 +169,10 @@ TOPICS = [
 
 def handbook(topic: str | None = None) -> dict:
     if topic is None:
-        return {"version": "0.5.0", "topics": [{key: entry[key] for key in ("id", "title", "target", "action")} for entry in TOPICS]}
+        from document_pipeline_api.version import __version__
+        return {"version": __version__, "topics": [{key: entry[key] for key in ("id", "title", "target", "action")} for entry in TOPICS]}
     entry = next((entry for entry in TOPICS if entry["id"] == topic), None)
     if entry is None:
         raise HTTPException(404, "没有这个手册主题，请先读取目录。")
-    return {"version": "0.5.0", **deepcopy(entry)}
+    from document_pipeline_api.version import __version__
+    return {"version": __version__, **deepcopy(entry)}

@@ -80,12 +80,19 @@ const extraction: Extraction = {
 };
 
 let taskListeners: Array<(event?: MessageEvent) => void> = [];
+let taskSubscriptionCount = 0;
 
 class MockEventSource {
+  private taskListener?: (event?: MessageEvent) => void;
+
   addEventListener(_type: string, fn: (event?: MessageEvent) => void) {
+    this.taskListener = fn;
+    taskSubscriptionCount += 1;
     taskListeners.push(fn);
   }
-  close() {}
+  close() {
+    if (this.taskListener) taskListeners = taskListeners.filter(listener => listener !== this.taskListener);
+  }
 }
 
 function triggerTaskEvent() {
@@ -97,6 +104,17 @@ function triggerTaskEvent() {
       ]),
     } as MessageEvent);
   }
+}
+
+async function waitForTaskListener() {
+  await waitFor(() => expect(taskListeners.length).toBeGreaterThan(0));
+}
+
+async function waitForResubscribedTaskListener(previousCount: number) {
+  await waitFor(() => {
+    expect(taskSubscriptionCount).toBeGreaterThan(previousCount);
+    expect(taskListeners.length).toBeGreaterThan(0);
+  });
 }
 
 describe("ExtractPage", () => {
@@ -160,6 +178,8 @@ describe("ExtractPage", () => {
   beforeEach(() => {
     window.localStorage.clear();
     taskListeners = [];
+    taskSubscriptionCount = 0;
+    HTMLElement.prototype.scrollIntoView = vi.fn();
     vi.stubGlobal("EventSource", MockEventSource);
     vi.stubGlobal(
       "fetch",
@@ -381,6 +401,134 @@ describe("ExtractPage", () => {
     });
   });
 
+  it.each(["1,23", "0x10", "   ", "1.0000000000000001", "9007199254740991.1"])(
+    "keeps invalid numeric review text %j and prevents saving it",
+    async (input) => {
+      const fetchMock = vi.fn(async (url: string | URL, _init?: RequestInit) => {
+        const path = String(url);
+        if (path.includes("/templates")) return response([]);
+        if (path.endsWith(`/tasks/${task.id}/result`)) return response(extraction);
+        throw new Error(path);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      render(<ExtractPage initialTask={task} />);
+
+      const amount = await screen.findByText("372", { selector: ".extract-header-value" });
+      amount.textContent = input;
+      fireEvent.blur(amount);
+      fireEvent.click(screen.getByRole("button", { name: "修订到表" }));
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(/标准数字|精度/);
+      expect(amount.textContent).toBe(input);
+      expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith(`/tasks/${task.id}/review`) && init?.method === "PUT")).toBe(false);
+    },
+  );
+
+  it("sends unsafe integer review values as decimal strings without rounding", async () => {
+    let sentValue: unknown;
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const path = String(url);
+      if (path.endsWith("/templates")) return response([]);
+      if (path.endsWith(`/tasks/${task.id}/result`)) return response({
+        ...extraction,
+        result: resultWire("9007199254740991"),
+        original_result: resultWire("9007199254740991"),
+      });
+      if (path.endsWith(`/tasks/${task.id}/review`) && init?.method === "PUT") {
+        sentValue = JSON.parse(String(init.body)).result.total_amount;
+        return response({ ...extraction, review_version: 3, result: resultWire("9007199254740993") });
+      }
+      throw new Error(path);
+    }));
+    render(<ExtractPage initialTask={task} />);
+
+    const amount = await screen.findByText("9007199254740991", { selector: ".extract-header-value" });
+    amount.textContent = "9007199254740993";
+    fireEvent.blur(amount);
+    fireEvent.click(screen.getByRole("button", { name: "修订到表" }));
+
+    await waitFor(() => expect(sentValue).toBe("9007199254740993"));
+  });
+
+  it("retains an invalid field when another numeric field is corrected and blocks save", async () => {
+    const fetchMock = vi.fn(async (url: string | URL, _init?: RequestInit) => {
+      const path = String(url);
+      if (path.includes("/templates")) return response([]);
+      if (path.endsWith(`/tasks/${task.id}/result`)) return response(extraction);
+      throw new Error(path);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ExtractPage initialTask={task} />);
+
+    const total = await screen.findByText("372", { selector: ".extract-header-value" });
+    total.textContent = "1,23";
+    fireEvent.blur(total);
+    const tax = await screen.findByText("21.06", { selector: ".extract-header-value" });
+    tax.textContent = "22.06";
+    fireEvent.blur(tax);
+
+    expect(screen.getByText("1,23", { selector: ".extract-header-value" })).toBeInTheDocument();
+    expect(screen.getByText("22.06", { selector: ".extract-header-value" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "修订到表" }));
+    expect(fetchMock.mock.calls.filter(([url, init]) => String(url).endsWith(`/tasks/${task.id}/review`) && init?.method === "PUT")).toEqual([]);
+  });
+
+  it("warns before leaving a dirty review, keeps the draft on cancel, and proceeds only after discard", async () => {
+    const proceeded = vi.fn();
+    const onNavigateHistory = () => {
+      const proceed = () => proceeded();
+      if (window.dispatchEvent(new CustomEvent("zhiyi:before-navigate", { cancelable: true, detail: { proceed } }))) proceed();
+    };
+    render(<ExtractPage initialTask={task} onNavigateHistory={onNavigateHistory} />);
+    const amount = await screen.findByText("372", { selector: ".extract-header-value" });
+    amount.textContent = "373";
+    fireEvent.blur(amount);
+
+    fireEvent.click(screen.getByRole("button", { name: "文件历史" }));
+    let dialog = await screen.findByRole("dialog", { name: "修改尚未保存" });
+    expect(proceeded).not.toHaveBeenCalled();
+    fireEvent.click(dialog.querySelector("button.btn.secondary")!);
+    expect(screen.getByText("373", { selector: ".extract-header-value" })).toBeInTheDocument();
+    expect(proceeded).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "文件历史" }));
+    dialog = await screen.findByRole("dialog", { name: "修改尚未保存" });
+    fireEvent.click(screen.getByRole("button", { name: "放弃修改并继续" }));
+    expect(proceeded).toHaveBeenCalledOnce();
+  });
+
+  it("guards upload-based file replacement and discards the old draft only after confirmation", async () => {
+    let uploadCalls = 0;
+    const uploadedTask = { ...task, id: "replacement-task", filename: "replacement.png", status: "queued" };
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const path = String(url);
+      if (path.includes("/templates")) return response([]);
+      if (path.endsWith(`/tasks/${task.id}/result`)) return response(extraction);
+      if (path.endsWith("/tasks") && init?.method === "POST") { uploadCalls += 1; return response(uploadedTask); }
+      if (path.includes("/tasks?")) return response([]);
+      throw new Error(path);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { container } = render(<ExtractPage initialTask={task} />);
+    const amount = await screen.findByText("372", { selector: ".extract-header-value" });
+    amount.textContent = "373";
+    fireEvent.blur(amount);
+    const input = container.querySelector('input[type="file"]')!;
+
+    fireEvent.change(input, { target: { files: [new File(["new"], "first-upload.png", { type: "image/png" })] } });
+    let dialog = await screen.findByRole("dialog", { name: "修改尚未保存" });
+    expect(uploadCalls).toBe(0);
+    fireEvent.click(dialog.querySelector("button.btn.secondary")!);
+    expect(screen.getByText("373", { selector: ".extract-header-value" })).toBeInTheDocument();
+    expect(uploadCalls).toBe(0);
+
+    fireEvent.change(input, { target: { files: [new File(["new"], "second-upload.png", { type: "image/png" })] } });
+    dialog = await screen.findByRole("dialog", { name: "修改尚未保存" });
+    fireEvent.click(screen.getByRole("button", { name: "放弃修改并继续" }));
+    await waitFor(() => expect(uploadCalls).toBe(1));
+    expect(screen.queryByText("373", { selector: ".extract-header-value" })).not.toBeInTheDocument();
+  });
+
   it("refreshes on task events and shows the extraction result automatically", async () => {
     const fetchMock = vi.fn().mockImplementation(
       async (input: string | URL, init?: RequestInit) => {
@@ -450,6 +598,7 @@ describe("ExtractPage", () => {
 
     expect(await screen.findByText("已暂停", {}, { timeout: 3000 })).toBeInTheDocument();
     // 暂停事件先刷新并保持监听；恢复后的完成事件再次刷新并展示结果。
+    await waitForTaskListener();
     act(() => triggerTaskEvent());
     act(() => triggerTaskEvent());
     expect(
@@ -532,11 +681,13 @@ describe("ExtractPage", () => {
     const input = document.querySelector('input[type="file"]')!;
     fireEvent.change(input, { target: { files: [new File(["first"], "previous.txt")] } });
     await screen.findByText("队列中 1 个任务");
+    await waitForTaskListener();
     act(() => triggerTaskEvent());
     await screen.findByText("371", { selector: ".extract-header-value" });
     fireEvent.change(input, { target: { files: [new File(["next"], "latest.png")] } });
     await waitFor(() => expect(screen.queryByText("371", { selector: ".extract-header-value" })).not.toBeInTheDocument());
     await screen.findByText("队列中 1 个任务");
+    await waitForTaskListener();
     act(() => triggerTaskEvent());
     if (outcome === "failed") {
       const alert = await screen.findByRole("alert");
@@ -571,6 +722,7 @@ describe("ExtractPage", () => {
     render(<ExtractPage />);
     fireEvent.change(document.querySelector('input[type="file"]')!, { target: { files: [new File(["good"], "good.txt"), new File(["bad"], "bad.png")] } });
     await screen.findByText("队列中 2 个任务");
+    await waitForTaskListener();
     act(() => triggerTaskEvent());
     expect(await screen.findByText("372", { selector: ".extract-header-value" })).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("bad.png · 提取失败");
@@ -622,10 +774,13 @@ describe("ExtractPage", () => {
 
     expect(await screen.findByText("队列中 2 个任务", {}, { timeout: 3000 })).toBeInTheDocument();
     // 事件 1：第一份完成 → 展示第一份结果
+    await waitForTaskListener();
+    const firstSubscription = taskSubscriptionCount;
     act(() => {
       triggerTaskEvent();
     });
     expect(await screen.findByText("371", { selector: ".extract-header-value" }, { timeout: 4000 })).toBeInTheDocument();
+    await waitForResubscribedTaskListener(firstSubscription);
     expect(screen.getByText("第一份.png")).toBeInTheDocument();
     // 事件 2：批次无变化（第二份仍在排队），不重复展示
     act(() => {
@@ -655,6 +810,10 @@ function result(totalAmount: number) {
     total_amount: totalAmount,
     items: [],
   };
+}
+
+function resultWire(totalAmount: string | number) {
+  return { ...result(372), total_amount: totalAmount };
 }
 
 function response(body: unknown): Response {

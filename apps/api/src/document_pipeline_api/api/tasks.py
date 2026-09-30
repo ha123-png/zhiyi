@@ -244,7 +244,8 @@ def tasks_summary(
     if template_id:
         statement = statement.where(TaskRecord.template_id == template_id)
     if since is not None:
-        statement = statement.where(TaskRecord.updated_at >= since)
+        from document_pipeline_api.services.tasks import normalize_task_since
+        statement = statement.where(TaskRecord.updated_at >= normalize_task_since(since))
     rows = session.execute(statement).all()
     summary = TasksSummary(total=sum(count for _, count in rows))
     from document_pipeline_api.services.tasks import ACTIVE_TASK_STATUSES

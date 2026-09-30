@@ -1,9 +1,10 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 from document_pipeline_api.schemas.templates import TemplatePresentation
 from document_pipeline_api.schemas.input_scope import InputScope
+from document_pipeline_api.schemas.json_numbers import stringify_unsafe_integers
 
 
 class ConfirmRequest(BaseModel):
@@ -73,6 +74,10 @@ class DataRowRead(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    @field_serializer("values", when_used="json")
+    def preserve_unsafe_integer_tokens(self, value):
+        return stringify_unsafe_integers(value)
+
 
 class ColumnDef(BaseModel):
     key: str
@@ -114,6 +119,10 @@ class DataRowRevisionRead(BaseModel):
     editor: str
     created_at: datetime
 
+    @field_serializer("before", "after", when_used="json")
+    def preserve_unsafe_integer_tokens(self, value):
+        return stringify_unsafe_integers(value)
+
 
 class SplitViewsRequest(BaseModel):
     field_key: str = Field(min_length=1, max_length=128)
@@ -129,6 +138,10 @@ class DataViewRead(BaseModel):
     row_count: int
     created_at: datetime
     updated_at: datetime
+
+    @field_serializer("field_value", when_used="json")
+    def preserve_unsafe_integer_token(self, value):
+        return stringify_unsafe_integers(value)
 
 
 class DataViewDetail(DataViewRead):

@@ -60,6 +60,16 @@ def recover_interrupted_runs(session):
                 )
                 or 0
             )
+        try:
+            usage = json.loads(run.usage_json)
+        except (TypeError, ValueError):
+            usage = {}
+        calls = usage.get("calls")
+        if isinstance(calls, list):
+            for call in calls:
+                if isinstance(call, dict) and call.get("status") == "running":
+                    call["status"] = "interrupted"
+            run.usage_json = encode(usage)
         run.status = "interrupted"
         run.error = "应用已重启；已保存生成内容，请重新提问。"
     session.commit()
@@ -77,6 +87,24 @@ class EventWriter:
         self.pending = []
         self.sequence = 0
         self.last_checkpoint = 0.0
+
+    def checkpoint(self):
+        """Commit current text and usage even when the last event was throttled."""
+        clock = time.monotonic()
+        with self.factory() as session:
+            run = session.get(AssistantRun, self.run_id)
+            if not run:
+                self.cancel.set()
+                raise InterruptedError("对话已删除。")
+            session.add_all(self.pending)
+            message = session.get(AssistantMessage, run.message_id)
+            message.parts_json = encode(self.parts)
+            run.snapshot_sequence = self.sequence
+            run.usage_json = encode(self.usage)
+            run.updated_at = now()
+            session.commit()
+        self.pending.clear()
+        self.last_checkpoint = clock
 
     def emit(self, kind, **data):
         self.sequence += 1

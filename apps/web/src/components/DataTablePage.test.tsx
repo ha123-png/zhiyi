@@ -25,6 +25,94 @@ function sourceCard(index: number, pending = false) {
 }
 
 describe("DataTablePage", () => {
+  it.each(["1,23", "0x10", "   ", "1.0000000000000001", "9007199254740991.1", "9e30"])(
+    "keeps invalid or unsafe numeric draft %j without sending a PATCH",
+    async (input) => {
+      const writes: string[] = [];
+      vi.stubGlobal("fetch", vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const path = String(url);
+        if (path.endsWith("/tables")) return response([table]);
+        if (path.includes("/views") || path.includes("/templates")) return response([]);
+        if (path.endsWith("/edit-sessions")) return response({ id: "edit-session" });
+        if (path.endsWith("/rows/1") && init?.method === "PATCH") {
+          writes.push(String(init.body));
+          return response({ id: 1, version: 2, values: { total_amount: 372 } });
+        }
+        return response({ ...table, columns, page: 1, page_size: 10, rows: [{ id: 1, task_id: null,
+          item_index: 1, version: 1, values: { seller_name: "合成供应方", total_amount: 372 }, created_at: "", updated_at: "" }] });
+      }));
+
+      render(<DataTablePage />);
+      const cell = await screen.findByRole("cell", { name: "编辑 合计金额，当前值 372" });
+      fireEvent.click(cell);
+      const editor = cell.querySelector<HTMLElement>('[contenteditable="true"]')!;
+      editor.textContent = input;
+      fireEvent.input(editor);
+      fireEvent.keyDown(editor, { key: "Enter" });
+
+      expect(await screen.findByLabelText("未保存输入：发票 · 行 1 · 合计金额")).toHaveValue(input);
+      expect(writes).toHaveLength(0);
+      expect(await screen.findByRole("alert")).toHaveTextContent(/标准数字|精度|大整数/);
+    },
+  );
+
+  it.each([["1.23", 1.23], ["-12", -12], ["1e3", 1000], ["9007199254740991", Number.MAX_SAFE_INTEGER]])(
+    "sends valid JSON number input %s without changing its numeric value",
+    async (input, expected) => {
+      const writes: Record<string, unknown>[] = [];
+      vi.stubGlobal("fetch", vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const path = String(url);
+        if (path.endsWith("/tables")) return response([table]);
+        if (path.includes("/views") || path.includes("/templates")) return response([]);
+        if (path.endsWith("/edit-sessions")) return response({ id: "edit-session" });
+        if (path.endsWith("/rows/1") && init?.method === "PATCH") {
+          writes.push(JSON.parse(String(init.body)));
+          return response({ id: 1, version: 2, values: { total_amount: expected } });
+        }
+        return response({ ...table, columns, page: 1, page_size: 10, rows: [{ id: 1, task_id: null,
+          item_index: 1, version: 1, values: { seller_name: "合成供应方", total_amount: 372 }, created_at: "", updated_at: "" }] });
+      }));
+
+      render(<DataTablePage />);
+      const cell = await screen.findByRole("cell", { name: "编辑 合计金额，当前值 372" });
+      fireEvent.click(cell);
+      const editor = cell.querySelector<HTMLElement>('[contenteditable="true"]')!;
+      editor.textContent = input;
+      fireEvent.input(editor);
+      fireEvent.keyDown(editor, { key: "Enter" });
+
+      await waitFor(() => expect(writes).toHaveLength(1));
+      expect(writes[0]?.changes).toEqual({ total_amount: expected });
+      expect(screen.queryByLabelText("未保存输入：发票 · 行 1 · 合计金额")).not.toBeInTheDocument();
+    },
+  );
+
+  it("sends unsafe integer cells as canonical decimal strings without losing digits", async () => {
+    let sentValue: unknown;
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const path = String(url);
+      if (path.endsWith("/tables")) return response([table]);
+      if (path.includes("/views") || path.includes("/templates")) return response([]);
+      if (path.endsWith("/edit-sessions")) return response({ id: "edit-session" });
+      if (path.endsWith("/rows/1") && init?.method === "PATCH") {
+        sentValue = JSON.parse(String(init.body)).changes.total_amount;
+        return response({ id: 1, version: 2, values: { total_amount: "9007199254740993" } });
+      }
+      return response({ ...table, columns, page: 1, page_size: 10, rows: [{ id: 1, task_id: null,
+        item_index: 1, version: 1, values: { seller_name: "合成供应方", total_amount: 372 }, created_at: "", updated_at: "" }] });
+    }));
+
+    render(<DataTablePage />);
+    const cell = await screen.findByRole("cell", { name: "编辑 合计金额，当前值 372" });
+    fireEvent.click(cell);
+    const editor = cell.querySelector<HTMLElement>('[contenteditable="true"]')!;
+    editor.textContent = "9007199254740993";
+    fireEvent.input(editor);
+    fireEvent.keyDown(editor, { key: "Enter" });
+
+    await waitFor(() => expect(sentValue).toBe("9007199254740993"));
+  });
+
   it("refreshes visible facts after an assistant approval without reloading the page", async () => {
     let amount = 3200;
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL) => {
@@ -421,6 +509,7 @@ describe("DataTablePage", () => {
     render(<DataTablePage />);
 
     const exportButton = await screen.findByRole("button", { name: "导出" });
+    await waitFor(() => expect(exportButton).toBeEnabled());
     fireEvent.click(exportButton);
     const viewsExport = screen.getByRole("button", { name: /按分 Sheet 导出/ });
 

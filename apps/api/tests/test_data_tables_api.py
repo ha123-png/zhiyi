@@ -185,7 +185,9 @@ def test_confirm_inserts_rows_and_exports_excel(tmp_path: Path) -> None:
         assert headers[:4] == ["销售方", "购买方", "发票号码", "开票日期"]
         assert headers.count("总税额") == 1
         assert headers.count("税额") == 1
-        assert sheet.cell(row=2, column=headers.index("商品名称") + 1).value == "'=unsafe"
+        formula_literal = sheet.cell(row=2, column=headers.index("商品名称") + 1)
+        assert formula_literal.value == "=unsafe"
+        assert formula_literal.data_type == "s"
 
 
 def test_custom_columns_are_table_only_and_header_column_merges_on_export(tmp_path: Path) -> None:

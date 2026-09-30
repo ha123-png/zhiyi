@@ -23,6 +23,14 @@ const fields: TemplateField[] = [
     instructions: "",
     value_type: "number",
   },
+  {
+    key: "total_amount",
+    label: "价税合计",
+    section: "header",
+    example: "",
+    instructions: "",
+    value_type: "number",
+  },
 ];
 
 it("builds a required rule without exposing internal field paths", () => {
@@ -59,6 +67,45 @@ it("keeps numeric allowed values numeric and rejects reversed bounds", () => {
   fireEvent.change(screen.getByLabelText("最小值（可空）"), { target: { value: "10" } });
   fireEvent.change(screen.getByLabelText("最大值（可空）"), { target: { value: "2" } });
   expect(screen.getByRole("button", { name: "添加校验规则" })).toBeDisabled();
+});
+
+it("accepts valid JSON exponent syntax in numeric enum values", () => {
+  const onChange = vi.fn();
+  render(<DeterministicRulesEditor disabled={false} fields={fields} rules={[]} onChange={onChange} />);
+  fireEvent.change(screen.getByLabelText("规则类型"), { target: { value: "enum" } });
+  fireEvent.change(screen.getByLabelText("检查字段"), { target: { value: "items[].amount" } });
+  fireEvent.change(screen.getByPlaceholderText("例如：有效，作废"), { target: { value: "1e3" } });
+  fireEvent.click(screen.getByRole("button", { name: "添加校验规则" }));
+  expect(onChange).toHaveBeenCalledWith([{ kind: "enum", field: "items[].amount", values: [1000], severity: "error" }]);
+});
+
+it.each(["0x10", "1.0000000000000001", "9007199254740991.1"])(
+  "rejects numeric enum values that are not exactly representable: %s",
+  value => {
+    const onChange = vi.fn();
+    render(<DeterministicRulesEditor disabled={false} fields={fields} rules={[]} onChange={onChange} />);
+    fireEvent.change(screen.getByLabelText("规则类型"), { target: { value: "enum" } });
+    fireEvent.change(screen.getByLabelText("检查字段"), { target: { value: "items[].amount" } });
+    fireEvent.change(screen.getByPlaceholderText("例如：有效，作废"), { target: { value } });
+    expect(screen.getByRole("button", { name: "添加校验规则" })).toBeDisabled();
+    expect(onChange).not.toHaveBeenCalled();
+  },
+);
+
+it("uses strict numeric syntax for range bounds and calculation tolerance", () => {
+  const onChange = vi.fn();
+  render(<DeterministicRulesEditor disabled={false} fields={fields} rules={[]} onChange={onChange} />);
+  fireEvent.change(screen.getByLabelText("规则类型"), { target: { value: "range" } });
+  fireEvent.change(screen.getByLabelText("检查字段"), { target: { value: "items[].amount" } });
+  fireEvent.change(screen.getByLabelText("最小值（可空）"), { target: { value: "0x10" } });
+  expect(screen.getByRole("button", { name: "添加校验规则" })).toBeDisabled();
+
+  fireEvent.change(screen.getByLabelText("规则类型"), { target: { value: "sum" } });
+  fireEvent.change(screen.getByLabelText("明细求和字段（如 明细金额）"), { target: { value: "items[].amount" } });
+  fireEvent.change(screen.getByLabelText("抬头合计字段（如 合计金额）"), { target: { value: "header.total_amount" } });
+  fireEvent.change(screen.getByLabelText("允许误差"), { target: { value: "0x10" } });
+  expect(screen.getByRole("button", { name: "添加校验规则" })).toBeDisabled();
+  expect(onChange).not.toHaveBeenCalled();
 });
 
 it("explains that natural-language requirements are not deterministic checks", () => {

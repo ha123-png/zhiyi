@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from document_pipeline_api.services.current_data import row_values, row_values_expression, update_current_schema
 from document_pipeline_api.services.cell_values import import_cell, infer_import_type
+from document_pipeline_api.services.excel_values import safe_excel_value
 from document_pipeline_api.services.table_scope import prepare_export_selection
 from document_pipeline_api.domain.tasks import TaskStatus
 from document_pipeline_api.models import (
@@ -590,7 +591,7 @@ def _unique_sheet_name(raw: str, used: set[str]) -> str:
 def _populate_export_sheet(sheet, rows, keys, labels, column_defs, scopes) -> None:
     header_fill = PatternFill("solid", fgColor="F0FDF4")
     for index, key in enumerate(keys, start=1):
-        cell = sheet.cell(row=1, column=index, value=labels[key])
+        cell = sheet.cell(row=1, column=index, value=safe_excel_value(labels[key]))
         cell.data_type = "s"
         cell.font = Font(bold=True, color="065F46")
         cell.fill = header_fill
@@ -600,8 +601,12 @@ def _populate_export_sheet(sheet, rows, keys, labels, column_defs, scopes) -> No
     row_number = 1
     for record in rows:
         values_map = row_values(record)
-        values = [_excel_safe(values_map.get(key)) for key in keys]
+        values = [safe_excel_value(values_map.get(key)) for key in keys]
         sheet.append(values)
+        for cell in sheet[sheet.max_row]:
+            if isinstance(cell.value, str):
+                # Preserve literal error-looking text without adding an apostrophe.
+                cell.data_type = "s"
         row_number += 1
         scopes.record(sheet, row_number, record, keys, {key for key, column in column_defs.items() if column.section == "header"})
         for index, value in enumerate(values):
@@ -779,6 +784,7 @@ def _canonical_json(value: object) -> str:
 
 
 def _excel_safe(value: object | None) -> object | None:
+    """CSV formula guard retained for legacy callers; XLSX uses safe_excel_value."""
     if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
         return f"'{value}"
     return value
@@ -1182,17 +1188,20 @@ def parse_import_rows(
                 raise ImportFileError("CSV 编码无法识别，请另存为 UTF-8 或 GB18030（GBK）后导入。") from error
         if "\x00" in text:
             raise ImportFileError("CSV 包含无效文字，请另存为 UTF-8 CSV 后导入。")
-        rows_iter = csv.reader(StringIO(text))
-        header_row = next(rows_iter, None)
-        if header_row is None:
-            return []
-        headers = _validate_import_headers(header_row, max_columns=max_columns)
-        return _collect_import_rows(
-            rows_iter,
-            headers,
-            max_rows=max_rows,
-            max_columns=max_columns,
-        )
+        try:
+            rows_iter = csv.reader(StringIO(text))
+            header_row = next(rows_iter, None)
+            if header_row is None:
+                return []
+            headers = _validate_import_headers(header_row, max_columns=max_columns)
+            return _collect_import_rows(
+                rows_iter,
+                headers,
+                max_rows=max_rows,
+                max_columns=max_columns,
+            )
+        except csv.Error as error:
+            raise ImportFileError("CSV 单元格内容超过当前读取限制，请拆分或缩短后重试。") from error
     try:
         with zipfile.ZipFile(BytesIO(content)) as archive:
             expanded_size = sum(info.file_size for info in archive.infolist())
@@ -1204,6 +1213,7 @@ def parse_import_rows(
             except ValueError as error:
                 raise ImportFileError(str(error)) from error
         workbook = load_workbook(BytesIO(content), read_only=False, data_only=True)
+        formula_workbook = load_workbook(BytesIO(content), read_only=False, data_only=False)
         try:
             if workbook.properties.subject == "zhiyi:per-file-export:v1":
                 raise ImportFileError("这是按文件阅读的导出工作簿，不能作为统一字段表直接导入。请先整理需要的数据为单行表头的普通工作表。")
@@ -1216,6 +1226,14 @@ def parse_import_rows(
             if not sheets:
                 return []
             sheet = workbook[sheet_name or sheets[0]]
+            formula_sheet = formula_workbook[sheet.title]
+            for row in formula_sheet.iter_rows():
+                for formula_cell in row:
+                    cached_cell = sheet[formula_cell.coordinate]
+                    if formula_cell.data_type == "f" and cached_cell.value is None:
+                        raise ImportFileError(
+                            "Excel 包含尚无计算结果缓存的公式；知意不会自行执行公式，请先在表格软件中计算并另存为值后导入。"
+                        )
             try:
                 row_scopes = read_workbook_scopes(workbook, sheet)
             except ValueError as error:
@@ -1262,6 +1280,7 @@ def parse_import_rows(
             )
         finally:
             workbook.close()
+            formula_workbook.close()
     except ImportFileError:
         raise
     except (OSError, ValueError, KeyError, zipfile.BadZipFile) as error:
@@ -1279,6 +1298,8 @@ def _validate_import_headers(
         raise ImportFileError(f"导入文件不能超过 {max_columns} 列。")
     if not headers or any(not header for header in headers):
         raise ImportFileError("导入文件的表头不能为空。")
+    if any(header in {"__row_group", "__header_labels"} for header in headers):
+        raise ImportFileError("导入表头使用了知意内部字段名，请重命名该业务列后再导入。")
     # Excel 允许视觉上重复的表头。内部为每次出现分配稳定后缀，避免 dict
     # 静默覆盖；写入既有模板表时首列按原字段映射，其余同名列保留为独立输入。
     seen: dict[str, int] = {}
@@ -1298,7 +1319,11 @@ def _collect_import_rows(
 ) -> list[dict[str, object]]:
     parsed: list[dict[str, object]] = []
     for row in rows_iter:
-        if len(row) > max_columns:
+        business_cell_count = sum(
+            1 for header in headers[:len(row)]
+            if header not in {SCOPE_KEY, REVIEW_KEY, "__row_group", "__header_labels"}
+        )
+        if business_cell_count > max_columns:
             raise ImportFileError(f"导入文件不能超过 {max_columns} 列。")
         if len(row) > len(headers):
             raise ImportFileError("数据列数超过表头列数，请整理表头后再导入。")
@@ -1351,9 +1376,11 @@ def import_table_rows(
     key_set = {column.key for column in columns}
     header_to_key: dict[str, str] = {}
     if rows:
-        for raw_header in rows[0]:
+        raw_headers = dict.fromkeys(header for row in rows for header in row)
+        mapped_headers: dict[str, str] = {}
+        for raw_header in raw_headers:
             header = str(raw_header).strip()
-            if header.startswith("__"):
+            if header in {SCOPE_KEY, REVIEW_KEY, "__row_group", "__header_labels"}:
                 continue
             base_label = re.sub(r"__重复\d+$", "", header)
             # 第一列同名字段复用现有契约；重复出现或全新字段新增独立列。
@@ -1370,6 +1397,13 @@ def import_table_rows(
                     )
                 )
             header_to_key[header] = key
+            prior_header = mapped_headers.get(key)
+            if prior_header is not None and prior_header != header:
+                raise HTTPException(
+                    422,
+                    f"导入列“{prior_header}”和“{header}”映射到同一目标字段，请保留一列后重试。",
+                )
+            mapped_headers[key] = header
             if base_label in imported_header_labels and any(column.key == key and column.section != "header" for column in columns):
                 raise HTTPException(422, f"字段“{base_label}”在目标表中是明细字段，导入不能将它改成文件级字段。")
     column_by_key = {column.key: column for column in columns}
@@ -1457,7 +1491,10 @@ def create_table_from_import(
     rows: list[dict[str, object]],
 ) -> DataTableRecord:
     """从文件表头创建独立表并导入；重复显示名必须先由用户重命名。"""
-    headers = [key for key in rows[0].keys() if not key.startswith("__")] if rows else []
+    internal_keys = {SCOPE_KEY, REVIEW_KEY, "__row_group", "__header_labels"}
+    headers = list(dict.fromkeys(
+        key for row in rows for key in row if key not in internal_keys
+    )) if rows else []
     duplicate_headers = [header for header in headers if re.search(r"__重复\d+$", header)]
     if duplicate_headers:
         labels = sorted({re.sub(r"__重复\d+$", "", key) for key in duplicate_headers})

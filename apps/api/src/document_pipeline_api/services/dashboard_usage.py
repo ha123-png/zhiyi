@@ -59,6 +59,10 @@ def usage_summary(session, start):
     if start is not None:
         query = query.where(AssistantRun.created_at >= start)
     for model, provider, status, encoded in session.execute(query):
+        # Local refresh runs recompute stored analysis from warehouse facts;
+        # they are not model invocations and must not count as unknown history.
+        if provider == "zhiyi_internal":
+            continue
         try:
             usage = json.loads(encoded)
         except (TypeError, ValueError):

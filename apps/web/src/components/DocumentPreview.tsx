@@ -139,12 +139,13 @@ function useWindow<T>(requestUrl: string) {
   }, [data, root, bookmark]);
   return { data, error: result.url === requestUrl ? result.error : undefined };
 }
-function PageControls({ offset, next, onMove, label, previous }: {
+function PageControls({ offset, next, onMove, label, previous, onPrevious, previousDisabled = false }: {
   offset: number; next?: number | null; onMove: (offset: number) => void; label: string; previous: number;
+  onPrevious?: () => void; previousDisabled?: boolean;
 }) {
   if (!offset && next == null) return null;
   return <nav className="document-preview-pagination" aria-label="原件预览分页">
-    <button className="btn secondary sm" disabled={offset === 0} onClick={() => onMove(previous)} type="button">上一段</button>
+    <button className="btn secondary sm" disabled={offset === 0 || previousDisabled} onClick={() => onPrevious ? onPrevious() : onMove(previous)} type="button">上一段</button>
     <span className="small muted">{label}</span>
     <button className="btn secondary sm" disabled={next == null} onClick={() => next != null && onMove(next)} type="button">下一段</button>
   </nav>;
@@ -158,18 +159,68 @@ function useOffset() {
     else if (back.current.at(-1) === next) back.current.pop();
     save({ offset: next, scrollTop: 0, previousOffsets: back.current }); setOffset(next);
   };
-  return { offset, move, previous: back.current.at(-1) ?? 0 };
+  return { offset, move, previous: back.current.at(-1) ?? 0, hasPrevious: back.current.length > 0 };
 }
 interface TextPreviewResponse { kind: "text" | "markdown"; text: string; truncated: boolean; next_offset?: number | null; offset?: number; total_bytes?: number }
 function TextDocument({ filename, scale, url }: DocumentPreviewProps) {
-  const { offset, move, previous } = useOffset();
+  const { offset, move, previous, hasPrevious } = useOffset();
   const { data, error } = useWindow<TextPreviewResponse>(`${previewUrl(url, "/preview")}?offset=${offset}`);
+  const [resolvingPrevious, setResolvingPrevious] = useState(false);
+  const [previousError, setPreviousError] = useState<string | null>(null);
+  const offsetRef = useRef(offset);
+  offsetRef.current = offset;
+  const previousSeqRef = useRef(0);
+  const previousControllerRef = useRef<AbortController | null>(null);
+  useEffect(() => () => {
+    previousSeqRef.current += 1;
+    previousControllerRef.current?.abort();
+  }, []);
+
+  const goPrevious = () => {
+    if (hasPrevious) {
+      previousSeqRef.current += 1;
+      previousControllerRef.current?.abort();
+      setResolvingPrevious(false);
+      setPreviousError(null);
+      move(previous);
+      return;
+    }
+    const target = offset;
+    const seq = ++previousSeqRef.current;
+    previousControllerRef.current?.abort();
+    const controller = new AbortController();
+    previousControllerRef.current = controller;
+    setResolvingPrevious(true);
+    setPreviousError(null);
+    const baseUrl = previewUrl(url, "/preview");
+    const candidates = [...new Set([0, 1, 2, 3].map((tail) => Math.max(0, target - 32_768 + tail)))];
+    void Promise.all(candidates.map(async (candidate) => {
+      const response = await fetch(`${baseUrl}?offset=${candidate}`, { signal: controller.signal, cache: "no-store" });
+      if (!response.ok) throw new Error(await responseErrorMessage(response, "原文件预览"));
+      return { candidate, data: await response.json() as TextPreviewResponse };
+    })).then((windows) => {
+      if (seq !== previousSeqRef.current || offsetRef.current !== target) return;
+      const previousWindow = windows.find((window) => window.data.next_offset === target);
+      if (!previousWindow) {
+        setPreviousError("无法确定上一段的原件位置，请重试或下载完整原件查看。");
+        return;
+      }
+      move(previousWindow.candidate);
+    }).catch((reason: unknown) => {
+      if (seq !== previousSeqRef.current || controller.signal.aborted) return;
+      setPreviousError(reason instanceof Error ? reason.message : "读取上一段失败，请重试。");
+    }).finally(() => {
+      if (seq === previousSeqRef.current) setResolvingPrevious(false);
+    });
+  };
   if (error) return <PreviewError error={error} />;
   if (!data) return <div className="document-preview-loading">正在读取原文件…</div>;
   return <article aria-label={`原文件：${filename}`} className="document-text-preview" style={{ fontSize: `${scale}rem` }}>
     {data.kind === "markdown" ? <div className="document-markdown-preview"><ReactMarkdown remarkPlugins={[remarkGfm]}>{data.text}</ReactMarkdown></div> : <pre>{data.text}</pre>}
     {data.truncated && data.next_offset == null && <div className="document-preview-note">预览仅显示开头 {data.text.length.toLocaleString("zh-CN")} 个字符；这不是模型的读取范围。</div>}
-    <PageControls offset={offset} next={data.next_offset} onMove={move} previous={previous}
+    {previousError && <div className="document-preview-error" role="alert">{previousError}</div>}
+    <PageControls offset={offset} next={data.next_offset} onMove={(next) => { previousSeqRef.current += 1; previousControllerRef.current?.abort(); setResolvingPrevious(false); move(next); }} previous={previous}
+      previousDisabled={resolvingPrevious} onPrevious={goPrevious}
       label="分段预览 · 原件完整保留" />
   </article>;
 }

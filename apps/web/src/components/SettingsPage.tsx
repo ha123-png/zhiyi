@@ -152,6 +152,7 @@ export function SettingsPage({
     setSettings(next);
     try {
       await updateSystemSettings(next);
+      setSettingsError(null);
       setNotice(
         `已${next[key] ? "开启" : "关闭"}${
           key === "image_convert"

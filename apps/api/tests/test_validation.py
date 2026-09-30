@@ -58,4 +58,4 @@ def test_line_quantity_times_price_must_equal_amount() -> None:
 
     assert issues[0].code == "line_amount_mismatch"
     assert issues[0].field == "items[0].amount"
-    assert "数量 1.0 × 单价 100.0" in issues[0].message
+    assert "数量 1 × 单价 100 不等于金额 120" in issues[0].message

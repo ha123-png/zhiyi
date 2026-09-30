@@ -1,7 +1,11 @@
 from pathlib import Path
 import json
 import hashlib
+import os
 import sqlite3
+import stat
+import subprocess
+import sys
 from uuid import uuid4
 import warnings
 import zipfile
@@ -147,6 +151,46 @@ def test_backup_inspection_rejects_path_traversal_and_duplicate_members(
         inspect_business_backup(duplicate)
 
 
+def test_backup_inspection_rejects_zip_symlink_member(tmp_path: Path) -> None:
+    symlink = tmp_path / "symlink.dpbak"
+    with zipfile.ZipFile(symlink, "w") as archive:
+        info = zipfile.ZipInfo("outside-link")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(info, b"../../outside")
+
+    with pytest.raises(BusinessBackupError, match="符号链接"):
+        inspect_business_backup(symlink)
+
+
+def test_backup_inspection_enforces_aggregate_expanded_size_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import document_pipeline_api.business_backup as backup_module
+
+    database = b"d" * 80
+    manifest = {
+        "format": backup_module.BACKUP_FORMAT,
+        "credentials_included": False,
+        "database": {
+            "archive_path": "database.db",
+            "size_bytes": len(database),
+            "sha256": hashlib.sha256(database).hexdigest(),
+        },
+        "files": [],
+    }
+    manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    assert len(manifest_bytes) + len(database) > 256
+    monkeypatch.setattr(backup_module, "MAX_BACKUP_CONTENT_BYTES", 256)
+    oversized = tmp_path / "expanded-size-limit.dpbak"
+    with zipfile.ZipFile(oversized, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", manifest_bytes)
+        archive.writestr("database.db", database)
+
+    with pytest.raises(BusinessBackupError, match="总大小超过安全上限"):
+        inspect_business_backup(oversized)
+
+
 def test_backup_rejects_non_uuid_task_identity(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     with TestClient(create_app(settings)) as client:
@@ -275,6 +319,119 @@ def test_restore_install_failure_rolls_back_exact_previous_state(
     )
     with sqlite3.connect(target_dir / "document-pipeline.db") as connection:
         assert connection.execute("SELECT id FROM tasks").fetchone() == (old_task_id,)
+
+
+def test_hard_exit_after_database_install_recovers_and_retains_staging_with_note(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "source"
+    source_settings = _settings(source_dir)
+    with TestClient(create_app(source_settings)) as client:
+        new_task_id = _upload(client, b"new-generation")
+    archive = create_business_backup(source_settings, tmp_path / "new-generation.dpbak")
+
+    target_dir = tmp_path / "target"
+    target_settings = _settings(target_dir)
+    with TestClient(create_app(target_settings)) as client:
+        old_task_id = _upload(client, b"old-generation")
+    old_original = (target_settings.storage_dir / f"{old_task_id}.png").read_bytes()
+
+    child_code = r"""
+import os
+import sys
+from pathlib import Path
+
+from document_pipeline_api.config import Settings
+import document_pipeline_api.business_backup as backup
+
+data_dir = Path(sys.argv[1])
+archive = Path(sys.argv[2])
+settings = Settings(
+    database_url=f"sqlite:///{data_dir / 'document-pipeline.db'}",
+    storage_dir=data_dir / "uploads",
+    queue_enabled=False,
+)
+move_path = backup._move_path
+
+def stop_after_installing_new_database(source, destination):
+    move_path(source, destination)
+    if source.name == "database.db" and destination == data_dir / "document-pipeline.db":
+        os._exit(73)
+
+backup._move_path = stop_after_installing_new_database
+backup.restore_business_backup(settings, archive, data_dir)
+os._exit(74)
+"""
+    api_dir = Path(__file__).resolve().parents[1]
+    child_tmp = tmp_path / "child-tmp"
+    child_tmp.mkdir()
+    child_env = os.environ.copy()
+    child_env["DOCUMENT_PIPELINE_DATA_DIR"] = str(tmp_path / "child-default-data")
+    child_env["PYTHONPATH"] = os.pathsep.join(
+        [str(api_dir / "src"), str(api_dir / "tests"), child_env.get("PYTHONPATH", "")]
+    )
+    child_env["TMP"] = child_env["TEMP"] = str(child_tmp)
+    stopped = subprocess.run(
+        [sys.executable, "-c", child_code, str(target_dir), str(archive)],
+        cwd=api_dir,
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert stopped.returncode == 73, stopped.stderr[-2000:]
+
+    journal = target_dir / "runtime" / "restore-pending.json"
+    state = json.loads(journal.read_text(encoding="utf-8"))
+    staging = target_dir / "runtime" / state["staging"]
+    staged_original = staging / "uploads" / f"{new_task_id}.png"
+    assert staged_original.read_bytes() == PNG_BYTES + b"new-generation"
+
+    with TestClient(create_app(target_settings)) as client:
+        tasks = client.get("/api/v1/tasks").json()
+        assert [task["id"] for task in tasks] == [old_task_id]
+        assert client.get(f"/api/v1/tasks/{old_task_id}/file").content == old_original
+
+    assert not journal.exists()
+    assert not staging.exists()
+    rollback = target_dir / "backups" / state["rollback"]
+    preserved_original = rollback / "interrupted-staging" / "uploads" / f"{new_task_id}.png"
+    assert preserved_original.read_bytes() == PNG_BYTES + b"new-generation"
+    note = json.loads((rollback / "restore-recovery.json").read_text(encoding="utf-8"))
+    assert note["state"] == "previous_data_restored"
+    assert "仍占用磁盘空间" in note["explanation"]
+
+
+def test_restore_preserves_unsafe_integer_exactly_and_fences_old_row_version(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        from document_pipeline_api.services.data_tables import create_table_from_import
+
+        with client.app.state.session_factory() as session:
+            table = create_table_from_import(
+                session, "精确整数恢复", [{"金额": 9007199254740993}],
+            )
+            table_id = table.id
+        table_url = f"/api/v1/tables/{table_id}"
+        before = client.get(table_url).json()["rows"][0]
+        assert before["values"]["import_1"] == "9007199254740993"
+        archive = create_business_backup(settings, tmp_path / "exact-integer.dpbak")
+        changed = client.patch(
+            f"{table_url}/rows/{before['id']}",
+            json={
+                "expected_version": before["version"],
+                "changes": {"import_1": "9007199254740995"},
+            },
+        )
+        assert changed.status_code == 200, changed.text
+
+    restore_business_backup(settings, archive, tmp_path)
+    with TestClient(create_app(settings)) as client:
+        restored = client.get(table_url).json()["rows"][0]
+        assert restored["values"]["import_1"] == "9007199254740993"
+        assert restored["version"] > before["version"]
 
 
 def test_restore_upgrades_a_portable_0009_database_before_install(tmp_path: Path) -> None:
