@@ -34,24 +34,33 @@ export function useFieldSort(identity: string, onMove: (from: number, to: number
       row.style.transform = `translateY(${offset}px)`;
     });
   }
-  function finish(commit: boolean) {
+  function finish(commit: boolean, { restoreFocus = true, updateState = true } = {}) {
     const drag = active.current;
     if (!drag) return;
     cancelAnimationFrame(drag.frame);
     const moved = commit && drag.lifted && drag.from !== drag.to;
     if (moved) beforeDrop.current = new Map(drag.rows.map(row => [row, row.getBoundingClientRect().top]));
     drag.rows.forEach(row => { row.style.transform = ""; row.classList.remove("field-lifted"); });
-    active.current = null; setPlaceholder(null);
+    active.current = null;
+    if (updateState) setPlaceholder(null);
     if (drag.handle.hasPointerCapture(drag.pointer)) drag.handle.releasePointerCapture(drag.pointer);
     if (moved) callback.current(drag.from, drag.to);
-    drag.handle.focus({ preventScroll: true });
+    if (restoreFocus && drag.handle.isConnected) drag.handle.focus({ preventScroll: true });
   }
   useEffect(() => {
     const cancel = (event: KeyboardEvent) => { if (event.key === "Escape" && active.current) { event.preventDefault(); event.stopPropagation(); finish(false); } };
+    const blur = () => finish(false, { restoreFocus: false });
     document.addEventListener("keydown", cancel, true);
-    return () => { document.removeEventListener("keydown", cancel, true); if (active.current) cancelAnimationFrame(active.current.frame); };
+    window.addEventListener("blur", blur);
+    return () => {
+      document.removeEventListener("keydown", cancel, true);
+      window.removeEventListener("blur", blur);
+      finish(false, { restoreFocus: false, updateState: false });
+    };
   }, []);
   useLayoutEffect(() => {
+    // A new template or field order invalidates the active position snapshot.
+    finish(false, { restoreFocus: false });
     const previous = beforeDrop.current; beforeDrop.current = null;
     if (!previous || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     previous.forEach((top, row) => {

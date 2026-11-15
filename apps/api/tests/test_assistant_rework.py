@@ -372,6 +372,10 @@ def test_task_batch_and_table_operations_use_native_services(client):
     assert tool["status"] == "pending", detail
     response = decide(client, tool["id"])
     assert response.status_code == 200, response.text
+    assert response.json()["result"]["execution"]["results"] == [
+        {"task_id": "task-a", "action": "pause"},
+        {"task_id": "task-b", "action": "pause"},
+    ]
     with client.app.state.session_factory() as session:
         for identifier in ["task-a", "task-b"]:
             task = session.get(TaskRecord, identifier)

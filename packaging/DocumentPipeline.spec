@@ -24,7 +24,9 @@ RELEASE_RESOURCES = Path(
         ROOT / ".local" / "release-resources",
     )
 ).resolve()
-APP_VERSION = os.environ.get("DOCUMENT_PIPELINE_BUILD_VERSION", "0.0.0")
+APP_VERSION = os.environ.get("DOCUMENT_PIPELINE_BUILD_VERSION", "").strip()
+if not APP_VERSION:
+    raise ValueError("DOCUMENT_PIPELINE_BUILD_VERSION is required; use scripts/build-release.ps1.")
 version_parts = [int(part) for part in APP_VERSION.split(".")]
 if len(version_parts) > 4 or not version_parts:
     raise ValueError(f"Unsupported Windows version: {APP_VERSION}")
@@ -65,9 +67,15 @@ pdf_datas, pdf_binaries, pdf_hiddenimports = collect_all("pypdfium2")
 datas = [
     (str(WEB), "web"),
     (str(ICON), "desktop"),
+    (str(ROOT / "packaging" / "install-update.ps1"), "desktop"),
     (str(API / "alembic.ini"), "api_runtime"),
-    (str(API / "migrations"), "api_runtime/migrations"),
 ]
+# Resolving the migration head creates local bytecode caches. Ship the source
+# migrations and Alembic template only, never generated .pyc files with build paths.
+for migration_asset in sorted((API / "migrations").rglob("*")):
+    if migration_asset.is_file() and migration_asset.suffix in {".py", ".mako"}:
+        destination = Path("api_runtime/migrations") / migration_asset.relative_to(API / "migrations").parent
+        datas.append((str(migration_asset), str(destination)))
 if RELEASE_RESOURCES.is_dir():
     datas.append((str(RELEASE_RESOURCES), "licenses"))
 datas.extend(pdf_datas)

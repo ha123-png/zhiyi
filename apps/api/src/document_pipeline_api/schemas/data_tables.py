@@ -27,6 +27,7 @@ class DataTableRead(BaseModel):
     grouping_fields: list[str] = Field(default_factory=list)
     collection_kind: Literal["table", "files"] = "table"
     file_count: int = 0
+    merge_sources: list[str] | None = None
     id: str
     name: str
     template_key: str
@@ -62,6 +63,7 @@ class MergeTablesRequest(BaseModel):
 
 
 class DataRowRead(BaseModel):
+    source_table_id: str | None = None
     is_header_only: bool = False
     shared_header_keys: list[str] | None = None
     review_pending: bool | None = None

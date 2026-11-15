@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -7,7 +8,7 @@ from document_pipeline_api.config import Settings
 from document_pipeline_api.main import create_app
 from document_pipeline_api.models import ExtractionRecord, TaskRecord
 from document_pipeline_api.schemas.extraction import DocumentExtraction
-from document_pipeline_api.services.integration_config import write_integration_config
+from document_pipeline_api.services.integration_config import integration_config_path, write_integration_config
 from image_test_data import PNG_BYTES
 
 
@@ -170,6 +171,60 @@ def test_read_token_cannot_use_write_endpoints(tmp_path: Path) -> None:
     assert capabilities.json()["scope"] == "read"
     assert capabilities.json()["write"] == []
     assert upload.status_code == 403
+
+
+def test_generated_http_keys_can_read_originals_and_revisions_without_file_permission_settings(tmp_path: Path) -> None:
+    with TestClient(create_app(_settings(tmp_path, enabled=False))) as client:
+        base = "/api/integration/v1"
+        keys = "/api/v1/integration/settings/keys"
+        read = _headers(client.post(keys, json={"kind": "read"}).json()["token"])
+        write = _headers(client.post(keys, json={"kind": "write"}).json()["token"])
+        table_id = _seed_confirmed_task(client)
+        original = client.post(
+            f"{base}/tasks", headers=write,
+            files={"file": ("standalone.png", PNG_BYTES, "image/png")},
+        ).json()
+        file_url = f"{base}/tasks/{original['id']}/file"
+        directory_url = f"{base}/tasks/integration-task/revisions"
+        assert client.get(file_url).status_code == 401
+        for headers in (read, write):
+            capabilities = client.get(f"{base}/capabilities", headers=headers).json()
+            assert {"file_revisions", "original_file"} <= set(capabilities["read"])
+            download = client.get(file_url, headers=headers)
+            assert download.status_code == 200 and download.content == PNG_BYTES
+            assert download.headers["cache-control"] == "no-store"
+            directory = client.get(directory_url, headers=headers)
+            assert directory.status_code == 200
+            revision = directory.json()["revisions"][0]["id"]
+            assert client.get(f"{directory_url}/{revision}", headers=headers).status_code == 200
+            assert client.get(f"{base}/tables/{table_id}/revisions", headers=headers).status_code == 200
+        assert client.post(f"{base}/tasks", headers=read,
+                           files={"file": ("second.png", PNG_BYTES, "image/png")}).status_code == 403
+
+
+def test_existing_http_key_keeps_old_file_grants_until_reissued(tmp_path: Path) -> None:
+    path = integration_config_path(tmp_path)
+    path.parent.mkdir()
+    legacy = {"read_token": READ_TOKEN, "write_token": WRITE_TOKEN,
+              "api_read_revision_read": True, "api_read_table_ids": ["legacy-table"]}
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    with TestClient(create_app(_settings(tmp_path, enabled=False))) as client:
+        settings = "/api/v1/integration/settings"
+        base = "/api/integration/v1"
+        assert client.get(settings).json()["legacy_http_keys"] == ["read", "write"]
+        old = _headers(READ_TOKEN)
+        assert {"file_revisions", "original_file"} & set(client.get(f"{base}/capabilities", headers=old).json()["read"]) == {"file_revisions"}
+        assert client.get(f"{base}/tasks/other/file", headers=old).status_code == 403
+        assert client.get(f"{base}/tables/other/revisions", headers=old).status_code == 404
+        assert client.post(f"{settings}/permissions", json={"task_read": True}).status_code == 200
+        assert json.loads(path.read_text(encoding="utf-8"))["api_read_table_ids"] == ["legacy-table"]
+        replacement = _headers(client.post(f"{settings}/keys", json={"kind": "read"}).json()["token"])
+        assert client.get(f"{base}/capabilities", headers=old).status_code == 401
+        assert {"file_revisions", "original_file"} <= set(client.get(f"{base}/capabilities", headers=replacement).json()["read"])
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert "api_read_table_ids" not in data
+        assert data["write_token"] == WRITE_TOKEN and data["mcp_task_read"]
+        assert client.get(settings).json()["legacy_http_keys"] == ["write"]
 
 
 def test_write_token_edits_same_versioned_fact_and_records_source(

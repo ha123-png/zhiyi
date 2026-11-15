@@ -42,6 +42,11 @@ def test_every_export_applies_the_intersection_of_group_search_and_selection(tmp
         book = load_workbook(BytesIO(split.content))
         assert book.sheetnames == ['甲'] and book.active.max_row == 2
         book.close()
+        filtered = client.get(f"/api/v1/tables/{table['id']}/export.xlsx", params={**scope, "columns": ["quantity", "name"]})
+        assert filtered.status_code == 200, filtered.text
+        book = load_workbook(BytesIO(filtered.content))
+        assert list(book.active.values) == [('数量', '商品名称'), (1, '目标')]
+        book.close()
         assert client.get(f"/api/v1/tables/{table['id']}/export.json", params={'row_ids': ''}).json() == []
         assert client.get(f"/api/v1/tables/{table['id']}/export.json", params={'row_ids': str(rows[0]['id'])}).json()[0]['quantity'] == 1
         for invalid in ({'row_ids': '999999'}, {'view_id': 'deleted'}, {'row_ids': 'true'}, {'row_ids': ',1'}, {'task_ids': 'not-this-table'}):
@@ -82,10 +87,36 @@ def test_autonomous_export_matches_file_search_and_preserves_all_its_details(cli
     assert packed.status_code == 200, packed.text
     with ZipFile(BytesIO(packed.content)) as archive:
         manifest = json.loads(archive.read('目录.json'))
-        assert manifest['total_files'] == 1 and manifest['parts'][0]['files'][0]['id'] == first
+        assert manifest['total_files'] == 1 and manifest['parts'][0]['files'] == ['匹配文件.txt']
         book = load_workbook(BytesIO(archive.read(manifest['parts'][0]['workbook'])))
         assert book['目录'].cell(2, 3).value == 2
         book.close()
     assert client.get(f'/api/v1/tables/{table}/export.json', params={'task_ids': second}).json()['files'][0]['file_id'] == second
     assert client.get(f'/api/v1/tables/{table}/export.json', params={'task_ids': ''}).json()['files'] == []
     assert client.get(f'/api/v1/tables/{table}/export.json', params={'row_ids': ''}).status_code == 422
+
+
+def test_revision_export_separates_same_name_tasks_and_versions(client):
+    first = upload(client, '收据.txt', content=b'first original')
+    second = upload(client, '收据.txt', content=b'second original')
+    initial = process(client, first, Model(payload(value='甲')))
+    process(client, second, Model(payload(value='乙')))
+    changed = initial.result.model_dump()
+    changed['header']['h1'] = '丙'
+    response = client.put(f'/api/v1/tasks/{first}/review', json={
+        'expected_version': initial.review_version, 'detail_ids': initial.detail_ids, 'result': changed,
+    })
+    assert response.status_code == 200, response.text
+    table = client.get('/api/v1/tables').json()[0]['id']
+    response = client.get(f'/api/v1/tables/{table}/export-notes.xlsx', params={'revisions': 'true'})
+    assert response.status_code == 200, response.text
+    book = load_workbook(BytesIO(response.content))
+    assert book.sheetnames == ['修订目录', '收据.txt', '收据.txt-2']
+    sheets = [list(sheet.values) for sheet in book.worksheets[1:]]
+    revised, other = sorted(sheets, key=len, reverse=True)
+    version_rows = [index for index, row in enumerate(revised) if row[0] == '版本']
+    assert len(version_rows) == 2
+    assert revised[version_rows[1]][1].startswith('V2')
+    assert revised[version_rows[1] - 1] == (None, None, None, None)
+    assert ('文件级', '客户', '甲', '丙') in revised
+    assert ('文件级', '客户', None, '乙') in other

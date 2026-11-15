@@ -32,6 +32,51 @@ def upload(client, **data):
     return client.post("/api/v1/tasks", files={"file": ("sample.txt", b"same original", "text/plain")}, data=data)
 
 
+def test_duplicate_confirmation_checks_content_when_a_file_is_selected_again(client):
+    original = upload(client).json()
+    conflict = upload(client).json()["detail"]
+    assert conflict["duplicate_sha256"] == original["sha256"]
+    wrong = client.post("/api/v1/tasks", files={"file": ("sample.txt", b"diff original", "text/plain")},
+                        data={"duplicate_policy": "allow", "expected_sha256": conflict["duplicate_sha256"]})
+    assert wrong.status_code == 409
+    assert len(client.get("/api/v1/tasks").json()) == 1
+    assert upload(client, duplicate_policy="allow", expected_sha256=conflict["duplicate_sha256"]).status_code == 201
+
+
+def test_pending_duplicate_reuses_verified_original_and_only_queues_once(client):
+    original = upload(client).json()
+    pending = "/api/v1/user-state/pending-duplicates"
+    assert client.put(pending, json={
+        "id": "reuse-original", "name": original["filename"], "size": original["size_bytes"], "selection": "smart",
+        "existingTaskId": original["id"], "sha256": original["sha256"], "createdAt": original["created_at"],
+    }).is_success
+    action = "/api/v1/tasks/pending-duplicates/reuse-original/extract"
+    first = client.post(action)
+    assert first.status_code == 201, first.text
+    assert first.json()["sha256"] == original["sha256"]
+    assert first.json()["id"] != original["id"]
+    assert client.get(pending).json() == []
+    assert client.post(action).status_code == 404
+    assert len(client.get("/api/v1/tasks").json()) == 2
+
+
+def test_missing_original_keeps_pending_and_batch_delete_keeps_existing_record(client):
+    original = upload(client).json()
+    pending = "/api/v1/user-state/pending-duplicates"
+    assert client.put(pending, json={
+        "id": "missing-original", "name": original["filename"], "size": original["size_bytes"], "selection": "smart",
+        "existingTaskId": original["id"], "sha256": original["sha256"], "createdAt": original["created_at"],
+    }).is_success
+    basename = f"{original['id']}.txt"
+    (client.app.state.settings.storage_dir / basename).unlink()
+    response = client.post("/api/v1/tasks/pending-duplicates/missing-original/extract")
+    assert response.status_code == 409 and response.json()["detail"]["code"] == "original_unavailable"
+    assert len(client.get(pending).json()) == 1
+    assert client.post("/api/v1/tasks/batch-delete", json={"pending_ids": ["missing-original"]}).is_success
+    assert client.get(pending).json() == []
+    assert [task["id"] for task in client.get("/api/v1/tasks").json()] == [original["id"]]
+
+
 @pytest.mark.parametrize("invalid", [{"template_mode": "manual"}, {"template_mode": "bogus"},
                                       {"template_mode": "bogus", "template_id": "builtin-invoice"}])
 def test_invalid_modes_cannot_create_semantically_identical_smart_task(client, tmp_path, invalid):
@@ -233,12 +278,19 @@ def test_upgrade_from_0045_preserves_all_existing_facts_and_original(client):
             data = {}
             for name in tables:
                 rows = connection.exec_driver_sql(f'SELECT * FROM "{name}"').mappings()
-                data[name] = [{k: v for k, v in row.items() if k != "upload_intent_json"} for row in rows]
+                data[name] = [
+                    {k: v for k, v in row.items() if k not in {"upload_intent_json", "merge_sources_json"}}
+                    for row in rows
+                ]
             return data
     before = dump()
     assert before["extractions"] and before["data_rows"] and before["file_current_data"]
     upgrade_database(engine)
     assert dump() == before
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql(
+            "SELECT COUNT(*) FROM data_tables WHERE merge_sources_json IS NOT NULL"
+        ).scalar_one() == 0
     assert original_path.read_bytes() == original_bytes
     assert upload(client).status_code == 409  # Legacy smart fallback.
     engine.dispose()

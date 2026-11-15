@@ -174,6 +174,7 @@ describe("TemplatesPage", () => {
     fireEvent.change(screen.getByLabelText("用途说明"), { target: { value: "更新用途" } });
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "新建空白模板" })).toBeDisabled());
+    expect(screen.getByRole("button", { name: /查看历史/ })).toBeDisabled();
     const target = [...container.querySelectorAll(".template-list-item")].find(e => e.textContent?.includes("发票"))!;
     expect(target).toHaveAttribute("aria-disabled", "true");
     fireEvent.click(target);
@@ -207,7 +208,7 @@ describe("TemplatesPage", () => {
     expect(
       screen.getByLabelText("额外提示词"),
     ).toBeInTheDocument();
-    expect(container.querySelector('input[type="file"]')).toHaveClass("visually-hidden");
+    expect(container.querySelector('input[type="file"]')).not.toBeVisible();
     expect(container.querySelector(".template-list-item")).toContainElement(
       container.querySelector(".tpl-item-main"),
     );
@@ -262,7 +263,8 @@ describe("TemplatesPage", () => {
 
     render(<TemplatesPage />);
 
-    expect(await screen.findByText("本地模板服务未连接")).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "模板读取失败" }));
+    expect(screen.getByRole("dialog", { name: "模板读取失败" })).toHaveTextContent("本地模板服务未连接");
     expect(screen.getByRole("heading", { name: "未命名模板" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "创建模板" })).toBeDisabled();
     expect(screen.queryByText("第 0 版")).not.toBeInTheDocument();
@@ -486,6 +488,7 @@ describe("template action transactions", () => {
     fireEvent.click(opener);
     let aiDialog = screen.getByRole("dialog", { name: "智能创建提取模板" });
     fireEvent.change(within(aiDialog).getByLabelText("需求描述"), { target: { value: "只使用本地合成响应验收 UI" } });
+    await waitFor(() => expect(within(aiDialog).getByRole("button", { name: "生成模板" })).toBeEnabled());
     fireEvent.click(within(aiDialog).getByRole("button", { name: "生成模板" }));
     await within(aiDialog).findByRole("button", { name: "保存模板" });
 
@@ -543,6 +546,7 @@ describe("template action transactions", () => {
     const dialog = screen.getByRole("dialog", { name: "智能创建提取模板" });
     const requirement = within(dialog).getByLabelText("需求描述");
     fireEvent.change(requirement, { target: { value: "第一次合成请求" } });
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "生成模板" })).toBeEnabled());
     fireEvent.click(within(dialog).getByRole("button", { name: "生成模板" }));
     await waitFor(() => expect(pendingGenerations).toHaveLength(1));
 

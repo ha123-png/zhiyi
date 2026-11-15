@@ -379,6 +379,8 @@ def test_mcp_live_connection_allows_restore_and_is_generation_fenced(tmp_path: P
             }
         }
         safe_environment["UV_OFFLINE"] = "1"
+        safe_environment["UV_NO_SYNC"] = "1"
+        safe_environment["UV_NO_CACHE"] = "1"
         params = StdioServerParameters(
             command=server_config["command"],
             args=server_config["args"],

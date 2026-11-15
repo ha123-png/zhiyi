@@ -8,7 +8,6 @@ from document_pipeline_api.models import (
     DataRowRecord,
     DataRowRevisionRecord,
     DataTableRecord,
-    ExtractionRecord,
 )
 from document_pipeline_api.services.current_data import row_values, get_current, revise_current
 from document_pipeline_api.models.task import utc_now
@@ -17,28 +16,7 @@ from document_pipeline_api.schemas.data_tables import (
     DataRowRevisionRead,
     DataRowUpdate,
 )
-from document_pipeline_api.schemas.extraction import DocumentKind
 from document_pipeline_api.schemas.input_scope import InputScope
-from document_pipeline_api.services.templates import get_template_version
-
-
-BUILTIN_HEADER_KEYS = {
-    "document_type",
-    "seller_name",
-    "buyer_name",
-    "seller_tax_id",
-    "buyer_tax_id",
-    "seller_contact",
-    "buyer_contact",
-    "buyer_address",
-    "document_number",
-    "document_date",
-    "amount_before_tax",
-    "tax_amount",
-    "total_amount",
-    "total_quantity",
-    "remarks",
-}
 
 
 def data_row_read(row: DataRowRecord) -> DataRowRead:
@@ -73,7 +51,12 @@ def update_data_row(
     request: DataRowUpdate,
 ) -> DataRowRead:
     from document_pipeline_api.services.read_snapshot import begin_write_snapshot
+    from document_pipeline_api.services.merged_tables import require_writable
     begin_write_snapshot(session)
+    table = session.get(DataTableRecord, table_id)
+    if table is None:
+        raise HTTPException(status_code=404, detail="没有找到这个数据表。")
+    require_writable(table)
     row = session.scalar(
         select(DataRowRecord).where(
             DataRowRecord.id == row_id,
@@ -85,9 +68,6 @@ def update_data_row(
     if request.expected_version != row.row_version:
         raise HTTPException(status_code=409, detail="这行数据已经更新，请刷新后再修改。")
 
-    table = session.get(DataTableRecord, table_id)
-    if table is None:
-        raise HTTPException(status_code=404, detail="没有找到这个数据表。")
     # 合法字段集 = 表的列契约（与前端可编辑列一致），而不是该行现有字段：
     # 新增的空行或原本缺失字段的行，在编辑缺失字段时不应被误判为"表里没有该字段"。
     from document_pipeline_api.services.data_tables import table_columns
@@ -101,7 +81,7 @@ def update_data_row(
     before = json.loads(row.row_json)
     _validate_row_changes(valid_keys, before, request.changes)
     from document_pipeline_api.services.current_data import check_column_values
-    check_column_values(request.changes, [column.model_dump() for column in table_column_defs])
+    check_column_values(request.changes, [column.model_dump() for column in table_column_defs], allow_text=request.editor == "local-user")
 
     # Independent groups retain shared fields only while all typed values agree.
     # A historically varied field is a per-row value, never a first-row override.
@@ -185,20 +165,6 @@ def update_data_row(
     session.commit()
     session.refresh(row)
     return data_row_read(row)
-
-
-def _header_keys_for_task(session: Session, task_id: str) -> set[str]:
-    extraction = session.get(ExtractionRecord, task_id)
-    if extraction is None or extraction.document_kind != DocumentKind.CUSTOM.value:
-        return BUILTIN_HEADER_KEYS
-    if extraction.template_id is None or extraction.template_version is None:
-        raise HTTPException(status_code=409, detail="这行数据缺少模板版本，不能修改。")
-    template = get_template_version(
-        session,
-        extraction.template_id,
-        extraction.template_version,
-    )
-    return {field.key for field in template.fields if field.section == "header"}
 
 
 def list_row_revisions(

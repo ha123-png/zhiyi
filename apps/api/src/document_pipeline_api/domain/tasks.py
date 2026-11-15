@@ -48,7 +48,9 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     ),
     TaskStatus.PAUSED: frozenset({TaskStatus.QUEUED, TaskStatus.CANCELLED}),
     TaskStatus.COMPLETED: frozenset(),
-    TaskStatus.CANCELLED: frozenset(),
+    TaskStatus.CANCELLED: frozenset(
+        {TaskStatus.QUEUED, TaskStatus.WAITING_FOR_TEMPLATE, TaskStatus.NEEDS_REVIEW}
+    ),
     TaskStatus.FAILED: frozenset({TaskStatus.QUEUED, TaskStatus.CANCELLED}),
 }
 

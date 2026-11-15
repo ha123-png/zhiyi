@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   Boxes,
   CheckCircle2,
-  ChevronDown,
   ClipboardCopy,
   Code2,
   KeyRound,
@@ -25,8 +24,10 @@ import {
 import type { IntegrationSettings, McpRuntimeConfig } from "../api";
 import type { DataTableRead } from "../types";
 import { useUnsavedChanges } from "../useUnsavedChanges";
+import { useModalFocus } from "../useModalFocus";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { Icon } from "./Icon";
+import { CollapseChevron } from "./CollapseChevron";
 import { Toast, useToast } from "./Toast";
 
 interface Endpoint {
@@ -37,11 +38,15 @@ interface Endpoint {
 
 const endpoints: Endpoint[] = [
   { method: "GET", path: "/capabilities", desc: "查询能力声明与权限范围" },
-  { method: "GET", path: "/tasks", desc: "查询任务列表" },
+  { method: "GET", path: "/tasks", desc: "分页查询任务，可按状态和文件名筛选" },
   { method: "GET", path: "/tasks/{id}/result", desc: "查询任务提取结果" },
+  { method: "GET", path: "/tasks/{id}/file", desc: "下载任务原件" },
+  { method: "GET", path: "/tasks/{id}/revisions", desc: "读取文件修订目录" },
+  { method: "GET", path: "/tasks/{id}/revisions/{revision_id}", desc: "分页读取指定版本的字段变化" },
   { method: "POST", path: "/tasks", desc: "上传文件创建任务（写密钥）" },
   { method: "GET", path: "/tables", desc: "查询数据表列表" },
   { method: "GET", path: "/tables/{id}", desc: "查询表详情（分页行）" },
+  { method: "GET", path: "/tables/{id}/revisions", desc: "查询独立记录的修订历史" },
   { method: "GET", path: "/tables/{id}/views", desc: "查询分 Sheet 视图" },
   {
     method: "GET",
@@ -74,11 +79,6 @@ const mcpFeatures = [
   },
 ];
 
-const cloudPlannerExample = `# 云端规划者：能看任务/模板并控制任务，不能读提取正文或业务数据
-DOCUMENT_PIPELINE_MCP_RESULT_READ_ENABLED=0
-DOCUMENT_PIPELINE_MCP_DATA_READ_ENABLED=0
-DOCUMENT_PIPELINE_MCP_TASK_CONTROL_ENABLED=1`;
-
 function buildCurlExample(baseUrl: string) {
   return `# 查询任务列表（读密钥）
 curl -H "Authorization: Bearer READ_TOKEN" \\
@@ -90,9 +90,10 @@ curl -X POST -H "Authorization: Bearer WRITE_TOKEN" \\
   ${baseUrl}/tasks
 
 # 修改数据行（写密钥，需带乐观锁版本）
+# 将 COLUMN_KEY 替换为表详情 columns 中的 key，不是显示名称
 curl -X PATCH -H "Authorization: Bearer WRITE_TOKEN" \\
   -H "Content-Type: application/json" \\
-  -d '{"expected_version":1,"changes":{"金额":"372.00"}}' \\
+  -d '{"expected_version":1,"changes":{"COLUMN_KEY":"372.00"}}' \\
   ${baseUrl}/tables/TABLE_ID/rows/ROW_ID`;
 }
 
@@ -107,6 +108,8 @@ function permissionSnapshot(value: {
   task_read?: boolean;
   template_read?: boolean;
   result_read?: boolean;
+  revision_read?: boolean;
+  original_read?: boolean;
   data_read?: boolean;
   task_control?: boolean;
   write_enabled?: boolean;
@@ -119,6 +122,8 @@ function permissionSnapshot(value: {
     task_read: Boolean(value.task_read),
     template_read: Boolean(value.template_read),
     result_read: Boolean(value.result_read),
+    revision_read: Boolean(value.revision_read),
+    original_read: Boolean(value.original_read),
     data_read: Boolean(value.data_read),
     task_control: Boolean(value.task_control),
     write_enabled: Boolean(value.write_enabled),
@@ -158,11 +163,7 @@ function CollapsibleCard({
           </h3>
           <div className="support">{support}</div>
         </div>
-        <Icon
-          className={`card-caret${collapsed ? " is-collapsed" : ""}`}
-          icon={ChevronDown}
-          size={17}
-        />
+        <CollapseChevron className="card-caret" expanded={!collapsed} size={17} />
       </button>
       <div className="card-body" inert={collapsed} aria-hidden={collapsed}>
         <div className="card-body-inner">{children}</div>
@@ -175,9 +176,11 @@ export function ConnectionsPage() {
   const { toast, notify, clear } = useToast();
   const integrationBaseUrl = getIntegrationBaseUrl();
   const [status, setStatus] = useState<{
-    enabled: boolean;
+    enabled: boolean | null;
     message: string;
-  }>({ enabled: false, message: "正在检测集成接口状态..." });
+  }>({ enabled: null, message: "正在检测集成接口状态…" });
+  const [statusLoading, setStatusLoading] = useState(true);
+  const statusRequest = useRef(0);
 
   // 集成配置（密钥状态 + MCP 权限）
   const [settings, setSettings] = useState<IntegrationSettings | null>(null);
@@ -198,7 +201,22 @@ export function ConnectionsPage() {
     kind: string;
     token: string;
   } | null>(null);
+  const revealedTokenInput = useRef<HTMLTextAreaElement>(null);
+  const revealedTokenDialog = useModalFocus(
+    revealedToken !== null,
+    () => setRevealedToken(null),
+    false,
+    revealedTokenInput,
+  );
   const [copied, setCopied] = useState(false);
+  const readKeyButton = useRef<HTMLButtonElement>(null);
+  const keyStatusRetry = useRef<HTMLButtonElement>(null);
+  const restoreKeyStatusFocus = useRef(false);
+  useLayoutEffect(() => {
+    if (settingsLoading || !restoreKeyStatusFocus.current) return;
+    restoreKeyStatusFocus.current = false;
+    if (!settingsError && document.activeElement === document.body) readKeyButton.current?.focus();
+  }, [settingsError, settingsLoading]);
   // 撤销确认
   const [revokeTarget, setRevokeTarget] = useState<"read" | "write" | null>(null);
   // 权限开关草稿
@@ -206,6 +224,8 @@ export function ConnectionsPage() {
     taskRead: false,
     templateRead: false,
     resultRead: false,
+    revisionRead: false,
+    originalRead: false,
     dataRead: false,
     taskControl: false,
     writeEnabled: false,
@@ -214,7 +234,10 @@ export function ConnectionsPage() {
   });
   const [savingPerms, setSavingPerms] = useState(false);
   const [tables, setTables] = useState<DataTableRead[]>([]);
+  const [tablesLoading, setTablesLoading] = useState(false);
+  const [hasLoadedTables, setHasLoadedTables] = useState(false);
   const [tableError, setTableError] = useState<string | null>(null);
+  const tablesRequest = useRef(0);
   const [dataScope, setDataScope] = useState<"all" | "selected">("all");
   const [tableIds, setTableIds] = useState<string[]>([]);
   const unsavedChanges = useUnsavedChanges(() => settings !== null && permissionSnapshot({
@@ -223,12 +246,16 @@ export function ConnectionsPage() {
     task_read: permDraft.taskRead,
     template_read: permDraft.templateRead,
     result_read: permDraft.resultRead,
+    revision_read: permDraft.revisionRead,
+    original_read: permDraft.originalRead,
     data_read: permDraft.dataRead,
     task_control: permDraft.taskControl,
     write_enabled: permDraft.writeEnabled,
     file_access: permDraft.fileAccess,
     file_roots: permDraft.fileRoots,
   }) !== permissionSnapshot(settings));
+  const integrationStatusUnknown = status.enabled === null
+    || (!status.enabled && !status.message.includes("集成接口未启用"));
 
   const applySettings = useCallback((next: IntegrationSettings) => {
     setSettings(next);
@@ -238,6 +265,8 @@ export function ConnectionsPage() {
       taskRead: next.task_read,
       templateRead: next.template_read,
       resultRead: next.result_read,
+      revisionRead: Boolean(next.revision_read),
+      originalRead: Boolean(next.original_read),
       dataRead: next.data_read,
       taskControl: next.task_control,
       writeEnabled: next.write_enabled,
@@ -245,13 +274,38 @@ export function ConnectionsPage() {
       fileRoots: (next.file_roots ?? []).join("\n"),
     });
   }, []);
+
+  const refreshTables = useCallback(async () => {
+    const request = ++tablesRequest.current;
+    setTablesLoading(true);
+    setTableError(null);
+    try {
+      const items = await getTables();
+      if (request === tablesRequest.current) {
+        setTables(items);
+        setHasLoadedTables(true);
+      }
+    } catch (err) {
+      if (request === tablesRequest.current) {
+        setTableError(err instanceof Error ? err.message : "读取数据表列表失败");
+      }
+    } finally {
+      if (request === tablesRequest.current) setTablesLoading(false);
+    }
+  }, []);
+
+  const needsTableList = permDraft.dataRead || permDraft.writeEnabled ||
+    permDraft.resultRead || permDraft.revisionRead || permDraft.originalRead;
   useEffect(() => {
-    if (!permDraft.dataRead && !permDraft.writeEnabled) return;
-    let current = true;
-    getTables().then(items => { if (current) { setTables(items); setTableError(null); } })
-      .catch(() => { if (current) setTableError("暂时无法读取数据表列表，请重新打开接口页面重试。"); });
-    return () => { current = false; };
-  }, [permDraft.dataRead, permDraft.writeEnabled]);
+    if (!needsTableList) {
+      tablesRequest.current += 1;
+      setTablesLoading(false);
+      setTableError(null);
+      return;
+    }
+    void refreshTables();
+    return () => { tablesRequest.current += 1; };
+  }, [needsTableList, refreshTables]);
 
   const refreshSettings = useCallback(async (syncPermissions = false) => {
     const request = ++settingsRequest.current;
@@ -273,10 +327,25 @@ export function ConnectionsPage() {
 
   useEffect(() => () => { settingsRequest.current += 1; }, []);
 
+  const refreshStatus = useCallback(async () => {
+    const request = ++statusRequest.current;
+    setStatus({ enabled: null, message: "正在检测集成接口状态…" });
+    setStatusLoading(true);
+    try {
+      const next = await getIntegrationStatus();
+      if (request === statusRequest.current) setStatus(next);
+    } catch {
+      if (request === statusRequest.current) setStatus({ enabled: false, message: "无法连接集成接口。" });
+    } finally {
+      if (request === statusRequest.current) setStatusLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
-    void getIntegrationStatus().then(setStatus);
+    void refreshStatus();
     void refreshSettings(true);
-  }, [refreshSettings]);
+    return () => { statusRequest.current += 1; };
+  }, [refreshSettings, refreshStatus]);
 
   const refreshMcpConfig = useCallback(async () => {
     const request = ++mcpConfigRequest.current;
@@ -307,9 +376,11 @@ export function ConnectionsPage() {
     setSettingsNotice(null);
     try {
       const result = await generateIntegrationKey(kind);
+      setSettings(current => current ? { ...current, [kind === "read" ? "read_token_set" : "write_token_set"]: true,
+        legacy_http_keys: current.legacy_http_keys?.filter(key => key !== kind) } : current);
       setRevealedToken(result);
       setCopied(false);
-      await refreshSettings();
+      await Promise.all([refreshSettings(), refreshStatus()]);
     } catch (err) {
       setSettingsError(err instanceof Error ? err.message : "生成密钥失败");
     } finally {
@@ -323,11 +394,13 @@ export function ConnectionsPage() {
     setSettingsError(null);
     try {
       await revokeIntegrationKey(revokeTarget);
+      setSettings(current => current ? { ...current, [revokeTarget === "read" ? "read_token_set" : "write_token_set"]: false,
+        legacy_http_keys: current.legacy_http_keys?.filter(key => key !== revokeTarget) } : current);
       setRevokeTarget(null);
       setSettingsNotice(
         `${revokeTarget === "read" ? "读" : "写"}密钥已撤销，HTTP API 立即生效。`,
       );
-      await refreshSettings();
+      await Promise.all([refreshSettings(), refreshStatus()]);
     } catch (err) {
       const message = err instanceof Error ? err.message : "撤销密钥失败";
       setSettingsError(message);
@@ -358,6 +431,8 @@ export function ConnectionsPage() {
         task_read: permDraft.taskRead,
         template_read: permDraft.templateRead,
         result_read: permDraft.resultRead,
+        revision_read: permDraft.revisionRead,
+        original_read: permDraft.originalRead,
         data_read: permDraft.dataRead,
         task_control: permDraft.taskControl,
         write_enabled: permDraft.writeEnabled,
@@ -379,11 +454,7 @@ export function ConnectionsPage() {
 
   return (
     <section className="view connections-view">
-      <header className="page-header">
-        <span className="eyebrow">集成</span>
-        <h1>接口与 MCP</h1>
-        <p className="support">外部系统集成与 MCP 工具的接入说明</p>
-      </header>
+
 
       <div className="settings-stack">
         <div className="task-col">
@@ -428,16 +499,24 @@ export function ConnectionsPage() {
             support={status.message}
             title="集成接口状态"
           >
-            <div className="settings-toggles">
+            <div className="settings-toggles" aria-busy={statusLoading}>
               <div className="setting-row">
                 <div>
                   <div className="settings-name">外部集成 API</div>
                   <div className="small muted">/api/integration/v1</div>
                 </div>
-                <span className={`badge ${status.enabled ? "live" : "warn"}`}>
-                  {status.enabled ? "已启用" : "未启用"}
+                <span aria-live="polite" className={`badge ${status.enabled && !statusLoading ? "live" : "warn"}`}>
+                  {statusLoading ? "正在检测" : integrationStatusUnknown ? "无法确认" : status.enabled ? "已启用" : "未启用"}
                 </span>
               </div>
+              {integrationStatusUnknown && !statusLoading && (
+                <div className="callout danger" role="alert">
+                  <span>{status.message}</span>
+                  <button className="btn secondary xs" type="button" disabled={statusLoading} onClick={() => void refreshStatus()}>
+                    {statusLoading ? "正在检测…" : "重新检测"}
+                  </button>
+                </div>
+              )}
               <div className="setting-row">
                 <div>
                   <div className="settings-name">监听地址</div>
@@ -458,8 +537,18 @@ export function ConnectionsPage() {
           >
             <div className="settings-toggles">
               {settingsError && (
-                <div className="callout danger" style={{ marginBottom: 12 }}>
-                  {settingsError}
+                <div className="callout danger" role="alert" style={{ marginBottom: 12 }}>
+                  <span>{settingsError}</span>
+                  <button className="btn secondary sm" type="button"
+                    ref={keyStatusRetry}
+                    aria-disabled={settingsLoading || busyKey !== null || savingPerms}
+                    onClick={() => {
+                      if (settingsLoading || busyKey !== null || savingPerms) return;
+                      restoreKeyStatusFocus.current = document.activeElement === keyStatusRetry.current;
+                      void refreshSettings(settings === null);
+                    }}>
+                    {settingsLoading ? "正在读取密钥状态…" : "重新读取密钥状态"}
+                  </button>
                 </div>
               )}
               {settingsNotice && (
@@ -467,32 +556,32 @@ export function ConnectionsPage() {
                   {settingsNotice}
                 </div>
               )}
-              <div className="setting-row">
-                <div>
-                  <div className="settings-name">读密钥</div>
-                  <div className="small muted">查询任务、结果、表和分 Sheet</div>
-                </div>
-                <span className={`badge ${settings?.read_token_set ? "live" : "warn"}`}>
-                  {settings?.read_token_set ? "已设置" : "未设置"}
-                </span>
-              </div>
-              <div className="setting-row">
-                <div>
-                  <div className="settings-name">写密钥</div>
-                  <div className="small muted">仅用于 HTTP API：上传文件、修改事实行</div>
-                </div>
-                <span className={`badge ${settings?.write_token_set ? "live" : "warn"}`}>
-                  {settings?.write_token_set ? "已设置" : "未设置"}
-                </span>
-              </div>
+              {(["read", "write"] as const).map(kind => {
+                const label = kind === "read" ? "读密钥" : "写密钥";
+                const enabled = settings?.[kind === "read" ? "read_token_set" : "write_token_set"];
+                const legacy = settings?.legacy_http_keys?.includes(kind);
+                return <div className="setting-row" key={kind}>
+                  <div>
+                    <div className="settings-name">{label}</div>
+                    <div className="small muted">{kind === "read"
+                      ? "查询任务、结果和数据表，下载原件并读取修订历史。"
+                      : "包含读取能力，还可上传文件和修改数据行。"}</div>
+                    {legacy && <div className="small muted">旧密钥沿用原权限，重新生成后使用上述权限。</div>}
+                  </div>
+                  <span className={`badge ${settings === null ? "muted" : enabled ? "live" : "warn"}`}>
+                    {settings === null ? settingsLoading ? "正在读取" : "待确认" : enabled ? "已设置" : "未设置"}
+                  </span>
+                </div>;
+              })}
               <div className="setting-row align-top">
                 <div style={{ minWidth: 0 }}>
                   <div className="settings-name">密钥操作</div>
                   <div className="small muted" style={{ marginBottom: 8 }}>
-                    生成后请立即复制保存；关闭弹窗后明文不可再查看。密钥只用于 HTTP API，并立即生效。
+                    密钥只用于 HTTP API。生成后立即生效，同类旧密钥随即失效。请在关闭弹窗前复制保存。
                   </div>
                   <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
                     <button
+                      ref={readKeyButton}
                       className="btn secondary sm"
                       disabled={busyKey !== null || savingPerms || settings === null}
                       onClick={() => void handleGenerateKey("read")}
@@ -536,7 +625,7 @@ export function ConnectionsPage() {
           {/* MCP 工具 */}
           <CollapsibleCard
             icon={Boxes}
-            support="协议适配器，不拥有独立业务逻辑；当前锁定 mcp==1.28.1"
+            support="让支持 MCP 的客户端在授权范围内使用知意的数据与任务"
             title="MCP 工具"
           >
             <div className="settings-toggles">
@@ -549,17 +638,7 @@ export function ConnectionsPage() {
                 </div>
               ))}
             </div>
-            <div style={{ marginTop: 14 }}>
-              <div className="settings-name">最小权限配置示例</div>
-              <div className="small muted" style={{ marginBottom: 8 }}>
-                每种 AI 使用独立 MCP 进程；未开启的工具不会出现在工具列表中。
-              </div>
-              <pre className="code-block">{cloudPlannerExample}</pre>
-              <div className="small muted" style={{ marginTop: 8 }}>
-                文件能力还需 MCP_FILE_ACCESS_ENABLED=1 与 MCP_FILE_ROOTS；事实修改需
-                MCP_WRITE_ENABLED=1。完整变量均以 DOCUMENT_PIPELINE_ 开头。
-              </div>
-            </div>
+            <p className="small muted">「读取原件」提供 <code>read_original_page</code>。「读取修订历史」提供文件版本和独立记录的修订查询。保存权限后请重新连接客户端。</p>
           </CollapsibleCard>
 
           {/* MCP 权限开关 */}
@@ -592,7 +671,9 @@ export function ConnectionsPage() {
               {([
                 ["taskRead", "读取任务", "允许 AI 查看任务列表、状态和文件名"],
                 ["templateRead", "读取模板", "允许 AI 查看模板、字段和校验规则"],
-                ["resultRead", "读取文件结果", "允许按文件读取当前数据、初始提取证据与校验问题；独立授权，不受下方所选数据表限制"],
+                ["resultRead", "读取文件结果", "读取当前数据、初次提取证据与校验问题"],
+                ["revisionRead", "读取修订历史", "读取文件版本及修改前后值，可能包含已删除的内容"],
+                ["originalRead", "读取原件", "按页或分段读取原件。外部 AI 客户端可能把内容发给云模型"],
                 ["dataRead", "读取数据仓库", "允许 AI 查看数据表、数据行、视图并执行聚合查询"],
               ] as const).map(([key, label, description]) => (
                 <div className="setting-row" key={key}>
@@ -602,6 +683,7 @@ export function ConnectionsPage() {
                   </div>
                   <button
                     aria-label={label}
+                    aria-pressed={permDraft[key]}
                     className={`toggle ${permDraft[key] ? "on" : "off"}`}
                     type="button"
                     disabled={savingPerms || settings === null}
@@ -645,7 +727,7 @@ export function ConnectionsPage() {
                   <span />
                 </button>
               </div>
-              {(permDraft.dataRead || permDraft.writeEnabled) && <div className="setting-row align-top">
+              {(permDraft.dataRead || permDraft.writeEnabled || permDraft.resultRead || permDraft.revisionRead || permDraft.originalRead) && <div className="setting-row align-top">
                 <div style={{ width: "100%" }}>
                   <label className="settings-name" htmlFor="mcp-data-scope">允许访问的数据表</label>
                   <select id="mcp-data-scope" value={dataScope} disabled={savingPerms || settings === null} onChange={e => setDataScope(e.target.value as "all" | "selected")}>
@@ -653,13 +735,21 @@ export function ConnectionsPage() {
                     <option value="selected">只允许选中的表</option>
                   </select>
                   {dataScope === "selected" && <div className="mcp-table-scope">
-                    {tableError ? <p role="alert">{tableError}</p> : tables.map(table => <label key={table.id}>
+                    {tablesLoading && !hasLoadedTables && <p className="small muted" role="status">正在读取数据表列表…</p>}
+                    {tablesLoading && hasLoadedTables && <p className="small muted" role="status">正在更新列表；已选数据表暂时保留。</p>}
+                    {tableError && <div className="callout danger mcp-table-error" role="alert">
+                      <p>{hasLoadedTables ? "读取失败，仍显示上次成功读取的列表；已选数据表保持不变。" : "暂时无法读取数据表，暂不能判断这里是否为空。"} {tableError}</p>
+                      <button className="btn secondary xs" type="button" disabled={tablesLoading} onClick={() => void refreshTables()}>
+                        {tablesLoading ? "正在读取…" : "重新读取数据表"}
+                      </button>
+                    </div>}
+                    {tables.map(table => <label key={table.id}>
                       <input type="checkbox" disabled={savingPerms || settings === null} checked={tableIds.includes(table.id)} onChange={e => setTableIds(ids => e.target.checked ? [...ids, table.id] : ids.filter(id => id !== table.id))} />{table.name}
                     </label>)}
-                    {!tableError && !tables.length && <p className="small muted">还没有可选的数据表。</p>}
+                    {hasLoadedTables && !tablesLoading && !tables.length && <p className="small muted">还没有可选的数据表。</p>}
                     <p className="small muted">已选 {tableIds.length} 张表。未选择时不允许访问任何数据表。</p>
                   </div>}
-                  <p className="small muted">此范围约束数据表工具的读取、聚合、修改和导出。“读取文件结果”独立授权，开启后可读取所选表之外的文件结果。</p>
+                  <p className="small muted">此范围也约束文件结果、修订历史和原件。授权合并表不会授予其原表的整份文件权限。</p>
                 </div>
               </div>}
               <div className="setting-row">
@@ -756,7 +846,7 @@ export function ConnectionsPage() {
             if (e.target === e.currentTarget) setRevealedToken(null);
           }}
         >
-          <div className="modal-card" role="dialog" aria-modal="true" aria-label="新密钥">
+          <div className="modal-card" aria-modal="true" aria-label="新密钥" {...revealedTokenDialog} role="dialog">
             <div className="modal-head">
               <div>
                 <h3>新{revealedToken.kind === "read" ? "读" : "写"}密钥已生成</h3>
@@ -769,6 +859,7 @@ export function ConnectionsPage() {
               <textarea
                 aria-label="密钥内容"
                 className="form-input"
+                ref={revealedTokenInput}
                 readOnly
                 rows={3}
                 value={revealedToken.token}
@@ -776,10 +867,10 @@ export function ConnectionsPage() {
                 style={{ fontFamily: "monospace", fontSize: 12 }}
               />
               <div className="row" style={{ justifyContent: "flex-end", gap: 8, marginTop: 12 }}>
-                <button className="btn ghost sm" onClick={() => setRevealedToken(null)}>
+                <button className="btn ghost sm" type="button" onClick={() => setRevealedToken(null)}>
                   关闭
                 </button>
-                <button className="btn primary sm" onClick={() => void copyToken()}>
+                <button className="btn primary sm" type="button" onClick={() => void copyToken()}>
                   <Icon icon={copied ? CheckCircle2 : ClipboardCopy} size={13} />
                   {copied ? "已复制" : "复制密钥"}
                 </button>

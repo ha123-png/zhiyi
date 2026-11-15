@@ -21,6 +21,7 @@ from fastapi import HTTPException
 from document_pipeline_api.services.file_operation_lock import file_operation_lock
 
 CONFIG_FILE_NAME = "integration.json"
+HTTP_KEY_PREFIX = "zhiyi_v2_"
 
 # 文件字段 → 环境变量
 FIELD_TO_ENV = {
@@ -33,12 +34,15 @@ FIELD_TO_ENV = {
     "mcp_file_access": "DOCUMENT_PIPELINE_MCP_FILE_ACCESS_ENABLED",
     "mcp_file_roots": "DOCUMENT_PIPELINE_MCP_FILE_ROOTS",
     "mcp_result_read": "DOCUMENT_PIPELINE_MCP_RESULT_READ_ENABLED",
+    "mcp_revision_read": "DOCUMENT_PIPELINE_MCP_REVISION_READ_ENABLED",
+    "mcp_original_read": "DOCUMENT_PIPELINE_MCP_ORIGINAL_READ_ENABLED",
     "mcp_data_read": "DOCUMENT_PIPELINE_MCP_DATA_READ_ENABLED",
     "mcp_data_scope": "DOCUMENT_PIPELINE_MCP_DATA_SCOPE",
     "mcp_table_ids": "DOCUMENT_PIPELINE_MCP_TABLE_IDS",
 }
 
-_ALL_FIELDS = set(FIELD_TO_ENV)
+_LEGACY_HTTP_FILE_FIELDS = ("revision_read", "original_read", "table_ids")
+_LEGACY_HTTP_FIELDS = {f"api_{kind}_{field}" for kind in ("read", "write") for field in _LEGACY_HTTP_FILE_FIELDS}
 _MCP_REVISION = "mcp_policy_revision"
 
 
@@ -59,7 +63,7 @@ def read_integration_config(data_dir: Path) -> dict[str, str]:
         return {}
     cleaned: dict[str, str] = {}
     for key, value in raw.items():
-        if key not in _ALL_FIELDS and key != _MCP_REVISION:
+        if key not in FIELD_TO_ENV and key not in _LEGACY_HTTP_FIELDS and key != _MCP_REVISION:
             continue
         if isinstance(value, bool):
             cleaned[key] = "1" if value else "0"
@@ -96,10 +100,14 @@ def _write_integration_config(data_dir: Path, updates: dict[str, object]) -> Non
     if not isinstance(current, dict):
         raise HTTPException(409, "集成配置格式损坏，原文件已保留。请从备份恢复配置后重试。")
     previous_policy = {key: value for key, value in current.items()
-                       if key in _ALL_FIELDS and key.startswith("mcp_")}
+                       if key in FIELD_TO_ENV and key.startswith("mcp_")}
     for key, value in updates.items():
-        if key not in _ALL_FIELDS:
+        if key not in FIELD_TO_ENV:
             continue
+        if key in {"read_token", "write_token"} and (current.get(key) != value or value is None):
+            kind = key.removesuffix("_token")
+            for field in _LEGACY_HTTP_FILE_FIELDS:
+                current.pop(f"api_{kind}_{field}", None)
         if value is None or value is False:
             current.pop(key, None)
         elif value is True:
@@ -109,7 +117,7 @@ def _write_integration_config(data_dir: Path, updates: dict[str, object]) -> Non
         elif isinstance(value, list):
             current[key] = [str(item) for item in value if str(item).strip()]
     updated_policy = {key: value for key, value in current.items()
-                      if key in _ALL_FIELDS and key.startswith("mcp_")}
+                      if key in FIELD_TO_ENV and key.startswith("mcp_")}
     if updated_policy != previous_policy:
         # Detect revoke-and-restore even when an idle client made no call between
         # both changes. HTTP credential rotation does not change this revision.
@@ -147,7 +155,11 @@ def apply_integration_config(data_dir: Path) -> None:
 
 def generate_token() -> str:
     """生成 ≥32 字符的 URL 安全随机密钥。"""
-    return secrets.token_urlsafe(32)
+    return HTTP_KEY_PREFIX + secrets.token_urlsafe(32)
+
+
+def is_current_http_key(token: str) -> bool:
+    return token.startswith(HTTP_KEY_PREFIX) and len(token) == len(HTTP_KEY_PREFIX) + 43
 
 
 def effective_integration_settings(data_dir: Path) -> dict[str, object]:
@@ -165,6 +177,10 @@ def effective_integration_settings(data_dir: Path) -> dict[str, object]:
         "task_read": enabled("mcp_task_read"),
         "template_read": enabled("mcp_template_read"),
         "result_read": enabled("mcp_result_read"),
+        "revision_read": enabled("mcp_revision_read"),
+        "original_read": enabled("mcp_original_read"),
+        "legacy_http_keys": [kind for kind in ("read", "write")
+                             if (token := config.get(f"{kind}_token")) and not is_current_http_key(token)],
         "data_read": enabled("mcp_data_read"),
         "data_scope": "selected" if config.get("mcp_data_scope") == "selected" else "all",
         "table_ids": [item for item in config.get("mcp_table_ids", "").split(os.pathsep) if item],

@@ -4,6 +4,7 @@ import re
 from datetime import date, datetime, time
 
 from fastapi import HTTPException
+from document_pipeline_api.schemas.json_numbers import NumericPrecisionError, number_from_token
 
 
 def infer_import_type(values) -> str:
@@ -46,7 +47,7 @@ def import_cell(value, kind: str, *, label: str, row_index: int):
                 if not re.fullmatch(r"[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", text):
                     raise ValueError()
                 text = text.replace(",", "")
-                value = int(text) if re.fullmatch(r"[+-]?\d+", text) else float(text)
+                value = number_from_token(text)
             if type(value) not in (int, float) or not math.isfinite(value):
                 raise ValueError()
             return value
@@ -70,5 +71,7 @@ def import_cell(value, kind: str, *, label: str, row_index: int):
                 return date.fromisoformat(value.strip()).isoformat()
             raise ValueError()
         raise ValueError()
+    except NumericPrecisionError as error:
+        raise HTTPException(422, f"第 {row_index} 条数据的“{label}”数值精度超出支持范围，本次未导入。请核对原值后重试。") from error
     except (ValueError, TypeError, OverflowError) as error:
         raise HTTPException(422, f"第 {row_index} 条数据的“{label}”不符合目标列类型（{kind}），本次未导入。请修正原文件后重试。") from error

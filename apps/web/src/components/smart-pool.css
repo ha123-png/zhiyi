@@ -1,0 +1,7 @@
+.smart-pool-settings { min-width: 0; }
+.smart-pool-help { margin: 0 0 12px; color: var(--muted-foreground); font-size: var(--text-help); line-height: 1.7; }
+.smart-pool-list { display: grid; gap: 14px; min-width: 0; }
+.smart-pool-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr)); gap: 10px; max-height: 300px; overflow-y: auto; padding: 2px; }
+.smart-pool-fallback { display: grid; gap: 8px; padding-top: 12px; border-top: 1px solid var(--border); }
+.smart-pool-group-label { font-size: var(--text-help); color: var(--muted-foreground); }
+.smart-pool-settings .callout { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }

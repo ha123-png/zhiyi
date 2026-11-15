@@ -3,7 +3,7 @@
 import time
 
 
-def tracked_stream(usage, provider, messages, specs, *, on_checkpoint=None):
+def tracked_stream(usage, provider, messages, specs, *, on_checkpoint=None, tool_choice=None):
     calls = usage.setdefault("calls", [])
     call = {"index": len(calls) + 1, "status": "running"}
     calls.append(call)
@@ -92,7 +92,8 @@ def tracked_stream(usage, provider, messages, specs, *, on_checkpoint=None):
 
     try:
         checkpoint()
-        for event in provider.stream(messages, specs):
+        options = {"tool_choice": tool_choice} if tool_choice is not None else {}
+        for event in provider.stream(messages, specs, **options):
             if event["type"] == "usage":
                 # Streaming usage is a snapshot, not an incremental token delta.
                 observed.update(event["usage"])

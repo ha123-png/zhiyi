@@ -1,4 +1,5 @@
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, Inexact, InvalidOperation, localcontext
+from fractions import Fraction
 
 from document_pipeline_api.domain.pattern_matching import matches_pattern
 
@@ -19,13 +20,21 @@ from document_pipeline_api.schemas.rules import (
 from document_pipeline_api.schemas.templates import TemplateFieldRead
 
 
-TEMPLATE_RULE_ENGINE_VERSION = "template-v2"
+TEMPLATE_RULE_ENGINE_VERSION = "template-v3"
+# Finite business inputs have at most 309 integer digits or a float exponent
+# of about 324. Allow ample intermediate headroom without expanding arbitrary
+# historical text exponents or unbounded expression products into giant ints.
+_MAX_CALCULATION_BITS = 13_000  # fewer than 4,000 decimal digits per integer
+_MAX_DECIMAL_COMPONENT = 3_900
+_MAX_NUMERIC_TEXT = 4_300
 
 
 def validate_template_rules(
     result: TemplateExtraction,
     rules: list[ValidationRule],
     fields: list[TemplateFieldRead],
+    *,
+    manual_revision: bool = False,
 ) -> list[ValidationIssue]:
     labels = {(field.section, field.key): field.label for field in fields}
     issues: list[ValidationIssue] = []
@@ -33,7 +42,7 @@ def validate_template_rules(
         bindings = range(len(result.items)) if _rule_uses_items(rule) else (None,)
         for item_index in bindings:
             try:
-                issue = _validate_rule(result, rule, labels, rule_index, item_index)
+                issue = _validate_rule(result, rule, labels, rule_index, item_index, manual_revision=manual_revision)
             except TimeoutError:
                 issues.append(_issue(rule_index, _concrete_path(rule.field, item_index),
                     "格式表达式计算过久，已停止该规则的检查；请简化表达式后重新核对。", "error"))
@@ -49,6 +58,8 @@ def _validate_rule(
     labels: dict[tuple[str, str], str],
     rule_index: int,
     item_index: int | None,
+    *,
+    manual_revision: bool,
 ) -> ValidationIssue | None:
     field_path = _concrete_path(rule.field, item_index)
     label = _field_label(rule.field, labels)
@@ -57,11 +68,13 @@ def _validate_rule(
         if value is None or (isinstance(value, str) and not value.strip()):
             return _issue(rule_index, field_path, f"{label}不能为空。", rule.severity)
         return None
-    if value is None:
+    if value is None and not (manual_revision and isinstance(rule, (RangeRule, EquationRule))):
         return None
     if isinstance(rule, RangeRule):
-        number = _decimal(value)
+        number = None if manual_revision and isinstance(value, str) else _decimal(value)
         if number is None:
+            if manual_revision:
+                return _not_checked(rule_index, field_path, label)
             return _issue(rule_index, field_path, f"{label}必须是数字。", rule.severity)
         if rule.minimum is not None and number < Decimal(str(rule.minimum)):
             return _issue(
@@ -100,8 +113,11 @@ def _validate_rule(
         return None
     if isinstance(rule, EquationRule):
         try:
-            left = _evaluate_expression(result, rule.left, item_index)
-            right = _evaluate_expression(result, rule.right, item_index)
+            left = _evaluate_expression(result, rule.left, item_index, require_numbers=manual_revision)
+            right = _evaluate_expression(result, rule.right, item_index, require_numbers=manual_revision)
+            if left is None or right is None:
+                return _not_checked(rule_index, field_path, label) if manual_revision else None
+            different = abs(_bounded_fraction(left - right)) > _fraction(rule.tolerance)
         except RuleEvaluationError as error:
             return _issue(
                 rule_index,
@@ -109,48 +125,58 @@ def _validate_rule(
                 f"{label}无法完成计算：{error}。",
                 rule.severity,
             )
-        if left is None or right is None:
-            return None
-        if abs(left - right) > Decimal(str(rule.tolerance)):
+        if different:
             return _issue(
                 rule_index,
                 field_path,
-                f"{label}计算不一致：左侧为 {left}，右侧为 {right}。",
+                f"{label}计算不一致：左侧为 {_display_fraction(left)}，右侧为 {_display_fraction(right)}。",
                 rule.severity,
             )
     return None
+
+
+def _not_checked(rule_index: int, field_path: str, label: str) -> ValidationIssue:
+    return _issue(rule_index, field_path, f"{label}未校验：计算所需的值为空或为文本。", "warning").model_copy(
+        update={"not_checked": True},
+    )
 
 
 def _evaluate_expression(
     result: TemplateExtraction,
     expression: RuleExpression,
     item_index: int | None,
-) -> Decimal | None:
+    *,
+    require_numbers: bool,
+) -> Fraction | None:
     if isinstance(expression, ConstantExpression):
-        return Decimal(str(expression.value))
+        return _fraction(expression.value)
     if isinstance(expression, FieldExpression):
-        return _decimal(_resolve_field(result, expression.path, item_index))
+        raw = _resolve_field(result, expression.path, item_index)
+        return None if require_numbers and isinstance(raw, str) else _fraction(raw)
     if isinstance(expression, SumExpression):
-        values = (
-            _decimal(_resolve_field(result, expression.path, index))
-            for index in range(len(result.items))
-        )
-        present = [value for value in values if value is not None]
-        return sum(present, Decimal(0)) if present else None
+        total = None
+        for index in range(len(result.items)):
+            raw = _resolve_field(result, expression.path, index)
+            value = None if require_numbers and isinstance(raw, str) else _fraction(raw)
+            if value is None and require_numbers:
+                return None
+            if value is not None:
+                total = value if total is None else _bounded_fraction(total + value)
+        return total
     if isinstance(expression, BinaryExpression):
-        left = _evaluate_expression(result, expression.left, item_index)
-        right = _evaluate_expression(result, expression.right, item_index)
+        left = _evaluate_expression(result, expression.left, item_index, require_numbers=require_numbers)
+        right = _evaluate_expression(result, expression.right, item_index, require_numbers=require_numbers)
         if left is None or right is None:
             return None
         if expression.op == "add":
-            return left + right
+            return _bounded_fraction(left + right)
         if expression.op == "subtract":
-            return left - right
+            return _bounded_fraction(left - right)
         if expression.op == "multiply":
-            return left * right
+            return _bounded_fraction(left * right)
         if right == 0:
             raise RuleEvaluationError("除数为 0")
-        return left / right
+        return _bounded_fraction(left / right)
     raise TypeError("未知规则表达式")
 
 
@@ -201,9 +227,46 @@ def _decimal(value: object) -> Decimal | None:
     if value is None or isinstance(value, bool):
         return None
     try:
-        return Decimal(str(value))
+        text = str(value)
+        if len(text) > _MAX_NUMERIC_TEXT:
+            return None
+        with localcontext():
+            number = Decimal(text)
+        return number if number.is_finite() else None
     except (InvalidOperation, ValueError):
         return None
+
+
+def _fraction(value: object) -> Fraction | None:
+    if isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT:
+        raise RuleEvaluationError("数值超出计算范围，请拆分计算或简化规则")
+    number = _decimal(value)
+    if number is None:
+        return None
+    _, digits, exponent = number.as_tuple()
+    if len(digits) > _MAX_DECIMAL_COMPONENT or abs(exponent) > _MAX_DECIMAL_COMPONENT:
+        raise RuleEvaluationError("数值超出计算范围，请拆分计算或简化规则")
+    return _bounded_fraction(Fraction(number))
+
+
+def _bounded_fraction(number: Fraction) -> Fraction:
+    if max(number.numerator.bit_length(), number.denominator.bit_length()) > _MAX_CALCULATION_BITS:
+        raise RuleEvaluationError("数值超出计算范围，请拆分计算或简化规则")
+    return number
+
+
+def _display_fraction(number: Fraction) -> str:
+    if number.denominator == 1:
+        return str(number.numerator)
+    # Display terminating decimals exactly when they fit the same small budget.
+    # Repeating decimals retain the exact fraction instead of a rounded claim.
+    with localcontext() as context:
+        context.prec = _MAX_NUMERIC_TEXT
+        context.traps[Inexact] = True
+        try:
+            return str(Decimal(number.numerator) / Decimal(number.denominator))
+        except Inexact:
+            return str(number)
 
 
 def _issue(

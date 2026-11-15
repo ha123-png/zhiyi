@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from test_assistant import client as ledger_fixture, ScriptedProvider, select_profile, send, finish
+from test_assistant import client as ledger_fixture, ScriptedProvider, select_profile, send, finish, final_answer
 from test_assistant_rework import plan_run, decide
 from document_pipeline_api.models import DataRowRecord, DataTableRecord, AssistantToolCall
 from document_pipeline_api.services.assistant_memory import summarize_result
@@ -271,7 +271,8 @@ def test_prose_never_creates_a_confirmable_or_executed_plan(client):
     client.app.state.conversation_factory = ScriptedProvider
     detail = finish(client, send(client, select_profile(client), text="金额增加1", context={"table_id": "ledger"}))
     assert not detail["tools"]
-    assert len(ScriptedProvider.requests) == 1
+    assert len(ScriptedProvider.requests) == 2  # One bounded completion-contract repair.
+    assert "已执行修改，请确认。" not in json.dumps(detail["messages"], ensure_ascii=False)
     assert values(client, 1, 2) == [(200, 1), (1000.5, 1)]
 
 
@@ -288,7 +289,7 @@ def test_latest_operation_state_is_available_without_replacing_the_model_reply(c
     detail = plan_run(client, [increment()])
     client.post(f"/api/v1/assistant/tools/{detail['tools'][0]['id']}/decision", json={"approve": approved})
     ScriptedProvider.requests = []
-    ScriptedProvider.plan = [[{"type": "text", "text": "请看对应操作卡的当前状态。"}]]
+    ScriptedProvider.plan = [[final_answer("请看对应操作卡的当前状态。")]]
     result = finish(client, send(client, select_profile(client), thread_id=detail['id'],
                                 text="我刚才的修改执行了吗？只说明状态。", context={"table_ids": ["ledger"]}))
     assert len(ScriptedProvider.requests) == 1
@@ -300,7 +301,7 @@ def test_status_only_does_not_reuse_an_operation_from_another_scope(client):
     detail = plan_run(client, [increment()])
     decide(client, detail['tools'][0]['id'])
     ScriptedProvider.requests = []
-    ScriptedProvider.plan = [[{"type": "text", "text": "当前范围没有可核对的操作记录。"}]]
+    ScriptedProvider.plan = [[final_answer("当前范围没有可核对的操作记录。")]]
     result = finish(client, send(client, select_profile(client), thread_id=detail['id'],
                                 text="刚才执行了吗？", context={"table_id": "ledger", "row_ids": [4]}))
     assert len(ScriptedProvider.requests) == 1
@@ -326,7 +327,7 @@ def test_undo_preview_replaces_other_pending_plan_in_same_thread(client):
 def test_normal_help_is_not_deleted_or_retried_because_it_mentions_confirmation(client):
     answer = "请在模板页面修改并确认保存；保存成功后状态显示已更新。"
     ScriptedProvider.requests = []
-    ScriptedProvider.plan = [[{"type": "text", "text": answer}]]
+    ScriptedProvider.plan = [[final_answer(answer)]]
     client.app.state.conversation_factory = ScriptedProvider
     detail = finish(client, send(client, select_profile(client), text="如何修改模板？", context={"table_id": "ledger"}))
     assert not detail["tools"]

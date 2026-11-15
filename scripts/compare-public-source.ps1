@@ -21,7 +21,41 @@ $sourceRoots = @("apps", "packaging", "scripts")
 $sourceFiles = @("VERSION", "package.json", "package-lock.json")
 $differences = New-Object System.Collections.Generic.List[string]
 
+function Get-ProductSourceFiles([string]$Root, [string]$SourceRoot, [bool]$Public) {
+    # Match release_evidence.py's source discovery, including new non-ignored files.
+    $raw = @(git -C $Root -c core.quotepath=false ls-files --cached --others --exclude-standard -z -- $SourceRoot)
+    if ($LASTEXITCODE -ne 0) { throw "Cannot enumerate product source files." }
+    $names = (($raw -join "`n") -split "`0") | Where-Object { $_ }
+    foreach ($name in $names) {
+        $generated = $name -match '(^|/)(\.git|\.local|\.venv|__pycache__|dist|node_modules|data|runtime|uploads|backups|private|keys)(/|$)' -or
+            $name -match '\.(db(?:-(?:shm|wal))?|sqlite3?|dpbak|log|key|pem|p12|pfx)$' -or
+            ($name -match '(^|/)\.env($|\.)' -and $name -notmatch '(^|/)\.env\.example$')
+        if ($generated) {
+            if ($Public) { throw "Public source contains an excluded runtime/private path: $name" }
+            continue
+        }
+        $name
+    }
+}
+
+function Assert-SafeSourcePath([string]$Root, [string]$RelativePath) {
+    $boundary = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $fullPath = [IO.Path]::GetFullPath((Join-Path $boundary $RelativePath))
+    if (-not $fullPath.StartsWith($boundary + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Source path is outside its repository."
+    }
+    $cursor = $fullPath
+    while ($cursor -and $cursor -ne $boundary) {
+        if ((Test-Path -LiteralPath $cursor) -and ((Get-Item -LiteralPath $cursor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Product source must not traverse links: $RelativePath"
+        }
+        $cursor = Split-Path -Parent $cursor
+    }
+}
+
 function Compare-File([string]$relativePath) {
+    Assert-SafeSourcePath $privateRoot $relativePath
+    Assert-SafeSourcePath $publicRoot $relativePath
     $privatePath = Join-Path $privateRoot $relativePath
     $publicPath = Join-Path $publicRoot $relativePath
 
@@ -42,14 +76,8 @@ function Compare-File([string]$relativePath) {
 }
 
 foreach ($sourceRoot in $sourceRoots) {
-    $privateFiles = @(
-        git -C $privateRoot ls-files -- $sourceRoot |
-            Where-Object { $_ -notmatch "(^|/)(__pycache__|dist|node_modules)(/|$)" }
-    )
-    $publicFiles = @(
-        git -C $publicRoot ls-files -- $sourceRoot |
-            Where-Object { $_ -notmatch "(^|/)(__pycache__|dist|node_modules)(/|$)" }
-    )
+    $privateFiles = @(Get-ProductSourceFiles $privateRoot $sourceRoot $false)
+    $publicFiles = @(Get-ProductSourceFiles $publicRoot $sourceRoot $true)
 
     foreach ($relativePath in @($privateFiles + $publicFiles | Sort-Object -Unique)) {
         Compare-File $relativePath

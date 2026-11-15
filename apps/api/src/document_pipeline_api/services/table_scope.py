@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 
 from document_pipeline_api.models import DataRowRecord, DataTableRecord, DataViewRecord, FileCurrentDataRecord
 from document_pipeline_api.services.current_data import row_search_predicate
+from document_pipeline_api.services.merged_tables import table_membership
 from document_pipeline_api.services.read_snapshot import begin_read_snapshot
 
 
@@ -38,7 +39,8 @@ def prepare_export_selection(session, table_id, scope=None):
     table = session.get(DataTableRecord, table_id)
     if table is None:
         raise HTTPException(404, "没有找到这个数据表。")
-    predicates = [DataRowRecord.table_id == table_id]
+    membership = table_membership(table)
+    predicates = [membership]
     parts = []
     from document_pipeline_api.services.data_groups import source_identity_expression, validate_source_keys
     keys = validate_source_keys(session, table_id, scope.source_keys)
@@ -57,21 +59,21 @@ def prepare_export_selection(session, table_id, scope=None):
     if scope.row_ids is not None:
         identifiers = set(scope.row_ids)
         found = set(session.scalars(select(DataRowRecord.id).where(
-            DataRowRecord.table_id == table_id, DataRowRecord.id.in_(identifiers))))
+            membership, DataRowRecord.id.in_(identifiers))))
         if found != identifiers:
             raise HTTPException(409, "选中明细已变化或不属于当前表，请刷新后重新选择。")
         predicates.append(DataRowRecord.id.in_(identifiers))
     if scope.task_ids is not None:
         identifiers = set(scope.task_ids)
         found = set(session.scalars(select(FileCurrentDataRecord.task_id).where(
-            FileCurrentDataRecord.table_id == table_id, FileCurrentDataRecord.has_data.is_(True),
+            FileCurrentDataRecord.table_id.in_(table.merge_sources or [table_id]), FileCurrentDataRecord.has_data.is_(True),
             FileCurrentDataRecord.task_id.in_(identifiers))))
         if found != identifiers:
             raise HTTPException(409, "选中文件已变化或不属于当前表，请刷新后重新选择。")
         predicates.append(DataRowRecord.task_id.in_(identifiers))
     search = scope.search.strip()
     files = select(FileCurrentDataRecord).where(
-        FileCurrentDataRecord.table_id == table_id, FileCurrentDataRecord.has_data.is_(True))
+        FileCurrentDataRecord.table_id.in_(table.merge_sources or [table_id]), FileCurrentDataRecord.has_data.is_(True))
     if scope.task_ids is not None:
         files = files.where(FileCurrentDataRecord.task_id.in_(scope.task_ids))
     if keys is not None:

@@ -483,7 +483,7 @@ def test_restore_upgrades_a_portable_0009_database_before_install(tmp_path: Path
 
     with sqlite3.connect(target_dir / "document-pipeline.db") as connection:
         assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-        "0046_upload_intent",
+        "0047_live_table_merge",
         )
         assert connection.execute(
             "SELECT storage_path FROM tasks WHERE id = ?", (task_id,)

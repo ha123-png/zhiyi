@@ -257,7 +257,7 @@ def test_upload_can_pin_custom_template_before_processing(client: TestClient) ->
     assert response.json()["template_version"] == 1
 
 
-def test_queued_task_can_be_cancelled(client: TestClient) -> None:
+def test_queued_task_can_be_cancelled_and_retried_without_reupload(client: TestClient) -> None:
     created = client.post(
         "/api/v1/tasks",
         files={"file": ("delivery.jpg", JPEG_BYTES, "image/jpeg")},
@@ -267,6 +267,12 @@ def test_queued_task_can_be_cancelled(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json()["status"] == "cancelled"
+    assert response.json()["has_result"] is False
+    retried = client.post(f"/api/v1/tasks/{created['id']}/retry")
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "queued"
+    assert retried.json()["id"] == created["id"]
+    assert retried.json()["sha256"] == created["sha256"]
 
 
 def test_sync_processing_endpoint_is_not_exposed(client: TestClient) -> None:
@@ -1338,11 +1344,13 @@ def test_tasks_summary_counts_by_status(client: TestClient) -> None:
         session.commit()
 
     summary = client.get("/api/v1/tasks/summary").json()
-    assert summary == {"total": 5, "completed": 2, "needs_review": 1, "failed": 1, "active": 2, "waiting_for_action": 0, "pending_exports": 0, "cancelled": 0}
+    assert summary == {"total": 5, "completed": 2, "needs_review": 1, "failed": 1, "active": 2, "waiting_for_action": 0, "pending_exports": 0, "cancelled": 0,
+                       "group_counts": {"all": 5, "active": 1, "pending": 1, "completed": 2, "failed": 1, "cancelled": 0}}
 
     # 带文件名筛选：只统计命中子集（c1/c2 文件名含 "c"）
     filtered = client.get("/api/v1/tasks/summary", params={"search": "c"}).json()
-    assert filtered == {"total": 2, "completed": 2, "needs_review": 0, "failed": 0, "active": 0, "waiting_for_action": 0, "pending_exports": 0, "cancelled": 0}
+    assert filtered == {"total": 2, "completed": 2, "needs_review": 0, "failed": 0, "active": 0, "waiting_for_action": 0, "pending_exports": 0, "cancelled": 0,
+                        "group_counts": {"all": 2, "active": 0, "pending": 0, "completed": 2, "failed": 0, "cancelled": 0}}
 
 
 def test_summary_counts_copy_actions_beyond_list_limit_and_excludes_model_failures(client: TestClient) -> None:

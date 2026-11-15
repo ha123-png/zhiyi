@@ -479,7 +479,7 @@ def test_probe_model_profile_reports_connectivity_and_multimodal(
     monkeypatch.setattr(
         services.model_profiles,
         "build_model_provider",
-        lambda probe_settings: _ProbeClient(multimodal=True),
+        lambda probe_settings, **kwargs: _ProbeClient(multimodal=True),
     )
     result = probe_model_profile(settings, body)
     assert result.connected is True
@@ -489,7 +489,7 @@ def test_probe_model_profile_reports_connectivity_and_multimodal(
     monkeypatch.setattr(
         services.model_profiles,
         "build_model_provider",
-        lambda probe_settings: _ProbeClient(multimodal=False),
+        lambda probe_settings, **kwargs: _ProbeClient(multimodal=False),
     )
     result = probe_model_profile(settings, body)
     assert result.connected is True
@@ -510,7 +510,7 @@ def test_probe_model_profile_reports_connectivity_and_multimodal(
     monkeypatch.setattr(
         services.model_profiles,
         "build_model_provider",
-        lambda probe_settings: _UnreachableClient(),
+        lambda probe_settings, **kwargs: _UnreachableClient(),
     )
     result = probe_model_profile(settings, body)
     assert result.connected is False

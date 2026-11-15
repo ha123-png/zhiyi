@@ -8,6 +8,7 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, WithJsonSche
 from pydantic.fields import FieldInfo
 
 from document_pipeline_api.model_providers import ModelProvider
+from document_pipeline_api.schemas.json_numbers import model_number
 from document_pipeline_api.schemas.templates import (
     TemplateFieldRead,
     TemplateMatchDecision,
@@ -36,7 +37,7 @@ TemplateDate = Annotated[
 
 VALUE_TYPES: dict[str, Any] = {
     "text": str,
-    "number": float,
+    "number": Annotated[int | float, BeforeValidator(model_number), WithJsonSchema({"type": "number"})],
     "date": TemplateDate,
     "boolean": bool,
 }

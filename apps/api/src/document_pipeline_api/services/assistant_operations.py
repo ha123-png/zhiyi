@@ -1,6 +1,6 @@
 """Reviewable business plans over existing services. One plan, one transaction."""
 
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException, Inexact, InvalidOperation, localcontext
 import hashlib
 import json
 import math
@@ -159,14 +159,38 @@ def increment_value(value, delta, label):
         raise HTTPException(422, f"「{label}」不是有效数值，不能增加或减少；请先核对该记录。")
     if not isinstance(delta, (int, float)):
         raise HTTPException(422, f"「{label}」的增量必须是数值。")
+    precision_error = f"「{label}」的计算结果超出当前可精确保存的数值精度，已停止修改；请核对原值和增量。"
     try:
         original = Decimal(str(value).replace(",", "").strip())
         change = Decimal(str(delta))
-        result = original + change
-        if not original.is_finite() or not change.is_finite() or not math.isfinite(float(result)):
+        if not original.is_finite() or not change.is_finite():
             raise InvalidOperation
-        return int(result) if result == result.to_integral_value() else float(result)
-    except (InvalidOperation, ValueError, OverflowError) as error:
+        # Keep both complete operands and a possible carry. The ambient Decimal
+        # precision (normally 28) must not round even a large integer plus zero.
+        precision = max(original.adjusted(), change.adjusted()) - min(
+            original.as_tuple().exponent, change.as_tuple().exponent) + 2
+        # Bound work for legacy strings with extreme exponents. This exceeds
+        # the span of any finite int/float accepted by the current data contract.
+        if precision > 4300:
+            raise HTTPException(422, precision_error)
+        with localcontext() as decimal_context:
+            decimal_context.prec = max(28, precision)
+            decimal_context.traps[Inexact] = True
+            result = original + change
+        approximate = float(result)
+        if not math.isfinite(approximate):
+            raise InvalidOperation
+        if result == result.to_integral_value():
+            return int(result)
+        # Floats use their JSON decimal spelling throughout the existing data
+        # contract. Reject any extra rounding at that boundary, including zero
+        # caused by underflow; integer responses already have a lossless codec.
+        if Decimal(str(approximate)) != result:
+            raise HTTPException(422, precision_error)
+        return approximate
+    except Inexact as error:
+        raise HTTPException(422, precision_error) from error
+    except (DecimalException, ValueError, OverflowError) as error:
         raise HTTPException(422, f"「{label}」不是有效数值，不能增加或减少；请先核对该记录。") from error
 
 
@@ -493,6 +517,7 @@ def apply_plan(session, context, plan, settings):
             can_undo = False
             for identifier in dict.fromkeys(op.task_ids):
                 permitted(context, "task", identifier)
+                result.append({"task_id": identifier, "action": op.action})
                 if op.action == "pause":
                     tasks.pause_task(session, identifier)
                 elif op.action == "cancel":
@@ -500,14 +525,15 @@ def apply_plan(session, context, plan, settings):
                 elif op.action == "resume":
                     tasks.resume_task(session, settings, identifier)
                 else:
-                    tasks.retry_task(session, settings, identifier)
+                    retried = tasks.retry_task(session, settings, identifier)
+                    if retried.status != "queued":
+                        continue
                 frozen = (
                     freeze_new_task_if_paused(session, identifier)
                     if op.action in {"resume", "retry"}
                     else False
                 )
                 queue.append({"task_id": identifier, "action": op.action, "frozen": frozen})
-                result.append({"task_id": identifier, "action": op.action})
         elif op.kind == "rename_table":
             data_tables.rename_table(session, op.table_id, op.name)
             undo.append(

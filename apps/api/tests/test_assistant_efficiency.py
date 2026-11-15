@@ -3,7 +3,7 @@ from copy import deepcopy
 import pytest
 
 from document_pipeline_api.services.assistant_usage import tracked_stream
-from test_assistant import client as ledger_fixture, ScriptedProvider, select_profile, send, finish
+from test_assistant import client as ledger_fixture, ScriptedProvider, select_profile, send, finish, final_answer
 
 client = ledger_fixture
 
@@ -174,7 +174,7 @@ def test_cloud_sized_history_retains_recent_text_and_stable_system(client):
 
         def stream(self, messages, tools):
             self.captured.append(deepcopy(messages))
-            yield {"type": "text", "text": "保留完整段落" * 600 + "末尾关键结论"}
+            yield final_answer("保留完整段落" * 600 + "末尾关键结论")
 
     client.app.state.conversation_factory = Provider
     profile = select_profile(client)

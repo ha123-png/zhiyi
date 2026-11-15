@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from document_pipeline_api.db import get_session
 from document_pipeline_api.services.current_data import create_edit_session, seal_edit_session
 from document_pipeline_api.api.data_tables import ExportScopeDependency
+from document_pipeline_api.api.numeric_body import validate_numeric_body
 
 
 router = APIRouter(tags=["file-data"])
@@ -38,7 +39,7 @@ class SourceClear(BaseModel):
     edit_session_id: str | None = Field(default=None, max_length=36)
 
 
-@router.patch("/tasks/{task_id}/current")
+@router.patch("/tasks/{task_id}/current", dependencies=[Depends(validate_numeric_body)])
 def edit_current_file(task_id: str, body: CurrentFilePatch, session: SessionDependency):
     from document_pipeline_api.models import DataRowRecord
     from document_pipeline_api.services.current_data import revise_current

@@ -29,6 +29,10 @@ class ModelRequestRejectedError(ModelServiceError):
 class ModelResponseError(ModelServiceError):
     code = "model_invalid_response"
 
+    def __init__(self, message: str, *, diagnostic: str | None = None) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
 
 class ModelProvider(Protocol):
     @property

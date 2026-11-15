@@ -103,29 +103,33 @@ def test_global_scope_policy_snapshot_review_and_original_survive(client):
     assert second.status_code == 201, second.text
     merged = client.post("/api/v1/tables/merge", json={"name": "合并保留范围", "table_ids": [table_id, second.json()["id"]]})
     assert merged.status_code == 201, merged.text
-    merged_row = client.get(f"/api/v1/tables/{merged.json()['id']}").json()["rows"][0]
-    assert merged_row["task_id"] is None
-    assert merged_row["input_scope"] == expected_scope
-    assert client.post("/api/v1/system/admin/clear-history", json={"confirm_text": "清除历史"}).status_code == 200
-    assert client.get(f"/api/v1/tables/{table_id}").json()["rows"] == []
+    source_table_id = table_id
     table_id = merged.json()["id"]
-    remaining = client.get(f"/api/v1/tables/{table_id}").json()["rows"][0]
-    assert remaining["task_id"] is None
-    assert remaining["input_scope"] == expected_scope
+    merged_row = client.get(f"/api/v1/tables/{table_id}").json()["rows"][0]
+    assert merged_row["task_id"] == task["id"]
+    assert merged_row["input_scope"] == expected_scope
     exported = client.get(f"/api/v1/tables/{table_id}/export.xlsx")
     assert exported.status_code == 200, exported.text
     workbook = load_workbook(BytesIO(exported.content))
-    assert "知意输入范围" in workbook.sheetnames
-    assert "局部读取" in workbook.worksheets[0].cell(2, 1).comment.text
-    recorded = list(workbook["知意输入范围"].values)
-    assert any(row[3] == "未提供" for row in recorded)
+    assert workbook.sheetnames == ["合并保留范围"]
+    assert workbook.worksheets[0].cell(2, 1).comment is None
+    notes = client.get(f"/api/v1/tables/{table_id}/export-notes.xlsx", params={"input_scope": "true", "revisions": "true", "search": "没有匹配的数据"})
+    assert notes.status_code == 200
+    supplemental = load_workbook(BytesIO(notes.content))
+    recorded = list(supplemental["提取范围"].values)
+    assert any(row[2].startswith("未读取") for row in recorded if row[2])
+    assert supplemental.sheetnames == ["修订目录", "large.md", "提取范围"]
+    assert supplemental["修订目录"]["C2"].hyperlink.location == "'large.md'!A1"
+    history = list(supplemental["large.md"].values)
+    assert history[2] == (None, None, None, None)
+    assert history[3][:2] == ("版本", "V1 · 初次提取")
+    assert history[4] == ("位置", "字段", "修改前", "修改后")
     for source_range in result.input_scope.selected:
-        assert any(row[4] == source_range.label() for row in recorded)
+        assert any(row[2] == "已读取 " + source_range.label() for row in recorded)
     xlsx_imported = client.post("/api/v1/tables/import-new", files={"file": ("范围随行.xlsx", exported.content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
     assert xlsx_imported.status_code == 201, xlsx_imported.text
     xlsx_row = client.get(f"/api/v1/tables/{xlsx_imported.json()['id']}").json()["rows"][0]
-    assert xlsx_row["input_scope"]["selected"] == expected_scope["selected"]
-    assert xlsx_row["input_scope"]["coverage"] == "partial"
+    assert xlsx_row.get("input_scope") is None
     assert xlsx_row["task_id"] is None
     json_export = client.get(f"/api/v1/tables/{table_id}/export.json")
     assert json_export.status_code == 200
@@ -155,6 +159,12 @@ def test_global_scope_policy_snapshot_review_and_original_survive(client):
             with path.open(encoding="utf-8-sig", newline="") as stream:
                 exported_rows = list(csv.DictReader(stream))
             assert json.loads(exported_rows[0]["知意输入范围（非业务字段）"]) == expected_scope
+    assert client.post("/api/v1/system/admin/clear-history", json={"confirm_text": "清除历史"}).status_code == 200
+    for live_id in (source_table_id, table_id):
+        assert client.get(f"/api/v1/tables/{live_id}").json()["rows"] == []
+    remaining = client.get(f"/api/v1/tables/{imported.json()['id']}").json()["rows"][0]
+    assert remaining["task_id"] is None
+    assert remaining["input_scope"] == imported_row["input_scope"]
 
 
 def test_smart_ambiguity_records_match_range_without_formal_extraction(client):

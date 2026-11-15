@@ -1,6 +1,6 @@
 import { FileLocation } from "./FileLocation";
 import { Disclosure } from "./Disclosure";
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { actOnTaskExport } from "../api";
 import { desktopApi } from "../desktop";
 import type { Task } from "../types";
@@ -10,7 +10,7 @@ const labels = {
   completed: "副本已导出", failed: "副本导出受阻", skipped: "已跳过副本导出", needs_rebind: "需重新确认位置",
 };
 
-export function TaskExportDetails({ task, expanded = false, focused = false, onUpdated }: { task: Task; expanded?: boolean; focused?: boolean; onUpdated?: (task: Task) => void }) {
+export function TaskExportDetails({ task, expanded = false, focused = false, onUpdated, onBusyChange }: { task: Task; expanded?: boolean; focused?: boolean; onUpdated?: (task: Task) => void; onBusyChange?: (busy: boolean) => void }) {
   const [result, setResult] = useState<Task | null>(null);
   const current = result ?? task;
   const state = current.file_export;
@@ -28,14 +28,14 @@ export function TaskExportDetails({ task, expanded = false, focused = false, onU
   const label = moving ? ({ disabled: "未开启", awaiting_confirmation: "等待归档", pending: "等待归档", exporting: "正在归档", completed: "已归档", failed: "归档受阻", skipped: "已跳过归档", needs_rebind: "归档待处理" }[state.status]) : state.status === "awaiting_confirmation" && task.status === "completed" ? "等待导出" : labels[state.status];
 
   async function act(action: "retry" | "skip") {
-    setBusy(true); setError("");
+    setBusy(true); onBusyChange?.(true); setError("");
     try {
       const updated = await actOnTaskExport(task.id, action === "skip" ? { action } : {
         action, ...(published ? {} : { filename, parent_path: parent }), acknowledge_uncertain: acknowledged,
       });
       setResult(updated); onUpdated?.(updated);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "副本操作失败，请重试。"); }
-    finally { setBusy(false); }
+    finally { setBusy(false); onBusyChange?.(false); }
   }
 
   async function chooseFolder() {
@@ -67,9 +67,11 @@ export function TaskExportDetails({ task, expanded = false, focused = false, onU
         {desktopApi()?.choose_folder ? <div className="template-folder-choice">
           <button type="button" className="btn secondary sm" disabled={busy} onClick={() => void chooseFolder()}>选择新路径</button>
           <span className="support" style={{ overflowWrap: "anywhere" }}>{parent || "尚未选择目录"}</span>
-        </div> : <label className="form-label" htmlFor={`export-path-${task.id}`}>知意服务所在电脑的目标目录
-          <input className="form-input" id={`export-path-${task.id}`} value={parent} disabled={busy} onChange={(event) => setParent(event.target.value)} />
-        </label>}
+        </div> : <>
+          <label className="form-label" htmlFor={`export-path-${task.id}`}>目标文件夹</label>
+          <input className="form-input" id={`export-path-${task.id}`} aria-describedby={`export-path-help-${task.id}`} value={parent} disabled={busy} onChange={(event) => setParent(event.target.value)} />
+          <p className="support" id={`export-path-help-${task.id}`}>填写知意所在电脑的目录。</p>
+        </>}
       </div>
       </>}<p className="support">{moving ? (published ? "重试会核实已写出的文件并完成归档，不会另建副本。跳过会保留当前已有的文件。" : "仅调整此次归档，不重新提取。") : "仅调整此次副本；保留内部原件，不重新提取。"}</p>
       {uncertain && <label><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} /> 我已检查上次目标，确认重新导出可能额外产生一份副本。</label>}
@@ -84,23 +86,4 @@ export function TaskExportDetails({ task, expanded = false, focused = false, onU
     {focused && <Disclosure title="原文件与位置"><p className="support">目标目录下会使用模板名文件夹，不修改模板的默认导出设置。</p>{details}</Disclosure>}
   </>;
   return focused ? <div className="task-export-form">{content}</div> : <Disclosure className="task-export-details" defaultOpen={expanded} title={`${moving ? "原文件归档" : "原件副本"} · ${label}`}>{content}</Disclosure>;
-}
-
-export function TaskExportAction({ task, onUpdated }: { task: Task; onUpdated?: (task: Task) => void }) {
-  const [open, setOpen] = useState(false);
-  const dialog = useRef<HTMLDialogElement>(null);
-  useEffect(() => { if (open) dialog.current?.showModal(); else dialog.current?.close(); }, [open]);
-  const title = task.file_export?.mode === "move" ? "处理原文件归档" : "处理原件副本";
-  const reason = ["destination_exists", "name_conflict"].includes(task.file_export?.error_code || "") ? "目标位置已有同名文件" : task.file_export?.error_message || "副本导出需要处理";
-  return <>
-    <div className="task-row-bottom task-export-action">
-      <span className="task-reason" title={reason}>{reason}</span>
-      <button type="button" className="btn secondary sm" onClick={() => setOpen(true)}>处理</button>
-    </div>
-    <dialog className="task-recovery-dialog" ref={dialog} aria-label={title} onCancel={() => setOpen(false)} onClose={() => setOpen(false)} onClick={event => { if (event.target === event.currentTarget) setOpen(false); }}>
-      {open && <div><header><h3>{title}</h3><button type="button" className="btn ghost sm" aria-label="关闭文件处理" onClick={() => setOpen(false)}>关闭</button></header>
-        <TaskExportDetails key={task.id} task={task} focused onUpdated={updated => { onUpdated?.(updated); setOpen(false); }} />
-      </div>}
-    </dialog>
-  </>;
 }

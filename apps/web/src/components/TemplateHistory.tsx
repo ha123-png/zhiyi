@@ -4,6 +4,7 @@ import { getTemplateVersions, getTemplateVersion, restoreTemplateVersion, type T
 import type { ExtractionTemplate } from "../types";
 import { templateDifferences } from "../templateHistory";
 import { Icon } from "./Icon";
+import { DisclosureSummary } from "./CollapseChevron";
 
 export function TemplateHistory({ current, dirty, onClose, onRestored, initialVersion }: {
   initialVersion?: number | null;
@@ -55,7 +56,7 @@ export function TemplateHistory({ current, dirty, onClose, onRestored, initialVe
     <div className="template-history-body">
       <nav className="template-version-list" aria-label="模板版本">{versions.map(v => <button key={v.version} disabled={busy} aria-pressed={selected === v.version} onClick={() => setSelected(v.version)}><strong>第 {v.version} 版{v.version === current.version ? " · 当前" : ""}</strong><span>{formatDate(v.created_at)}</span><span>{v.field_count} 个字段</span></button>)}{loading && <p className="support">读取中…</p>}{more && <button disabled={loading || busy} onClick={() => void loadMore()}>更早的版本</button>}</nav>
       <div className="template-version-detail" aria-live="polite">
-        <details className="template-restoration-log"><summary>最近恢复记录</summary>{restorationError ? <p role="alert">{restorationError}</p> : restorations.length ? <><p className="support">最近 20 次版本切换，不创建重复版本。</p><ul>{restorations.map(item => <li key={item.id}>从第 {item.from_version} 版恢复到第 {item.to_version} 版<time>{formatDate(item.created_at)}</time></li>)}</ul></> : <p className="support">还没有恢复记录。</p>}</details>
+        <details className="template-restoration-log"><DisclosureSummary>最近恢复记录</DisclosureSummary>{restorationError ? <p role="alert">{restorationError}</p> : restorations.length ? <><p className="support">最近 20 次版本切换，不创建重复版本。</p><ul>{restorations.map(item => <li key={item.id}>从第 {item.from_version} 版恢复到第 {item.to_version} 版<time>{formatDate(item.created_at)}</time></li>)}</ul></> : <p className="support">还没有恢复记录。</p>}</details>
         {error && <p role="alert" className="callout danger">{error}</p>}
         {!target && !error && <p className="support">正在读取版本…</p>}
         {target && <><h4>{selected === current.version ? "当前版本内容" : `恢复第 ${selected} 版会带来这些变化`}</h4>

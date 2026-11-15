@@ -26,13 +26,13 @@ beforeEach(() => {
   vi.mocked(deleteDataRows).mockResolvedValue();
 });
 function show(props: Partial<Parameters<typeof SourceCardCollection>[0]> = {}) {
-  const onChanged = vi.fn(); const onSelect = vi.fn(); const onSelectRow = vi.fn();
-  render(<SourceCardCollection tableId={tableId} selected={[]} onSelect={onSelect} onSelectRow={onSelectRow} onChanged={onChanged} {...props} />);
-  return {onChanged, onSelect, onSelectRow};
+  const onChanged = vi.fn(); const onSelect = vi.fn();
+  render(<SourceCardCollection tableId={tableId} selected={[]} onSelect={onSelect} onChanged={onChanged} {...props} />);
+  return {onChanged, onSelect};
 }
 async function open() {
   fireEvent.click(await screen.findByRole("button", {name: "查看与编辑"}));
-  await waitFor(() => expect(screen.getByRole("button", {name: "编辑共享字段"})).toBeEnabled());
+  await screen.findByRole("checkbox", {name: "选择明细 1"});
 }
 
 it("keeps 1000 details in one selectable source and loads only a page on demand", async () => {
@@ -46,7 +46,7 @@ it("keeps 1000 details in one selectable source and loads only a page on demand"
   await open();
   expect(getSourceDetails).toHaveBeenCalledWith(tableId, source.id, {}, 1);
   fireEvent.click(screen.getByRole("checkbox", {name: "选择明细 1"}));
-  expect(callbacks.onSelectRow).toHaveBeenCalledWith(detail.rows[0], true);
+  expect(screen.getByRole("button", {name: "删除选中（1）"})).toBeEnabled();
   fireEvent.click(screen.getByRole("button", {name: "下一页明细"}));
   await waitFor(() => expect(getSourceDetails).toHaveBeenLastCalledWith(tableId, source.id, {}, 2));
 });
@@ -71,58 +71,60 @@ it("does not promote partial search results to complete file selection or cleari
   expect(await screen.findByRole("checkbox", {name: "选择完整来源 订单.pdf"})).toBeDisabled();
   fireEvent.click(screen.getByRole("button", {name: "查看与编辑"}));
   expect(await screen.findByText("当前筛选匹配 1 / 1000 条记录")).toBeInTheDocument();
-  expect(screen.getByRole("button", {name: "编辑共享字段"})).toBeDisabled();
+  expect(screen.queryByRole("group", {name: "编辑 客户"})).not.toBeInTheDocument();
   fireEvent.keyDown(screen.getByRole("button", {name: "更多数据操作"}), {key: "ArrowDown"});
-  expect(await screen.findByRole("menuitem", {name: "清空此来源数据"})).toHaveAttribute("aria-disabled", "true");
+  expect(await screen.findByRole("menuitem", {name: "清空来源"})).toHaveAttribute("aria-disabled", "true");
   expect(getSourceDetails).toHaveBeenCalledWith(tableId, source.id, {search: "局部"}, 1);
 });
 
-it("edits shared values with their version and reveals deletion only for the edited detail", async () => {
+function editField(label: string, text: string) {
+  const field = screen.getByRole("group", {name: "编辑 " + label});
+  fireEvent.click(field);
+  const editor = within(field).getByRole("textbox");
+  editor.textContent = text;
+  fireEvent.blur(editor);
+}
+
+it("saves shared values on blur and deletes selected details from within the dialog", async () => {
   const {onChanged} = show(); await open();
-  expect(screen.queryByRole("button", {name: /删除/})).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", {name: "编辑共享字段"}));
-  fireEvent.change(screen.getByRole("textbox", {name: "客户"}), {target: {value: "乙"}});
-  fireEvent.click(screen.getByRole("button", {name: "提交修改"}));
+  expect(screen.getByRole("button", {name: "删除选中"})).toBeDisabled();
+  editField("客户", "乙");
   await waitFor(() => expect(updateDataRow).toHaveBeenCalledWith(tableId, 7, 8, {customer: "乙"}, undefined, ["customer"]));
-  expect(onChanged).toHaveBeenCalledTimes(1);
-  await waitFor(() => expect(screen.getByRole("button", {name: "编辑明细 1"})).toBeEnabled());
-  fireEvent.click(screen.getByRole("button", {name: "编辑明细 1"}));
-  fireEvent.click(screen.getByRole("button", {name: "删除此明细"}));
-  expect(screen.getByRole("dialog", {name: "删除此明细？"})).toHaveTextContent("原件和修订历史仍会保留");
+  expect(onChanged).toHaveBeenCalled();
+  const box = await screen.findByRole("checkbox", {name: "选择明细 1"});
+  await waitFor(() => expect(box).toBeEnabled());
+  fireEvent.click(box);
+  fireEvent.click(screen.getByRole("button", {name: "删除选中（1）"}));
+  expect(screen.getByRole("dialog", {name: "删除选中明细？"})).toHaveTextContent("修订历史保留");
   fireEvent.click(screen.getByRole("button", {name: "确认删除"}));
   await waitFor(() => expect(deleteDataRows).toHaveBeenCalledWith(tableId, [7], undefined, {7: 8}));
 });
 
-it("keeps a failed save editable and does not close or report success", async () => {
-  vi.mocked(updateDataRow).mockRejectedValue(new Error("这行数据已经更新，请刷新后再修改。"));
-  const {onChanged} = show(); await open();
-  fireEvent.click(screen.getByRole("button", {name: "编辑明细 1"}));
-  fireEvent.change(screen.getByRole("textbox", {name: "数量"}), {target: {value: "12"}});
-  fireEvent.click(screen.getByRole("button", {name: "提交修改"}));
-  expect(await screen.findByRole("alert")).toHaveTextContent("已经更新");
-  expect(screen.getByRole("textbox", {name: "数量"})).toHaveValue("12");
-  expect(onChanged).not.toHaveBeenCalled();
+it.each([
+  ["9007199254740995", "9007199254740995"],
+  ["1,675.00", 1675],
+  ["待核", "待核"],
+  ["1.0000000000000001", "1.0000000000000001"],
+])("preserves typed or textual quantity %s on automatic save", async (input, value) => {
+  show(); await open();
+  editField("数量", input);
+  await waitFor(() => expect(updateDataRow).toHaveBeenCalledWith(tableId, 7, 8, {quantity: value}, undefined, ["customer"]));
 });
 
-it("protects unsaved input on close and reread without hiding the data behind an inline warning", async () => {
-  vi.mocked(updateDataRow).mockRejectedValue(new Error("其他窗口已修改"));
+it("shows a failed write near the edited field and retries with the original input", async () => {
+  vi.mocked(updateDataRow).mockRejectedValueOnce(new Error("暂时写入失败"));
   show(); await open();
-  fireEvent.click(screen.getByRole("button", {name: "编辑明细 1"}));
-  fireEvent.change(screen.getByRole("textbox", {name: "数量"}), {target: {value: "12"}});
-  expect(screen.getByRole("status")).toHaveTextContent("提交或取消后可切换");
-  fireEvent.click(screen.getByRole("button", {name: "关闭来源详情"}));
-  const confirmation = screen.getByRole("dialog", {name: "放弃未提交的修改？"});
-  fireEvent.keyDown(within(confirmation).getByRole("button", {name: "取消"}), {key: "Escape"});
-  expect(screen.queryByRole("dialog", {name: "放弃未提交的修改？"})).not.toBeInTheDocument();
-  expect(screen.getByRole("textbox", {name: "数量"})).toHaveValue("12");
-  fireEvent.click(screen.getByRole("button", {name: "提交修改"}));
-  await screen.findByText("其他窗口已修改");
-  const reads = vi.mocked(getSourceDetails).mock.calls.length;
-  fireEvent.click(screen.getByRole("button", {name: "重新读取"}));
-  expect(getSourceDetails).toHaveBeenCalledTimes(reads);
-  fireEvent.click(screen.getByRole("button", {name: "放弃修改"}));
-  await waitFor(() => expect(getSourceDetails).toHaveBeenCalledTimes(reads + 1));
-  expect(screen.queryByRole("textbox", {name: "数量"})).not.toBeInTheDocument();
+  editField("数量", "12");
+  expect(await screen.findByRole("alert")).toHaveTextContent("暂时写入失败");
+  editField("客户", "另一处修改");
+  await waitFor(() => expect(screen.getByRole("button", {name: "重试"})).toBeEnabled());
+  expect(screen.getByRole("alert")).toHaveTextContent("暂时写入失败");
+  fireEvent.click(screen.getByRole("button", {name: "重试"}));
+  const editor = within(screen.getByRole("group", {name: "编辑 数量"})).getByRole("textbox");
+  expect(editor).toHaveTextContent("12");
+  fireEvent.blur(editor);
+  await waitFor(() => expect(updateDataRow).toHaveBeenCalledTimes(3));
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
 it("reopens at the last detail page without keeping a stale business-data cache", async () => {
@@ -140,8 +142,8 @@ it("closes after deleting the last matched detail without expanding a filtered s
   vi.mocked(getSourceDetails).mockResolvedValue({...detail, complete: false, total: 1});
   const {onChanged} = show({scope: {search: "局部"}});
   fireEvent.click(await screen.findByRole("button", {name: "查看与编辑"}));
-  fireEvent.click(await screen.findByRole("button", {name: "编辑明细 1"}));
-  fireEvent.click(screen.getByRole("button", {name: "删除此明细"}));
+  fireEvent.click(await screen.findByRole("checkbox", {name: "选择明细 1"}));
+  fireEvent.click(screen.getByRole("button", {name: "删除选中（1）"}));
   fireEvent.click(screen.getByRole("button", {name: "确认删除"}));
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   expect(deleteDataRows).toHaveBeenCalledWith(tableId, [7], undefined, {7: 8});
@@ -152,11 +154,9 @@ it("does not leave stale values visible when a committed edit leaves the filter"
   vi.mocked(getSourceDetails).mockResolvedValueOnce(detail)
     .mockRejectedValueOnce(Object.assign(new Error("不在当前范围"), {status: 404}));
   show({scope: {search: "0"}}); await open();
-  fireEvent.click(screen.getByRole("button", {name: "编辑明细 1"}));
-  fireEvent.change(screen.getByRole("textbox", {name: "数量"}), {target: {value: "12"}});
-  fireEvent.click(screen.getByRole("button", {name: "提交修改"}));
+  editField("数量", "12");
   expect(await screen.findByText(/当前筛选范围内已没有此来源的数据/)).toHaveAttribute("role", "status");
-  expect(screen.queryByRole("button", {name: "编辑明细 1"})).not.toBeInTheDocument();
+  expect(screen.queryByRole("group", {name: "编辑 数量"})).not.toBeInTheDocument();
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
@@ -170,7 +170,7 @@ it("clears a whole source using the reviewed group token and retains original vi
   expect(localStorage.getItem("zhiyi-card-split")).toBe("70");
   expect(screen.queryByRole("button", {name: "放大图片原件"})).not.toBeInTheDocument();
   fireEvent.keyDown(screen.getByRole("button", {name: "更多数据操作"}), {key: "ArrowDown"});
-  fireEvent.click(await screen.findByRole("menuitem", {name: "清空此来源数据"}));
+  fireEvent.click(await screen.findByRole("menuitem", {name: "清空来源"}));
   fireEvent.click(screen.getByRole("button", {name: "确认清空"}));
   await waitFor(() => expect(clearSourceCards).toHaveBeenCalledWith(tableId, [{id: source.id, version: source.version}], {}));
 });
@@ -209,7 +209,7 @@ it("keeps image scale with its original URL across comparison and detail reopen"
   const cards = await screen.findAllByRole("article");
   const openCard = async (index: number) => {
     fireEvent.click(within(cards[index]).getByRole("button", {name: "查看与编辑"}));
-    await waitFor(() => expect(screen.getByRole("button", {name: "编辑共享字段"})).toBeEnabled());
+    await screen.findByRole("checkbox", {name: "选择明细 1"});
   };
   await openCard(0);
   fireEvent.click(screen.getByRole("button", {name: "原件对照"}));
@@ -243,4 +243,69 @@ it("hides fields only in the preview and reads full, unfolded long values withou
   expect(within(screen.getByRole("dialog")).getByText(full).closest("details")).toBeNull();
   expect(screen.queryByRole("button", {name: "原件对照"})).not.toBeInTheDocument();
   expect(screen.queryByRole("button", {name: "修订历史"})).not.toBeInTheDocument();
+});
+
+it("supports keyboard editing and discards only an uncommitted field with Escape", async () => {
+  show(); await open();
+  const field = screen.getByRole("group", {name: "编辑 数量"});
+  fireEvent.keyDown(field, {key: "F2"});
+  const editor = within(field).getByRole("textbox");
+  expect(editor).toHaveFocus();
+  editor.textContent = "13";
+  fireEvent.keyDown(editor, {key: "Escape"});
+  expect(field).toHaveTextContent("0");
+  expect(updateDataRow).not.toHaveBeenCalled();
+});
+
+it("offers a notice with retry when the first source read fails without claiming the collection is empty", async () => {
+  vi.mocked(getSourceCards).mockRejectedValueOnce(new Error("来源列表暂不可达"));
+  show();
+  fireEvent.click(await screen.findByRole("button", { name: "来源读取失败" }));
+  expect(screen.getByRole("dialog", { name: "来源读取失败" })).toBeInTheDocument();
+  expect(screen.queryByText("没有符合条件的数据")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "重新读取来源" }));
+  expect(await screen.findByRole("button", { name: "查看与编辑" })).toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("does not display old-scope sources when a changed filter fails", async () => {
+  const props = {tableId, selected: [], onSelect: vi.fn(), onChanged: vi.fn()};
+  const view = render(<SourceCardCollection {...props} scope={{search: "甲"}} />);
+  await screen.findByRole("button", { name: "查看与编辑" });
+  vi.mocked(getSourceCards).mockRejectedValueOnce(new Error("新范围读取失败"));
+  view.rerender(<SourceCardCollection {...props} scope={{search: "乙"}} />);
+  fireEvent.click(await screen.findByRole("button", { name: "来源读取失败" }));
+  expect(screen.getByRole("dialog", { name: "来源读取失败" })).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "查看与编辑" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("checkbox", { name: "选择完整来源 订单.pdf" })).not.toBeInTheDocument();
+});
+
+it("does not present the previous detail page as editable when the next page read fails", async () => {
+  vi.mocked(getSourceDetails).mockReset().mockResolvedValueOnce(detail)
+    .mockRejectedValueOnce(new Error("第二页暂不可达"))
+    .mockResolvedValueOnce({ ...detail, page: 2, rows: [{ ...detail.rows[0], id: 17, item_index: 11 }] });
+  show(); await open();
+  fireEvent.click(screen.getByRole("button", { name: "下一页明细" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("第二页暂不可达");
+  expect(screen.queryByRole("group", { name: "编辑 数量" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("group", { name: "编辑 客户" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("checkbox", { name: "选择明细 1" })).not.toBeInTheDocument();
+  expect(updateDataRow).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "重新读取" }));
+  expect(await screen.findByRole("checkbox", { name: "选择明细 11" })).toBeEnabled();
+  expect(getSourceDetails).toHaveBeenLastCalledWith(tableId, source.id, {}, 2);
+  expect(screen.getByText("2 / 100")).toBeInTheDocument();
+});
+
+it("does not reopen stale values for editing after a committed save cannot be reread", async () => {
+  vi.mocked(getSourceDetails).mockReset().mockResolvedValueOnce(detail)
+    .mockRejectedValueOnce(new Error("保存后读取暂不可达"))
+    .mockResolvedValueOnce({ ...detail, rows: [{ ...detail.rows[0], version: 9, values: { quantity: 12 } }] });
+  const { onChanged } = show(); await open();
+  editField("数量", "12");
+  expect(await screen.findByRole("alert")).toHaveTextContent("保存后读取暂不可达");
+  expect(onChanged).toHaveBeenCalledTimes(1);
+  expect(screen.queryByRole("group", { name: "编辑 数量" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "重新读取" }));
+  expect(await screen.findByRole("group", {name: "编辑 数量"})).toHaveTextContent("12");
 });

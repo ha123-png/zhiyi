@@ -1,12 +1,15 @@
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_serializer
 
 from document_pipeline_api.schemas.templates import TemplateRead
 from document_pipeline_api.schemas.input_scope import InputScope, SourceRange
 from document_pipeline_api.schemas.file_name import FileNameRead
-from document_pipeline_api.schemas.json_numbers import stringify_unsafe_integers
+from document_pipeline_api.schemas.json_numbers import model_number, stringify_unsafe_integers
+
+
+ExtractionNumber = Annotated[int | float, BeforeValidator(model_number)]
 
 
 class DocumentKind(StrEnum):
@@ -28,11 +31,11 @@ class LineItem(BaseModel):
     name: str | None
     specification: str | None
     unit: str | None
-    quantity: int | float | None
-    unit_price: int | float | None
-    amount: int | float | None
+    quantity: ExtractionNumber | None
+    unit_price: ExtractionNumber | None
+    amount: ExtractionNumber | None
     tax_rate: str | None
-    tax_amount: int | float | None
+    tax_amount: ExtractionNumber | None
     remarks: str | None = None
 
 
@@ -49,10 +52,10 @@ class DocumentExtraction(BaseModel):
     buyer_address: str | None = None
     document_number: str | None
     document_date: str | None
-    amount_before_tax: int | float | None
-    tax_amount: int | float | None
-    total_amount: int | float | None
-    total_quantity: int | float | None = None
+    amount_before_tax: ExtractionNumber | None
+    tax_amount: ExtractionNumber | None
+    total_amount: ExtractionNumber | None
+    total_quantity: ExtractionNumber | None = None
     remarks: str | None = None
     items: list[LineItem]
 
@@ -74,6 +77,8 @@ class ValidationIssue(BaseModel):
     severity: Literal["warning", "error"]
     # 用户可显式忽略（保持审计语义：被忽略的问题仍记录，但不再阻断确认）
     ignored: bool = False
+    not_checked: bool = False
+    raw_value: TemplateScalar = None
 
 
 class EvidenceRegion(BaseModel):

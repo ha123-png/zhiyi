@@ -5,7 +5,8 @@ import threading
 from ipaddress import ip_address
 from urllib.parse import urlparse
 import httpx
-from document_pipeline_api.model_diagnostics import safe_diagnostic
+from document_pipeline_api.model_diagnostics import safe_diagnostic, service_error_diagnostic
+from document_pipeline_api.schemas.json_numbers import JSONNumberToken, loads_json_numbers, normalize_json_number_tokens
 
 
 class VisionNotSupportedError(ValueError):
@@ -99,9 +100,9 @@ class ConversationProvider:
     def close(self):
         self.client.close()
 
-    def stream(self, messages, tools):
+    def stream(self, messages, tools, *, tool_choice=None):
         try:
-            yield from self._stream(messages, tools)
+            yield from self._stream(messages, tools, tool_choice=tool_choice)
         except httpx.RequestError as error:
             if self.cancel.is_set():
                 raise InterruptedError("已停止生成。") from error
@@ -109,9 +110,11 @@ class ConversationProvider:
             # already accepted it or after partial content has reached the user.
             raise transport_failure(error, self.settings) from error
 
-    def _stream(self, messages, tools):
+    def _stream(self, messages, tools, *, tool_choice=None):
         s = self.settings
         ollama = s.model_provider == "ollama"
+        if tool_choice is not None and ollama:
+            raise ValueError("当前 Ollama 对话接口不支持定向完成回答；已保留实际工具结果，未展示未经核对的正文。请使用支持原生结束工具的模型。")
         url = s.model_base_url.rstrip("/") + ("/api/chat" if ollama else "/chat/completions")
         if ollama:
             normalized = []
@@ -138,6 +141,8 @@ class ConversationProvider:
         payload.update(reasoning_control)
         if tools:
             payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
         host = urlparse(s.model_base_url).hostname or ""
         if (
             host.endswith(".aliyuncs.com")
@@ -184,9 +189,13 @@ class ConversationProvider:
                             }
                         break
         if ollama:
-            payload["options"] = {"num_ctx": s.model_context_length}
+            options = {}
+            if s.model_loaded_context_length is not None:
+                options["num_ctx"] = s.model_loaded_context_length
             if s.model_temperature is not None:
-                payload["options"]["temperature"] = s.model_temperature
+                options["temperature"] = s.model_temperature
+            if options:
+                payload["options"] = options
         else:
             # Known provider supports streaming usage; do not impose this extension
             # on arbitrary OpenAI-compatible local servers.
@@ -206,7 +215,13 @@ class ConversationProvider:
                     diagnostic.extend(chunk[: max(0, 6000 - len(diagnostic))])
                     if len(diagnostic) >= 6000:
                         break
-                detail = safe_diagnostic(diagnostic.decode("utf-8", errors="replace")[:2000])
+                detail = service_error_diagnostic(
+                    diagnostic.decode("utf-8", errors="replace"), s.model_api_key, limit=2000,
+                )
+                if tool_choice is not None and response.status_code in {400, 422}:
+                    raise ValueError(
+                        "模型服务拒绝定向完成回答。请重试，或切换支持工具调用的模型。"
+                    )
                 has_images = any(
                     isinstance(m.get("content"), list)
                     and any(p.get("type") == "image_url" for p in m["content"])
@@ -243,6 +258,7 @@ class ConversationProvider:
             produced = False
             received = 0
             truncated = False
+            content_filtered = False
             reasoning_characters = 0
             reasoning_observed = False
             reasoning_notice_sent = False
@@ -266,8 +282,12 @@ class ConversationProvider:
                     c.get("finish_reason") == "length" for c in item.get("choices", [])
                 ):
                     truncated = True
+                if not ollama and any(
+                    c.get("finish_reason") == "content_filter" for c in item.get("choices", [])
+                ):
+                    content_filtered = True
                 if item.get("error"):
-                    raise ValueError("聊天服务返回错误：" + safe_diagnostic(str(item["error"])))
+                    raise ValueError("聊天服务返回错误：" + service_error_diagnostic(item["error"], s.model_api_key))
                 if item.get("usage"):
                     yield {"type": "usage", "usage": item["usage"]}
                 if ollama and item.get("done") and "prompt_eval_count" in item:
@@ -314,6 +334,11 @@ class ConversationProvider:
                 if delta.get("content"):
                     produced = True
                     yield {"type": "text", "text": delta["content"]}
+                exact_calls = None
+                if ollama and delta.get("tool_calls"):
+                    # Preserve only argument lexemes. Usage and other protocol
+                    # metadata keep the normal JSON decoder and ordinary types.
+                    exact_calls = json.loads(line, parse_float=JSONNumberToken, parse_constant=JSONNumberToken)["message"]["tool_calls"]
                 for index, call in enumerate(delta.get("tool_calls") or []):
                     slot = call.get("index", index)
                     state = calls.setdefault(
@@ -325,6 +350,8 @@ class ConversationProvider:
                     if fn.get("name"):
                         state["name"] += fn["name"]
                     args = fn.get("arguments", "")
+                    if exact_calls is not None:
+                        args = normalize_json_number_tokens(exact_calls[index].get("function", {}).get("arguments", ""))
                     state["arguments"] += (
                         json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else args
                     )
@@ -341,6 +368,10 @@ class ConversationProvider:
                 "reasoning_observed": reasoning_observed,
                 "reasoning_characters": reasoning_characters,
             }}
+            if content_filtered:
+                raise ValueError(
+                    "聊天服务因内容限制拒绝了这次响应，其中的工具调用未执行。请查看服务的内容限制或联系服务方。"
+                )
             if truncated:
                 raise ValueError(
                     "模型回答达到输出长度限制，未将不完整的工具参数用于执行。请缩小本次问题；已保留收到的文字。"
@@ -350,7 +381,7 @@ class ConversationProvider:
             # Validate the whole completed batch before exposing any executable
             # request, including when a later parallel call has broken JSON.
             parsed_calls = [
-                {**call, "arguments": json.loads(call["arguments"] or "{}")}
+                {**call, "arguments": loads_json_numbers(call["arguments"] or "{}")}
                 for call in calls.values()
             ]
             for call in parsed_calls:

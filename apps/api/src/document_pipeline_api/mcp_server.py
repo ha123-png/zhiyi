@@ -6,6 +6,9 @@ from pathlib import Path
 from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.utilities.types import Image
+from fastapi import HTTPException
+from base64 import b64decode
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 from starlette.datastructures import Headers, UploadFile
@@ -16,8 +19,9 @@ from document_pipeline_api.migrations import upgrade_database
 from document_pipeline_api.models.task import TaskRecord
 from document_pipeline_api.model_diagnostics import safe_diagnostic
 from document_pipeline_api.schemas.data_tables import DataRowUpdate
-from document_pipeline_api.schemas.tasks import TaskRead
-from document_pipeline_api.services.data_rows import update_data_row
+from document_pipeline_api.services.integration_access import integration_task, restrict_file_to_tables
+from document_pipeline_api.services.file_revisions import list_revisions, revision_details
+from document_pipeline_api.services.data_rows import independent_history, update_data_row
 from document_pipeline_api.services.data_tables import (
     get_data_table,
     list_data_tables,
@@ -38,6 +42,8 @@ from document_pipeline_api.services.tasks import (
     select_task_template,
 )
 from document_pipeline_api.services.templates import list_templates
+from document_pipeline_api.services.task_presentation import pending_details_for_tasks
+from document_pipeline_api.services.read_snapshot import begin_read_snapshot
 
 
 def create_mcp_server(
@@ -50,6 +56,8 @@ def create_mcp_server(
     task_read_enabled: bool = False,
     template_read_enabled: bool = False,
     result_read_enabled: bool = False,
+    revision_read_enabled: bool = False,
+    original_read_enabled: bool = False,
     data_read_enabled: bool = False,
     allowed_table_ids: tuple[str, ...] | None = None,
 ) -> FastMCP:
@@ -135,6 +143,13 @@ def create_mcp_server(
             return server.tool(name=name)(guarded)
         return register
 
+    def check_file(session, task_id):
+        begin_read_snapshot(session)
+        try:
+            restrict_file_to_tables(session, task_id, allowed_table_ids)
+        except HTTPException as error:
+            raise ValueError(error.detail) from None
+
     @guarded_tool(name="get_capabilities")
     def mcp_get_capabilities() -> dict[str, object]:
         """返回当前 MCP 实例实际开放的能力；未授权工具不会注册。"""
@@ -143,6 +158,8 @@ def create_mcp_server(
                 *(["tasks"] if task_read_enabled else []),
                 *(["templates"] if template_read_enabled else []),
                 *(["results"] if result_read_enabled else []),
+                *(["file_revisions"] if revision_read_enabled else []),
+                *(["original_pages"] if original_read_enabled else []),
                 *(
                     ["table_metadata", "table_rows", "views", "aggregate"]
                     if data_read_enabled
@@ -169,10 +186,11 @@ def create_mcp_server(
         def mcp_get_task(task_id: str) -> dict[str, object]:
             """按导入返回的任务 ID 查询进度与待处理事项，无需反复扫描任务列表。"""
             with session_factory() as session:
+                begin_read_snapshot(session)
                 task = session.get(TaskRecord, task_id)
                 if task is None:
                     raise ValueError("任务不存在。")
-                return TaskRead.model_validate(task).model_dump(mode="json")
+                return integration_task(task).model_dump(mode="json")
 
         @guarded_tool(name="get_task_diagnostics")
         def mcp_get_task_diagnostics(task_id: str) -> dict[str, object]:
@@ -196,16 +214,19 @@ def create_mcp_server(
             if not 1 <= limit <= 500 or offset < 0:
                 raise ValueError("limit 必须在 1 到 500 之间，offset 不能小于 0。")
             with session_factory() as session:
+                begin_read_snapshot(session)
+                tasks = list_tasks(
+                    session,
+                    status=status,
+                    search=search,
+                    template_id=template_id,
+                    limit=limit,
+                    offset=offset,
+                )
+                pending = pending_details_for_tasks(session, tasks)
                 return [
-                    TaskRead.model_validate(task).model_dump(mode="json")
-                    for task in list_tasks(
-                        session,
-                        status=status,
-                        search=search,
-                        template_id=template_id,
-                        limit=limit,
-                        offset=offset,
-                    )
+                    integration_task(task, pending).model_dump(mode="json")
+                    for task in tasks
                 ]
 
     if result_read_enabled:
@@ -217,6 +238,7 @@ def create_mcp_server(
         ) -> dict[str, object]:
             """只读当前事实；默认3条、最多20条明细和12个字段，长值显式标记截断。用 next_page/next_field_page/next_issue_page 继续，后续传 expected_version=review_version，避免混用版本。不夹带初次结果。"""
             with session_factory() as session:
+                check_file(session, task_id)
                 return read_task_result_page(session, task_id, page=page, page_size=page_size,
                                              field_page=field_page, expected_version=expected_version)
 
@@ -224,6 +246,7 @@ def create_mcp_server(
         def mcp_get_task_evidence(task_id: str, page: int = 1, page_size: int = 3, field_page: int = 1) -> dict[str, object]:
             """明确需要核对时才读初次提取证据，非当前事实、非原文件；默认3条明细、12个字段，可分页。用户修订和删除不改变此证据。"""
             with session_factory() as session:
+                check_file(session, task_id)
                 return read_task_result_page(session, task_id, view="initial", page=page,
                                              page_size=page_size, field_page=field_page)
 
@@ -234,8 +257,56 @@ def create_mcp_server(
         ) -> dict[str, object]:
             """按需读单字段完整值，文本每次最多2000字符；path 使用返回的 truncated_paths，或 [header,key]/[items,从0开始的全文件位置,key]。校验字段用 [validation_issues,位置,key]。current 必须传 expected_version；initial 是历史证据。"""
             with session_factory() as session:
+                check_file(session, task_id)
                 return read_task_result_value(session, task_id, path, view=view, offset=offset,
                                               limit=limit, expected_version=expected_version)
+
+    if revision_read_enabled:
+        @guarded_tool(name="get_file_revisions")
+        def mcp_file_revisions(task_id: str, revision_id: str | None = None,
+                               page: int = 1, page_size: int = 20) -> dict[str, object]:
+            """读取授权文件的修订目录。提供目录中的 revision_id 可查看对应版本的前后值。"""
+            with session_factory() as session:
+                check_file(session, task_id)
+                try:
+                    if revision_id is None:
+                        return list_revisions(session, task_id, page=page, page_size=page_size)
+                    return revision_details(session, task_id, revision_id, page=page, page_size=page_size)
+                except HTTPException as error:
+                    raise ValueError(error.detail) from None
+
+        @guarded_tool(name="get_independent_row_revisions")
+        def mcp_row_revisions(table_id: str, row_id: int | None = None,
+                              page: int = 1, page_size: int = 20) -> dict[str, object]:
+            """读取授权表中导入或手工记录的修订。可按行查询。"""
+            if page < 1 or not 1 <= page_size <= 50 or (row_id is not None and row_id < 1):
+                raise ValueError("页码和行号须为正数，每页最多读取 50 条。")
+            with session_factory() as session:
+                try:
+                    return independent_history(session, table_id, row_id=row_id, page=page, page_size=page_size)
+                except HTTPException as error:
+                    raise ValueError(error.detail) from None
+
+    if original_read_enabled:
+        @guarded_tool(name="read_original_page")
+        def mcp_read_original_page(task_id: str, page: int = 1, offset: int = 0, vision: bool = False):
+            """读取授权原件的一页或一段文字。图片和扫描件可显式选 vision；返回单页图像。"""
+            from document_pipeline_api.services.assistant_tools import OriginalPage
+            from document_pipeline_api.services.assistant_originals import read_original
+
+            body = OriginalPage(task_id=task_id, page=page, offset=offset, vision=vision)
+            with session_factory() as session:
+                check_file(session, task_id)
+                try:
+                    result = read_original(session, settings, body)
+                except HTTPException as error:
+                    raise ValueError(error.detail) from None
+                except (OSError, ValueError):
+                    raise ValueError("无法读取此原件。请在知意中查看原件状态。") from None
+            image = result.pop("_image", None)
+            if image:
+                return [result, Image(data=b64decode(image.split(",", 1)[1]), format="jpeg")]
+            return result
 
     if template_read_enabled:
 
@@ -360,9 +431,9 @@ def create_mcp_server(
 
                     if action in {"pause", "cancel"}:
                         revoke_task(task.id)
-                    elif not freeze_new_task_if_paused(session, task.id):
+                    elif task.status == "queued" and not freeze_new_task_if_paused(session, task.id):
                         enqueue_task(task.id)
-                return TaskRead.model_validate(task).model_dump(mode="json")
+                return integration_task(task).model_dump(mode="json")
 
         @guarded_tool(name="select_task_template")
         def mcp_select_task_template(task_id: str, template_id: str) -> dict[str, object]:
@@ -376,7 +447,7 @@ def create_mcp_server(
                     from document_pipeline_api.services.queueing import enqueue_task
 
                     enqueue_task(task.id)
-                return TaskRead.model_validate(task).model_dump(mode="json")
+                return integration_task(task).model_dump(mode="json")
 
     if file_access_enabled:
 
@@ -414,7 +485,7 @@ def create_mcp_server(
                         from document_pipeline_api.services.queueing import enqueue_task
 
                         enqueue_task(task.id)
-                    return TaskRead.model_validate(task).model_dump(mode="json")
+                    return integration_task(task).model_dump(mode="json")
             finally:
                 # FastAPI normally closes request uploads; MCP constructs this UploadFile
                 # itself, so it must also release the source handle on every error path.
@@ -472,6 +543,8 @@ def main() -> None:
         task_read_enabled=task_read_enabled,
         template_read_enabled=template_read_enabled,
         result_read_enabled=result_read_enabled,
+        revision_read_enabled=_env_enabled("DOCUMENT_PIPELINE_MCP_REVISION_READ_ENABLED"),
+        original_read_enabled=_env_enabled("DOCUMENT_PIPELINE_MCP_ORIGINAL_READ_ENABLED"),
         data_read_enabled=data_read_enabled,
         allowed_table_ids=(tuple(item for item in os.getenv("DOCUMENT_PIPELINE_MCP_TABLE_IDS", "").split(os.pathsep) if item)
                            if os.getenv("DOCUMENT_PIPELINE_MCP_DATA_SCOPE") == "selected" else None),

@@ -23,6 +23,7 @@ from document_pipeline_api.schemas.rules import (
     FieldExpression,
     RangeRule,
     RequiredRule,
+    RuleNumber,
     SumExpression,
 )
 from document_pipeline_api.schemas.templates import (
@@ -111,9 +112,9 @@ class AiGeneratedRule(BaseModel):
     kind: str | None = None
     field: str | None = None
     section: str | None = None
-    minimum: float | None = None
-    maximum: float | None = None
-    values: list[str | float | bool] = Field(default_factory=list)
+    minimum: RuleNumber | None = None
+    maximum: RuleNumber | None = None
+    values: list[str | RuleNumber | bool] = Field(default_factory=list)
     operation: str | None = None
     inputs: list[str] = Field(default_factory=list)
     input_section: str | None = None
@@ -219,8 +220,6 @@ def generate_template_draft(
             client.close()
 
     warnings = []
-    if raw.presentation_mode not in {"table", "card"}:
-        warnings.append("AI 未返回有效的默认展示方式，草稿暂用表格，请核对后保存。")
     if any(f.section not in ALLOWED_SECTIONS or f.value_type not in ALLOWED_VALUE_TYPES for f in raw.fields):
         warnings.append("部分字段的类型或分区缺失／无效，已使用文本／整份文件作为缺失项默认值，请核对。")
     fields = [
@@ -239,11 +238,6 @@ def generate_template_draft(
     name = (raw.name or "").strip()[:128]
     description = (raw.description or "").strip()[:512]
     suggestions = _clean_rule_suggestions(raw.rules, fields) if with_rules else []
-    if with_rules and not any(suggestion.status == "accepted" for suggestion in suggestions):
-        warnings.append(
-            "本次未生成可用的校验规则，可在模板中补充。"
-            if suggestions else "本次未生成校验规则，可在模板中补充。"
-        )
     return TemplateDraft(
         name=name,
         description=description,

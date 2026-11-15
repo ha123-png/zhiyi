@@ -1,4 +1,5 @@
 from datetime import datetime
+import json
 
 from sqlalchemy import (
     Boolean,
@@ -33,11 +34,16 @@ class DataTableRecord(Base):
     document_kind: Mapped[str] = mapped_column(String(32))
     collection_kind: Mapped[str] = mapped_column(String(16), default="table")
     grouping_json: Mapped[str] = mapped_column(Text, default="[]")
-    # 手动新建/合并表的列定义（[{"key","label","value_type"}]）；内置与模板表留空，
+    # 手动新建表和旧合并表的列定义；内置与模板表留空，
     # 列契约从内置映射或模板字段推导。仅用于无模板驱动的表。
     columns_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    merge_sources_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     presentation_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    @property
+    def merge_sources(self) -> list[str] | None:
+        return json.loads(self.merge_sources_json) if self.merge_sources_json is not None else None
 
 
 class ConfirmedDocumentRecord(Base):

@@ -1,0 +1,33 @@
+.extract-template-config { min-width: 0; }
+.extract-config-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px 24px; }
+.extract-template-select { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 12px; min-width: 0; flex: 1; }
+.extract-template-select .form-label { margin: 0; flex: none; }
+.extract-matching-controls { flex: 1; min-width: 0; }
+.extract-matching-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 12px; }
+.extract-template-select .form-select { width: min(100%, 300px); min-width: 0; max-width: 100%; text-overflow: ellipsis; }
+.extract-scope-button { flex: none; }
+.extract-scope-description { color: var(--muted-foreground); font-size: var(--text-help); line-height: 1.7; overflow-wrap: anywhere; }
+.extract-template-description { margin: 10px 0 0; color: var(--muted-foreground); font-size: var(--text-help); line-height: 1.7; overflow-wrap: anywhere; }
+.extract-scope-dialog { width: min(720px, calc(100vw - 32px)); max-height: min(720px, calc(100dvh - 40px)); overflow: hidden; }
+.extract-scope-dialog .template-history-head { flex-shrink: 0; }
+.extract-scope-dialog .template-history-head > div { min-width: 0; }
+.extract-scope-body { min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 20px 24px; }
+.extract-scope-dialog .smart-pool-grid { grid-template-columns: minmax(0, 1fr); max-height: none; overflow: visible; }
+.extract-scope-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 24px; border-top: 1px solid var(--border); flex-shrink: 0; }
+.extract-scope-footer .support { min-width: 0; }
+.extract-scope-footer .btn { flex-shrink: 0; }
+@media(max-width:640px) {
+  .extract-template-select { flex-basis: 100%; }
+  .extract-template-select .form-select { flex: 1; width: auto; }
+  .extract-scope-dialog .template-history-head { padding: 16px; }
+  .extract-scope-body { padding: 16px; }
+  .extract-scope-footer { padding: 12px 16px; }
+}
+.template-history-dialog.notice-dialog { width: min(620px, calc(100vw - 32px)); }
+.notice-dialog-body { overflow-wrap: anywhere; }
+.notice-dialog-body > :first-child { margin-top: 0; }
+.notice-dialog-body > :last-child { margin-bottom: 0; }
+.notice-dialog-actions { justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+.notice-dialog-list { padding-left: 1.25rem; }
+.notice-dialog-list li + li { margin-top: 10px; }
+.task-notice-slot { display: contents; }

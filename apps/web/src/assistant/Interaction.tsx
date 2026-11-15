@@ -7,7 +7,8 @@ import {
   type PointerEvent,
 } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { ChevronRight } from "lucide-react";
+import { CollapseChevron } from "../components/CollapseChevron";
+import { usePointerDrag } from "../usePointerDrag";
 
 export function useConversationScroll(
   threadId: string | undefined,
@@ -128,10 +129,7 @@ export function Fold({
         aria-controls={bodyId}
         onClick={() => setOpen(!open)}
       >
-        <ChevronRight
-          size={13}
-          style={{ transform: open ? "rotate(90deg)" : undefined }}
-        />
+        <CollapseChevron expanded={open} size={13} />
         {title}
       </button>
       <AnimatePresence initial={false}>
@@ -163,15 +161,16 @@ export function usePanelWidth(
   reverse = false,
 ) {
   const [width, setWidth] = useState(() => {
-    const saved = Number(localStorage.getItem(key));
-    return saved >= min && saved <= max ? saved : initial;
+    try {
+      const saved = Number(localStorage.getItem(key));
+      return saved >= min && saved <= max ? saved : initial;
+    } catch { return initial; }
   });
-  const cleanup = useRef<(() => void) | null>(null);
-  useEffect(() => () => cleanup.current?.(), []);
+  const startPointerDrag = usePointerDrag();
   const update = (value: number) => {
     const next = Math.max(min, Math.min(max, value));
     setWidth(next);
-    localStorage.setItem(key, String(next));
+    try { localStorage.setItem(key, String(next)); } catch { /* Resizing remains available without browser persistence. */ }
   };
   return {
     width,
@@ -191,20 +190,12 @@ export function usePanelWidth(
         }
       },
       onPointerDown: (e: PointerEvent) => {
+        if (e.button !== 0) return;
         e.preventDefault();
-        cleanup.current?.();
         const start = e.clientX;
         const move = (p: globalThis.PointerEvent) =>
           update(width + (p.clientX - start) * (reverse ? -1 : 1));
-        const end = () => {
-          window.removeEventListener("pointermove", move);
-          window.removeEventListener("pointerup", end);
-          window.removeEventListener("pointercancel", end);
-        };
-        cleanup.current = end;
-        window.addEventListener("pointermove", move);
-        window.addEventListener("pointerup", end);
-        window.addEventListener("pointercancel", end);
+        startPointerDrag(move, undefined, e.pointerId, e.currentTarget);
       },
     },
   };

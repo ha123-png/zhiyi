@@ -18,6 +18,19 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    if op.get_bind().dialect.name == "sqlite":
+        # Rebuilding tasks fails when extractions, reviews or duplicate tasks
+        # already reference it. A nullable inline REFERENCES column can be
+        # added without dropping the parent or disabling foreign-key checks.
+        for table in ("tasks", "extractions"):
+            op.execute(sa.text(
+                f"ALTER TABLE {table} ADD COLUMN template_id VARCHAR(36) REFERENCES templates(id)"
+            ))
+            op.add_column(table, sa.Column("template_version", sa.Integer(), nullable=True))
+        op.add_column("tasks", sa.Column(
+            "candidate_templates_json", sa.Text(), nullable=False, server_default="[]",
+        ))
+        return
     with op.batch_alter_table("tasks") as batch:
         batch.add_column(sa.Column("template_id", sa.String(length=36), nullable=True))
         batch.add_column(sa.Column("template_version", sa.Integer(), nullable=True))
@@ -47,6 +60,18 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    if op.get_bind().dialect.name == "sqlite":
+        foreign_keys = sa.inspect(op.get_bind()).get_foreign_keys("tasks")
+        if any(key["constrained_columns"] == ["template_id"] and key["name"] is None
+               for key in foreign_keys):
+            # The inline constraint belongs to its column. Native DROP COLUMN
+            # removes both without rebuilding referenced tasks. Databases
+            # created by the old named-constraint migration keep its path below.
+            for table in ("extractions", "tasks"):
+                op.drop_column(table, "template_version")
+                op.drop_column(table, "template_id")
+            op.drop_column("tasks", "candidate_templates_json")
+            return
     with op.batch_alter_table("extractions") as batch:
         batch.drop_constraint("fk_extractions_template_id", type_="foreignkey")
         batch.drop_column("template_version")

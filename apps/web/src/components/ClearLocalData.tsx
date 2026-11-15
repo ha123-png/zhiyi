@@ -5,11 +5,16 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { Icon } from "./Icon";
 
 export function resetKnownBrowserData() {
-  for (const key of Object.keys(localStorage)) {
-    if (["theme", "zhiyi-card-split", "last-extraction-record-v1", "extract-batch-queue-v1", "last-upload-mode-v1"].includes(key)
-      || key.startsWith("onboarding-done-v")) localStorage.removeItem(key);
-  }
-  sessionStorage.removeItem("zhiyi-settings-anchor");
+  let cleared = true;
+  try {
+    for (const key of Object.keys(localStorage)) {
+      if (["theme", "zhiyi-card-split", "last-extraction-record-v1", "extract-batch-queue-v1", "last-upload-mode-v1"].includes(key)
+        || key.startsWith("onboarding-done-v")) localStorage.removeItem(key);
+    }
+  } catch { cleared = false; }
+  try { sessionStorage.removeItem("zhiyi-settings-anchor"); }
+  catch { cleared = false; }
+  return cleared;
 }
 
 const reload = () => window.location.reload();
@@ -19,6 +24,7 @@ export function ClearLocalData({ onCleared = reload }: { onCleared?: () => void 
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [waiting, setWaiting] = useState(false);
+  const [browserResetPending, setBrowserResetPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const previousResult = useRef<string | number | undefined>(undefined);
   const finished = useRef(false);
@@ -26,11 +32,17 @@ export function ClearLocalData({ onCleared = reload }: { onCleared?: () => void 
   function complete() {
     if (finished.current) return;
     finished.current = true;
-    resetKnownBrowserData();
+    setStatus(current => current ? { ...current, incomplete: false } : current);
     setWaiting(false);
     setBusy(false);
     setOpen(false);
-    onCleared();
+    finishBrowserReset();
+  }
+
+  function finishBrowserReset() {
+    const cleared = resetKnownBrowserData();
+    setBrowserResetPending(!cleared);
+    if (cleared) onCleared();
   }
 
   useEffect(() => {
@@ -93,12 +105,16 @@ export function ClearLocalData({ onCleared = reload }: { onCleared?: () => void 
         <div className="settings-name">清除全部本地数据</div>
         <div className="small muted">删除内部原件、全部记录和数据表、自定义模板及保存的设置和密钥。保留外部副本、备份和模型文件。</div>
       </div>
-      <button className="btn danger sm" type="button" disabled={busy || !status} onClick={() => setOpen(true)}>
+      <button className="btn danger sm" type="button" disabled={busy || !status || finished.current} onClick={() => setOpen(true)}>
         <Icon icon={Trash2} size={13} /> {status?.incomplete ? "重试清除" : "清除全部"}
       </button>
     </div>
     {status?.incomplete && !waiting && <div className="callout danger" role="alert">上次清除未完成，部分数据可能已经删除。新任务已暂停，请重试清除。</div>}
     {waiting && <div className="callout" role="status">正在停止任务、清除数据并重新启动知意。请保持页面打开，完成后会自动刷新。</div>}
+    {browserResetPending && <div className="callout danger" role="alert">
+      知意中的数据已清除，但浏览器偏好未能清除。请允许此站点使用本地存储后重试，或在浏览器设置中清除此站点数据后重新打开知意。
+      <button className="btn secondary sm" type="button" onClick={finishBrowserReset}>重试清除浏览器偏好</button>
+    </div>}
     {error && <div className="callout danger" role="alert">{error}
       {!status && <button className="btn secondary sm" type="button" onClick={() => {
         void getClearDataStatus().then((value) => { setStatus(value); setError(null); })

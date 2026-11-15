@@ -13,6 +13,7 @@ from document_pipeline_api.config import Settings
 from document_pipeline_api.models import TaskRecord, TemplateLocalBindingRecord
 from document_pipeline_api.services.file_copies import suggest_safe_stem, validate_copy_name
 from document_pipeline_api.services.file_operation_lock import file_operation_lock
+from document_pipeline_api.services.read_snapshot import begin_write_snapshot
 from document_pipeline_api.services.templates import get_template_version
 from document_pipeline_api.storage_paths import ensure_managed_path, resolve_task_storage_path, task_storage_name
 
@@ -79,6 +80,23 @@ def _classify(session: Session, settings: Settings, task_id: str) -> None:
             task.storage_path = relative
             task.internal_storage_json = json.dumps({"status": "moving", "folder": binding.internal_folder, "previous_path": actual_previous}, ensure_ascii=False)
             session.commit()
+        # The durable intent must survive a crash, so it commits before
+        # moving bytes. Reacquire the database write boundary afterwards:
+        # a worker may have claimed the task since the initial status read
+        # and retained the old image path. Defer that move until it finishes.
+        begin_write_snapshot(session)
+        session.refresh(task)
+        if (task.template_id, task.template_version) != (template.id, template.version):
+            # A concurrent template choice could not acquire our file lock.
+            # Keep recovery pending even when the old folder already matched.
+            info = task.internal_storage or {}
+            task.internal_storage_json = json.dumps({**info, "status": "moving"}, ensure_ascii=False)
+            session.commit()
+            return
+        if task.status in {"processing", "validating"}:
+            session.rollback()
+            return
+        if source != target:
             if target.exists() and source.samefile(target):
                 source.unlink()
             else:

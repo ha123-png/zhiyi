@@ -1,0 +1,17 @@
+.page-opening {
+  min-width: 0;
+  opacity: 0;
+  animation: page-opening-appear 180ms ease-out 120ms forwards;
+}
+.page-opening-body span {
+  display: block;
+  max-width: 100%;
+  border-radius: 6px;
+  background: var(--muted);
+}
+.page-opening-body { display: grid; gap: 14px; padding: 24px; border: 1px solid var(--border); border-radius: 12px; }
+.page-opening-body span { height: 12px; width: 74%; }
+.page-opening-body span:first-child { width: 34%; height: 18px; margin-bottom: 12px; }
+.page-opening-body span:last-child { width: 58%; }
+@keyframes page-opening-appear { to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .page-opening { animation: none; opacity: 1; } }

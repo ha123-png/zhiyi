@@ -13,12 +13,8 @@ from document_pipeline_api.model_providers import (
 from document_pipeline_api.model_providers.local_model_manager import (
     build_local_model_manager,
 )
+from document_pipeline_api.model_providers.loaded_context import read_loaded_context_lengths
 from document_pipeline_api.public_errors import public_error_message
-from document_pipeline_api.model_secrets import (
-    ModelSecretStore,
-    SecretStoreError,
-    create_model_secret_store,
-)
 from document_pipeline_api.services.model_runtime import (
     settings_for_active_profile,
     settings_for_active_profile_metadata,
@@ -54,7 +50,7 @@ def system_status(request: Request, session: SessionDependency) -> SystemStatus:
         active_settings = settings_for_active_profile(
             session,
             settings,
-            _secret_store(request, required=False),
+            request.app.state.model_secret_store,
         )
     except Exception:
         try:
@@ -89,21 +85,6 @@ def system_status(request: Request, session: SessionDependency) -> SystemStatus:
     )
 
 
-def _secret_store(request: Request, *, required: bool) -> ModelSecretStore | None:
-    store = request.app.state.model_secret_store
-    if store is not None or not required:
-        return store
-    try:
-        store = create_model_secret_store()
-    except SecretStoreError as error:
-        raise HTTPException(
-            status_code=503,
-            detail=public_error_message(error, "系统密钥库暂时不可用，请重启知意后重试。"),
-        ) from error
-    request.app.state.model_secret_store = store
-    return store
-
-
 class LocalModelStatus(BaseModel):
     provider: str
     base_url: str
@@ -124,6 +105,7 @@ class LocalModelList(BaseModel):
     provider: str
     available: list[str]
     loaded: list[str]
+    loaded_context_lengths: dict[str, int] = Field(default_factory=dict)
 
 
 class LocalModelLoad(BaseModel):
@@ -202,11 +184,12 @@ def local_model_models(
     request: Request,
     session: SessionDependency,
 ) -> LocalModelList:
-    provider, _base_url, manager = _local_manager_for_active_profile(request, session)
+    provider, base_url, manager = _local_manager_for_active_profile(request, session)
     return LocalModelList(
         provider=provider,
         available=manager.list_models(),
         loaded=manager.loaded_models(),
+        loaded_context_lengths=read_loaded_context_lengths(provider, base_url),
     )
 
 

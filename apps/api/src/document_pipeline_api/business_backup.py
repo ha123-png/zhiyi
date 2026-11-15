@@ -290,12 +290,15 @@ def _prepare_staged_database(
         from document_pipeline_api.models import TaskRecord
         from document_pipeline_api.schemas.tasks import TaskRead
         from document_pipeline_api.schemas.input_scope import InputPolicy
+        from document_pipeline_api.services.task_presentation import pending_details_for_tasks
         try:
             with Session(engine) as session:
-                for task in session.scalars(select(TaskRecord).execution_options(yield_per=100)):
-                    TaskRead.model_validate(task)
-                    if task.input_policy_json:
-                        InputPolicy.model_validate_json(task.input_policy_json)
+                for batch in session.scalars(select(TaskRecord).execution_options(yield_per=100)).partitions(100):
+                    pending = pending_details_for_tasks(session, batch)
+                    for task in batch:
+                        TaskRead.model_validate(task, context={"pending_details": pending})
+                        if task.input_policy_json:
+                            InputPolicy.model_validate_json(task.input_policy_json)
         except (ValueError, TypeError) as error:
             raise BusinessBackupError("备份中的任务业务结构无效，当前数据没有改变。") from error
     finally:

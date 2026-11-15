@@ -9,6 +9,7 @@ import io
 import importlib.util
 import json
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -58,6 +59,7 @@ class CandidateManifestTests(unittest.TestCase):
         self.project = self.root / "project"
         for relative, content in {
             "packaging/installer.nsi": b"candidate installer source",
+            "packaging/purge-option.nsh": b"candidate purge option helper",
             "packaging/app.ico": b"candidate app icon",
             "packaging/uninstall.ico": b"candidate uninstall icon",
             "packaging/write-uninstall-list.ps1": b"candidate uninstall include generator",
@@ -157,6 +159,16 @@ class CandidateManifestTests(unittest.TestCase):
         (self.project / "packaging/installer.nsi").write_bytes(b"different installer")
         with self.assertRaisesRegex(helper.VerificationError, "build source differs"):
             helper.verify_build_sources(self.dist, self.project, required)
+
+    def test_lifecycle_compiler_refuses_changed_purge_include_before_running_installer(self):
+        lifecycle = (HELPER_PATH.parent / "smoke-release-lifecycle.ps1").read_text(encoding="utf-8")
+        block = re.search(r"foreach\s*\(\$relativeSource\s+in\s+@\((.*?)\)\)\s*\{", lifecycle, re.S)
+        self.assertIsNotNone(block, "lifecycle source binding list is missing")
+        selected = re.findall(r'"([^"\r\n]+)"', block.group(1))
+        self.assertTrue(helper.verify_build_sources(self.dist, self.project, selected)["verified"])
+        (self.project / "packaging/purge-option.nsh").write_bytes(b"different purge helper")
+        with self.assertRaisesRegex(helper.VerificationError, "purge-option.nsh"):
+            helper.verify_build_sources(self.dist, self.project, selected)
 
 
 class FakeApi:

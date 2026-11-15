@@ -14,7 +14,6 @@ from document_pipeline_api.models import (
 )
 from document_pipeline_api.models.task import utc_now
 from document_pipeline_api.schemas.templates import (
-    TemplateBehavior,
     TemplateBody,
     TemplateRead,
     TemplateVersionSummary,
@@ -664,21 +663,6 @@ def _current_version(
     if version is None:
         raise RuntimeError("模板当前版本不存在。")
     return version
-
-
-def _version_matches(version: TemplateVersionRecord, body: TemplateBody) -> bool:
-    return (
-        version.name == body.name
-        and version.description == body.description
-        and version.extra_instructions == body.extra_instructions
-        and json.loads(version.fields_json)
-        == [field.model_dump() for field in body.fields]
-        and json.loads(version.validation_rules_json) == body.validation_rules
-        and json.loads(version.deterministic_rules_json)
-        == [rule.model_dump(mode="json") for rule in body.deterministic_rules]
-        and json.loads(version.output_mapping_json) == body.output_mapping
-        and TemplateBehavior.model_validate_json(version.behavior_json) == body.behavior
-    )
 
 
 def _to_read(

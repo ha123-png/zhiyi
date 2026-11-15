@@ -6,7 +6,9 @@ param(
     [switch]$AllowDirty,
     [switch]$RequireSignature,
     [string]$CertificateThumbprint = "",
-    [string]$TimestampServer = "http://timestamp.acs.microsoft.com"
+    [string]$TimestampServer = "http://timestamp.acs.microsoft.com",
+    [switch]$ReuseWorkspaceDependencies,
+    [string]$WorkspaceDependencyRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -43,6 +45,39 @@ if ($isDirty -and -not $AllowDirty) {
     throw "Release builds require a clean Git worktree. Commit or stash changes, or use -AllowDirty for a non-releasable engineering build."
 }
 
+if ([bool]$ReuseWorkspaceDependencies -ne [bool]$WorkspaceDependencyRoot) {
+    throw "Dependency reuse requires both -ReuseWorkspaceDependencies and -WorkspaceDependencyRoot."
+}
+$reuseEnvironment = [ordered]@{}
+$reusePython = $null
+$reusePreflight = $null
+$reuseAnalysis = $null
+try {
+    if ($ReuseWorkspaceDependencies) {
+        $WorkspaceDependencyRoot = (Resolve-Path -LiteralPath $WorkspaceDependencyRoot).Path
+        $reusePython = Join-Path $WorkspaceDependencyRoot "apps\api\.venv\Scripts\python.exe"
+        if (-not (Test-Path -LiteralPath $reusePython -PathType Leaf)) {
+            throw "Workspace API virtual environment Python is missing."
+        }
+        foreach ($name in @("PYTHONPATH", "PYTHONHOME", "PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE", "UV_NO_SYNC", "UV_PROJECT_ENVIRONMENT", "NODE_OPTIONS", "NODE_PATH", "PYINSTALLER_CONFIG_DIR")) {
+            $reuseEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+        }
+        $env:PYTHONPATH = Join-Path $projectRoot "apps\api\src"
+        [Environment]::SetEnvironmentVariable("PYTHONHOME", $null, "Process")
+        $env:PYTHONNOUSERSITE = "1"
+        $env:PYTHONDONTWRITEBYTECODE = "1"
+        $env:UV_NO_SYNC = "1"
+        $env:UV_PROJECT_ENVIRONMENT = Join-Path $WorkspaceDependencyRoot "apps\api\.venv"
+        [Environment]::SetEnvironmentVariable("NODE_OPTIONS", $null, "Process")
+        [Environment]::SetEnvironmentVariable("NODE_PATH", $null, "Process")
+        Push-Location $projectRoot
+        try {
+            $preflightJson = & $reusePython (Join-Path $projectRoot "scripts\release_dependency_reuse.py") preflight --candidate $projectRoot --dependency-root $WorkspaceDependencyRoot
+            if ($LASTEXITCODE -ne 0) { throw "Workspace dependency reuse preflight failed." }
+            $reusePreflight = ($preflightJson | Out-String) | ConvertFrom-Json
+        } finally { Pop-Location }
+    }
+
 # Resolve the alembic migration head at build time instead of hardcoding it,
 # so new migrations never need a manual sync. Multiple heads make
 # get_current_head() fail, which prevents recording an ambiguous head.
@@ -57,7 +92,14 @@ try {
     # PowerShell 5.1 wraps any native stderr output in NativeCommandError when
     # ErrorActionPreference is Stop. uv writes harmless build progress there.
     $ErrorActionPreference = "Continue"
-    $migrationHead = (& uv --cache-dir (Join-Path $projectRoot ".uv-cache") run --locked --project (Join-Path $projectRoot "apps/api") python -c "from alembic.config import Config; from alembic.script import ScriptDirectory; print(ScriptDirectory.from_config(Config('$alembicIni')).get_current_head())" 2>$null)
+    if ($ReuseWorkspaceDependencies) {
+        Push-Location $projectRoot
+        try {
+            $migrationHead = (& $reusePython -c "import sys; from alembic.config import Config; from alembic.script import ScriptDirectory; print(ScriptDirectory.from_config(Config(sys.argv[1])).get_current_head())" $alembicIni 2>$null)
+        } finally { Pop-Location }
+    } else {
+        $migrationHead = (& uv --cache-dir (Join-Path $projectRoot ".uv-cache") run --locked --project (Join-Path $projectRoot "apps/api") python -c "from alembic.config import Config; from alembic.script import ScriptDirectory; print(ScriptDirectory.from_config(Config('$alembicIni')).get_current_head())" 2>$null)
+    }
 } finally {
     $ErrorActionPreference = $savedErrorActionPreference
 }
@@ -113,6 +155,12 @@ $resourceRoot = Join-Path $releaseRoot "resources"
 $auditRoot = Join-Path $releaseRoot "audit"
 $specPath = Join-Path $projectRoot "packaging\DocumentPipeline.spec"
 New-Item -ItemType Directory -Path $resourceRoot, $auditRoot -Force | Out-Null
+if ($ReuseWorkspaceDependencies) {
+    # --clean must only clear this candidate's PyInstaller cache.
+    $env:PYINSTALLER_CONFIG_DIR = Join-Path $workRoot "pyinstaller-cache"
+    # This receipt is private: the public metadata below uses pathless labels.
+    $reusePreflight | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $auditRoot "WORKSPACE_REUSE_PRIVATE.json")
+}
 
 $makensis = $null
 if ($BuildInstaller) {
@@ -137,7 +185,11 @@ try {
     # overrides and .env files for this compile-time setting.
     $env:VITE_API_BASE_URL = "/api/v1"
     $sourceManifest = Join-Path $resourceRoot "SOURCE_INPUTS.json"
-    uv --cache-dir .uv-cache run --locked --project apps/api python scripts/release_evidence.py source --root $projectRoot --manifest $sourceManifest
+    if ($ReuseWorkspaceDependencies) {
+        & $reusePython scripts/release_evidence.py source --root $projectRoot --manifest $sourceManifest
+    } else {
+        uv --cache-dir .uv-cache run --locked --project apps/api python scripts/release_evidence.py source --root $projectRoot --manifest $sourceManifest
+    }
     if ($LASTEXITCODE -ne 0) { throw "Cannot capture source inputs." }
     $sourceInputs = Get-Content -Raw -Encoding utf8 -LiteralPath $sourceManifest | ConvertFrom-Json
     if ($sourceInputs.git_revision -ne $revision -or $sourceInputs.source_dirty -ne $isDirty) {
@@ -147,30 +199,50 @@ try {
         node = Read-ToolVersion "node" @("--version")
         npm = Read-ToolVersion "npm.cmd" @("--version")
         uv = Read-ToolVersion "uv" @("--version")
-        python = Read-ToolVersion "uv" @("run", "--locked", "--project", "apps/api", "python", "--version")
-        pyinstaller = Read-ToolVersion "uv" @("run", "--locked", "--project", "apps/api", "pyinstaller", "--version")
-        nsis_path = $makensis
+        python = if ($ReuseWorkspaceDependencies) { Read-ToolVersion $reusePython @("--version") } else { Read-ToolVersion "uv" @("run", "--locked", "--project", "apps/api", "python", "--version") }
+        pyinstaller = if ($ReuseWorkspaceDependencies) { Read-ToolVersion $reusePython @("-m", "PyInstaller", "--version") } else { Read-ToolVersion "uv" @("run", "--locked", "--project", "apps/api", "pyinstaller", "--version") }
+        nsis_executable = if ($makensis) { [IO.Path]::GetFileName($makensis) } else { $null }
         nsis_version = if ($makensis) { Read-ToolVersion $makensis @("/VERSION") } else { $null }
         upx_enabled = $false
         frontend_api_base = "/api/v1"
     }
     $npmCache = Join-Path $projectRoot ".npm-cache"
     New-Item -ItemType Directory -Path $npmCache -Force | Out-Null
-    # Reproducible build: npm ci installs exactly from the lockfile (it fails
-    # when package.json and the lockfile disagree, which also verifies the web
-    # version recorded in the lockfile), then the frontend bundle is built.
-    npm.cmd ci --cache $npmCache
-    if ($LASTEXITCODE -ne 0) { throw "Frontend dependency install (npm ci) failed." }
-    npm.cmd --workspace apps/web run build
-    if ($LASTEXITCODE -ne 0) { throw "Frontend production build failed." }
+    $requirements = Join-Path $auditRoot "python-requirements.txt"
+    if ($ReuseWorkspaceDependencies) {
+        # Exporting a frozen lock is read-only with respect to the reused venv.
+        # Check every applicable runtime pin before running the frontend build.
+        uv export --cache-dir .uv-cache --project apps/api --frozen --no-dev --no-emit-project --no-header --format requirements-txt --output-file $requirements | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Python release dependency export failed." }
+        $runtimeJson = & $reusePython scripts/release_dependency_reuse.py verify-python-deps --requirements $requirements
+        if ($LASTEXITCODE -ne 0) { throw "Workspace Python runtime differs from the frozen lock." }
+        $pythonRuntimeInventory = ($runtimeJson | Out-String) | ConvertFrom-Json
+    }
+    if ($ReuseWorkspaceDependencies) {
+        $frontendGraph = Join-Path $resourceRoot "FRONTEND_SOURCE_GRAPH.json"
+        Push-Location (Join-Path $projectRoot "apps\web")
+        try {
+            & node (Join-Path $projectRoot "scripts\release_frontend_reuse.mjs") --candidate $projectRoot --dependency-root $WorkspaceDependencyRoot --report $frontendGraph
+            if ($LASTEXITCODE -ne 0) { throw "Frontend reuse build or source graph validation failed." }
+        } finally { Pop-Location }
+        $frontendGraphInfo = Get-Content -Raw -Encoding utf8 -LiteralPath $frontendGraph | ConvertFrom-Json
+    } else {
+        # Default mode retains the clean locked installation.
+        npm.cmd ci --cache $npmCache
+        if ($LASTEXITCODE -ne 0) { throw "Frontend dependency install (npm ci) failed." }
+        npm.cmd --workspace apps/web run build
+        if ($LASTEXITCODE -ne 0) { throw "Frontend production build failed." }
+    }
 
     $npmAudit = Join-Path $auditRoot "npm-audit.json"
     npm.cmd audit --cache $npmCache --omit=dev --json | Set-Content -Encoding utf8 -LiteralPath $npmAudit
     if ($LASTEXITCODE -ne 0) { throw "npm production dependency audit failed." }
 
-    $requirements = Join-Path $auditRoot "python-requirements.txt"
-    uv export --cache-dir .uv-cache --project apps/api --frozen --no-dev --no-emit-project --format requirements-txt --output-file $requirements | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Python release dependency export failed." }
+    # Generated release resources must not embed the builder's absolute paths.
+    if (-not $ReuseWorkspaceDependencies) {
+        uv export --cache-dir .uv-cache --project apps/api --frozen --no-dev --no-emit-project --no-header --format requirements-txt --output-file $requirements | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Python release dependency export failed." }
+    }
     $pythonAudit = Join-Path $auditRoot "pip-audit.json"
     # --disable-pip: the input is already a uv --frozen locked list, so there is
     # no need for pip-audit to re-run the pip resolver over it. The default
@@ -180,12 +252,21 @@ try {
     # Use pip-audit's default cache (no --cache-dir): pointing it at an empty
     # local dir forces a full OSV vulnerability-database download on every build,
     # which stalls behind slow CDN connectivity; the default cache is reused.
-    uv --cache-dir .uv-cache run --locked --project apps/api pip-audit --disable-pip --require-hashes -r $requirements --format json --output $pythonAudit
+    if ($ReuseWorkspaceDependencies) {
+        & $reusePython -m pip_audit --cache-dir (Join-Path $auditRoot "pip-audit-cache") --disable-pip --require-hashes -r $requirements --format json --output $pythonAudit
+    } else {
+        uv --cache-dir .uv-cache run --locked --project apps/api pip-audit --disable-pip --require-hashes -r $requirements --format json --output $pythonAudit
+    }
     if ($LASTEXITCODE -ne 0) { throw "Python production dependency audit failed." }
 
     $noticeArgs = @("--root", $projectRoot, "--output", $resourceRoot, "--version", $Version, "--revision", $revision, "--fail-on-policy", "--python-requirements", $requirements, "--python-audit", $pythonAudit)
     if ($makensis) { $noticeArgs += @("--nsis-executable", $makensis) }
-    uv --cache-dir .uv-cache run --locked --project apps/api python scripts/collect-third-party-notices.py @noticeArgs
+    if ($ReuseWorkspaceDependencies) {
+        $noticeArgs += @("--node-dependency-root", $WorkspaceDependencyRoot)
+        & $reusePython scripts/collect-third-party-notices.py @noticeArgs
+    } else {
+        uv --cache-dir .uv-cache run --locked --project apps/api python scripts/collect-third-party-notices.py @noticeArgs
+    }
     if ($LASTEXITCODE -ne 0) { throw "Third-party license/SBOM policy failed." }
     Copy-Item -LiteralPath $npmAudit, $pythonAudit, $requirements -Destination $resourceRoot
 
@@ -199,12 +280,39 @@ try {
         builder_os = [System.Environment]::OSVersion.VersionString
         architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
     }
-    $buildMetadata | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $resourceRoot "BUILD_METADATA.json")
+    if ($ReuseWorkspaceDependencies) {
+        $reusePublic = [ordered]@{
+            mode = $reusePreflight.mode
+            node_source = "workspace-root/node_modules"
+            python_source = "workspace-root/apps/api/.venv"
+            input_sha256 = $reusePreflight.input_sha256
+            node_inventory = $reusePreflight.node_inventory
+            node_tool_versions = $reusePreflight.node_tool_versions
+            python_tool_versions = $reusePreflight.python_tool_versions
+            python_runtime_inventory = $pythonRuntimeInventory
+            frontend_source_graph_sha256 = $frontendGraphInfo.source_graph_sha256
+            typescript_check = "tsc -b --force --listFiles --noEmit; output paths checked before native compiler"
+            boundary = "Existing dependencies were reused; no clean install or full dependency-byte reproducibility is claimed."
+        }
+        $buildMetadata["dependency_source"] = $reusePublic
+    }
+    $buildMetadata | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $resourceRoot "BUILD_METADATA.json")
 
     $env:DOCUMENT_PIPELINE_RELEASE_RESOURCES = $resourceRoot
     $env:DOCUMENT_PIPELINE_BUILD_VERSION = $Version
-    uv --cache-dir .uv-cache run --locked --project apps/api pyinstaller --noconfirm --clean --distpath $distRoot --workpath $workRoot $specPath
+    if ($ReuseWorkspaceDependencies) {
+        & $reusePython -m PyInstaller --noconfirm --clean --distpath $distRoot --workpath $workRoot $specPath
+    } else {
+        uv --cache-dir .uv-cache run --locked --project apps/api pyinstaller --noconfirm --clean --distpath $distRoot --workpath $workRoot $specPath
+    }
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
+    if ($ReuseWorkspaceDependencies) {
+        $analysisToc = Join-Path $workRoot "DocumentPipeline\Analysis-00.toc"
+        $analysisJson = & $reusePython scripts/release_dependency_reuse.py verify-analysis --candidate $projectRoot --dependency-root $WorkspaceDependencyRoot --analysis-toc $analysisToc
+        if ($LASTEXITCODE -ne 0) { throw "PyInstaller application source validation failed." }
+        $reuseAnalysis = ($analysisJson | Out-String) | ConvertFrom-Json
+        $reuseAnalysis | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $auditRoot "PYINSTALLER_SOURCE_GRAPH.json")
+    }
 
     $executable = Join-Path $distRoot "Zhiyi\ZhiyiCLI.exe"
     if (-not (Test-Path -LiteralPath $executable)) { throw "Release executable is missing." }
@@ -243,10 +351,18 @@ try {
     if ($RequireSignature -and @($artifacts | Where-Object signature_status -ne "Valid").Count -gt 0) {
         throw "Release signature gate failed. Every EXE and installer must have a valid Authenticode signature."
     }
-    uv --cache-dir .uv-cache run --locked --project apps/api python scripts/release_evidence.py verify-source --root $projectRoot --manifest $sourceManifest
+    if ($ReuseWorkspaceDependencies) {
+        & $reusePython scripts/release_evidence.py verify-source --root $projectRoot --manifest $sourceManifest
+    } else {
+        uv --cache-dir .uv-cache run --locked --project apps/api python scripts/release_evidence.py verify-source --root $projectRoot --manifest $sourceManifest
+    }
     if ($LASTEXITCODE -ne 0) { throw "Candidate source drifted during build." }
     $payloadManifest = Join-Path $distRoot "PAYLOAD_MANIFEST.json"
-    uv --cache-dir .uv-cache run --locked --project apps/api python scripts/release_evidence.py payload --root (Join-Path $distRoot "Zhiyi") --manifest $payloadManifest
+    if ($ReuseWorkspaceDependencies) {
+        & $reusePython scripts/release_evidence.py payload --root (Join-Path $distRoot "Zhiyi") --manifest $payloadManifest
+    } else {
+        uv --cache-dir .uv-cache run --locked --project apps/api python scripts/release_evidence.py payload --root (Join-Path $distRoot "Zhiyi") --manifest $payloadManifest
+    }
     if ($LASTEXITCODE -ne 0) { throw "Cannot bind complete release payload." }
     $manifest = [ordered]@{
         schema_version = 2
@@ -277,6 +393,10 @@ try {
             }
         })
     }
+    if ($ReuseWorkspaceDependencies) {
+        $manifest["dependency_source"] = $reusePublic
+        $manifest["python_application_source_graph"] = $reuseAnalysis
+    }
     $manifest | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $distRoot "RELEASE_MANIFEST.json")
     Copy-Item -LiteralPath $resourceRoot -Destination (Join-Path $distRoot "resources") -Recurse
     $checksumTargets = @($artifacts) + @([ordered]@{ path = "PAYLOAD_MANIFEST.json"; sha256 = $manifest.payload_manifest_sha256 }) + @($manifest.evidence)
@@ -290,3 +410,8 @@ try {
 }
 
 Write-Output "Release directory: $distRoot"
+} finally {
+    foreach ($name in $reuseEnvironment.Keys) {
+        [Environment]::SetEnvironmentVariable($name, $reuseEnvironment[$name], "Process")
+    }
+}

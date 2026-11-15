@@ -158,7 +158,7 @@ def test_backup_status_reports_supervised_restore_result(client: TestClient) -> 
     runtime_dir = client.app.state.settings.storage_dir.parent / "runtime"
     runtime_dir.mkdir(exist_ok=True)
     (runtime_dir / "restore-result.json").write_text(
-        '{"state":"failed","message":"恢复失败但原数据保持不变"}',
+        '{"state":"failed","message":"恢复失败但原数据保持不变","completed_at":1760000000.5}',
         encoding="utf-8",
     )
 
@@ -167,3 +167,15 @@ def test_backup_status_reports_supervised_restore_result(client: TestClient) -> 
     assert response.status_code == 200
     assert response.json()["restore_state"] == "failed"
     assert "原数据保持不变" in response.json()["restore_message"]
+    assert response.json()["restore_completed_at"] == 1760000000.5
+
+
+def test_backup_status_ignores_invalid_restore_result(client: TestClient) -> None:
+    runtime_dir = client.app.state.settings.storage_dir.parent / "runtime"
+    runtime_dir.mkdir(exist_ok=True)
+    (runtime_dir / "restore-result.json").write_text("[]", encoding="utf-8")
+
+    response = client.get("/api/v1/backups/status")
+
+    assert response.status_code == 200
+    assert response.json()["restore_state"] is None

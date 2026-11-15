@@ -62,6 +62,19 @@ describe("DocumentPreview", () => {
     expect(screen.getByText("正文")).toBeInTheDocument();
   });
 
+  it("keeps markdown external images inert and opens explicit web links without document referrers", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ kind: "markdown",
+      text: "![远程示意](https://example.test/pixel?document=private)\n[参考网站](https://example.test/reference)\n[相对原件](../private.md)", truncated: false }) }));
+    render(<DocumentPreview contentType="text/markdown" filename="来源说明.md" pageNumber={1} scale={1}
+      url="/api/v1/tasks/markdown-external/file" />);
+    const external = await screen.findByRole("link", { name: "参考网站" });
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(external).toHaveAttribute("href", "https://example.test/reference");
+    expect(external).toHaveAttribute("target", "_blank");
+    expect(external).toHaveAttribute("rel", "noopener noreferrer");
+    expect(screen.queryByRole("link", { name: "相对原件" })).not.toBeInTheDocument();
+  });
+
   it("renders Word document as structured blocks with in-place images", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,
@@ -102,7 +115,6 @@ describe("DocumentPreview", () => {
       scale={1} url="/api/v1/tasks/long/file" />);
     expect(await screen.findByText(/预览仅显示开头 5 个字符/)).toBeInTheDocument();
     expect(screen.getByText(/这不是模型的读取范围/)).toBeInTheDocument();
-    expect(screen.getByText("下载完整原件")).toHaveAttribute("href", "/api/v1/tasks/long/file");
   });
 
   it("keeps access to the original when Office preview fails", async () => {
@@ -110,7 +122,6 @@ describe("DocumentPreview", () => {
     render(<DocumentPreview contentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
       filename="大表.xlsx" pageNumber={1} scale={1} url="/api/v1/tasks/large/file" />);
     expect(await screen.findByText("预览资源超限")).toBeInTheDocument();
-    expect(screen.getByText("下载完整原件")).toHaveAttribute("download", "大表.xlsx");
     expect(screen.getByText(/预览失败不影响已保存的原件/)).toBeInTheDocument();
   });
 
@@ -237,9 +248,9 @@ describe("DocumentPreview", () => {
     expect(screen.getByRole("spinbutton", { name: "原件行号" })).toHaveValue(51);
   });
 
-  it("does not add an inner download when the parent already owns it, and reports image failure", async () => {
+  it("reports image failure inside the preview", async () => {
     render(<DocumentPreview contentType="image/png" filename="fail.png" pageNumber={1} scale={1}
-      url="/api/v1/tasks/image-failure-test/file" showDownload={false} />);
+      url="/api/v1/tasks/image-failure-test/file" />);
     expect(screen.queryByText("下载完整原件")).not.toBeInTheDocument();
     fireEvent.error(screen.getByRole("img"));
     await waitFor(() => expect(screen.getByText("这张图片无法预览，请在原件中查看。")).toBeInTheDocument());

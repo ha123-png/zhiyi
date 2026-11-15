@@ -1,4 +1,5 @@
 """Bounded diagnostics for local inspection, with credentials and paths redacted."""
+import json
 import re
 
 DIAGNOSTIC_LIMIT = 8192
@@ -21,6 +22,29 @@ def safe_diagnostic(message: str, *, secrets: tuple[str, ...] = (), limit: int =
         first = (limit - len(marker)) // 2
         text = text[:first] + marker + text[-(limit - first - len(marker)):]
     return text
+
+
+def service_error_diagnostic(error, secret, *, limit=DIAGNOSTIC_LIMIT):
+    # Services can return either plain text or a JSON object. Redact the known
+    # credential in both literal and JSON-escaped form before truncating it.
+    if isinstance(error, str):
+        try:
+            decoded = json.loads(error)
+        except (ValueError, RecursionError):
+            pass
+        else:
+            if isinstance(decoded, (dict, list, str)):
+                error = decoded
+    text = error if isinstance(error, str) else json.dumps(error, ensure_ascii=False)
+    secrets = (secret or "",)
+    if secret:
+        encoded = json.dumps(secret, ensure_ascii=False)[1:-1]
+        ascii_encoded = json.dumps(secret, ensure_ascii=True)[1:-1]
+        secrets += (
+            encoded, ascii_encoded,
+            encoded.replace("/", r"\/"), ascii_encoded.replace("/", r"\/"),
+        )
+    return safe_diagnostic(text, secrets=secrets, limit=limit)
 
 
 def diagnostic_summary(message: str) -> str:

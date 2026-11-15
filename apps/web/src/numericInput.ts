@@ -45,3 +45,22 @@ export function parseNumericInput(input: string, label: string): number | string
   }
   return value;
 }
+
+export function manualCellValue(input: string, kind?: string): string | number | boolean | null {
+  if (!input) return null;
+  const text = input.trim();
+  if (kind === "number" || kind === "integer") {
+    const decimal = /^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(text) ? text.replaceAll(",", "") : text;
+    try {
+      return decimal ? parseNumericInput(decimal, "") : input;
+    } catch {
+      return input;
+    }
+  }
+  if (kind === "boolean") {
+    const normalized = text.toLowerCase();
+    if (["是", "true", "1"].includes(normalized)) return true;
+    if (["否", "false", "0"].includes(normalized)) return false;
+  }
+  return input;
+}

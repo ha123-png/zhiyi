@@ -85,16 +85,16 @@ def current_snapshot(session: Session, task_id: str) -> dict:
     }
 
 
-def _check_values(values: dict, schema: list[dict], section: str) -> None:
+def _check_values(values: dict, schema: list[dict], section: str, *, allow_text: bool = False) -> None:
     fields = {column["key"]: column for column in schema if column.get("section") == section}
     unknown = values.keys() - fields.keys()
     if unknown:
         raise HTTPException(422, f"不存在的{('文件' if section == 'header' else '明细')}字段：{', '.join(sorted(unknown))}。")
-    check_column_values(values, list(fields.values()))
+    check_column_values(values, list(fields.values()), allow_text=allow_text)
 
 
-def check_column_values(values: dict, schema: list[dict]) -> None:
-    """Validate the same scalar contract for file, independent and external writes."""
+def check_column_values(values: dict, schema: list[dict], *, allow_text: bool = False) -> None:
+    """Validate values and preserve text exceptions when revising current data."""
     fields = {column["key"]: column for column in schema}
     unknown = values.keys() - fields.keys()
     if unknown:
@@ -104,7 +104,7 @@ def check_column_values(values: dict, schema: list[dict]) -> None:
         if kind in {"number", "integer"} and isinstance(value, str):
             value = parse_unsafe_integer_string(value)
             values[key] = value
-        if value is None or value == "":
+        if value is None or value == "" or allow_text and isinstance(value, str):
             continue
         valid = not isinstance(value, (dict, list))
         if kind in {"number", "integer"}:
@@ -329,6 +329,8 @@ def revise_current(
             raise HTTPException(409, "本轮编辑已经结束，请刷新后继续。")
     schema = json.loads(current.schema_json)
     header_changes, detail_changes = header_changes or {}, detail_changes or {}
+    type_review = validation_json is None and "autonomous_field_type" in current.validation_json
+    previous_ids = [item["id"] for item in current_snapshot(session, task_id)["items"]] if type_review else []
     deleted = set(deleted_ids or [])
     affected = detail_changes.keys() | deleted
     rows = {row.id: row for row in session.scalars(select(DataRowRecord).where(
@@ -338,9 +340,11 @@ def revise_current(
         raise HTTPException(409, "修改范围包含不存在、已删除或同时被修改和删除的明细。")
     if any(rows[row_id].is_header_only for row_id in detail_changes):
         raise HTTPException(409, "这份文件只有文件级信息，不能把占位行当作明细编辑。")
-    _check_values(header_changes, schema, "header")
-    for values in list(detail_changes.values()) + (new_items or []):
-        _check_values(values, schema, "item")
+    _check_values(header_changes, schema, "header", allow_text=True)
+    for values in detail_changes.values():
+        _check_values(values, schema, "item", allow_text=True)
+    for values in new_items or []:
+        _check_values(values, schema, "item", allow_text=True)
     before = {"header": json.loads(current.header_json), "has_data": current.has_data,
               "validation": json.loads(current.validation_json),
               "items": [{"id": row.id, "item_index": row.item_index, "values": json.loads(row.row_json)}
@@ -425,7 +429,7 @@ def revise_current(
     session.execute(update(DataRowRecord).where(DataRowRecord.task_id == task_id)
                     .values(row_version=current.current_version + 1, updated_at=current.updated_at))
     if validation_json is None:
-        refresh_validation(session, current)
+        refresh_validation(session, current, previous_ids)
     after = {"header": header, "has_data": current.has_data, "items": prospective + [
         {"id": row.id, "item_index": row.item_index, "values": json.loads(row.row_json)} for row in added_rows],
         "validation": json.loads(current.validation_json)}
@@ -435,11 +439,11 @@ def revise_current(
     return current
 
 
-def refresh_validation(session: Session, current: FileCurrentDataRecord) -> None:
+def refresh_validation(session: Session, current: FileCurrentDataRecord, previous_ids: list[int]) -> None:
     from document_pipeline_api.models import ExtractionRecord, TaskRecord
     from document_pipeline_api.services.rule_evaluation import evaluate_rules
     from document_pipeline_api.services.processing_input import input_scope_issues
-    from document_pipeline_api.schemas.extraction import DocumentKind
+    from document_pipeline_api.schemas.extraction import DocumentKind, TemplateExtraction
 
     extraction = session.get(ExtractionRecord, current.task_id)
     if extraction is None:
@@ -453,18 +457,29 @@ def refresh_validation(session: Session, current: FileCurrentDataRecord) -> None
         if needs_rules:
             evaluation = evaluate_rules(session, document_kind=DocumentKind(extraction.document_kind),
                                         result=validation_result(extraction, extraction_result(session, extraction)),
-                                        template_id=extraction.template_id, template_version=extraction.template_version)
+                                        template_id=extraction.template_id, template_version=extraction.template_version,
+                                        manual_revision=True)
             issues = evaluation.issues
         issues += input_scope_issues(extraction.input_scope_json)
+        if "autonomous_field_type" in current.validation_json:
+            from document_pipeline_api.services.autonomous_extraction import carry_type_issues
+            from document_pipeline_api.schemas.extraction import ValidationIssue
+            snapshot = current_snapshot(session, current.task_id)
+            result = TemplateExtraction(header=snapshot["header"], items=[row["values"] for row in snapshot["items"]])
+            prior = [ValidationIssue.model_validate(issue) for issue in json.loads(current.validation_json)]
+            issues.extend(carry_type_issues(prior, previous_ids, [row["id"] for row in snapshot["items"]], result))
     # An earlier ignore was attached to earlier values. Changed facts receive a
     # fresh evaluation under the pinned rules, from either editing entry point.
     current.validation_json = encode([issue.model_dump() for issue in issues])
     task = session.get(TaskRecord, current.task_id)
     if task is not None and task.status in {"completed", "needs_review"}:
-        task.status = "needs_review" if issues else "completed"
+        pending = task.status == "needs_review" and any(not issue.not_checked for issue in issues)
+        task.status = "needs_review" if pending else "completed"
+        if not pending:
+            task.completed_at = task.completed_at or current.updated_at
         task.updated_at = current.updated_at
-    session.execute(update(DataRowRecord).where(DataRowRecord.task_id == current.task_id)
-                    .values(review_pending=bool(issues)))
+        session.execute(update(DataRowRecord).where(DataRowRecord.task_id == current.task_id)
+                        .values(review_pending=pending))
 
 
 def extraction_result(session: Session, extraction):
@@ -483,7 +498,12 @@ def validation_result(extraction, payload):
     if extraction.document_kind == "custom":
         return payload
     aliases = {value: key for key, value in ITEM_ALIASES.items()}
-    return DocumentExtraction.model_validate({**{key: None for key in DocumentExtraction.model_fields if key != "items"},
-                                              **{key: value for key, value in payload.header.items() if key in DocumentExtraction.model_fields}, "items": [
-        {**{key: None for key in LineItem.model_fields}, **{aliases.get(key, key): value for key, value in item.items() if aliases.get(key, key) in LineItem.model_fields}} for item in payload.items
-    ]})
+    header = {key: payload.header.get(key) for key in DocumentExtraction.model_fields if key != "items"}
+    items = [
+        LineItem.model_construct(**{
+            **dict.fromkeys(LineItem.model_fields),
+            **{aliases.get(key, key): value for key, value in item.items() if aliases.get(key, key) in LineItem.model_fields},
+        })
+        for item in payload.items
+    ]
+    return DocumentExtraction.model_construct(**header, items=items)

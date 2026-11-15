@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import importlib.util
 from importlib import metadata
 import json
 from pathlib import Path
@@ -144,8 +145,41 @@ def _copy_python_licenses(
     return rows
 
 
-def _copy_node_licenses(root: Path, output: Path) -> list[dict[str, str]]:
+def _package_tree_sha256(package_dir: Path) -> str:
+    files = []
+    for path in package_dir.rglob("*"):
+        if path.is_symlink() or path.is_junction():
+            raise RuntimeError("A reviewed npm package must not contain links")
+        if path.is_file():
+            files.append({"path": path.relative_to(package_dir).as_posix(),
+                          "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                          "size_bytes": path.stat().st_size})
+    files.sort(key=lambda item: item["path"])
+    data = json.dumps(files, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _copy_node_licenses(root: Path, output: Path, dependency_root: Path | None = None) -> list[dict[str, str]]:
     lock = json.loads((root / "package-lock.json").read_text(encoding="utf-8"))
+    # A clean build uses its own installed dependencies; reuse must opt into
+    # an explicitly validated workspace root. Both paths require completeness.
+    dependency_root = (dependency_root or root).resolve(strict=True)
+    spec = importlib.util.spec_from_file_location(
+        "release_dependency_reuse", Path(__file__).with_name("release_dependency_reuse.py")
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Cannot load dependency validation")
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+    overrides = {}
+    override_path = root / "packaging/licenses/node-overrides.json"
+    if override_path.exists():
+        if override_path.is_symlink() or override_path.is_junction():
+            raise RuntimeError("Node license exception index must not be a link")
+        override_index = json.loads(override_path.read_text(encoding="utf-8"))
+        if override_index.get("schema") != 1 or not isinstance(override_index.get("packages"), dict):
+            raise RuntimeError("Invalid node license exception index")
+        overrides = override_index["packages"]
     rows: list[dict[str, str]] = []
     for package_path, package in sorted(lock.get("packages", {}).items()):
         if not package_path.startswith("node_modules/") or package.get("dev") is True:
@@ -153,30 +187,89 @@ def _copy_node_licenses(root: Path, output: Path) -> list[dict[str, str]]:
         name = package_path.removeprefix("node_modules/")
         if name == "@document-pipeline/web":
             continue
+        if not helpers.package_applies(package):
+            continue
         version = str(package.get("version", "unknown"))
-        package_dir = root / package_path
+        package_dir = helpers.checked_package_dir(dependency_root, package_path)
         license_name = package.get("license")
         package_json = package_dir / "package.json"
+        if not package_json.is_file():
+            raise RuntimeError(f"Production dependency is missing: {package_path}")
+        installed = json.loads(package_json.read_text(encoding="utf-8"))
+        expected_name = package.get("name") or package_path.rsplit("node_modules/", 1)[-1]
+        if installed.get("version") != version or installed.get("name") != expected_name:
+            raise RuntimeError(f"Production dependency differs from lock: {package_path}")
+        override = overrides.get(f"{name}@{version}")
+        if override is not None:
+            if (override.get("version") != version or override.get("package_integrity") != package.get("integrity")
+                    or _package_tree_sha256(package_dir) != override.get("package_tree_sha256")):
+                raise RuntimeError(f"Reviewed license exception does not match exact package bytes: {package_path}")
+            if not all(isinstance(override.get(field), str) and override[field] for field in
+                       ("file", "sha256", "license", "source_url", "source_revision", "disclosure")):
+                raise RuntimeError(f"Incomplete license exception provenance: {package_path}")
+            license_name = override["license"]
         if not license_name and package_json.is_file():
             license_name = json.loads(package_json.read_text(encoding="utf-8")).get("license")
-        rows.append(
-            {
+        row = {
                 "ecosystem": "node",
                 "name": name,
                 "version": version,
                 "license": str(license_name or "未声明"),
             }
-        )
+        if override is not None:
+            row["license_provenance"] = {
+                key: override[key] for key in ("disclosure", "source_url", "source_revision", "sha256", "package_tree_sha256")
+            }
+        rows.append(row)
         if not package_dir.is_dir():
             continue
+        copied = False
         for source in package_dir.iterdir():
             if not source.is_file() or not LICENSE_NAMES.match(source.name):
                 continue
+            if source.is_symlink() or not source.resolve().is_relative_to(package_dir.resolve()):
+                raise RuntimeError(f"Production dependency license is linked outside its package: {package_path}")
             destination = output / "node" / _safe_name(
                 f"{name}-{version}-{source.name}"
             )
+            if destination.exists():
+                raise RuntimeError(f"Production dependency license destination collides: {package_path}")
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, destination)
+            copied = True
+        if override is not None:
+            license_root = root / "packaging/licenses"
+            source = license_root / override["file"]
+            if (source.parent != license_root or source.is_symlink() or not source.is_file()
+                    or hashlib.sha256(source.read_bytes()).hexdigest() != override["sha256"]):
+                raise RuntimeError(f"Reviewed upstream license differs: {package_path}")
+            destination = output / "node" / _safe_name(f"{name}-{version}-{source.name}")
+            if destination.exists():
+                raise RuntimeError(f"Production dependency license destination collides: {package_path}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+            copied = True
+        vendor = package_dir / "lib-vendor"
+        nested = {}
+        if vendor.exists():
+            if vendor.is_symlink() or vendor.is_junction():
+                raise RuntimeError(f"Vendored license directory is linked: {package_path}")
+            for source in sorted(vendor.rglob("*")):
+                if source.is_symlink() or source.is_junction():
+                    raise RuntimeError(f"Vendored dependency contains a link: {package_path}")
+                if not source.is_file() or not LICENSE_NAMES.match(source.name):
+                    continue
+                relative = source.relative_to(package_dir).as_posix()
+                nested[relative] = hashlib.sha256(source.read_bytes()).hexdigest()
+                destination = output / "node" / _safe_name(f"{name}-{version}-{relative}")
+                if destination.exists():
+                    raise RuntimeError(f"Vendored license destination collides: {package_path}")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+        if override is not None and nested != override.get("nested_license_sha256", {}):
+            raise RuntimeError(f"Reviewed vendored licenses differ: {package_path}")
+        if not copied:
+            raise RuntimeError(f"Production dependency has no license file: {package_path}")
     return rows
 
 
@@ -257,6 +350,8 @@ def main() -> None:
     parser.add_argument("--revision", required=True)
     parser.add_argument("--fail-on-policy", action="store_true")
     parser.add_argument("--nsis-executable", type=Path)
+    parser.add_argument("--node-dependency-root", type=Path,
+                        help="Verified workspace dependency root for explicit strict reuse")
     parser.add_argument("--python-requirements", type=Path, required=True)
     parser.add_argument("--python-audit", type=Path, required=True)
     args = parser.parse_args()
@@ -267,7 +362,7 @@ def main() -> None:
     rows = _copy_python_licenses(
         output, _runtime_python_versions(args.python_requirements, args.python_audit)
     )
-    rows.extend(_copy_node_licenses(root, output))
+    rows.extend(_copy_node_licenses(root, output, dependency_root=args.node_dependency_root))
     rows.extend(_copy_build_tool_licenses(output, args.nsis_executable))
     rows.sort(key=lambda row: (row["ecosystem"], row["name"].lower(), row["version"]))
     lines = [
@@ -283,6 +378,16 @@ def main() -> None:
         f"{row['license'].replace('|', '/')} |"
         for row in rows
     )
+    provenance_rows = [row for row in rows if "license_provenance" in row]
+    if provenance_rows:
+        lines.extend(["", "## 许可证来源说明", ""])
+        for row in provenance_rows:
+            provenance = row["license_provenance"]
+            lines.extend([
+                f"- {row['name']}@{row['version']}：{provenance['disclosure']}",
+                f"  来源：{provenance['source_url']}；修订：{provenance['source_revision']}；"
+                f"许可证 SHA256：{provenance['sha256']}；包内容清单 SHA256：{provenance['package_tree_sha256']}。",
+            ])
     (output / "THIRD_PARTY_NOTICES.md").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
     )

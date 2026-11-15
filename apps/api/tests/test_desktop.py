@@ -219,7 +219,9 @@ def test_desktop_bridge_does_not_expose_native_window(tmp_path: Path) -> None:
     assert all(name.startswith("_") for name in vars(api))
     public = {name for name in dir(api) if not name.startswith("_")}
     assert public == {"get_export_directory", "choose_export_directory", "choose_folder", "choose_import_files",
-                      "open_export_folder", "export_template", "download_task_file", "export_table"}
+                      "open_export_folder", "open_backup_folder", "export_template", "download_task_file", "export_table",
+                      "restart_with_update"}
+    assert api.restart_with_update()["ok"] is False
 
 
 def test_secondary_desktop_instance_focuses_existing_window(monkeypatch, tmp_path: Path) -> None:

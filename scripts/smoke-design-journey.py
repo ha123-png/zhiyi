@@ -20,20 +20,50 @@ from document_pipeline_api.model_providers.openai_compatible import OpenAICompat
 from document_pipeline_api.services.extraction import process_task
 
 
+def write_fixture_once(path: Path, content: bytes, boundary: Path) -> None:
+    """Create a fixture exclusively, or reuse an identical completed one."""
+    root = boundary.resolve()
+    absolute = path.absolute()
+    try:
+        relative = absolute.relative_to(root)
+    except ValueError as error:
+        raise RuntimeError("Fixture path escapes its synthetic workspace") from error
+    if not relative.parts or ".." in relative.parts:
+        raise RuntimeError("Fixture path escapes its synthetic workspace")
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink() or cursor.is_junction():
+            raise RuntimeError("Fixture path contains a link")
+    if path.exists():
+        if not path.is_file() or path.read_bytes() != content:
+            raise RuntimeError("Existing fixture has different contents; preserve it and stop")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as output:
+        output.write(content)
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--key-file", type=Path, required=True)
     args = parser.parse_args()
-    root = Path(__file__).resolve().parents[1] / ".local/acceptance-design-live"
+    local = Path(__file__).resolve().parents[1] / ".local"
+    root = local / "acceptance-design-live"
+    if local.is_symlink() or local.is_junction() or root.is_symlink() or root.is_junction():
+        raise RuntimeError("Synthetic workspace must not be a link")
     root.mkdir(parents=True, exist_ok=True)
     ledger = root / "journey.json"
+    if ledger.is_symlink() or ledger.is_junction():
+        raise RuntimeError("Synthetic journey ledger must not be a link")
     state = json.loads(ledger.read_text(encoding="utf-8")) if ledger.exists() else {"requests": [], "cases": {}}
     settings = Settings(database_url=f"sqlite:///{root / 'document-pipeline.db'}", storage_dir=root / "uploads", queue_enabled=False)
     stage = "setup"
 
     def record():
         temporary = ledger.with_suffix(".tmp")
-        temporary.write_bytes(json.dumps(state, ensure_ascii=False, indent=2).encode())
+        with temporary.open("xb") as output:
+            output.write(json.dumps(state, ensure_ascii=False, indent=2).encode())
         temporary.replace(ledger)
 
     original_post = OpenAICompatibleProvider._post_completion
@@ -109,9 +139,11 @@ def main():
                 continue
             case = state["cases"].setdefault(stage, {})
             raw = (content + ("补充观察记录。" * 200 + "TAIL_NOT_SENT_917" if limited else "")).encode()
-            (root / filename).write_bytes(raw)
+            write_fixture_once(root / filename, raw, root)
             req("PUT", "/system/settings", json={"allow_limited_input": limited, "input_text_limit": 180})
             external = root / "external-copy"
+            if external.is_symlink() or external.is_junction():
+                raise RuntimeError("Synthetic external-copy directory must not be a link")
             external.mkdir(exist_ok=True)
             if limited:
                 binding_url = f"/templates/{template['id']}/local-export"
@@ -138,8 +170,7 @@ def main():
             assert req("GET", f"/tasks/{task_id}/file").content == raw
             conflict = external / template["name"] / suggestion
             if limited and not case.get("confirmed"):
-                conflict.parent.mkdir(parents=True, exist_ok=True)
-                conflict.write_bytes(b"existing independent file - do not overwrite")
+                write_fixture_once(conflict, b"existing independent file - do not overwrite", external)
             if not case.get("confirmed"):
                 confirmation = req("POST", f"/tasks/{task_id}/confirm", json={"expected_review_version": result["review_version"], "filename": suggestion}).json()
                 case.update(confirmed=True, table_id=confirmation["table_id"])

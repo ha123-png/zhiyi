@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ArrowRight, History, X } from "lucide-react";
 import { getFileRevision, getFileRevisions, type FileRevisionDetail, type FileRevisionSummary } from "../api";
 import { serverDate } from "../time";
+import { trapModalTab } from "../useModalFocus";
 import { Icon } from "./Icon";
 
 function summary(version: FileRevisionSummary) {
@@ -24,10 +25,24 @@ function FileRevisionHistoryContent({ taskId, filename, onClose }: {taskId: stri
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<string | null>(null);
-  const [details, setDetails] = useState<FileRevisionDetail | null>(null);
+  const [detailResult, setDetails] = useState<FileRevisionDetail | null>(null);
   const [detailPage, setDetailPage] = useState(1);
-  const [error, setError] = useState("");
+  const [listError, setListError] = useState("");
+  const [listRetry, setListRetry] = useState(0);
+  const [detailError, setDetailError] = useState("");
+  const [detailRetry, setDetailRetry] = useState(0);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [loading, setLoading] = useState(true);
+  const details = detailResult?.id === selected ? detailResult : null;
+  useLayoutEffect(() => {
+    const modal = dialog.current;
+    const active = document.activeElement;
+    // A retry control can disappear, or the last-page button become disabled.
+    // Keep focus inside the native dialog without stealing it from a chosen version.
+    if (modal?.open && (active === document.body || (active instanceof HTMLElement && modal.contains(active) && active.matches(":disabled")))) {
+      changes.current?.focus({preventScroll: true});
+    }
+  }, [loading, detailLoading, listError, detailError, versions.length]);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
     dialog.current?.showModal();
@@ -35,24 +50,25 @@ function FileRevisionHistoryContent({ taskId, filename, onClose }: {taskId: stri
   }, []);
   useEffect(() => {
     let active = true;
-    setLoading(true); setError("");
+    setLoading(true); setListError("");
     getFileRevisions(taskId, page).then(result => {
       if (!active) return;
       setVersions(current => page === 1 ? result.revisions : [...current, ...result.revisions]);
       setTotal(result.total);
       setSelected(current => current ?? result.revisions[0]?.id ?? null);
-    }).catch(e => { if (active) setError(e.message); }).finally(() => { if (active) setLoading(false); });
+    }).catch(e => { if (active) setListError(e.message); }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [taskId, page]);
+  }, [taskId, page, listRetry]);
   useEffect(() => {
     if (!selected) return;
     let active = true;
-    setDetails(null); setError("");
+    setDetailLoading(true); setDetailError("");
     if (changes.current) changes.current.scrollTop = 0;
     getFileRevision(taskId, selected, detailPage).then(result => { if (active) setDetails(result); })
-      .catch(e => { if (active) setError(e.message); });
+      .catch(e => { if (active) setDetailError(e.message); })
+      .finally(() => { if (active) setDetailLoading(false); });
     return () => { active = false; };
-  }, [taskId, selected, detailPage]);
+  }, [taskId, selected, detailPage, detailRetry]);
   const labels = new Map(details?.schema.map(field => [field.key, field.label]));
   function ordered(keys: string[]) {
     const present = new Set(keys);
@@ -66,22 +82,28 @@ function FileRevisionHistoryContent({ taskId, filename, onClose }: {taskId: stri
     </div>;
   }
   return <dialog ref={dialog} className="template-history-dialog file-revision-dialog" aria-labelledby="file-revision-title"
+    onKeyDown={trapModalTab}
     onCancel={event => { event.preventDefault(); onClose(); }}>
     <div className="template-history-head"><div><h3 id="file-revision-title"><Icon icon={History} size={18} /> 文件修订历史</h3>
       <p className="support" title={filename}>{filename}</p></div>
       <button className="btn ghost icon-only sm" aria-label="关闭文件修订历史" onClick={onClose}><Icon icon={X} size={18} /></button>
     </div>
     <div className="template-history-body">
-      <nav className="template-version-list" aria-label="文件版本">{versions.map(version => <button key={version.id} aria-pressed={selected === version.id}
+      <nav className="template-version-list" aria-label="文件版本" aria-busy={loading}>{versions.map(version => <button key={version.id} aria-pressed={selected === version.id}
         onClick={() => { setDetailPage(1); setSelected(version.id); }}>
         <strong>V{version.version}{!version.sealed ? " · 本轮修改" : ""}</strong>
         <span>{serverDate(version.created_at).toLocaleString("zh-CN", {hour12: false})}</span><span>{summary(version)}</span>
       </button>)}{loading && <p className="support">读取中…</p>}
-      {versions.length < total && <button disabled={loading} onClick={() => setPage(value => value + 1)}>更早的版本</button>}</nav>
-      <div ref={changes} className="template-version-detail" aria-live="polite">
-        {error && <p role="alert" className="callout danger">{error}</p>}
-        {!loading && !versions.length && <p className="support">还没有修订记录。</p>}
-        {selected && !details && !error && <p className="support">正在读取变化…</p>}
+      {versions.length < total && <button aria-disabled={loading} onClick={() => { if (!loading) { if (listError) setListRetry(value => value + 1); else setPage(value => value + 1); } }}>
+        {listError ? "重新读取更早的版本" : "更早的版本"}</button>}</nav>
+      <div ref={changes} className="template-version-detail" tabIndex={-1} aria-label="修订变化" aria-live="polite" aria-busy={detailLoading}>
+        {listError && <><p role="alert" className="callout danger">版本列表读取失败：{listError}</p>
+          {!versions.length && <button className="btn secondary sm" disabled={loading} onClick={() => setListRetry(value => value + 1)}>重新读取版本</button>}</>}
+        {!loading && !listError && !versions.length && <p className="support">还没有修订记录。</p>}
+        {detailError && <><p role="alert" className="callout danger">第 {detailPage} 页变化读取失败：{detailError}</p>
+          {details && details.page !== detailPage && <p className="support">仍显示第 {details.page} 页变化。</p>}
+          <button className="btn secondary sm" disabled={detailLoading} onClick={() => setDetailRetry(value => value + 1)}>重新读取变化</button></>}
+        {selected && !detailError && (detailLoading || !details) && <p className="support">正在读取变化…</p>}
         {details && <><h4>V{details.version} · {summary(details)}</h4>
           {Object.keys(details.header).length > 0 && <section className="revision-item"><h5>文件级</h5><div className="revision-diff">
             {ordered(Object.keys(details.header)).map(key => difference(key, details.header[key].before, details.header[key].after))}
@@ -102,9 +124,9 @@ function FileRevisionHistoryContent({ taskId, filename, onClose }: {taskId: stri
             </section>;
           })}
           {details.total_details > details.page_size && <div className="file-revision-pagination">
-            <button className="btn secondary sm" disabled={detailPage === 1} onClick={() => setDetailPage(value => value - 1)}>上一页明细</button>
-            <span className="support">{detailPage} / {Math.ceil(details.total_details / details.page_size)}</span>
-            <button className="btn secondary sm" disabled={detailPage * details.page_size >= details.total_details} onClick={() => setDetailPage(value => value + 1)}>下一页明细</button>
+            <button className="btn secondary sm" disabled={details.page === 1} aria-disabled={detailLoading || details.page === 1} onClick={() => { if (!detailLoading && details.page > 1) { setDetailPage(details.page - 1); setDetailRetry(value => value + 1); } }}>上一页明细</button>
+            <span className="support">{details.page} / {Math.ceil(details.total_details / details.page_size)}</span>
+            <button className="btn secondary sm" disabled={details.page * details.page_size >= details.total_details} aria-disabled={detailLoading || details.page * details.page_size >= details.total_details} onClick={() => { if (!detailLoading && details.page * details.page_size < details.total_details) { setDetailPage(details.page + 1); setDetailRetry(value => value + 1); } }}>下一页明细</button>
           </div>}
         </>}
       </div>

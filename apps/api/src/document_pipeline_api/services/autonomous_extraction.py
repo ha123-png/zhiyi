@@ -1,20 +1,29 @@
 """One optional template; each file keeps its own schema and current data."""
+from datetime import date
 import json
 import math
 import re
+from typing import Annotated, Literal
 
 from fastapi import HTTPException
-from pydantic import Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, WrapValidator, model_validator
+from pydantic_core import PydanticCustomError
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.models import TemplateRecord
 from document_pipeline_api.models.task import utc_now
-from document_pipeline_api.schemas.extraction import TemplateExtraction
+from document_pipeline_api.schemas.extraction import TemplateExtraction, TemplateScalar, ValidationIssue
+from document_pipeline_api.schemas.json_numbers import JSONNumberToken, NumericPrecisionError, number_from_token
 from document_pipeline_api.schemas.templates import TemplateBody, TemplateFieldRead, TemplateRead
 
 
 AUTONOMOUS_TEMPLATE_ID = "builtin-autonomous"
 _JSON_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
+# Sentence separators and spaces carry no date information. Match the whole
+# value so ranges, timestamps and text surrounding the date remain reviewable.
+_MODEL_DATE = re.compile(r"[\s,，.。;；:：、!?！？]*([0-9]{4}-[0-9]{2}-[0-9]{2})[\s,，.。;；:：、!?！？]*")
+MODEL_FIELD_TYPE_ISSUE = "autonomous_field_type"
+_DETAIL_PATH = re.compile(r"items\[(\d+)]\.(.+)")
 
 
 def _model_number(value):
@@ -22,7 +31,7 @@ def _model_number(value):
     # the strict current-data contract, and text identifiers never pass here.
     if not isinstance(value, str) or _JSON_NUMBER.fullmatch(value) is None:
         return value
-    number = json.loads(value, parse_int=float)
+    number = float(number_from_token(value))
     mantissa = re.split('[eE]', value, maxsplit=1)[0]
     if (not math.isfinite(number) or abs(number) > 2**53 - 1
             or (number == 0 and any(digit in mantissa for digit in '123456789'))):
@@ -72,14 +81,15 @@ class AutonomousExtraction(TemplateExtraction):
         keys, labels = set(), set()
         for field in self.fields:
             label = " ".join(field.label.split()).casefold()
+            scoped_label = (field.section, label)
             key = field.key
             if (not key or len(key) > 128 or key in keys or key.startswith('__')
                     or key in {'source_filename', 'item_index'} or any(char in key for char in '.[]\\"')):
                 raise ValueError("每个字段必须有独立、有效的标识。")
-            if not label or label in labels:
-                raise ValueError("同一文件的字段名称不能重复或为空。")
+            if not label or scoped_label in labels:
+                raise PydanticCustomError("autonomous_field_label", "同一分区内的字段名称不能重复或为空。")
             keys.add(key)
-            labels.add(label)
+            labels.add(scoped_label)
         for field in self.fields:
             if field.value_type != 'number':
                 continue
@@ -93,7 +103,7 @@ class AutonomousExtraction(TemplateExtraction):
                     # cannot be safely adapted must not be reinterpreted as an
                     # exact Python int by the shared current-data validator.
                     if isinstance(row[field.key], str) and row[field.key] != '':
-                        raise ValueError("number 字段必须是可无损解析的 JSON 数字。")
+                        raise PydanticCustomError("autonomous_number_value", "数值字段必须填写数字。")
         schema = self.columns()
         try:
             _check_values(self.header, schema, 'header')
@@ -108,23 +118,143 @@ class AutonomousExtraction(TemplateExtraction):
                  "value_type": field.value_type, "user_defined": False} for field in self.fields]
 
 
+class AutonomousField(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1, max_length=128)
+    value_type: Literal["text", "number", "date", "boolean"]
+
+
+def _keep_model_number_token(value, validate):
+    return value if isinstance(value, JSONNumberToken) else validate(value)
+
+
+AutonomousScalar = Annotated[TemplateScalar, WrapValidator(_keep_model_number_token)]
+
+
+class AutonomousHeaderField(AutonomousField):
+    value: AutonomousScalar
+
+
+class AutonomousModelResult(BaseModel):
+    """The model describes columns and gives values in order. Only Zhiyi assigns keys."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    header: list[AutonomousHeaderField] = Field(max_length=100)
+    item_fields: list[AutonomousField] = Field(max_length=100)
+    items: list[list[AutonomousScalar]]
+    _extraction: AutonomousExtraction = PrivateAttr()
+    _issues: list[ValidationIssue] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="after")
+    def build_extraction(self):
+        if any(len(row) != len(self.item_fields) for row in self.items) or (self.items and not self.item_fields):
+            raise PydanticCustomError("autonomous_row_width", "有明细的值数量与明细字段数量不一致。")
+        header_keys = [f"h{index}" for index in range(1, len(self.header) + 1)]
+        item_keys = [f"i{index}" for index in range(1, len(self.item_fields) + 1)]
+        self._extraction = AutonomousExtraction(
+            fields=[
+                TemplateFieldRead(key=key, label=field.label, value_type=field.value_type, section=section)
+                for section, keys, definitions in (("header", header_keys, self.header), ("item", item_keys, self.item_fields))
+                for key, field in zip(keys, definitions, strict=True)
+            ],
+            header={
+                key: _model_value(field, field.value, f"header.{key}", self._issues)
+                for key, field in zip(header_keys, self.header, strict=True)
+            },
+            items=[
+                {key: _model_value(field, value, f"items[{index}].{key}", self._issues)
+                 for key, field, value in zip(item_keys, self.item_fields, row, strict=True)}
+                for index, row in enumerate(self.items)
+            ],
+        )
+        return self
+
+    def extraction(self) -> AutonomousExtraction:
+        return self._extraction
+
+    def type_issues(self) -> list[ValidationIssue]:
+        return self._issues
+
+
+def _model_value(
+    field: AutonomousField, value: TemplateScalar, path: str, issues: list[ValidationIssue],
+) -> TemplateScalar:
+    if value is None or value == "":
+        return value
+    kind = field.value_type
+    exact_token = isinstance(value, JSONNumberToken)
+    if kind == "date" and isinstance(value, str) and not exact_token:
+        match = _MODEL_DATE.fullmatch(value)
+        try:
+            if match:
+                return date.fromisoformat(match[1]).isoformat()
+        except ValueError:
+            pass
+    elif kind == "number" and not exact_token:
+        try:
+            number = _model_number(value.strip() if isinstance(value, str) else value)
+            if type(number) in (int, float) and math.isfinite(number):
+                return number
+        except (NumericPrecisionError, OverflowError, ValueError):
+            pass
+    elif kind == "text":
+        if isinstance(value, str) or type(value) is int or (type(value) is float and math.isfinite(value)):
+            return str(value)
+    elif kind == "boolean" and isinstance(value, bool):
+        return value
+    labels = {"date": "日期", "number": "数字", "boolean": "是非值", "text": "文本"}
+    message = ("模型返回的数字超出可保留的精度。请对照原件核对。" if exact_token
+               else f"模型返回的内容无法确认为{labels[kind]}。请对照原件核对。")
+    issues.append(ValidationIssue(
+        code=MODEL_FIELD_TYPE_ISSUE, field=path, severity="warning",
+        message=message,
+        raw_value=str(value) if exact_token else value,
+    ))
+    return None
+
+
+def carry_type_issues(
+    prior: list[ValidationIssue], previous_ids: list[int], current_ids: list[int | None],
+    result: TemplateExtraction,
+) -> list[ValidationIssue]:
+    """Keep unresolved fields with the same detail even if rows were deleted."""
+    positions = {identity: index for index, identity in enumerate(current_ids) if identity is not None}
+    remaining = []
+    for issue in prior:
+        if issue.code != MODEL_FIELD_TYPE_ISSUE:
+            continue
+        detail = _DETAIL_PATH.fullmatch(issue.field)
+        if detail:
+            previous, key = int(detail[1]), detail[2]
+            index = positions.get(previous_ids[previous]) if previous < len(previous_ids) else None
+            if index is not None and key in result.items[index] and result.items[index][key] is None:
+                remaining.append(issue.model_copy(update={"field": f"items[{index}].{key}"}))
+        elif issue.field.startswith("header."):
+            key = issue.field.removeprefix("header.")
+            if key in result.header and result.header[key] is None:
+                remaining.append(issue)
+    return remaining
+
+
 def extraction_prompt(template: TemplateRead) -> str:
-    shape = {
-        "fields": [{"key": "f1", "label": "字段名称", "section": "header", "value_type": "text"}],
-        "header": {"f1": "文件中实际内容"}, "items": [],
-    }
     return (
         "阅读本次提供的文件，选择对理解和使用这份文件有意义的信息，并整理成结构化数据。\n"
-        "fields 描述本文件的字段，使用 f1、f2 等简短且互不重复的 key，label 使用清楚的名称；"
-        "section 为 header（整份文件一次）或 item（逐条明细），value_type 为 text、number、date 或 boolean。"
-        "同一份文件内的字段名称和 key 必须各自唯一。\n"
-        "header 仅使用文件字段的 key；items 每条仅使用明细字段的 key，按原件顺序保留全部已提供明细。"
-        "没有明细时 items=[]。不编造信息，缺失值为 null；number 字段使用不带引号的 JSON 数字，"
+        "header 列出整份文件的字段，包括原文明确给出的汇总或结论，每个字段有 label、value_type 和 value。"
+        "label 是字段名称，value 只填写原文中与该字段对应的完整值。\n"
+        "item_fields 按列列出明细的 label 和 value_type。items 中每一行按相同列顺序填写值，"
+        "与 item_fields 等长，按原件顺序保留全部已提供明细。没有明细时 item_fields 和 items 都用空数组。"
+        "只把整份文件共用的信息放在 header，只在单条明细出现的值放在 items。"
+        "每项事实只提取一次。同一分区内每个字段使用不同名称。"
+        "跨分区名称相同且含义不同时，优先用名称体现各自的范围。"
+        "value_type 只能是 text、number、date 或 boolean。"
+        "只提取实际内容，缺失值保留为 null；number 字段使用不带引号的 JSON 数字，"
         "不带单位或千分位分隔符；text 字段保持原文（包括编号中的前导零），日期为 YYYY-MM-DD，真假值使用 true/false。"
+        "内容含有区间、单位或不确定表述且无法无损规范时，按原文作为文本保留。"
         "不要把整份原文塞进单个字段，不为解释增加虚构事实。\n"
         + (f"用户额外要求：{template.extra_instructions}\n" if template.extra_instructions else "")
-        + "返回以下结构的 JSON，示例仅说明格式，按本文件内容决定实际字段："
-        + json.dumps(shape, ensure_ascii=False)
+        + "只返回包含 header、item_fields 和 items 三个数组的 JSON 对象。\n以下是本次需要处理的文件内容："
     )
 
 

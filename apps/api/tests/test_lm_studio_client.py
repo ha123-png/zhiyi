@@ -318,7 +318,7 @@ def test_openai_compatible_classifies_timeout(tmp_path: Path) -> None:
 def test_openai_compatible_connect_refused_gives_plain_actionable_message(
     tmp_path: Path,
 ) -> None:
-    """LM Studio 未打开（连接被拒）时应给出小白可读、带服务地址的操作提示。"""
+    """本地连接被拒时给出清晰操作提示，不暴露服务地址。"""
     image = tmp_path / "invoice.png"
     image.write_bytes(b"image")
 
@@ -335,8 +335,8 @@ def test_openai_compatible_connect_refused_gives_plain_actionable_message(
         provider.extract_image(image, "提取", DocumentExtraction)
     message = str(caught.value)
     assert "无法连接模型服务" in message
-    assert "127.0.0.1:1234" in message
-    assert "LM Studio" in message
+    assert "服务地址" in message and "网络" in message
+    assert "127.0.0.1:1234" not in message and "LM Studio" not in message
     assert "结构化输出" not in message
 
 

@@ -183,8 +183,9 @@ def generate_draft(
                     image_paths.extend(
                         render_pdf_pages(
                             path,
-                            tmp_dir / "rendered",
+                            tmp_dir / "rendered" / path.stem,
                             max_pages=1,
+                            max_total_pixels=settings.max_image_total_pixels,
                         )
                     )
                 except Exception as error:

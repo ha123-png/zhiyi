@@ -8,7 +8,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.models import DataRowRecord, DataTableRecord
-from document_pipeline_api.services.data_tables import get_data_table, table_columns, _csv_safe
+from document_pipeline_api.services.data_tables import get_data_table, table_columns, _csv_safe, _row_order
+from document_pipeline_api.services.merged_tables import export_records, merge_order
+from document_pipeline_api.services.table_scope import prepare_export_selection
 from document_pipeline_api.services.assistant_analysis import AnalysisRequest, Metric, analyze
 from document_pipeline_api.services.atomic_output import new_text_file
 from document_pipeline_api.services.export_scope import REVIEW_KEY, REVIEW_LABEL, table_has_pending_reviews
@@ -79,8 +81,9 @@ def export_data_table_file(
             shutil.copyfileobj(source, target, length=1024 * 1024)
         return detail.row_count
     columns = [column.key for column in detail.columns]
-    scoped = table_has_input_scopes(session, table_id)
-    pending = table_has_pending_reviews(session, table_id)
+    selection = prepare_export_selection(session, table_id)
+    scoped = table_has_input_scopes(session, table_id, predicates=selection.predicates, include_sources=bool(detail.merge_sources))
+    pending = table_has_pending_reviews(session, table_id, predicates=selection.predicates, include_sources=bool(detail.merge_sources))
     if pending and REVIEW_LABEL in [column.label for column in detail.columns]:
         raise ValueError("业务列名与知意来源状态说明列冲突，请重命名后导出。")
     if scoped and SCOPE_LABEL in [column.label for column in detail.columns]:
@@ -89,13 +92,13 @@ def export_data_table_file(
         with new_text_file(path, encoding="utf-8-sig", newline="") as stream:
             writer = csv.writer(stream)
             writer.writerow([_csv_safe(column.label) for column in detail.columns] + ([SCOPE_LABEL] if scoped else []) + ([REVIEW_LABEL] if pending else []))
-            for values in _iter_table_values(session, table_id):
+            for values in _iter_table_values(session, selection):
                 writer.writerow([_csv_safe(values.get(column)) for column in columns] + ([csv_scope_value(values)] if scoped else []) + (["待核对" if values.get(REVIEW_KEY) else ""] if pending else []))
     else:
         with new_text_file(path) as stream:
             stream.write("[")
             first = True
-            for values in _iter_table_values(session, table_id):
+            for values in _iter_table_values(session, selection):
                 if not first:
                     stream.write(",")
                 stream.write(json.dumps(values, ensure_ascii=False))
@@ -104,12 +107,12 @@ def export_data_table_file(
     return detail.row_count
 
 
-def _iter_table_values(session: Session, table_id: str):
+def _iter_table_values(session: Session, selection):
     row_jsons = session.scalars(
         select(DataRowRecord)
-        .where(DataRowRecord.table_id == table_id)
-        .order_by(DataRowRecord.id)
+        .where(*selection.predicates)
+        .order_by(*(merge_order(selection.table) + _row_order() if selection.table.merge_sources else [DataRowRecord.id]))
         .execution_options(yield_per=1000)
     )
-    for row_json in row_jsons:
+    for row_json in export_records(session, selection.table, row_jsons):
         yield export_row_values(row_json)

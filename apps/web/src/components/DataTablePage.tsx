@@ -17,17 +17,10 @@ import {
   Braces,
   CheckCheck,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
-  ChevronsLeft,
-  ChevronsRight,
   Columns3,
-  Copy,
   Download,
   FileSpreadsheet,
   FileText,
-  Filter,
-  FolderOpen,
   GitMerge,
   History,
   Info,
@@ -53,8 +46,11 @@ import {
   deleteCustomColumn,
   getTable,
   getTableExportUrl,
+  getTableNotesExportUrl,
   getTableViewsExportUrl,
   getTables,
+  getTaskSummary,
+  subscribeTaskEvents,
   getTableView,
   getTableViews,
   getTemplates,
@@ -75,13 +71,21 @@ import type {
   SourceCard,
 } from "../types";
 import { Icon } from "./Icon";
+import { CollapseChevron } from "./CollapseChevron";
 import { EditableText } from "./EditableText";
 import { SourceCardCollection } from "./SourceCardCollection";
+import { WarehousePagination } from "./WarehousePagination";
+import { EXAMPLE_WAREHOUSE_ID, EXAMPLE_WAREHOUSE_NAME, exampleColumns, exampleRows, editExampleRow, exampleSourceId, warehouseExampleCards, warehouseExampleDetail } from "./firstRunExampleData";
 import { ImportSheetDialog } from "./ImportSheetDialog";
 import { InputScopeDetails } from "./InputScopeDetails";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { Toast, useToast } from "./Toast";
-import { parseNumericInput } from "../numericInput";
+import { NoticeDialog } from "./NoticeDialog";
+import { CheckboxOption } from "./CheckboxOption";
+import { manualCellValue } from "../numericInput";
+import { useModalFocus } from "../useModalFocus";
+import { usePointerDrag } from "../usePointerDrag";
+import "./warehouse-states.css";
 
 // --- Types ---
 
@@ -106,7 +110,6 @@ interface UnsavedCellDraft {
 
 const TABLE_PAGE_SIZE = 10;
 
-const IDENTITY_KEYS = new Set(["source_filename", "item_index"]);
 
 // --- Helpers ---
 
@@ -118,6 +121,7 @@ function getCellValue(row: DataRowRead, colKey: string): string {
 }
 
 interface DataTablePageProps {
+  onNavigateExtract?: () => void;
   initialRowId?: number | null;
   initialTemplateId?: string | null;
   initialTableId?: string | null;
@@ -127,16 +131,21 @@ interface DataTablePageProps {
 }
 
 export function DataTablePage({
+  onNavigateExtract,
   initialRowId = null,
   initialTemplateId = null,
   initialTableId = null,
   jumpNotice = null,
   highlightTaskId = null,
 }: DataTablePageProps = {}) {
-  const [dsFilterOpen, setDsFilterOpen] = useState(false);
   const [importMenuOpen, setImportMenuOpen] = useState(false);
   const [pendingImport, setPendingImport] = useState<{file: File; tableId: string | null; sheets: string[]} | null>(null);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const [exportNotes, setExportNotes] = useState<{ tableId: string; name: string } | null>(null);
+  const [exportRevisions, setExportRevisions] = useState(true);
+  const [exportInputScope, setExportInputScope] = useState(true);
+  const [exportNotesBusy, setExportNotesBusy] = useState(false);
+  const [exportNotesError, setExportNotesError] = useState("");
   const [fieldFilterOpen, setFieldFilterOpen] = useState(false);
   const [addColumnOpen, setAddColumnOpen] = useState(false);
   const [newColumnLabel, setNewColumnLabel] = useState("");
@@ -157,27 +166,31 @@ export function DataTablePage({
   const [tables, setTables] = useState<DataTableRead[]>([]);
   const [tablesLoading, setTablesLoading] = useState(true);
   const [tablesError, setTablesError] = useState<string | null>(null);
+  const [tablesReload, setTablesReload] = useState(0);
+  const [emptyWorkspaceConfirmed, setEmptyWorkspaceConfirmed] = useState<boolean | null>(null);
 
   const [currentTableId, setCurrentTableId] = useState<string | null>(null);
+  const [localExampleRows, setLocalExampleRows] = useState(() => exampleRows);
   const [presentationOverrides, setPresentationOverrides] = useState<Record<string, "table" | "card">>({});
   const [tableDetail, setTableDetail] = useState<DataTableDetail | DataViewDetail | null>(null);
   const [tableLoading, setTableLoading] = useState(false);
+  const [tableLoadError, setTableLoadError] = useState<string | null>(null);
+  const [loadedDetailKey, setLoadedDetailKey] = useState<string | null>(null);
   const [tableError, setTableError] = useState<string | null>(null);
-  const [tableNotice, setTableNotice] = useState<string | null>(null);
+  const [noticesOpen, setNoticesOpen] = useState(false);
   const [unsavedCellDrafts, setUnsavedCellDrafts] = useState<UnsavedCellDraft[]>([]);
   const cellSaveAttempts = useRef(new Map<string, number>());
   useEffect(() => { if (tableError) notify(tableError, "error"); }, [tableError, notify]);
-  useEffect(() => { if (tableNotice) notify(tableNotice, "success"); }, [tableNotice, notify]);
+  useEffect(() => { if (jumpNotice) notify(jumpNotice, "info"); }, [jumpNotice, notify]);
 
   const [page, setPage] = useState(1);
-  const [jumpPageInput, setJumpPageInput] = useState("");
   const [searchText, setSearchText] = useState("");
   const [reloadTrigger, setReloadTrigger] = useState(0);
   useEffect(() => {
     const changed = (event: Event) => {
       if ((event as CustomEvent<{ table_id?: string }>).detail?.table_id === currentTableId) {
         setReloadTrigger(n => n + 1);
-        setTableNotice("问知意已执行确认的修改，当前数据已刷新；历史分析仍保留原快照。");
+        notify("数据已更新。", "success");
       }
     };
     window.addEventListener("zhiyi:assistant-changed", changed);
@@ -208,9 +221,10 @@ export function DataTablePage({
   }, [selectedRows]);
   useEffect(() => { setSelectedSources([]); setClearSourcesConfirm(false); setDeleteRowsConfirm(false); setDeleteColumnTarget(null); }, [currentTableId, currentViewId, searchText]);
   useAssistantPageContext("tables", { table_id: currentTableId, table_name: tableDetail?.name,
-    row_ids: selectedRows.length ? selectedRows : null, source_keys: selectedSources.length ? selectedSources.map(source => source.id) : null,
+    row_ids: currentTableId && selectedRows.length ? selectedRows : null, source_keys: currentTableId && selectedSources.length ? selectedSources.map(source => source.id) : null,
     view_id: currentViewId, search: searchText });
   const [editingCell, setEditingCell] = useState<string | null>(null);
+  const editingRowSnapshot = useRef<{ row: DataRowRead; column: string } | null>(null);
   const [mergeSelection, setMergeSelection] = useState<string[]>([]);
   const [mergeName, setMergeName] = useState("");
   const [renamingSheet, setRenamingSheet] = useState(false);
@@ -227,19 +241,48 @@ export function DataTablePage({
   const [newTableName, setNewTableName] = useState("");
   const [newTableTemplate, setNewTableTemplate] = useState("");
   const [templates, setTemplates] = useState<ExtractionTemplate[]>([]);
+  const [templatesLoading, setTemplatesLoading] = useState(true);
+  const [templatesError, setTemplatesError] = useState<string | null>(null);
+  const [templatesReload, setTemplatesReload] = useState(0);
+  const [tablesRefreshError, setTablesRefreshError] = useState<string | null>(null);
+  const [tablesRefreshing, setTablesRefreshing] = useState(false);
+  const catalogGeneration = useRef(0);
 
   const cancelEditRef = useRef(false);
   const importInputRef = useRef<HTMLInputElement>(null);
   const importNewInputRef = useRef<HTMLInputElement>(null);
+  const importGate = useRef(false);
+  const [unconfirmedImport, setUnconfirmedImport] = useState<{filename: string; tableId: string | null} | null>(null);
+  const importButtonRef = useRef<HTMLButtonElement>(null);
+  const wasUnconfirmedImport = useRef(false);
+  useEffect(() => {
+    if (!unconfirmedImport && wasUnconfirmedImport.current) importButtonRef.current?.focus({preventScroll: true});
+    wasUnconfirmedImport.current = Boolean(unconfirmedImport);
+  }, [unconfirmedImport]);
+  const newColumnInputRef = useRef<HTMLInputElement>(null);
+  const tableMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const startPointerDrag = usePointerDrag();
+  const menuFocusHandoff = useRef<(() => void) | null>(null);
+  const mergeDialog = useModalFocus(mergeModalOpen, () => setMergeModalOpen(false), busyAction);
+  const splitDialog = useModalFocus(splitModalOpen, () => setSplitModalOpen(false), splitting);
+  const createDialog = useModalFocus(createModalOpen, () => setCreateModalOpen(false), busyAction);
+  const deleteTableDialog = useModalFocus(deleteConfirmOpen, () => setDeleteConfirmOpen(false), busyAction, undefined, tableMenuButtonRef);
+  const fieldDialog = useModalFocus(fieldFilterOpen, () => setFieldFilterOpen(false));
+  const addColumnDialog = useModalFocus(addColumnOpen, () => setAddColumnOpen(false), busyAction, newColumnInputRef);
 
   const [sidebarWidth, setSidebarWidth] = useState(240);
-  const sidebarDrag = useRef<{x: number; width: number} | null>(null);
   const resizeSidebar = (width: number) => setSidebarWidth(Math.max(180, Math.min(360, width)));
 
   // 加载表列表
   useEffect(() => {
+    let active = true;
+    const generation = ++catalogGeneration.current;
+    setTablesLoading(true);
+    setTablesError(null);
+    setTablesRefreshError(null);
     getTables()
       .then((res) => {
+        if (!active || generation !== catalogGeneration.current) return;
         setTables(res);
         if (res.length > 0) {
           // 优先用确认记录精确定位目标表；无则按模板匹配
@@ -251,23 +294,81 @@ export function DataTablePage({
                 table.template_key === initialTemplateId
                 || table.template_key === normalizedTemplateId,
             );
-          setCurrentTableId((prev) => prev ?? preferred?.id ?? res[0].id);
+          setCurrentTableId((prev) => res.some(table => table.id === prev) ? prev : preferred?.id ?? res[0].id);
+        } else {
+          setCurrentTableId(null);
         }
       })
-      .catch((err) => setTablesError(err instanceof Error ? err.message : "加载表列表失败"))
-      .finally(() => setTablesLoading(false));
-  }, [initialTemplateId, initialTableId]);
+      .catch((err) => { if (active && generation === catalogGeneration.current) setTablesError(err instanceof Error ? err.message : "加载表列表失败"); })
+      .finally(() => { if (active && generation === catalogGeneration.current) setTablesLoading(false); });
+    return () => { active = false; };
+  }, [initialTemplateId, initialTableId, tablesReload]);
+
+  useEffect(() => {
+    let active = true;
+    setEmptyWorkspaceConfirmed(null);
+    if (!tablesLoading && !tablesError && tables.length === 0) {
+      // A deleted/cleared warehouse can still have real file history.
+      getTaskSummary().then(summary => { if (active) setEmptyWorkspaceConfirmed(summary.completed === 0 && summary.needs_review === 0); })
+        .catch(() => { if (active) setEmptyWorkspaceConfirmed(false); });
+    }
+    return () => { active = false; };
+  }, [tablesLoading, tablesError, tables.length, tablesReload]);
+
+  useEffect(() => {
+    if (tables.length || typeof EventSource === "undefined") return;
+    return subscribeTaskEvents(events => {
+      if (events.some(event => event.status === "completed" || event.status === "needs_review")) {
+        setTablesReload(value => value + 1);
+      }
+    });
+  }, [tables.length]);
+
+  async function refreshTableCatalogAfterWrite(committed?: DataTableRead) {
+    const generation = ++catalogGeneration.current;
+    setTablesRefreshing(true);
+    if (committed) setTables(current => [committed, ...current.filter(table => table.id !== committed.id)]);
+    try {
+      const catalog = await getTables();
+      if (generation !== catalogGeneration.current) return;
+      setTables(catalog);
+      setTablesError(null);
+      setTablesRefreshError(null);
+    } catch (error) {
+      if (generation === catalogGeneration.current) {
+        setTablesRefreshError(`更改已保存，但数据表目录暂未刷新：${(error instanceof Error ? error.message : "读取失败").replace(/[。.!！]+$/u, "")}。请重新读取目录，无需重复提交。`);
+      }
+    } finally {
+      if (generation === catalogGeneration.current) { setTablesLoading(false); setTablesRefreshing(false); }
+    }
+  }
 
   // 加载模板列表（新建表用）
   useEffect(() => {
+    let active = true;
+    setTemplatesLoading(true);
+    setTemplatesError(null);
     getTemplates(true)
-      .then(setTemplates)
-      .catch(() => setTemplates([]));
-  }, []);
+      .then(result => { if (active) setTemplates(result); })
+      .catch(error => { if (active) setTemplatesError(error instanceof Error ? error.message : "字段模板读取失败"); })
+      .finally(() => { if (active) setTemplatesLoading(false); });
+    return () => { active = false; };
+  }, [templatesReload]);
 
-  const detailMatches = tableDetail && ("table_id" in tableDetail ? tableDetail.table_id : tableDetail.id) === currentTableId;
-  const isFileCollection = tables.find(table => table.id === currentTableId)?.collection_kind === "files";
-  const presentationMode = isFileCollection ? "card" : (currentTableId && presentationOverrides[currentTableId]) || (detailMatches ? tableDetail.presentation?.mode : undefined) || "table";
+  const detailKey = JSON.stringify([currentTableId, currentViewId, page, searchText]);
+  const detailMatches = Boolean(tableDetail && loadedDetailKey === detailKey);
+  const showingExample = emptyWorkspaceConfirmed && !tablesLoading && !tablesError && tables.length === 0;
+  const displayTableId = currentTableId ?? (showingExample ? EXAMPLE_WAREHOUSE_ID : null);
+  const dataUnavailable = !showingExample && (!detailMatches || tablesLoading || Boolean(tablesError));
+  const activeTable = tables.find(table => table.id === currentTableId);
+  const isFileCollection = activeTable?.collection_kind === "files";
+  const isMerge = Boolean(activeTable?.merge_sources);
+  const appendUnavailable = isMerge ? "合并表只读，请到原表追加"
+    : isFileCollection ? "文件卡片集合不支持表格追加"
+    : showingExample || !currentTableId ? "请先选择普通数据表"
+    : dataUnavailable ? "当前表数据暂不可用" : "";
+  const mergeCandidates = tables.filter(table => table.collection_kind !== "files" && !table.merge_sources);
+  const presentationMode = isFileCollection ? "card" : isMerge ? "table" : (displayTableId && presentationOverrides[displayTableId]) || (detailMatches ? tableDetail?.presentation?.mode : undefined) || "table";
   const cardArea = useRef<HTMLDivElement>(null);
   const pageSize = TABLE_PAGE_SIZE;
   useEffect(() => {
@@ -275,7 +376,7 @@ export function DataTablePage({
     let cancelled = false;
     void assistantApi<{ page: number }>(`/references/tables/${encodeURIComponent(currentTableId)}/rows/${initialRowId}?page_size=${pageSize}`).then(result => {
       if (!cancelled) { setCurrentViewId(null); setSearchText(""); setPage(result.page); setSelectedRows([initialRowId]); setPresentationOverrides(previous => ({...previous, [currentTableId]: "table"})); }
-    }).catch(error => { if (!cancelled) setTableNotice(error.message); });
+    }).catch(error => { if (!cancelled) notify(error.message, "error"); });
     return () => { cancelled = true; };
   }, [initialRowId, currentTableId, initialTableId, pageSize]);
   useEffect(() => {
@@ -289,10 +390,14 @@ export function DataTablePage({
   useEffect(() => {
     if (currentTableId === null) {
       setTableDetail(null);
+      setLoadedDetailKey(null);
+      setTableLoadError(null);
+      setTableLoading(false);
       return;
     }
     let cancelled = false;
     setTableLoading(true);
+    setTableLoadError(null);
     setTableError(null);
     const request = currentViewId
       ? getTableView(currentTableId, currentViewId, page, pageSize, searchText)
@@ -301,11 +406,12 @@ export function DataTablePage({
       .then((detail) => {
         if (!cancelled) {
           setTableDetail(detail);
+          setLoadedDetailKey(detailKey);
           setTableError(null);
         }
       })
       .catch((err) => {
-        if (!cancelled) setTableError(err instanceof Error ? err.message : "加载表数据失败");
+        if (!cancelled) setTableLoadError(err instanceof Error ? err.message : "加载表数据失败");
       })
       .finally(() => {
         if (!cancelled) setTableLoading(false);
@@ -313,7 +419,7 @@ export function DataTablePage({
     return () => {
       cancelled = true;
     };
-  }, [currentTableId, currentViewId, page, pageSize, searchText, reloadTrigger]);
+  }, [currentTableId, currentViewId, page, pageSize, searchText, reloadTrigger, detailKey]);
 
   useEffect(() => {
     const generation = ++viewsGeneration.current;
@@ -424,8 +530,7 @@ export function DataTablePage({
   }, []);
 
   const columns: ColumnDef[] = useMemo(() => {
-    if (!tableDetail) return [];
-    return tableDetail.columns.map((c: TableColumnDef) => ({
+    return (showingExample ? exampleColumns : tableDetail?.columns ?? []).map((c: TableColumnDef) => ({
       key: c.key,
       label: c.label,
       numeric: c.value_type === "number",
@@ -434,48 +539,55 @@ export function DataTablePage({
       width: columnWidths[c.key] ?? (c.value_type === "number" ? 112 : 132),
       userDefined: Boolean(c.user_defined),
     }));
-  }, [tableDetail, columnWidths]);
+  }, [tableDetail, columnWidths, showingExample]);
 
   const visibleColumns = columns.filter((col) => !hiddenCols.includes(col.key));
   const widthFor = (col: ColumnDef) => columnWidths[col.key] ?? col.width;
-  const tableMinWidth = 44 + visibleColumns.reduce((sum, col) => sum + widthFor(col), 0);
-  const rows = (tableDetail?.rows ?? []).slice(0, pageSize);
+  const leadingWidth = isMerge ? 160 : 44;
+  const tableMinWidth = leadingWidth + visibleColumns.reduce((sum, col) => sum + widthFor(col), 0);
+  const matchingExampleRows = useMemo(() => {
+    const search = searchText.trim().toLowerCase();
+    return search ? localExampleRows.filter(row => Object.values(row.values).some(value => String(value).toLowerCase().includes(search))) : localExampleRows;
+  }, [searchText, localExampleRows]);
+  const exampleCards = useMemo(() => showingExample ? warehouseExampleCards(localExampleRows, matchingExampleRows) : undefined,
+    [showingExample, localExampleRows, matchingExampleRows]);
+  const rows = showingExample ? matchingExampleRows.slice((page - 1) * pageSize, page * pageSize) : (tableDetail?.rows ?? []).slice(0, pageSize);
 
   const contentUnit = "行";
-  const totalRows = tableDetail?.row_count ?? 0;
+  const totalRows = showingExample ? matchingExampleRows.length : tableDetail?.row_count ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+  useEffect(() => {
+    if (showingExample && page > totalPages) setPage(totalPages);
+  }, [showingExample, page, totalPages]);
 
   const selectedCount = selectedRows.length;
   const allSelected = rows.length > 0 && rows.every((row) => selectedRows.includes(row.id));
 
   const currentSheetName =
-    tableDetail?.name ?? tables.find((t) => t.id === currentTableId)?.name ?? "";
+    (showingExample ? EXAMPLE_WAREHOUSE_NAME : detailMatches ? tableDetail?.name : null) ?? views.find(view => view.id === currentViewId)?.name ?? tables.find((t) => t.id === currentTableId)?.name ?? "数据仓库";
   const currentSheetSource =
     tableDetail && "source_table_name" in tableDetail
-      ? `分组 · ${tableDetail.source_table_name}`
-      : "全部记录";
+      ? `分组 · ${tableDetail.source_table_name}${searchText.trim() ? " · 搜索结果" : ""}`
+      : searchText.trim() ? "搜索结果" : "全部记录";
 
   const mergePreviewRows = mergeSelection.reduce(
     (sum, id) => sum + (tables.find((t) => t.id === id)?.row_count ?? 0),
     0,
   );
 
-  // 分页页码（最多展示 3 个）
-  const pageNumbers: number[] = [];
-  const pageStart = Math.max(1, Math.min(page - 1, totalPages - 2));
-  const pageEnd = Math.min(totalPages, pageStart + 2);
-  for (let p = pageStart; p <= pageEnd; p++) pageNumbers.push(p);
-
   // 多明细合并：按 task_id 连续分组合并抬头列
   const rowGroups = useMemo(() => {
-    const groups: Array<{ taskId: string | null; rows: DataRowRead[] }> = [];
+    const groups: Array<{ key: string; rows: DataRowRead[] }> = [];
     for (const row of rows) {
-      const key = row.task_id ?? String(row.values.__row_group ?? `row-${row.id}`);
+      const independentGroup = row.values.__row_group;
+      const source = row.task_id ? ["file", row.task_id]
+        : typeof independentGroup === "string" && independentGroup ? ["group", independentGroup] : ["row", row.id];
+      const key = JSON.stringify([row.source_table_id, ...source]);
       const last = groups[groups.length - 1];
-      if (last && last.taskId === key) {
+      if (last && last.key === key) {
         last.rows.push(row);
       } else {
-        groups.push({ taskId: key, rows: [row] });
+        groups.push({ key, rows: [row] });
       }
     }
     return groups;
@@ -505,6 +617,20 @@ export function DataTablePage({
     setTableError(null);
   }
 
+  async function openMergedSource(row: DataRowRead) {
+    if (!row.source_table_id) return;
+    const tableId = row.source_table_id;
+    try {
+      const result = await assistantApi<{ page: number }>(`/references/tables/${encodeURIComponent(tableId)}/rows/${row.id}?page_size=${pageSize}`);
+      selectTable(tableId);
+      setPage(result.page);
+      setSelectedRows([row.id]);
+      setPresentationOverrides(previous => ({...previous, [tableId]: "table"}));
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "无法打开原表", "error");
+    }
+  }
+
   function selectView(viewId: string) {
     setCurrentViewId(viewId);
     setPage(1);
@@ -519,14 +645,6 @@ export function DataTablePage({
     setPage(p);
     setSelectedRows([]);
     setEditingCell(null);
-  }
-
-  function jumpToPage() {
-    const target = Number(jumpPageInput);
-    if (!Number.isNaN(target)) {
-      goToPage(target);
-      setJumpPageInput("");
-    }
   }
 
   function toggleSelectAll() {
@@ -564,6 +682,7 @@ export function DataTablePage({
     key: string,
     initialWidth: number,
   ) {
+    if (event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
     const startX = event.clientX;
@@ -572,13 +691,7 @@ export function DataTablePage({
       const nextWidth = Math.min(520, Math.max(72, initialWidth + moveEvent.clientX - startX));
       setColumnWidths((current) => ({ ...current, [key]: nextWidth }));
     };
-    const finish = () => {
-      setResizingColKey(null);
-      document.removeEventListener("pointermove", move);
-      document.removeEventListener("pointerup", finish);
-    };
-    document.addEventListener("pointermove", move);
-    document.addEventListener("pointerup", finish);
+    startPointerDrag(move, () => setResizingColKey(null), event.pointerId, event.currentTarget);
   }
 
   function resizeColumnWithKeyboard(
@@ -608,9 +721,9 @@ export function DataTablePage({
       return;
     }
     try {
-      await renameTable(currentTableId, nextName);
+      const renamed = await renameTable(currentTableId, nextName);
       setReloadTrigger((n) => n + 1);
-      await getTables().then(setTables);
+      await refreshTableCatalogAfterWrite(renamed);
     } catch (err) {
       setTableError(err instanceof Error ? err.message : "重命名失败");
     }
@@ -627,18 +740,28 @@ export function DataTablePage({
       return;
     }
     setExportMenuOpen(false);
+    if (!isFileCollection && !isMerge && (format === "xlsx" || format === "views") && !visibleColumns.length) {
+      notify("请至少显示一个字段再导出。");
+      return;
+    }
     if (format === "views" && views.length === 0) {
       setTableError(null);
-      setTableNotice("当前数据表还没有分 Sheet，请先创建分 Sheet 后再导出。");
+      notify("当前数据表还没有分 Sheet，请先创建分 Sheet 后再导出。");
       return;
     }
     const scope = { viewId: currentViewId, search: searchText, rowIds: !isFileCollection && selectedRows.length ? selectedRows : null,
-      sourceKeys: selectedSources.length ? selectedSources.map(source => source.id) : null };
+      sourceKeys: selectedSources.length ? selectedSources.map(source => source.id) : null,
+      columns: !isFileCollection && (format === "xlsx" || format === "views")
+        ? [...(isMerge ? ["__zhiyi_source_table"] : []), ...visibleColumns.map(column => column.key)] : undefined };
     const url = format === "views" ? getTableViewsExportUrl(currentTableId, scope) : getTableExportUrl(currentTableId, format, scope);
+    const filename = `${currentSheetName || "数据表"}${searchText.trim() ? "-搜索结果" : ""}${selectedSources.length ? "-选中来源" : selectedRows.length && !isFileCollection ? "-选中明细" : ""}${format === "views" ? "-分Sheet.xlsx" : `.${format}`}`;
+    await downloadExport(url, filename);
+  }
+
+  async function downloadExport(url: string, filename: string, onError = (message: string) => notify(message, "error")): Promise<boolean> {
     const bridge = desktopApi();
     try {
       const absoluteUrl = new URL(url, window.location.origin).toString();
-      const filename = `${currentSheetName || "数据表"}${searchText.trim() ? "-搜索结果" : ""}${selectedSources.length ? "-选中来源" : selectedRows.length && !isFileCollection ? "-选中明细" : ""}${format === "views" ? "-分Sheet.xlsx" : `.${format}`}`;
       if (!bridge) {
         const response = await fetch(url);
         if (!response.ok) {
@@ -650,21 +773,27 @@ export function DataTablePage({
         link.href = objectUrl; link.download = match ? decodeURIComponent(match[1]) : filename;
         document.body.appendChild(link); link.click(); link.remove();
         window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
-        setTableError(null); setTableNotice("已导出当前范围。");
-        return;
+        setTableError(null); notify("导出成功。", "success");
+        return true;
       }
       const path = await bridge.export_table(absoluteUrl, filename);
       setTableError(null);
-      setTableNotice(`已导出到 ${path}`);
+      if (path) notify(`已导出到 ${path}`, "success");
+      return Boolean(path);
     } catch (err) {
-      setTableError(err instanceof Error ? err.message : "导出失败");
+      onError(err instanceof Error ? err.message : "导出失败");
+      return false;
     }
   }
 
   async function importFile(file: File, tableId: string | null, sheetName?: string) {
+    if (importGate.current) return;
+    importGate.current = true;
     setImportMenuOpen(false);
     setBusyAction(true);
     setTableError(null);
+    let rejected = false;
+    let uncertain = false;
     try {
       const body = new FormData();
       body.append("file", file);
@@ -673,22 +802,33 @@ export function DataTablePage({
         method: "POST",
         body,
       });
-      const data = await response.clone().json().catch(() => null) as {id?: string; name?: string; detail?: unknown} | null;
+      const data = await response.clone().json().catch(() => null) as (DataTableRead & {detail?: unknown}) | null;
       const detail = data?.detail as {code?: string; sheets?: unknown} | undefined;
-      if (!response.ok && detail?.code === "select_sheet" && Array.isArray(detail.sheets) && detail.sheets.every(sheet => typeof sheet === "string")) {
+      if (response.status === 409 && detail?.code === "select_sheet" && Array.isArray(detail.sheets) && detail.sheets.every(sheet => typeof sheet === "string")) {
         setPendingImport({file, tableId, sheets: detail.sheets});
         return;
       }
+      rejected = response.status >= 400 && response.status < 500 && ![408, 499].includes(response.status);
       if (!response.ok) throw new Error(await responseErrorMessage(response, "导入"));
       if (!data?.id) throw new Error("导入结果未能确认，请刷新数据表查看。");
       setPendingImport(null);
       if (!tableId) { setCurrentTableId(data.id); setCurrentViewId(null); }
-      setTableNotice(`已将「${file.name}${sheetName ? ` · ${sheetName}` : ""}」导入「${data.name || "数据表"}」。`);
+      notify(`已导入「${data.name || "数据表"}」。`, "success");
       setReloadTrigger((n) => n + 1);
-      await getTables().then(setTables);
+      await refreshTableCatalogAfterWrite(data);
     } catch (err) {
-      setTableError(err instanceof Error ? err.message : "导入失败");
+      if (rejected) {
+        setTableError(err instanceof Error ? err.message : "导入失败");
+      } else {
+        // Losing a response does not prove the append was rolled back. In
+        // particular, don't leave a worksheet dialog able to resubmit it.
+        uncertain = true;
+        setPendingImport(null);
+        setUnconfirmedImport({filename: file.name, tableId});
+        notify("导入结果待确认。请打开「仓库事项」核对。", "error");
+      }
     } finally {
+      if (!uncertain) importGate.current = false;
       setBusyAction(false);
       if (importInputRef.current) importInputRef.current.value = "";
       if (importNewInputRef.current) importNewInputRef.current.value = "";
@@ -696,34 +836,40 @@ export function DataTablePage({
   }
 
   async function handleImportFile(file: File) {
-    if (currentTableId) await importFile(file, currentTableId);
+    if (currentTableId && !isMerge && !isFileCollection) await importFile(file, currentTableId);
   }
 
   async function handleImportNewTable(file: File) {
     await importFile(file, null);
   }
 
+  function beginCellEdit(row: DataRowRead, column: string, cell: string) {
+    if (editingCell === cell) return;
+    editingRowSnapshot.current = { row, column };
+    cancelEditRef.current = false;
+    setEditingCell(cell);
+  }
+
   async function commitCellEdit(row: DataRowRead, colKey: string, newValue: string) {
-    if (!currentTableId || !tableDetail) return;
+    const snapshot = editingRowSnapshot.current;
+    editingRowSnapshot.current = null;
+    if (snapshot?.row.id === row.id && snapshot.column === colKey) row = snapshot.row;
     const oldValue = getCellValue(row, colKey);
     if (newValue === oldValue) return;
+    const column = columns.find((item) => item.key === colKey);
+    if (showingExample) {
+      setLocalExampleRows(current => editExampleRow(current, row.id, colKey, manualCellValue(newValue, column?.valueType)));
+      return;
+    }
+    if (!currentTableId || !tableDetail) return;
     const key = JSON.stringify([currentTableId, row.id, colKey]);
     const attempt = (cellSaveAttempts.current.get(key) ?? 0) + 1;
     cellSaveAttempts.current.set(key, attempt);
-    const column = columns.find((item) => item.key === colKey);
     const draft: UnsavedCellDraft = {key, tableId: currentTableId,
       tableName: tables.find(table => table.id === currentTableId)?.name ?? currentTableId,
       rowId: row.id, columnLabel: column?.label ?? colKey, input: newValue};
     try {
-      let value: unknown = newValue === "" ? null : newValue;
-      if (value !== null && column?.valueType === "number") {
-        value = parseNumericInput(newValue, column.label);
-      } else if (value !== null && column?.valueType === "boolean") {
-        const normalized = newValue.trim().toLowerCase();
-        if (["true", "是", "1"].includes(normalized)) value = true;
-        else if (["false", "否", "0"].includes(normalized)) value = false;
-        else throw new Error(`「${column.label}」需要填写是/否。`);
-      }
+      const value = manualCellValue(newValue, column?.valueType);
       await updateDataRow(currentTableId, row.id, row.version, {
         [colKey]: value,
       }, undefined, row.shared_header_keys ?? undefined);
@@ -745,6 +891,7 @@ export function DataTablePage({
   async function handleAddColumn() {
     if (!currentTableId || !newColumnLabel.trim()) return;
     setBusyAction(true);
+    setTableError(null);
     try {
       await addCustomColumn(currentTableId, newColumnLabel.trim(), newColumnSection, newColumnType);
       setAddColumnOpen(false);
@@ -752,7 +899,7 @@ export function DataTablePage({
       setNewColumnSection("header");
       setNewColumnType("text");
       setReloadTrigger((n) => n + 1);
-      setTableNotice("附加列已创建；它只属于数据表，不会发送给模型。 ");
+      notify("附加列已创建。", "success");
     } catch (err) {
       setTableError(err instanceof Error ? err.message : "新增列失败");
     } finally {
@@ -768,7 +915,7 @@ export function DataTablePage({
       await deleteCustomColumn(currentTableId, column.key);
       setDeleteColumnTarget(null);
       setReloadTrigger((n) => n + 1);
-      setTableNotice(`已删除附加列“${column.label}”。`);
+      notify(`已删除附加列“${column.label}”。`, "success");
     } catch (err) {
       setTableError(err instanceof Error ? err.message : "删除列失败");
     } finally {
@@ -787,8 +934,8 @@ export function DataTablePage({
       if (generation !== viewsGeneration.current) return;
       setViews(created);
       setMoreViews(created.length === 200);
-      setTableNotice(groupBy === "none" ? "已取消分组，数据未改变。" : "分组会随当前数据更新，新类别会自动出现。");
-      await getTables().then(setTables);
+      notify(groupBy === "none" ? "已取消分组。" : "分组已保存。", "success");
+      await refreshTableCatalogAfterWrite();
       if (generation !== viewsGeneration.current) return;
       setCurrentViewId(created[0]?.id ?? null);
       setPage(1);
@@ -811,9 +958,9 @@ export function DataTablePage({
       setMergeModalOpen(false);
       setMergeSelection([]);
       setMergeName("");
-      await getTables().then(setTables);
       selectTable(merged.id);
       setTableError(null);
+      await refreshTableCatalogAfterWrite(merged);
     } catch (err) {
       setTableError(err instanceof Error ? err.message : "合并失败");
     } finally {
@@ -822,7 +969,7 @@ export function DataTablePage({
   }
 
   async function handleCreateTable() {
-    if (!newTableName.trim() || !newTableTemplate) return;
+    if (!newTableName.trim() || !newTableTemplate || templatesLoading || templatesError) return;
     setBusyAction(true);
     setTableError(null);
     try {
@@ -830,8 +977,8 @@ export function DataTablePage({
       setCreateModalOpen(false);
       setNewTableName("");
       setNewTableTemplate("");
-      await getTables().then(setTables);
       selectTable(created.id);
+      await refreshTableCatalogAfterWrite(created);
     } catch (err) {
       setTableError(err instanceof Error ? err.message : "新建表失败");
     } finally {
@@ -840,6 +987,15 @@ export function DataTablePage({
   }
 
   async function handleAddRow() {
+    if (showingExample) {
+      setLocalExampleRows(current => [...current, {
+        id: Math.max(0, ...current.map(row => row.id)) + 1, version: 1, task_id: null, item_index: 1,
+        created_at: "", updated_at: "", values: {},
+      }]);
+      setSearchText("");
+      setPage(Math.ceil((localExampleRows.length + 1) / pageSize));
+      return;
+    }
     if (!currentTableId) return;
     setBusyAction(true);
     setTableError(null);
@@ -848,7 +1004,7 @@ export function DataTablePage({
       // 跳转到新行所在页（空行追加在末尾），让用户立即看到并直接编辑
       setPage(Math.max(1, Math.ceil((totalRows + 1) / pageSize)));
       setReloadTrigger((n) => n + 1);
-      await getTables().then(setTables);
+      await refreshTableCatalogAfterWrite();
     } catch (err) {
       setTableError(err instanceof Error ? err.message : "新增行失败");
     } finally {
@@ -857,7 +1013,14 @@ export function DataTablePage({
   }
 
   async function handleDeleteRows() {
-    if (!currentTableId || selectedRows.length === 0) return;
+    if (!selectedRows.length) return;
+    if (showingExample) {
+      setLocalExampleRows(current => current.filter(row => !selectedRows.includes(row.id)));
+      setSelectedRows([]);
+      setDeleteRowsConfirm(false);
+      return;
+    }
+    if (!currentTableId) return;
     setBusyAction(true);
     setTableError(null);
     try {
@@ -869,7 +1032,7 @@ export function DataTablePage({
       setDeleteRowsConfirm(false);
       setSelectedRows([]);
       setReloadTrigger((n) => n + 1);
-      await getTables().then(setTables);
+      await refreshTableCatalogAfterWrite();
     } catch (err) {
       setTableError(err instanceof Error ? err.message : "删除行失败");
     } finally {
@@ -878,12 +1041,20 @@ export function DataTablePage({
   }
 
   async function handleClearSources() {
-    if (!currentTableId || !selectedSources.length) return;
+    if (!selectedSources.length) return;
+    if (showingExample) {
+      const selected = new Set(selectedSources.map(source => source.id));
+      setLocalExampleRows(current => current.filter(row => !selected.has(exampleSourceId(row))));
+      setSelectedSources([]);
+      setClearSourcesConfirm(false);
+      return;
+    }
+    if (!currentTableId) return;
     setBusyAction(true); setTableError(null);
     try {
       await clearSourceCards(currentTableId, selectedSources.map(({id, version}) => ({id, version})), {viewId: currentViewId, search: searchText});
       setSelectedSources([]); setClearSourcesConfirm(false); setReloadTrigger(n => n + 1);
-      await getTables().then(setTables);
+      await refreshTableCatalogAfterWrite();
     } catch (err) { setTableError(err instanceof Error ? err.message : "清空未完成，请重试。"); }
     finally { setBusyAction(false); }
   }
@@ -898,7 +1069,8 @@ export function DataTablePage({
       setCurrentTableId(null);
       setCurrentViewId(null);
       setTableDetail(null);
-      await getTables().then(setTables);
+      setTables(current => current.filter(table => table.id !== currentTableId));
+      await refreshTableCatalogAfterWrite();
     } catch (err) {
       setTableError(err instanceof Error ? err.message : "删除表失败");
     } finally {
@@ -916,12 +1088,45 @@ export function DataTablePage({
 
   // 全局行索引（rowGroups 展开时递增）
   let rowIndexCounter = 0;
+  const staleTableError = detailMatches && !tablesError ? tableLoadError : null;
+  const showTableSourceStatus = !dataUnavailable && presentationMode === "table";
+  const pendingReviewCount = showTableSourceStatus ? rows.filter(row => row.review_pending).length : 0;
+  const hasPartialInput = showTableSourceStatus && rows.some(row => row.input_scope?.coverage === "partial");
+  const hasWarehouseNotices = Boolean(unconfirmedImport || tablesRefreshError || staleTableError || unsavedCellDrafts.length || pendingReviewCount || hasPartialInput);
+  useEffect(() => { if (!hasWarehouseNotices) setNoticesOpen(false); }, [hasWarehouseNotices]);
 
   return (
     <div className={`view${presentationMode === "card" ? " presentation-card" : ""}`}>
-      {unsavedCellDrafts.length > 0 && <details className="callout warning" style={{marginBottom: 16}}>
-        <summary>未保存输入（{unsavedCellDrafts.length}）· 展开查看或复制</summary>
-        <p>以下输入未写入数据表，仅在本页暂存。可复制后重新修改；关闭条目或离开本页会丢弃输入。</p>
+      {noticesOpen && hasWarehouseNotices && <NoticeDialog title="仓库事项" onClose={() => setNoticesOpen(false)}>
+      {unconfirmedImport && <section>
+        <p>「{unconfirmedImport.filename}」的导入结果尚未确认，可能已经写入。请先重新读取数据核对，重复导入会新增记录。</p>
+        <button className="btn secondary sm" aria-disabled={tablesLoading || tableLoading} onClick={() => {
+          if (tablesLoading || tableLoading) return;
+          if (unconfirmedImport.tableId) {
+            setCurrentTableId(unconfirmedImport.tableId); setCurrentViewId(null); setPage(1); setSearchText("");
+            setSelectedRows([]); setSelectedSources([]);
+          }
+          setTablesReload(value => value + 1); setReloadTrigger(value => value + 1);
+          setNoticesOpen(false);
+        }}>{unconfirmedImport.tableId ? "重新读取目标表核对" : "重新读取目录核对"}</button>
+        <button className="btn ghost sm" disabled={tablesLoading || tableLoading} onClick={() => {
+          importGate.current = false; setUnconfirmedImport(null);
+        }}>已核对，继续操作</button>
+      </section>}
+      {tablesRefreshError && <section>
+        <p>{tablesRefreshError}</p>
+        <button className="btn secondary sm" disabled={tablesRefreshing} onClick={() => void refreshTableCatalogAfterWrite()}>重新读取数据表目录</button>
+      </section>}
+      {staleTableError && <section>
+        <p>未能刷新，当前保留上次读取的内容。</p>
+        <p>{staleTableError}</p>
+        <button className="btn secondary sm" type="button" onClick={() => {
+          setNoticesOpen(false); setReloadTrigger(value => value + 1);
+        }}>重新读取表数据</button>
+      </section>}
+      {unsavedCellDrafts.length > 0 && <section>
+        <h4>未保存输入（{unsavedCellDrafts.length}）</h4>
+        <p>可复制输入后重新编辑。离开数据仓库会清除本页暂存。</p>
         {unsavedCellDrafts.map(draft => {
           const label = `${draft.tableName} · 行 ${draft.rowId} · ${draft.columnLabel}`;
           return <div key={draft.key} style={{marginTop: 12}}>
@@ -934,35 +1139,53 @@ export function DataTablePage({
             </button>
           </div>;
         })}
-      </details>}
-      {jumpNotice && (
-        <div className="callout warning" style={{ marginBottom: 16 }}>
-          {jumpNotice}
-        </div>
+      </section>}
+      {pendingReviewCount > 0 && (
+        <section>
+          <h4>本页有 {pendingReviewCount} 条来源待核对的数据</h4>
+          <p>到文件历史可查看校验问题。</p>
+          {rows.filter((row, index) => row.review_pending && !rows.slice(0, index).some((previous) => previous.review_pending &&
+            (previous.task_id ?? previous.values.__row_group ?? previous.id) === (row.task_id ?? row.values.__row_group ?? row.id)
+          )).map((row) => <p key={row.id}>{String(row.values.source_filename || `内容 ${row.id}`)}{!row.task_id && " · 来源已移除或来自导入/合并，保留原待核对状态"}</p>)}
+        </section>
       )}
+      {hasPartialInput && (
+        <section>
+          <h4>本页有局部读取的数据</h4>
+          <p>这些结果只基于文件的部分内容，不能代表全文或全部明细。修改表中数据不会改变当时的读取范围。</p>
+          {rows.filter((row, index) => row.input_scope?.coverage === "partial" && !rows.slice(0, index).some((previous) =>
+            (previous.task_id ?? previous.values.__row_group ?? previous.id) === (row.task_id ?? row.values.__row_group ?? row.id)
+            && JSON.stringify(previous.input_scope) === JSON.stringify(row.input_scope)
+          )).map((row) => <InputScopeDetails key={row.id} scope={row.input_scope}
+            label={String(row.values.source_filename || `内容 ${row.id}`)} originalAvailable={Boolean(row.task_id)} />)}
+        </section>
+      )}
+      </NoticeDialog>}
       <div className="datastore-layout">
         {/* Toolbar */}
         <div className="datastore-toolbar">
           <div className="datastore-toolbar-left" style={{ gap: "calc(var(--space-4) * 2)" }}>
-            {!isFileCollection && <>
-            <button className="btn secondary sm" onClick={() => setFieldFilterOpen(true)}>
-              <Icon icon={Columns3} size={15} /> 字段
+            {hasWarehouseNotices && <button className="btn ghost sm" type="button" aria-haspopup="dialog"
+              onClick={() => { clear(); setNoticesOpen(true); }}>仓库事项</button>}
+            {!isFileCollection && !showingExample && <>
+            <button className="btn secondary sm" disabled={dataUnavailable} onClick={() => setFieldFilterOpen(true)}>
+              <Icon icon={Columns3} size={15} /> 字段设置
               {hiddenCols.length > 0 && (
                 <span className="filter-count-badge">{hiddenCols.length}</span>
               )}
             </button>
             <button
               className="btn secondary sm"
-              disabled={!currentTableId || Boolean(currentViewId)}
-              onClick={() => setAddColumnOpen(true)}
+              disabled={isMerge || dataUnavailable || Boolean(currentViewId)}
+              onClick={() => { setTableError(null); setAddColumnOpen(true); }}
               title={currentViewId ? "请回到原始数据表后新增列" : "新增不参与 AI 提取的附加列"}
             >
               <Icon icon={Plus} size={15} /> 新增列
             </button>
             <button
               className="btn secondary sm"
-              disabled={!currentTableId}
-              onClick={() => setSplitModalOpen(true)}
+              disabled={isMerge || dataUnavailable}
+              onClick={() => { setTableError(null); setSplitModalOpen(true); }}
             >
               <Icon icon={Table2} size={15} /> {presentationMode === "card" ? "分组" : "分 Sheet"}
             </button>
@@ -970,15 +1193,17 @@ export function DataTablePage({
             </>}
             {!isFileCollection && <button
               className="btn secondary sm"
-              disabled={isFileCollection || tables.filter(table => table.collection_kind !== "files").length < 2}
-              onClick={() => setMergeModalOpen(true)}
-              title={tables.length < 2 ? "至少需要两张表才能合并" : undefined}
+              disabled={tablesLoading || Boolean(tablesError) || mergeCandidates.length < 2}
+              onClick={() => { setTableError(null); setMergeModalOpen(true); }}
+              title={mergeCandidates.length < 2 ? "至少需要两张原表才能合并" : undefined}
             >
               <Icon icon={GitMerge} size={15} /> 合并表
             </button>}
             <div className="toolbar-menu-wrap">
               <button
+                ref={importButtonRef}
                 className="btn secondary sm"
+                disabled={tablesLoading || Boolean(tablesError) || busyAction || Boolean(unconfirmedImport)}
                 onClick={() => setImportMenuOpen(!importMenuOpen)}
               >
                 <Icon icon={Upload} size={15} /> 导入
@@ -986,7 +1211,7 @@ export function DataTablePage({
               </button>
               <input
                 ref={importInputRef}
-                className="visually-hidden"
+                hidden
                 type="file"
                 accept=".xlsx,.csv"
                 onChange={(event) => {
@@ -994,20 +1219,20 @@ export function DataTablePage({
                   if (file) void handleImportFile(file);
                 }}
               />
-              <input ref={importNewInputRef} className="visually-hidden" type="file" accept=".xlsx,.csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) void handleImportNewTable(file); }} />
+              <input ref={importNewInputRef} hidden type="file" accept=".xlsx,.csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) void handleImportNewTable(file); }} />
               {importMenuOpen && (
                 <div className="toolbar-menu">
-                  <button className="toolbar-menu-item" disabled={isFileCollection} onClick={() => importInputRef.current?.click()}>
-                    <Icon icon={FileSpreadsheet} size={15} /> 追加到当前表<span className="menu-hint">XLSX / CSV</span>
+                  <button className="toolbar-menu-item" disabled={Boolean(appendUnavailable)} onClick={() => importInputRef.current?.click()}>
+                    <Icon icon={FileSpreadsheet} size={15} /> 追加到当前表<span className="menu-hint">{appendUnavailable || "按列名匹配"}</span>
                   </button>
                   <button className="toolbar-menu-item" onClick={() => importNewInputRef.current?.click()}>
-                    <Icon icon={FileText} size={15} /> 从文件新建表<span className="menu-hint">保留重复表头</span>
+                    <Icon icon={FileText} size={15} /> 从文件新建表<span className="menu-hint">按文件表头建表</span>
                   </button>
                 </div>
               )}
             </div>
             <div className="toolbar-menu-wrap">
-              <button className="btn secondary sm" disabled={tableLoading || viewsRefreshing || !detailMatches} onClick={() => setExportMenuOpen(!exportMenuOpen)}>
+              <button className="btn secondary sm" disabled={showingExample || tableLoading || viewsRefreshing || dataUnavailable} onClick={() => setExportMenuOpen(!exportMenuOpen)}>
                 <Icon icon={Download} size={15} /> 导出
                 <Icon icon={ChevronDown} size={13} style={{ opacity: 0.6 }} />
               </button>
@@ -1031,6 +1256,18 @@ export function DataTablePage({
                   <div className="toolbar-menu-sep" />
                   <button className="toolbar-menu-item" onClick={() => handleExport("json")}>
                     <Icon icon={Braces} size={15} /> 导出 JSON<span className="menu-hint">JSON</span>
+                  </button>
+                  <button className="toolbar-menu-item" onClick={() => {
+                    const table = tables.find(item => item.id === currentTableId);
+                    if (table) {
+                      setExportMenuOpen(false);
+                      setExportRevisions(true);
+                      setExportInputScope(true);
+                      setExportNotesError("");
+                      setExportNotes({ tableId: table.id, name: table.name });
+                    }
+                  }}>
+                    <Icon icon={FileText} size={15} /> 附加资料<span className="menu-hint">整表</span>
                   </button>
                 </div>
               )}
@@ -1059,12 +1296,12 @@ export function DataTablePage({
 
         <div className="datastore-compact-navigation">
           <label className="visually-hidden" htmlFor="compact-table">选择数据表或分组</label>
-          <select id="compact-table" className="form-select" value={currentViewId && views.some(view => view.id === currentViewId) ? `view:${currentViewId}` : `table:${currentTableId ?? ""}`}
-            onChange={(event) => { const value = event.target.value; if (value.startsWith("view:")) selectView(value.slice(5)); else selectTable(value.slice(6)); }}>
-            <optgroup label="数据表">{tables.map((table) => <option key={table.id} value={`table:${table.id}`}>{table.name} · {table.collection_kind === "files" ? `${table.file_count ?? 0} 份文件` : `${table.row_count} 行`}</option>)}</optgroup>
+          <select id="compact-table" className="form-select" value={currentViewId && views.some(view => view.id === currentViewId) ? `view:${currentViewId}` : `table:${displayTableId ?? ""}`}
+            onChange={(event) => { const value = event.target.value; if (value.startsWith("view:")) selectView(value.slice(5)); else if (value !== `table:${EXAMPLE_WAREHOUSE_ID}`) selectTable(value.slice(6)); }}>
+            <optgroup label="数据表">{showingExample && <option value={`table:${EXAMPLE_WAREHOUSE_ID}`}>{EXAMPLE_WAREHOUSE_NAME}</option>}{tables.map((table) => <option key={table.id} value={`table:${table.id}`}>{table.name} · {table.collection_kind === "files" ? `${table.file_count ?? 0} 份文件` : `${table.row_count} 行`}</option>)}</optgroup>
             {views.length > 0 && <optgroup label="当前表的分组">{views.map((view) => <option key={view.id} value={`view:${view.id}`}>{view.name}</option>)}</optgroup>}
           </select>
-          <button className="btn ghost sm icon-only" title="新建表" onClick={() => { setNewTableName(""); setNewTableTemplate(""); setCreateModalOpen(true); }}><Icon icon={Plus} size={14} /></button>
+          <button className="btn ghost sm icon-only" disabled={tablesLoading || Boolean(tablesError)} title="新建表" onClick={() => { setTableError(null); setNewTableName(""); setNewTableTemplate(""); setCreateModalOpen(true); }}><Icon icon={Plus} size={14} /></button>
         </div>
         {/* Sheet tree + detail + 可拖拽分隔条 */}
         <div className={`datastore-split${resizingColKey ? " dragging-col" : ""}`}>
@@ -1074,9 +1311,11 @@ export function DataTablePage({
               <div className="sheet-tree-add">
                 <button
                   className="btn ghost sm icon-only"
+                  disabled={tablesLoading || Boolean(tablesError)}
                   onClick={() => {
                     setNewTableName("");
                     setNewTableTemplate("");
+                    setTableError(null);
                     setCreateModalOpen(true);
                   }}
                   title="新建表（基于模板创建空表）"
@@ -1091,7 +1330,7 @@ export function DataTablePage({
                   <Icon icon={Loader2} size={20} className="spin" />
                 </div>
               ) : tablesError ? (
-                <div className="callout danger" style={{ margin: 12 }}>{tablesError}</div>
+                <p className="support" style={{ margin: 12 }}>数据表列表暂不可用，请重新读取。</p>
               ) : (
                 <>
                   <button
@@ -1102,12 +1341,17 @@ export function DataTablePage({
                     }
                     title={treeGroupsOpen.records ? "收起原始记录" : "展开原始记录"}
                   >
-                    <Icon icon={ChevronDown} size={16} />
+                    <CollapseChevron expanded={treeGroupsOpen.records} size={16} />
                     <span className="sheet-tree-group-label">原始记录</span>
                   </button>
                   <div className={`sheet-tree-group-body${treeGroupsOpen.records ? " open" : ""}`} inert={!treeGroupsOpen.records} aria-hidden={!treeGroupsOpen.records}>
                     <div className="sheet-tree-group-inner">
-                  {tables.length === 0 && (
+                  {showingExample && <button type="button" className="sheet-tree-item active" aria-current="page">
+                    <Icon icon={Table2} size={14} />
+                    <span className="warehouse-example-name">{EXAMPLE_WAREHOUSE_NAME}</span>
+                    <span className="row-count">{localExampleRows.length}</span>
+                  </button>}
+                  {tables.length === 0 && !showingExample && (
                     <div className="sheet-tree-empty">暂无数据表，先处理文件或新建表</div>
                   )}
                   {tables.map((t) => (
@@ -1123,7 +1367,7 @@ export function DataTablePage({
                   ))}
                     </div>
                   </div>
-                  {!isFileCollection && <><button
+                  {!isFileCollection && !isMerge && <><button
                     className="sheet-tree-group-title"
                     aria-expanded={treeGroupsOpen.views}
                     onClick={() =>
@@ -1131,7 +1375,7 @@ export function DataTablePage({
                     }
                     title={`${treeGroupsOpen.views ? "收起" : "展开"}${presentationMode === "card" ? "内容分组" : "分 Sheet 视图"}`}
                   >
-                    <Icon icon={ChevronDown} size={16} />
+                    <CollapseChevron expanded={treeGroupsOpen.views} size={16} />
                     <span className="sheet-tree-group-label">{presentationMode === "card" ? "内容分组" : "分 Sheet 视图"}</span>
                   </button>
                   <div className={`sheet-tree-group-body${treeGroupsOpen.views ? " open" : ""}`} inert={!treeGroupsOpen.views} aria-hidden={!treeGroupsOpen.views}>
@@ -1165,12 +1409,12 @@ export function DataTablePage({
             aria-valuemin={180} aria-valuemax={360} aria-valuenow={sidebarWidth} tabIndex={0}
             onPointerDown={event => {
               if (event.button !== 0) return;
-              event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId);
-              sidebarDrag.current = {x: event.clientX, width: sidebarWidth};
+              event.preventDefault();
+              const startX = event.clientX;
+              const initialWidth = sidebarWidth;
+              setResizingColKey(null);
+              startPointerDrag(move => resizeSidebar(initialWidth + move.clientX - startX), undefined, event.pointerId, event.currentTarget);
             }}
-            onPointerMove={event => { if (sidebarDrag.current) resizeSidebar(sidebarDrag.current.width + event.clientX - sidebarDrag.current.x); }}
-            onPointerUp={event => { sidebarDrag.current = null; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); }}
-            onPointerCancel={() => { sidebarDrag.current = null; }} onLostPointerCapture={() => { sidebarDrag.current = null; }}
             onKeyDown={event => {
               if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
               event.preventDefault(); resizeSidebar(event.key === "Home" ? 180 : event.key === "End" ? 360 : sidebarWidth + (event.key === "ArrowLeft" ? -12 : 12));
@@ -1179,45 +1423,59 @@ export function DataTablePage({
           <div className="sheet-detail">
             <div className="panel-title" style={{ marginBottom: 0 }}>
               <div>
-                {!renamingSheet ? (
-                  <h3
-                    onClick={() => {
-                      if (!currentViewId && currentTableId) startRenameSheet();
-                    }}
-                    style={{ cursor: currentViewId ? "default" : "text" }}
-                    title={currentViewId ? undefined : "点击重命名"}
-                  >
-                    {currentSheetName}
-                  </h3>
-                ) : (
-                  <input
-                    aria-label="表名称"
-                    className="sheet-name-input"
-                    type="text"
-                    autoFocus
-                    value={sheetNameInput}
-                    onChange={(e) => setSheetNameInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        void commitRenameSheet();
-                      } else if (e.key === "Escape") {
-                        setRenamingSheet(false);
-                      }
-                    }}
-                    onBlur={() => void commitRenameSheet()}
-                  />
-                )}
-                <div className="support">{isFileCollection ? `字段按文件保存 · 共 ${tables.find(table => table.id === currentTableId)?.file_count ?? 0} 份文件` : <>共 <span>{totalRows}</span> {contentUnit} · <span>{currentSheetSource}</span></>}</div>
+                <div className="warehouse-sheet-name-line">
+                  {!renamingSheet ? (
+                    <h3
+                      onClick={() => {
+                        if (!currentViewId && currentTableId && !dataUnavailable) startRenameSheet();
+                      }}
+                      style={{ cursor: !currentTableId || currentViewId || dataUnavailable ? "default" : "text" }}
+                      title={!currentTableId || currentViewId || dataUnavailable ? undefined : "点击重命名"}
+                    >
+                      {currentSheetName}
+                    </h3>
+                  ) : (
+                    <input
+                      aria-label="表名称"
+                      className="sheet-name-input"
+                      type="text"
+                      autoFocus
+                      value={sheetNameInput}
+                      onChange={(e) => setSheetNameInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          void commitRenameSheet();
+                        } else if (e.key === "Escape") {
+                          setRenamingSheet(false);
+                        }
+                      }}
+                      onBlur={() => void commitRenameSheet()}
+                    />
+                  )}
+                  {showingExample && <span className="warehouse-example-note">改动仅本页，提取首条真实数据后隐藏</span>}
+                </div>
+                <div className="support">{dataUnavailable
+                  ? tablesError || tableLoadError ? "数据暂时无法读取" : tablesLoading || currentTableId ? "正在读取数据…" : "处理文件或导入表格后，在这里核对和整理。"
+                  : <>{tableLoadError && "上次读取的内容 · "}{isFileCollection ? `字段按文件保存 · 共 ${tables.find(table => table.id === currentTableId)?.file_count ?? 0} 份文件` : <>共 <span>{totalRows}</span> {contentUnit} · <span>{currentSheetSource}</span></>}</>}</div>
               </div>
               <div className="sheet-detail-actions">
-                {!currentViewId && currentTableId ? (
+                {!currentViewId && currentTableId && !dataUnavailable ? (
                   <DropdownMenu.Root>
-                    <DropdownMenu.Trigger asChild><button className="btn ghost sm icon-only" aria-label="数据表操作"><Icon icon={MoreHorizontal} size={18} /></button></DropdownMenu.Trigger>
-                    <DropdownMenu.Portal><DropdownMenu.Content className="record-menu" align="end" sideOffset={6}>
-                      <DropdownMenu.Item onSelect={startRenameSheet}><Icon icon={Pencil} size={14} />重命名</DropdownMenu.Item>
-                      {!isFileCollection && <DropdownMenu.Item onSelect={() => setIndependentHistoryOpen(true)}><Icon icon={History} size={14} />独立数据历史</DropdownMenu.Item>}
+                    <DropdownMenu.Trigger asChild><button ref={tableMenuButtonRef} className="btn ghost sm icon-only" aria-label="数据表操作"><Icon icon={MoreHorizontal} size={18} /></button></DropdownMenu.Trigger>
+                    <DropdownMenu.Portal><DropdownMenu.Content className="record-menu" align="end" sideOffset={6}
+                      onCloseAutoFocus={event => {
+                        const handoff = menuFocusHandoff.current;
+                        // Open the next focus owner only after Radix releases its menu scope.
+                        if (handoff) { event.preventDefault(); menuFocusHandoff.current = null; queueMicrotask(handoff); }
+                      }}>
+                      <DropdownMenu.Item onSelect={() => { menuFocusHandoff.current = startRenameSheet; }}><Icon icon={Pencil} size={14} />重命名</DropdownMenu.Item>
+                      {!isFileCollection && !isMerge && <DropdownMenu.Item onSelect={() => {
+                        menuFocusHandoff.current = () => setIndependentHistoryOpen(true);
+                      }}><Icon icon={History} size={14} />独立数据历史</DropdownMenu.Item>}
                       <DropdownMenu.Separator />
-                      <DropdownMenu.Item className="danger" onSelect={() => setDeleteConfirmOpen(true)}><Icon icon={Trash2} size={14} />删除数据表</DropdownMenu.Item>
+                      <DropdownMenu.Item className="danger" onSelect={() => {
+                        menuFocusHandoff.current = () => { setTableError(null); setDeleteConfirmOpen(true); };
+                      }}><Icon icon={Trash2} size={14} />{isMerge ? "删除合并表" : "删除数据表"}</DropdownMenu.Item>
                     </DropdownMenu.Content></DropdownMenu.Portal>
                   </DropdownMenu.Root>
                 ) : null}
@@ -1226,19 +1484,19 @@ export function DataTablePage({
 
             <div className="data-table-wrap">
               {/* 行级操作栏 */}
-              <div className="row-actions-bar">
+              {!dataUnavailable && <div className="row-actions-bar">
                 <div className="row-actions-left">
-                  {(presentationMode === "card" && selectedRows.length === 0 || selectedSources.length > 0) ? <button className="btn xs danger-soft" disabled={busyAction || !selectedSources.length} onClick={() => setClearSourcesConfirm(true)}><Icon icon={Trash2} size={14} />清空选中来源数据</button> : <button
-                    className="btn xs danger-soft"
-                    disabled={busyAction || selectedRows.length === 0}
-                    onClick={() => setDeleteRowsConfirm(true)}
-                  >
+                  {presentationMode === "card" ? <button className="btn xs danger-soft"
+                    disabled={busyAction || selectedSources.length === 0} onClick={() => setClearSourcesConfirm(true)}>
+                    <Icon icon={Trash2} size={14} /> 清空来源
+                  </button> : <button className="btn xs danger-soft"
+                    disabled={isMerge || busyAction || selectedRows.length === 0} onClick={() => setDeleteRowsConfirm(true)}>
                     <Icon icon={Trash2} size={14} /> 删除选中
                   </button>}
                   {!isFileCollection && <>
-                  <button
+                  {!showingExample && <button
                     className="btn xs secondary"
-                    disabled={selectedRows.length !== 1}
+                    disabled={isMerge || selectedRows.length !== 1}
                     onClick={() => {
                       const row = rows.find((r) => r.id === selectedRows[0]) ?? selectedRowSnapshots.current[selectedRows[0]];
                       if (row) void openRevisions(row.id);
@@ -1246,30 +1504,26 @@ export function DataTablePage({
                     title={selectedRows.length !== 1 ? "先勾选一行查看其修订历史" : "查看选中行的修订历史"}
                   >
                     <Icon icon={History} size={14} /> 修订历史
-                  </button>
+                  </button>}
                   <button
                     className="btn xs primary"
-                    disabled={busyAction}
+                    disabled={isMerge || busyAction}
                     onClick={() => void handleAddRow()}
                     title={presentationMode === "card" ? "新增空白内容，展开卡片后填写" : "在表尾新增一行空记录，直接在表格里填写"}
                   >
-                    <Icon icon={Plus} size={14} /> {presentationMode === "card" ? "新增独立记录" : "新增一行"}
-                  </button>
-                  <button className="btn xs secondary" onClick={() => setFieldFilterOpen(true)}>
-                    <Icon icon={Columns3} size={14} /> 字段筛选
-                    {hiddenCols.length > 0 && (
-                      <span className="filter-count-badge">{hiddenCols.length}</span>
-                    )}
+                    <Icon icon={Plus} size={14} /> {presentationMode === "card" ? "新增记录" : "新增一行"}
                   </button>
                   </>}
                 </div>
                 <div className="row-actions-right">
-                  {!isFileCollection && <div className="presentation-switch" aria-label="内容展示方式">
+                  {!isFileCollection && !isMerge && <div className="presentation-switch" aria-label="内容展示方式">
                     {(["table", "card"] as const).map((mode) => <button key={mode} className={`btn xs ${presentationMode === mode ? "primary" : "ghost"}`}
-                      disabled={!currentTableId} aria-pressed={presentationMode === mode}
+                      disabled={!displayTableId} aria-pressed={presentationMode === mode}
                       onClick={() => {
-                        if (!currentTableId || mode === presentationMode) return;
-                        setPresentationOverrides({ ...presentationOverrides, [currentTableId]: mode });
+                        if (!displayTableId || mode === presentationMode) return;
+                        setSelectedRows([]);
+                        setSelectedSources([]);
+                        setPresentationOverrides(previous => ({ ...previous, [displayTableId]: mode }));
                       }}>
                       {mode === "table" ? "表格" : "卡片"}
                     </button>)}
@@ -1280,55 +1534,57 @@ export function DataTablePage({
                   )}
                   {presentationMode === "table" && <span className="row-total-hint">共 <span>{totalRows}</span> {contentUnit}</span>}
                 </div>
-              </div>
-              {presentationMode === "table" && rows.some((row) => row.review_pending) && (
-                <details className="support data-source-details" style={{ padding: "8px 16px", color: "var(--warning-text)", overflowWrap: "anywhere" }}>
-                  <summary>本页有 {rows.filter((row) => row.review_pending).length} 条来源待核对的数据</summary>
-                  <p>关联文件的数据修改后，会按提取时的规则重新校验。可在文件历史查看问题；导出保留待核对标记。独立导入和合并数据只保留原来源的核对状态。</p>
-                  {rows.filter((row, index) => row.review_pending && !rows.slice(0, index).some((previous) => previous.review_pending &&
-                    (previous.task_id ?? previous.values.__row_group ?? previous.id) === (row.task_id ?? row.values.__row_group ?? row.id)
-                  )).map((row) => <p key={row.id}>{String(row.values.source_filename || `内容 ${row.id}`)}{!row.task_id && " · 来源已移除或来自导入/合并，保留原待核对状态"}</p>)}
-                </details>
-              )}
-              {presentationMode === "table" && rows.some((row) => row.input_scope?.coverage === "partial") && (
-                <details className="support data-source-details" style={{ padding: "8px 16px", overflowWrap: "anywhere" }}>
-                  <summary>本页有局部读取的数据 · 查看来源范围</summary>
-                  <p>这些结果只基于文件的部分内容，不能代表全文或全部明细。修改表中数据不会改变当时的读取范围。</p>
-                  {rows.filter((row, index) => row.input_scope?.coverage === "partial" && !rows.slice(0, index).some((previous) =>
-                    (previous.task_id ?? previous.values.__row_group ?? previous.id) === (row.task_id ?? row.values.__row_group ?? row.id)
-                    && JSON.stringify(previous.input_scope) === JSON.stringify(row.input_scope)
-                  )).map((row) => <InputScopeDetails key={row.id} scope={row.input_scope}
-                    label={String(row.values.source_filename || `内容 ${row.id}`)} originalAvailable={Boolean(row.task_id)} />)}
-                </details>
-              )}
+              </div>}
               <div className="data-table-scroll" ref={cardArea}>
-                {tableLoading && !detailMatches ? (
-                  <div style={{ padding: 48, textAlign: "center" }}>
-                    <Icon icon={Loader2} size={24} className="spin" />
+                {tablesError || (tableLoadError && !detailMatches) ? (
+                  <div className="table-empty-state warehouse-read-state" role="alert">
+                    <h3>暂时无法读取{tablesError ? "数据表列表" : "这张表"}</h3>
+                    <p className="support">{tablesError || tableLoadError}</p>
+                    <p className="support">尚未确认当前数据，请重新读取后继续。</p>
+                    <button className="btn secondary" type="button" onClick={() => {
+                      if (tablesError) setTablesReload(value => value + 1);
+                      else setReloadTrigger(value => value + 1);
+                    }}>{tablesError ? "重新读取数据表" : "重新读取表数据"}</button>
                   </div>
-                ) : presentationMode === "card" && currentTableId ? (
-                  <SourceCardCollection key={`${currentTableId}:${currentViewId}`} tableId={currentTableId} scope={{viewId: currentViewId, search: searchText}}
+                ) : tablesLoading || (currentTableId && !detailMatches) || (!currentTableId && tables.length === 0 && emptyWorkspaceConfirmed === null) ? (
+                  <div className="table-empty-state warehouse-read-state" role="status">
+                    <Icon icon={Loader2} size={24} className="spin" /><span>正在读取数据…</span>
+                  </div>
+                ) : !displayTableId ? (
+                  <div className="table-empty-state warehouse-read-state">
+                    <Icon icon={Table2} size={28} /><h3>还没有数据表</h3>
+                    <p className="support">可以先提取一份文件，或从上方导入已有表格。</p>
+                    {onNavigateExtract && <button className="btn primary" type="button" onClick={onNavigateExtract}>去文件提取</button>}
+                  </div>
+                ) : presentationMode === "card" ? (
+                  <SourceCardCollection key={`${displayTableId}:${currentViewId}`} tableId={displayTableId} scope={{viewId: currentViewId, search: searchText}}
+                    example={exampleCards && {
+                      cards: exampleCards,
+                      detail: (card, page) => warehouseExampleDetail(card, matchingExampleRows, page),
+                      edit: (id, key, value) => setLocalExampleRows(current => editExampleRow(current, id, key, value)),
+                      remove: (card, details) => setLocalExampleRows(current => current.filter(row =>
+                        details ? !details.some(detail => detail.id === row.id) : exampleSourceId(row) !== card.id)),
+                    }}
                     reload={reloadTrigger} selected={selectedSources} onSelect={sources => { setSelectedSources(sources); setSelectedRows([]); }}
-                    selectedRows={selectedRows} onSelectRow={isFileCollection ? undefined : (row, checked) => { selectedRowSnapshots.current[row.id] = row; setSelectedSources([]); setSelectedRows(previous => checked ? [...previous.filter(id => id !== row.id), row.id] : previous.filter(id => id !== row.id)); }}
                     onChanged={() => { setSelectedSources([]); setSelectedRows([]); setReloadTrigger(n => n + 1); }} hiddenFields={hiddenCols} highlightTaskId={highlightTaskId} />
                 ) : rows.length === 0 && columns.length === 0 ? (
                   <div className="table-empty-state">
                     <Icon icon={Table2} size={28} />
                     <div>这张表还没有数据</div>
-                    <div className="small muted">使用“新增一行”或“导入”开始填写</div>
+                    {!isMerge && !showingExample && <div className="small muted">使用“新增一行”或“导入”开始填写</div>}
                   </div>
                 ) : (
                   <table className="data-table" style={{ minWidth: `${tableMinWidth}px` }}>
                     <colgroup>
-                      <col style={{ width: 44 }} />
+                      <col style={{ width: leadingWidth }} />
                       {visibleColumns.map((col) => (
                         <col key={col.key} style={{ width: widthFor(col) }} />
                       ))}
                     </colgroup>
                     <thead>
                       <tr>
-                        <th className="th-check" style={{ width: 44 }}>
-                          <input aria-label="全选或取消全选" type="checkbox" checked={allSelected} onChange={() => toggleSelectAll()} title="全选 / 取消全选" />
+                        <th className={isMerge ? "" : "th-check"} style={{ width: leadingWidth }}>
+                          {isMerge ? "原表" : <input aria-label="全选或取消全选" type="checkbox" checked={allSelected} onChange={() => toggleSelectAll()} title="全选 / 取消全选" />}
                         </th>
                         {visibleColumns.map((col) => (
                           <th
@@ -1364,17 +1620,27 @@ export function DataTablePage({
                             <tr
                               key={row.id}
                               className={`${selectedRows.includes(row.id) ? "checked" : ""}${isHighlight ? " is-highlight" : ""}`}
-                              title="单击单元格直接编辑 · 勾选框用于批量选择"
+                              title={isMerge ? undefined : "单击单元格直接编辑 · 勾选框用于批量选择"}
                             >
-                              <td className="td-check" onClick={(e) => e.stopPropagation()}>
+                              {isMerge ? <td>
+                                <button type="button" className="btn ghost xs merge-source-link"
+                                  onClick={() => void openMergedSource(row)}>{tables.find(table => table.id === row.source_table_id)?.name ?? "原表"}</button>
+                              </td> : <td className="td-check">
                                 <input aria-label="勾选此行加入批量" type="checkbox" checked={selectedRows.includes(row.id)} onChange={() => toggleSelectRow(row.id)} title="勾选加入批量" />
-                              </td>
+                              </td>}
                               {visibleColumns.map((col) => {
                                 const cellText = getCellValue(row, col.key);
                                 const isMatch =
                                   searchQuery !== "" &&
                                   cellText.toLowerCase().includes(searchQuery);
-                                if (headerKeys.has(col.key) && (row.shared_header_keys?.includes(col.key) ?? true)) {
+                                const shared = headerKeys.has(col.key) && (row.shared_header_keys?.includes(col.key) ?? true);
+                                if (isMerge) {
+                                  if (shared && !isGroupFirst) return null;
+                                  return <td key={col.key} rowSpan={shared ? group.rows.length : undefined}
+                                    className={`${col.numeric ? "numeric " : ""}${isMatch ? "cell-match" : ""}`}
+                                    title={cellText}>{cellText}</td>;
+                                }
+                                if (shared) {
                                   if (!isGroupFirst) {
                                     return null;
                                   }
@@ -1385,17 +1651,13 @@ export function DataTablePage({
                                       rowSpan={group.rows.length}
                                       className={`${editingCell === `${idx}-${col.key}` ? "focused" : ""}${col.numeric ? " numeric" : ""} header-cell${isMatch ? " cell-match" : ""}`}
                                       onClick={() => {
-                                        if (editingCell !== `${idx}-${col.key}`) {
-                                          cancelEditRef.current = false;
-                                          setEditingCell(`${idx}-${col.key}`);
-                                        }
+                                        beginCellEdit(row, col.key, `${idx}-${col.key}`);
                                       }}
                                       onKeyDown={(event) => {
                                         if (event.target !== event.currentTarget) return;
                                         if (event.key === "Enter" || event.key === "F2") {
                                           event.preventDefault();
-                                          cancelEditRef.current = false;
-                                          setEditingCell(`${idx}-${col.key}`);
+                                          beginCellEdit(row, col.key, `${idx}-${col.key}`);
                                         }
                                       }}
                                       tabIndex={0}
@@ -1428,17 +1690,13 @@ export function DataTablePage({
                                     key={col.key}
                                     className={`${editingCell === `${idx}-${col.key}` ? "focused" : ""}${col.numeric ? " numeric" : ""}${isMatch ? " cell-match" : ""}`}
                                     onClick={() => {
-                                      if (editingCell !== `${idx}-${col.key}`) {
-                                        cancelEditRef.current = false;
-                                        setEditingCell(`${idx}-${col.key}`);
-                                      }
+                                      beginCellEdit(row, col.key, `${idx}-${col.key}`);
                                     }}
                                     onKeyDown={(event) => {
                                       if (event.target !== event.currentTarget) return;
                                       if (event.key === "Enter" || event.key === "F2") {
                                         event.preventDefault();
-                                        cancelEditRef.current = false;
-                                        setEditingCell(`${idx}-${col.key}`);
+                                        beginCellEdit(row, col.key, `${idx}-${col.key}`);
                                       }
                                     }}
                                     tabIndex={0}
@@ -1485,45 +1743,9 @@ export function DataTablePage({
                   </table>
                 )}
               </div>
-              {presentationMode === "table" && <div className="table-footer">
-                <span className="footer-info">显示 <span>{rows.length === 0 ? 0 : (page - 1) * pageSize + 1}</span>-<span>{(page - 1) * pageSize + rows.length}</span> {contentUnit}，共 <span>{totalRows}</span> {contentUnit}</span>
-                <div className="pagination">
-                  <button className="btn icon-only sm" disabled={page <= 1} onClick={() => goToPage(1)} title="第一页">
-                    <Icon icon={ChevronsLeft} size={14} />
-                  </button>
-                  <button className="btn icon-only sm" disabled={page <= 1} onClick={() => goToPage(Math.max(1, page - 1))} title="上一页">
-                    <Icon icon={ChevronLeft} size={14} />
-                  </button>
-                  {pageNumbers.map((p) => (
-                    <button key={p} className={`btn sm${p === page ? " active" : ""}`} onClick={() => goToPage(p)}>{p}</button>
-                  ))}
-                  <button className="btn icon-only sm" disabled={page >= totalPages} onClick={() => goToPage(Math.min(totalPages, page + 1))} title="下一页">
-                    <Icon icon={ChevronRight} size={14} />
-                  </button>
-                  <button className="btn icon-only sm" disabled={page >= totalPages} onClick={() => goToPage(totalPages)} title="最后一页">
-                    <Icon icon={ChevronsRight} size={14} />
-                  </button>
-                  <span className="pagination-jump">
-                    第
-                    <input
-                      type="number"
-                      min={1}
-                      max={totalPages}
-                      value={jumpPageInput}
-                      onChange={(e) => setJumpPageInput(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") jumpToPage();
-                      }}
-                      placeholder={String(page)}
-                      aria-label="跳转页码"
-                    />
-                    页 / 共 {totalPages} 页
-                    <button className="btn sm secondary" disabled={!jumpPageInput.trim()} onClick={jumpToPage}>
-                      跳转
-                    </button>
-                  </span>
-                </div>
-              </div>}
+              {presentationMode === "table" && !dataUnavailable &&
+                <WarehousePagination key={`${displayTableId}:${currentViewId}`} page={page} pageCount={totalPages} onChange={goToPage}
+                  summary={<>显示 {rows.length === 0 ? 0 : (page - 1) * pageSize + 1}-{(page - 1) * pageSize + rows.length} {contentUnit}，共 {totalRows} {contentUnit}</>} />}
             </div>
           </div>
         </div>
@@ -1531,32 +1753,32 @@ export function DataTablePage({
 
       {/* 合并表模态 */}
       {mergeModalOpen && (
-        <div className="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) setMergeModalOpen(false); }}>
-          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget && !busyAction) setMergeModalOpen(false); }}>
+          <div className="modal-card" role="dialog" aria-modal="true" aria-labelledby="warehouse-merge-title" {...mergeDialog} onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
               <div>
                 <div className="modal-eyebrow"><Icon icon={GitMerge} size={15} /> 合并表</div>
-                <h3>选择需要合并的数据表</h3>
-                <div className="support">将多张表纵向合并为一张新表，字段取并集，保留全部行。</div>
+                <h3 id="warehouse-merge-title">选择需要合并的数据表</h3>
+                <div className="support">按勾选顺序排列记录。合并表随原表更新。</div>
               </div>
-              <button aria-label="关闭" className="btn ghost sm icon-only" onClick={() => setMergeModalOpen(false)}>
+              <button aria-label="关闭合并表" disabled={busyAction} className="btn ghost sm icon-only" onClick={() => setMergeModalOpen(false)}>
                 <Icon icon={X} size={16} />
               </button>
             </div>
             <div className="modal-body">
               <div className="merge-sheet-list">
-                {tables.filter(table => table.collection_kind !== "files").map((s) => (
+                {mergeCandidates.map((s) => (
                   <label className={`merge-sheet-row${mergeSelection.includes(s.id) ? " checked" : ""}`} key={s.id}>
-                    <input type="checkbox" checked={mergeSelection.includes(s.id)} onChange={() => toggleMergeSheet(s.id)} />
+                    <input type="checkbox" disabled={busyAction} checked={mergeSelection.includes(s.id)} onChange={() => toggleMergeSheet(s.id)} />
                     <Icon icon={Table2} size={15} style={{ color: "var(--color-text-muted)" }} />
                     <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.name}</span>
-                    <span className="row-count">{s.row_count + " 行"}</span>
+                    <span className="row-count">{mergeSelection.includes(s.id) && `第 ${mergeSelection.indexOf(s.id) + 1} 张 · `}{s.row_count} 行</span>
                   </label>
                 ))}
               </div>
               <div className="merge-name-row">
-                <label className="form-label" htmlFor="merge-table-name">新表名称</label>
-                <input aria-label="新表名称" className="form-input" type="text" id="merge-table-name" value={mergeName} onChange={(e) => setMergeName(e.target.value)} placeholder="为合并后的表命名" />
+                <label className="form-label" htmlFor="merge-table-name">合并表名称</label>
+                <input aria-label="合并表名称" disabled={busyAction} className="form-input" type="text" id="merge-table-name" value={mergeName} onChange={(e) => setMergeName(e.target.value)} placeholder="为合并后的表命名" />
               </div>
               <div className="merge-summary">
                 <div className="merge-summary-stat">
@@ -1573,9 +1795,10 @@ export function DataTablePage({
                   </div>
                 )}
               </div>
+              {tableError && <p role="alert" className="callout danger">{tableError}</p>}
             </div>
             <div className="modal-foot">
-              <button className="btn ghost" onClick={() => setMergeModalOpen(false)}>取消</button>
+              <button className="btn ghost" disabled={busyAction} onClick={() => setMergeModalOpen(false)}>取消</button>
               <button
                 className="btn primary"
                 disabled={mergeSelection.length < 2 || !mergeName.trim() || busyAction}
@@ -1593,23 +1816,23 @@ export function DataTablePage({
         <div
           className="modal-overlay"
           onClick={(event) => {
-            if (event.target === event.currentTarget) setSplitModalOpen(false);
+            if (event.target === event.currentTarget && !splitting) setSplitModalOpen(false);
           }}
         >
-          <div className="modal-card" onClick={(event) => event.stopPropagation()} style={{ maxWidth: 480 }}>
+          <div className="modal-card" role="dialog" aria-modal="true" aria-labelledby="warehouse-split-title" {...splitDialog} onClick={(event) => event.stopPropagation()} style={{ maxWidth: 480 }}>
             <div className="modal-head">
               <div>
                 <div className="modal-eyebrow"><Icon icon={Table2} size={15} /> 内容分组</div>
-                <h3>选择分组方式</h3>
+                <h3 id="warehouse-split-title">选择分组方式</h3>
                 <div className="support">按来源文件或字段浏览，数据仍只保存一份。</div>
               </div>
-              <button className="btn ghost sm icon-only" onClick={() => setSplitModalOpen(false)}>
+              <button aria-label="关闭分组设置" disabled={splitting} className="btn ghost sm icon-only" onClick={() => setSplitModalOpen(false)}>
                 <Icon icon={X} size={16} />
               </button>
             </div>
             <div className="modal-body">
               <label className="form-field"><span className="form-label">分组方式</span>
-                <select className="form-select" value={groupBy} onChange={(event) => setGroupBy(event.target.value as "none" | "file" | "field")}>
+                <select className="form-select" disabled={splitting} value={groupBy} onChange={(event) => setGroupBy(event.target.value as "none" | "file" | "field")}>
                   <option value="none">取消全部分组</option><option value="file">按文件或独立来源组</option><option value="field">按字段</option>
                 </select>
               </label>
@@ -1617,6 +1840,7 @@ export function DataTablePage({
                 <span className="form-label">用于分类的字段</span>
                 <select
                   className="form-select"
+                  disabled={splitting}
                   value={splitFieldKey}
                   onChange={(event) => setSplitFieldKey(event.target.value)}
                 >
@@ -1626,9 +1850,10 @@ export function DataTablePage({
                   ))}
                 </select>
               </label>}
+              {tableError && <p role="alert" className="callout danger">{tableError}</p>}
             </div>
             <div className="modal-foot">
-              <button className="btn ghost" onClick={() => setSplitModalOpen(false)}>取消</button>
+              <button className="btn ghost" disabled={splitting} onClick={() => setSplitModalOpen(false)}>取消</button>
               <button
                 className="btn primary"
                 disabled={(groupBy === "field" && !splitFieldKey) || splitting}
@@ -1644,15 +1869,15 @@ export function DataTablePage({
 
       {/* 新建表模态 */}
       {createModalOpen && (
-        <div className="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) setCreateModalOpen(false); }}>
-          <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 440 }}>
+        <div className="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget && !busyAction) setCreateModalOpen(false); }}>
+          <div className="modal-card" role="dialog" aria-modal="true" aria-labelledby="warehouse-create-title" {...createDialog} onClick={(e) => e.stopPropagation()} style={{ maxWidth: 440 }}>
             <div className="modal-head">
               <div>
                 <div className="modal-eyebrow"><Icon icon={Plus} size={15} /> 新建表</div>
-                <h3>基于模板创建空表</h3>
+                <h3 id="warehouse-create-title">基于模板创建空表</h3>
                 <div className="support">空白表没有字段定义，无法填写，因此必须选择一个模板作为字段来源。</div>
               </div>
-              <button className="btn ghost sm icon-only" onClick={() => setCreateModalOpen(false)}>
+              <button aria-label="关闭新建表" disabled={busyAction} className="btn ghost sm icon-only" onClick={() => setCreateModalOpen(false)}>
                 <Icon icon={X} size={16} />
               </button>
             </div>
@@ -1662,6 +1887,7 @@ export function DataTablePage({
                 <input
                   className="form-input"
                   type="text"
+                  disabled={busyAction}
                   value={newTableName}
                   onChange={(e) => setNewTableName(e.target.value)}
                   placeholder="例如：2026 年 8 月发票"
@@ -1671,6 +1897,7 @@ export function DataTablePage({
                 <span className="form-label">字段模板</span>
                 <select
                   className="form-select"
+                  disabled={busyAction || templatesLoading || Boolean(templatesError)}
                   value={newTableTemplate}
                   onChange={(e) => setNewTableTemplate(e.target.value)}
                 >
@@ -1680,12 +1907,19 @@ export function DataTablePage({
                   ))}
                 </select>
               </label>
+              {templatesLoading && <p className="support" role="status">正在读取字段模板…</p>}
+              {templatesError && <div className="callout danger" role="alert">字段模板读取失败：{templatesError}
+                <button className="btn secondary sm" onClick={() => setTemplatesReload(value => value + 1)}>重新读取字段模板</button>
+              </div>}
+              {!templatesLoading && !templatesError && !templates.some(template => template.engine_kind !== "autonomous") &&
+                <p className="support">还没有可用的字段模板，请先到模板页新建模板。</p>}
+              {tableError && <p role="alert" className="callout danger">{tableError}</p>}
             </div>
             <div className="modal-foot">
-              <button className="btn ghost" onClick={() => setCreateModalOpen(false)}>取消</button>
+              <button className="btn ghost" disabled={busyAction} onClick={() => setCreateModalOpen(false)}>取消</button>
               <button
                 className="btn primary"
-                disabled={!newTableName.trim() || !newTableTemplate || busyAction}
+                disabled={!newTableName.trim() || !newTableTemplate || busyAction || templatesLoading || Boolean(templatesError)}
                 onClick={() => void handleCreateTable()}
               >
                 {busyAction ? <Icon icon={Loader2} size={15} className="spin" /> : <Icon icon={Plus} size={15} />}
@@ -1698,20 +1932,21 @@ export function DataTablePage({
 
       {/* 删除表确认 */}
       {deleteConfirmOpen && (
-        <div className="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) setDeleteConfirmOpen(false); }}>
-          <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 420 }}>
+        <div className="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget && !busyAction) setDeleteConfirmOpen(false); }}>
+          <div className="modal-card" role="dialog" aria-modal="true" aria-labelledby="warehouse-delete-title" {...deleteTableDialog} onClick={(e) => e.stopPropagation()} style={{ maxWidth: 420 }}>
             <div className="modal-head">
               <div>
                 <div className="modal-eyebrow"><Icon icon={Trash2} size={15} /> 删除表</div>
-                <h3>删除“{currentSheetName}”？</h3>
-                <div className="support">将删除该表、全部当前数据、分 Sheet 视图及独立数据历史。关联文件的原件与文件修订历史保留，模板仍可用于后续提取。此操作不可恢复。</div>
+                <h3 id="warehouse-delete-title">删除“{currentSheetName}”？</h3>
+                <div className="support">{isMerge ? "删除此合并表。原表和记录保留。" : "将删除该表、全部当前数据、分 Sheet 视图及独立数据历史。关联文件的原件与文件修订历史保留，模板仍可用于后续提取。此操作不可恢复。"}</div>
               </div>
-              <button aria-label="关闭" className="btn ghost sm icon-only" onClick={() => setDeleteConfirmOpen(false)}>
+              <button aria-label="关闭删除表确认" disabled={busyAction} className="btn ghost sm icon-only" onClick={() => setDeleteConfirmOpen(false)}>
                 <Icon icon={X} size={16} />
               </button>
             </div>
+            {tableError && <div className="modal-body"><p role="alert" className="callout danger">{tableError}</p></div>}
             <div className="modal-foot">
-              <button className="btn ghost" onClick={() => setDeleteConfirmOpen(false)}>取消</button>
+              <button className="btn ghost" disabled={busyAction} onClick={() => setDeleteConfirmOpen(false)}>取消</button>
               <button
                 className="btn danger-soft"
                 disabled={busyAction}
@@ -1728,14 +1963,14 @@ export function DataTablePage({
       {/* 字段筛选模态 */}
       {fieldFilterOpen && (
         <div className="modal-overlay" onClick={(e) => { if (e.target === e.currentTarget) setFieldFilterOpen(false); }}>
-          <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 440 }}>
+          <div className="modal-card" role="dialog" aria-modal="true" aria-labelledby="warehouse-fields-title" {...fieldDialog} onClick={(e) => e.stopPropagation()} style={{ maxWidth: 440 }}>
             <div className="modal-head">
               <div>
-                <div className="modal-eyebrow"><Icon icon={Columns3} size={15} /> 字段筛选</div>
-                <h3>显示字段</h3>
-                <div className="support">勾选要显示的列，取消则隐藏该列。</div>
+                <div className="modal-eyebrow"><Icon icon={Columns3} size={15} /> 数据表</div>
+                <h3 id="warehouse-fields-title">显示字段</h3>
+                <div className="support">勾选要在表格中显示的列，取消则隐藏该列。</div>
               </div>
-              <button className="btn ghost sm icon-only" onClick={() => setFieldFilterOpen(false)}>
+              <button aria-label="关闭字段显示设置" className="btn ghost sm icon-only" onClick={() => setFieldFilterOpen(false)}>
                 <Icon icon={X} size={16} />
               </button>
             </div>
@@ -1754,6 +1989,7 @@ export function DataTablePage({
                         onClick={(event) => {
                           event.preventDefault();
                           event.stopPropagation();
+                          setTableError(null);
                           setDeleteColumnTarget(col);
                         }}
                         title="删除附加列"
@@ -1774,23 +2010,24 @@ export function DataTablePage({
       )}
 
       {addColumnOpen && (
-        <div className="modal-overlay" onClick={(event) => { if (event.target === event.currentTarget) setAddColumnOpen(false); }}>
-          <div className="modal-card" style={{ maxWidth: 480 }}>
+        <div className="modal-overlay" onClick={(event) => { if (event.target === event.currentTarget && !busyAction) setAddColumnOpen(false); }}>
+          <div className="modal-card" role="dialog" aria-modal="true" aria-labelledby="warehouse-add-column-title" {...addColumnDialog} style={{ maxWidth: 480 }}>
             <div className="modal-head">
-              <div><h3>新增附加列</h3><div className="support">用于整理当前数据，不改变模板的提取规则；填写后也会记录在文件修订中。</div></div>
-              <button aria-label="关闭" className="btn ghost sm icon-only" onClick={() => setAddColumnOpen(false)}><Icon icon={X} size={16} /></button>
+              <div><h3 id="warehouse-add-column-title">新增附加列</h3><div className="support">用于整理当前数据，不改变模板的提取规则；填写后也会记录在文件修订中。</div></div>
+              <button aria-label="关闭新增附加列" disabled={busyAction} className="btn ghost sm icon-only" onClick={() => setAddColumnOpen(false)}><Icon icon={X} size={16} /></button>
             </div>
             <div className="modal-body">
-              <label className="form-field"><span>列名</span><input autoFocus className="form-input" maxLength={64} value={newColumnLabel} onChange={(event) => setNewColumnLabel(event.target.value)} placeholder="例如：内部备注" /></label>
-              <label className="form-field"><span>字段类型</span><select className="form-input" value={newColumnType} onChange={event => setNewColumnType(event.target.value as typeof newColumnType)}>
+              <label className="form-field"><span>列名</span><input ref={newColumnInputRef} disabled={busyAction} className="form-input" maxLength={64} value={newColumnLabel} onChange={(event) => setNewColumnLabel(event.target.value)} placeholder="例如：内部备注" /></label>
+              <label className="form-field"><span>字段类型</span><select disabled={busyAction} className="form-input" value={newColumnType} onChange={event => setNewColumnType(event.target.value as typeof newColumnType)}>
                 <option value="text">文字</option><option value="number">数字</option><option value="date">日期</option><option value="boolean">是 / 否</option>
               </select></label>
               <div className="form-field"><span>填写方式</span><div className="column-mode-options" role="group" aria-label="附加列填写方式">
-                <button type="button" className={`column-mode-button${newColumnSection === "header" ? " active" : ""}`} onClick={() => setNewColumnSection("header")}><strong>按表头填写</strong><span>同一文件共用一个值，导出时合并单元格</span></button>
-                <button type="button" className={`column-mode-button${newColumnSection === "item" ? " active" : ""}`} onClick={() => setNewColumnSection("item")}><strong>按明细填写</strong><span>每条明细可以分别填写不同内容</span></button>
+                <button type="button" disabled={busyAction} className={`column-mode-button${newColumnSection === "header" ? " active" : ""}`} onClick={() => setNewColumnSection("header")}><strong>按表头填写</strong><span>同一文件共用一个值，导出时合并单元格</span></button>
+                <button type="button" disabled={busyAction} className={`column-mode-button${newColumnSection === "item" ? " active" : ""}`} onClick={() => setNewColumnSection("item")}><strong>按明细填写</strong><span>每条明细可以分别填写不同内容</span></button>
               </div></div>
+              {tableError && <p role="alert" className="callout danger">{tableError}</p>}
             </div>
-            <div className="modal-foot"><button className="btn ghost" onClick={() => setAddColumnOpen(false)}>取消</button><button className="btn primary" disabled={busyAction || !newColumnLabel.trim()} onClick={() => void handleAddColumn()}>新增列</button></div>
+            <div className="modal-foot"><button className="btn ghost" disabled={busyAction} onClick={() => setAddColumnOpen(false)}>取消</button><button className="btn primary" disabled={busyAction || !newColumnLabel.trim()} onClick={() => void handleAddColumn()}>新增列</button></div>
           </div>
         </div>
       )}
@@ -1806,17 +2043,41 @@ export function DataTablePage({
         key={`${currentTableId}-${independentHistoryOpen ? "all" : revisionSource?.id}`}
         tableId={currentTableId} tableName={tables.find(table => table.id === currentTableId)?.name ?? "数据表"}
         rowId={independentHistoryOpen ? undefined : revisionSource?.id} columns={tableDetail?.columns ?? []}
-        onClose={() => {setIndependentHistoryOpen(false); setRevisionsOpen(false);}} />}
+        onClose={() => {
+          const restoreMenu = independentHistoryOpen;
+          setIndependentHistoryOpen(false); setRevisionsOpen(false);
+          if (restoreMenu) queueMicrotask(() => tableMenuButtonRef.current?.focus({ preventScroll: true }));
+        }} />}
 
-      <ConfirmDialog open={clearSourcesConfirm} title="清空选中来源数据"
+      <ConfirmDialog open={clearSourcesConfirm} title="清空来源"
         description={<>{`将清空 ${selectedSources.length} 个完整来源的 ${selectedSources.reduce((count, source) => count + source.row_count, 0)} 条当前记录。文件原件和修订历史保留；这些数据将不再出现在统计、问知意或后续导出中。`}<span className="confirm-source-list" role="list" aria-label="将清空的完整来源">{selectedSources.map(source => <span role="listitem" key={source.id}>{source.filename || "独立记录"} · {source.row_count} 条</span>)}</span></>}
         buttonLabel="确认清空" busy={busyAction} onConfirm={() => void handleClearSources()} onClose={() => setClearSourcesConfirm(false)} />
       <ConfirmDialog open={deleteRowsConfirm} title={`删除 ${selectedRows.length} 条明细？`}
         description="这些明细将从当前数据中删除，并保留删除前内容的修订记录。文件原件保留；若删去文件的最后一条明细，该文件的共享字段也会从当前数据中清空。"
         buttonLabel="确认删除" busy={busyAction} onConfirm={() => void handleDeleteRows()} onClose={() => setDeleteRowsConfirm(false)} />
       <ConfirmDialog open={deleteColumnTarget !== null} title={`删除附加列“${deleteColumnTarget?.label ?? ""}”？`}
+        error={tableError}
         description="仅能删除整张表中没有当前值、且未被分组或仪表盘使用的附加列。已有数据或依赖时会拒绝删除。历史内容保留。"
         buttonLabel="确认删除" busy={busyAction} onConfirm={() => { if (deleteColumnTarget) void handleDeleteColumn(deleteColumnTarget); }} onClose={() => setDeleteColumnTarget(null)} />
+      {exportNotes && <NoticeDialog title="导出附加资料" busy={exportNotesBusy} onClose={() => setExportNotes(null)}
+        actions={<button className="btn primary" type="button" disabled={exportNotesBusy || (!exportRevisions && !exportInputScope)}
+          onClick={async () => {
+            setExportNotesBusy(true);
+            setExportNotesError("");
+            const saved = await downloadExport(getTableNotesExportUrl(exportNotes.tableId, exportRevisions, exportInputScope),
+              `${exportNotes.name}-附加资料.xlsx`, setExportNotesError);
+            setExportNotesBusy(false);
+            if (saved) setExportNotes(null);
+          }}>导出</button>}>
+        <p>导出「{exportNotes.name}」整表的资料，包含筛选和勾选范围以外的记录。</p>
+        <div className="checkbox-options">
+          <CheckboxOption title="修订历史" description="每个任务一张工作表，按版本列出修改前后的值。"
+            checked={exportRevisions} disabled={exportNotesBusy} onChange={setExportRevisions} />
+          <CheckboxOption title="提取范围" description="列出哪些内容交给了模型，以及哪些部分未读取。"
+            checked={exportInputScope} disabled={exportNotesBusy} onChange={setExportInputScope} />
+        </div>
+        {exportNotesError && <p role="alert">{exportNotesError}</p>}
+      </NoticeDialog>}
       <Toast toast={toast} onDismiss={clear} />
     </div>
   );

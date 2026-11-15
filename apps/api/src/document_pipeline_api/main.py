@@ -28,6 +28,7 @@ from document_pipeline_api.api.system import router as system_router
 from document_pipeline_api.api.tasks import router as tasks_router
 from document_pipeline_api.api.templates import router as templates_router
 from document_pipeline_api.api.user_state import router as user_state_router
+from document_pipeline_api.api.updates import router as updates_router
 from document_pipeline_api.config import Settings
 from document_pipeline_api.db import build_engine
 from document_pipeline_api.migrations import upgrade_database
@@ -279,6 +280,7 @@ def create_app(
     application.include_router(tasks_router, prefix="/api/v1")
     application.include_router(templates_router, prefix="/api/v1")
     application.include_router(user_state_router, prefix="/api/v1")
+    application.include_router(updates_router, prefix="/api/v1")
     active_web_dir = web_dir if web_dir is not None else bundled_web_dir()
     if active_web_dir is not None:
         mount_web_app(application, active_web_dir)

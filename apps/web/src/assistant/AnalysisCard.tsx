@@ -20,6 +20,7 @@ import {
 import { Expand, X, Database, ArrowUpRight } from "lucide-react";
 import type { Analysis, ChartSpec, ChartType, Reference } from "./types";
 import { statisticFromAnalysis } from "../dashboard/pinAnalysis";
+import { formatNumericValue } from "../numberDisplay";
 
 const colors = Array.from({ length: 6 }, (_, i) => `var(--ask-chart-${i})`);
 const visited = new Set<string>();
@@ -40,9 +41,7 @@ const fmt = (value: unknown) =>
   value == null
     ? "—"
     : typeof value === "number"
-      ? new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 6 }).format(
-          value,
-        )
+      ? formatNumericValue(value)
       : String(value);
 const metricName = (key: string) =>
   key
@@ -54,6 +53,71 @@ const metricName = (key: string) =>
     .replace(/^distinct:/, "去重数 · ")
     .replace(/^missing:/, "缺失数 · ")
     .replace(/^duplicates:/, "重复数 · ");
+
+/** Project the query schema for readers; never rewrite the saved request. */
+function readableAnalysisQuery(analysis: Analysis): Record<string, string> {
+  const request = analysis.source.request;
+  const details: Record<string, string> = {};
+  const dimensionLabels = (analysis as Analysis & { dimension_labels?: Record<string, string> }).dimension_labels;
+  const fieldLabel = (field: string) => analysis.columns?.find(column => column.key === field)?.label
+    || dimensionLabels?.[field] || field;
+  const operators: Record<string, string> = {
+    eq: "等于", ne: "不等于", contains: "包含", gt: "大于", gte: "不小于", lt: "小于", lte: "不大于", empty: "未填写",
+  };
+  const aggregates: Record<string, string> = {
+    count: "记录数", sum: "合计", avg: "平均", min: "最小", max: "最大",
+    distinct: "去重数", missing: "缺失数", duplicates: "重复数",
+  };
+  const metricLabel = (key: string) => {
+    if (analysis.metric_labels?.[key]) return analysis.metric_labels[key];
+    if (key === "row_id" && !analysis.columns?.some(column => column.key === key) && !dimensionLabels?.[key]) return "记录顺序";
+    const separator = key.indexOf(":");
+    const operation = key.slice(0, separator);
+    if (separator > 0 && aggregates[operation]) {
+      const field = key.slice(separator + 1);
+      return field === "*" ? aggregates[operation] : `${aggregates[operation]} · ${fieldLabel(field)}`;
+    }
+    return fieldLabel(key);
+  };
+  const object = (value: unknown): Record<string, unknown> =>
+    value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  if (Array.isArray(request.filters)) {
+    const filters = request.filters.flatMap(value => {
+      const rule = object(value);
+      if (typeof rule.field !== "string" || typeof rule.op !== "string" || !operators[rule.op]) return [];
+      const criterion = `${fieldLabel(rule.field)} ${operators[rule.op]}`;
+      if (rule.op !== "empty" && ["string", "number", "boolean"].includes(typeof rule.value)) {
+        return [`${criterion} ${String(rule.value)}`];
+      }
+      return [criterion];
+    });
+    if (filters.length) details["筛选条件"] = filters.join(" · ");
+  }
+  if (Array.isArray(request.dimensions) && request.dimensions.length) {
+    details["分组字段"] = request.dimensions.filter((value): value is string => typeof value === "string").map(fieldLabel).join(" · ");
+  }
+  if (Array.isArray(request.metrics)) {
+    const metrics = request.metrics.flatMap(value => {
+      const metric = object(value);
+      if (typeof metric.op !== "string" || !aggregates[metric.op]) return [];
+      return [metricLabel(`${metric.op}:${typeof metric.field === "string" ? metric.field : "*"}`)];
+    });
+    if (metrics.length) details["统计指标"] = metrics.join(" · ");
+  }
+  const buckets: Record<string, string> = { day: "日", month: "月", year: "年" };
+  if (typeof request.time_bucket === "string" && buckets[request.time_bucket]) details["时间粒度"] = buckets[request.time_bucket];
+  const grains: Record<string, string> = { auto: "自动", row: "按明细", document: "按文件" };
+  if (typeof request.grain === "string" && grains[request.grain]) details["统计粒度"] = grains[request.grain];
+  if (typeof request.sort === "string" && request.sort) details["排序"] = `${metricLabel(request.sort)} · ${request.descending === false ? "升序" : "降序"}`;
+  if (typeof request.limit === "number" && Number.isFinite(request.limit)) details["最多展示"] = String(request.limit);
+  if (typeof request.records === "boolean") details["结果类型"] = request.records ? "明细记录" : "汇总统计";
+  if (typeof request.search === "string" && request.search) details["搜索"] = request.search;
+  const selectedRows = Array.isArray(request.row_ids) ? new Set(request.row_ids).size : null;
+  const selectedFile = typeof request.task_id === "string" && Boolean(request.task_id);
+  if (selectedRows !== null) details["资料范围"] = `${selectedFile ? "所选文件内的" : ""}${selectedRows} 条指定记录`;
+  else if (selectedFile) details["资料范围"] = "所选文件";
+  return details;
+}
 
 function AnalysisCardView({
   analysis,
@@ -178,7 +242,7 @@ function AnalysisCardView({
                       })
                     }
                   >
-                    第 {row.row_id} 条 <ArrowUpRight size={12} />
+                    查看记录 <ArrowUpRight size={12} />
                   </button>
                 </td>
               </tr>
@@ -196,12 +260,13 @@ function AnalysisCardView({
         <div>
         {data[0]?.[x] && data[0][x] !== "全部" && <p className="ask-metric-category">{fmt(data[0][x])}</p>}
         <dl className="ask-metrics">
-          {series.map((s) => (
-            <div key={s}>
+          {series.map((s) => {
+            const text = fmt(data[0]?.[s]);
+            return <div key={s}>
               <dt>{name(s)}</dt>
-              <dd>{fmt(data[0]?.[s])}</dd>
-            </div>
-          ))}
+              <dd className={text.length >= 12 ? "long-number" : undefined}>{text}</dd>
+            </div>;
+          })}
         </dl>
         </div>
       );
@@ -472,7 +537,7 @@ function AnalysisCardView({
               {fmt(
                 hovered != null
                   ? data[hovered]?.[series[0]]
-                  : data.reduce(
+                  : analysis.totals?.[series[0]] ?? data.reduce(
                       (sum, row) => sum + Number(row[series[0]] ?? 0),
                       0,
                     ),
@@ -488,6 +553,8 @@ function AnalysisCardView({
       </div>
     );
   }
+  const queryDetails = Object.entries(readableAnalysisQuery(analysis));
+  const sourceTask = analysis.source.request.task_id;
   const legend = actualType !== "table" && actualType !== "metric" && (
         <div className="ask-chart-legend">
           {(actualType === "pie" || actualType === "donut"
@@ -558,13 +625,12 @@ function AnalysisCardView({
         {graphic(false)}
       </motion.div>
       {legend}
-      {analysis.source.scope_description && <p className="ask-notice">{analysis.source.scope_description}</p>}
-      {analysis.warnings.filter(w => /尚待|待确认|未计入|无法|缺失|无效|未记录|不能|不代表完整|部分读取/.test(w)).map((w, i) =>
-        <p className="ask-quality-summary" key={i}>{w}</p>)}
+      {[...new Set(analysis.warnings)].map(warning =>
+        <p className="ask-quality-summary" key={warning}>{warning.replace(/：有 (\d+) 个非空值无法作为数字，已排除；未按零计算。$/, "中有 $1 条非数字值未计入。")}</p>)}
       {analysis.truncated && <p className="ask-quality-summary">{analysis.rows ? `共 ${analysis.source.row_count} 条记录，预览 ${analysis.rows.length} 条。` : `共 ${analysis.group_count ?? "多"} 组，展示前 ${data.length} 组；统计总计包含完整查询范围。`}</p>}
-      <Fold title="数据与来源" className="ask-analysis-details">
+      <Fold title="来源" className="ask-analysis-details">
       <div className="ask-analysis-evidence">
-      {actualType !== "table" && table()}
+      {actualType !== "table" && actualType !== "metric" && <Fold title="查看明细">{table()}</Fold>}
       {(analysis.group_count ?? data.length) > 1 && analysis.totals && (
         <div className="ask-totals">
           <span>完整查询范围</span>
@@ -589,25 +655,17 @@ function AnalysisCardView({
           {analysis.source.table_name}
           <ArrowUpRight size={12} />
         </button>
-        <span>
-          {analysis.source.row_count} 条记录 · {analysis.source.document_count}{" "}
-          份来源
-        </span>
+        {typeof sourceTask === "string" && sourceTask && <button className="ask-resource-link" type="button"
+          onClick={() => navigate({ kind: "task", id: sourceTask })}>查看所选原文件 <ArrowUpRight size={12} /></button>}
         <time dateTime={analysis.source.generated_at}>
-          {new Date(analysis.source.generated_at).toLocaleString("zh-CN")}
+          生成于 {new Date(analysis.source.generated_at).toLocaleString("zh-CN")}
         </time>
       </footer>
-        <p className="ask-notice">
-          这是生成时保存的快照，后续数据变化不会自动改写。
-        </p>
-        {analysis.warnings.map((w, i) => (
-          <p className="ask-notice" key={i}>
-            {w}
-          </p>
-        ))}
-        <Fold title="高级详情 · 查询条件">
-          <pre>{JSON.stringify(analysis.source.request, null, 2)}</pre>
-        </Fold>
+        {queryDetails.length > 0 ? <Fold title="查询条件">
+          <dl className="ask-query-conditions" aria-label="查询条件">
+            {queryDetails.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}
+          </dl>
+        </Fold> : analysis.source.scope_description && <p className="ask-notice">{analysis.source.scope_description}</p>}
       </div>
         {(refresh || statisticFromAnalysis(analysis, spec)) && <div className="ask-analysis-refresh">
           {statisticFromAnalysis(analysis, spec) && <button type="button" className="ask-resource-link" onClick={() =>
@@ -651,7 +709,7 @@ function AnalysisCardView({
             {analysis.truncated && <p className="ask-quality-summary">{analysis.rows ? `共 ${analysis.source.row_count} 条记录，预览 ${analysis.rows.length} 条。` : `共 ${analysis.group_count ?? "多"} 组，展示前 ${data.length} 组；统计总计包含完整查询范围。`}</p>}
             {graphic(true)}
             {legend}
-            {actualType !== "table" && <Fold title="查看底层数据">{table()}</Fold>}
+            {actualType !== "table" && actualType !== "metric" && <Fold title="查看明细">{table()}</Fold>}
           </>
         )}
       </dialog>

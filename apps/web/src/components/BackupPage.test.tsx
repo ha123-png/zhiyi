@@ -51,10 +51,14 @@ describe("BackupPage", () => {
   });
 
   it("shows backup status and list", async () => {
+    const copy = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", Object.create(navigator, { clipboard: { value: { writeText: copy } } }));
     render(<BackupPage />);
     expect(await screen.findByText("1")).toBeInTheDocument();
     expect(screen.getByText("最近成功备份")).toBeInTheDocument();
-    expect(screen.getByText("C:\\data\\backups")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "备份存放位置" })).toHaveValue(backupStatus.backup_dir);
+    fireEvent.click(screen.getByRole("button", { name: "复制路径" }));
+    await waitFor(() => expect(copy).toHaveBeenCalledWith(backupStatus.backup_dir));
   });
 
   it("has no serious or critical automated accessibility violations", async () => {
@@ -74,6 +78,7 @@ describe("BackupPage", () => {
   it("creates a backup and notifies", async () => {
     render(<BackupPage />);
     const createButton = await screen.findByRole("button", { name: /立即备份/ });
+    await waitFor(() => expect(createButton).toBeEnabled());
     fireEvent.click(createButton);
     await waitFor(() => {
       const fetchMock = vi.mocked(fetch);

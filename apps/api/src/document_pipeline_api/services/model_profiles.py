@@ -28,7 +28,9 @@ from document_pipeline_api.models import (
 )
 from document_pipeline_api.models.task import utc_now
 from document_pipeline_api.public_errors import public_error_message
-from document_pipeline_api.services.model_context import default_context_budget, profile_context_budget
+from document_pipeline_api.services.model_context import (
+    DEFAULT_LOCAL_PROFILE_ID, default_context_budget, profile_context_budget, profile_context_policy,
+)
 from document_pipeline_api.services.read_snapshot import begin_write_snapshot
 from document_pipeline_api.schemas.model_profiles import (
     ModelProfileBody,
@@ -39,7 +41,6 @@ from document_pipeline_api.schemas.model_profiles import (
 )
 
 EXPERIMENTAL_ONE_CLICK_PROFILE_ID = "zhiyi-builtin-qwen35-4b"
-DEFAULT_LOCAL_PROFILE_ID = "default-local-qwen35-4b"
 
 
 def ensure_default_local_profile(session: Session) -> None:
@@ -62,6 +63,7 @@ def ensure_default_local_profile(session: Session) -> None:
             reasoning_effort="none",
             timeout_seconds=180,
             context_length=8192,
+            context_policy="auto",
             temperature=None,
             multimodal=None,
             secret_ref=None,
@@ -175,14 +177,6 @@ def list_model_profiles(
             update={"has_api_key": has_api_key},
         ))
     return result
-
-
-def get_model_profile(session: Session, profile_id: str) -> ModelProfileRead:
-    profile = session.get(ModelProfileRecord, profile_id)
-    if profile is None:
-        raise HTTPException(status_code=404, detail="没有找到这个 AI 服务方案。")
-    version = _get_version(session, profile.id, profile.current_version)
-    return _as_read(profile, version, session.get(ModelRuntimeStateRecord, 1))
 
 
 def create_model_profile(
@@ -439,7 +433,7 @@ def _as_read(
         reasoning_effort=version.reasoning_effort,
         timeout_seconds=version.timeout_seconds,
         context_length=profile_context_budget(version),
-        context_policy=version.context_policy,
+        context_policy=profile_context_policy(version),
         temperature=version.temperature,
         multimodal=version.multimodal,
         has_api_key=version.secret_ref is not None,
@@ -509,7 +503,7 @@ def probe_model_profile(
         model_temperature=body.temperature,
         model_api_key=api_key,
     )
-    client = build_model_provider(probe_settings)
+    client = build_model_provider(probe_settings, timeout_seconds=probe_settings.model_timeout_seconds)
     try:
         try:
             available = client.available_models()

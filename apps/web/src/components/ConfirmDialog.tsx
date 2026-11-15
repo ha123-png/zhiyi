@@ -7,6 +7,7 @@ interface ConfirmDialogProps {
   tone?: "danger" | "normal";
   open: boolean;
   title: string;
+  titleClassName?: string;
   description: ReactNode;
   /** 必须逐字输入的确认文字（参考 GitHub 删除仓库）。为空表示无需输入、可直接确认 */
   confirmText?: string;
@@ -23,6 +24,7 @@ export function ConfirmDialog({
   tone = "danger",
   open,
   title,
+  titleClassName,
   description,
   confirmText,
   buttonLabel,
@@ -44,6 +46,11 @@ export function ConfirmDialog({
 
   const dialog = useModalFocus(open, onClose, busy, requireText ? inputRef : cancelRef);
   useLayoutEffect(() => { if (!open) setInput(""); }, [open]);
+  useLayoutEffect(() => {
+    if (open && !busy && dialog.ref.current && !dialog.ref.current.contains(document.activeElement)) {
+      (requireText ? inputRef.current : cancelRef.current)?.focus({ preventScroll: true });
+    }
+  }, [open, busy, requireText, dialog.ref]);
 
   if (!open) return null;
 
@@ -59,11 +66,12 @@ export function ConfirmDialog({
         {...dialog}
         role="dialog"
       >
-        <div className="modal-head modal-head-centered">
+        <div className="confirm-dialog-scroll" style={{ minHeight: 0, overflowY: "auto", overflowX: "hidden" }}>
+          <div className="modal-head modal-head-centered">
           <span className="modal-eyebrow">
             <Icon icon={ShieldAlert} size={13} /> {eyebrow ?? (tone === "danger" ? "危险操作" : "未保存的编辑")}
           </span>
-          <h3 id={titleId}>{title}</h3>
+          <h3 id={titleId} className={titleClassName}>{title}</h3>
           <div className="support" id={descriptionId}>{description}</div>
         </div>
         {requireText && (
@@ -80,14 +88,21 @@ export function ConfirmDialog({
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && matched && !busy) onConfirm();
+                if (e.key === "Enter" && !e.nativeEvent.isComposing && matched && !busy) {
+                  // Closing restores focus to the opener. Consume Enter so the
+                  // browser cannot activate that button again after the close.
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onConfirm();
+                }
               }}
               placeholder={`输入 ${confirmText} 后确认按钮可用`}
             />
           </div>
         )}
-        {error && <div className="callout danger" role="alert" style={{ margin: "0 20px 14px" }}>{error}</div>}
-        <div className="modal-foot">
+          {error && <div className="callout danger" role="alert" style={{ margin: "0 20px 14px" }}>{error}</div>}
+        </div>
+        <div className="modal-foot" style={{ flexShrink: 0 }}>
           <button ref={cancelRef} className="btn secondary" type="button" disabled={busy} onClick={onClose}>
             {cancelLabel}
           </button>

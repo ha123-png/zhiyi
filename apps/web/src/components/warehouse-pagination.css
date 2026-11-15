@@ -1,0 +1,29 @@
+.table-footer.warehouse-pagination {
+  container-type: inline-size;
+  /* The chat launcher sits over the lower right of both warehouse views. */
+  padding-inline-end: 68px;
+}
+.warehouse-pagination .pagination { flex-wrap: wrap; margin-inline-start: auto; }
+.warehouse-page-buttons {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--space-4) * 1);
+}
+@container (max-width: 650px) {
+  .warehouse-pagination .pagination .btn { min-height: 36px; height: 36px; padding-inline: 9px; }
+  .warehouse-pagination .pagination .btn.icon-only { width: 36px; padding-inline: 0; }
+}
+@container (max-width: 470px) {
+  .warehouse-pagination .pagination .warehouse-page-edge,
+  .warehouse-pagination .pagination .warehouse-page-number,
+  .warehouse-page-copy { display: none; }
+  .warehouse-pagination .footer-info { font-size: .75rem; }
+  .warehouse-pagination .pagination-jump input { width: 42px; }
+}
+@container (max-width: 255px) {
+  .warehouse-pagination .pagination .btn { min-height: 32px; height: 32px; padding-inline: 8px; }
+  .warehouse-pagination .pagination .btn.icon-only { width: 32px; padding-inline: 0; }
+  .warehouse-pagination .pagination-jump { gap: 3px; }
+  .warehouse-pagination .pagination-jump button { padding-inline: 6px; }
+  .warehouse-pagination .pagination-jump input { width: 34px; }
+}

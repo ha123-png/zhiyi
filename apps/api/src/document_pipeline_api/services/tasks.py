@@ -23,6 +23,7 @@ from document_pipeline_api.models import (
     ReviewRevisionRecord,
 )
 from document_pipeline_api.models.task import TaskRecord, utc_now
+from document_pipeline_api.models.system_setting import PENDING_DUPLICATE_PREFIX, SystemSettingRecord
 from document_pipeline_api.services.file_formats import (
     CONVERTIBLE_IMAGE_TYPES,
     TEXT_CONTENT_TYPES,
@@ -36,7 +37,10 @@ from document_pipeline_api.services.model_runtime import model_snapshot_values
 from document_pipeline_api.services.processing_input import prepare_input, policy_from_settings
 from document_pipeline_api.services.input_scope import InputBudgetError
 from document_pipeline_api.schemas.input_scope import InputPolicy
+from document_pipeline_api.schemas.tasks import TaskBatchRetryResult, TaskGroup, TaskRetrySkipped
+from document_pipeline_api.services.task_presentation import pending_details_for_task
 from document_pipeline_api.services.queue_pause import clear_pause_if_queue_empty
+from document_pipeline_api.services.read_snapshot import begin_write_snapshot
 from document_pipeline_api.services.system_settings import get_bool_setting, upload_limit_bytes
 from document_pipeline_api.services.templates import get_active_template
 from document_pipeline_api.storage_paths import task_storage_name
@@ -59,12 +63,18 @@ ACTIVE_CAPACITY_STATUSES = {
     TaskStatus.PROCESSING.value,
     TaskStatus.VALIDATING.value,
 }
+RETRYABLE_TASK_STATUSES = {TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}
 HISTORY_CLEARABLE_STATUSES = {
     TaskStatus.COMPLETED.value,
     TaskStatus.NEEDS_REVIEW.value,
     TaskStatus.FAILED.value,
     TaskStatus.CANCELLED.value,
 }
+
+
+class UploadFingerprintMismatch(HTTPException):
+    def __init__(self):
+        super().__init__(409, "所选文件内容与原来提交的文件不同。请重新选择原文件。")
 
 
 async def create_task_from_upload(
@@ -77,6 +87,8 @@ async def create_task_from_upload(
     target_table_id: str | None = None,
     source_file: dict | None = None,
     duplicate_policy: Literal["reject", "allow"] = "reject",
+    expected_sha256: str | None = None,
+    pending_duplicate_id: str | None = None,
 ) -> TaskRecord:
     # All ingress adapters share the same semantic modes. The worker's legacy
     # fallback treats unknown/no-template modes as smart; admitting those here
@@ -145,6 +157,9 @@ async def create_task_from_upload(
                 digest.update(chunk)
                 target.write(chunk)
 
+        sha256 = digest.hexdigest()
+        if expected_sha256 is not None and sha256 != expected_sha256:
+            raise UploadFingerprintMismatch()
         policy = policy_from_settings(session)
         try:
             prepared, page_count = prepare_input(temporary_path, upload.content_type, settings, policy)
@@ -153,7 +168,6 @@ async def create_task_from_upload(
         except Exception as error:
             raise HTTPException(status_code=422, detail="文件损坏或无法读取，请确认文件有效且未加密。") from error
         processing_units = max(1, sum(unit.text is None for unit in prepared.units))
-        sha256 = digest.hexdigest()
         duplicate_id = session.scalar(
             select(TaskRecord.id)
             .where(TaskRecord.sha256 == sha256)
@@ -195,6 +209,16 @@ async def create_task_from_upload(
         if selected_template is not None:
             from document_pipeline_api.services.local_exports import snapshot_task_export
             snapshot_task_export(session, task, selected_template)
+        if pending_duplicate_id:
+            pending = session.get(SystemSettingRecord, PENDING_DUPLICATE_PREFIX + pending_duplicate_id)
+            if duplicate_policy != "allow" or expected_sha256 is None:
+                raise HTTPException(422, "确认重复文件时需要核对原件。")
+            if pending is None:
+                raise HTTPException(409, "这条待确认记录已经处理，请刷新任务列表。")
+            saved = json.loads(pending.value)
+            if saved.get("sha256") != sha256 or saved.get("selection") != (selected_id or "smart"):
+                raise HTTPException(409, "文件内容或模板与待确认记录不一致。")
+            session.delete(pending)
         commit_attempted = True
         session.commit()
         committed = True
@@ -387,6 +411,7 @@ def _insert_task_if_capacity_available(
                     "message": "这份文件已按相同方式导入。再次提取会新建任务，可能重复生成数据并产生模型费用。",
                     "duplicate_task_id": duplicate_id,
                     "duplicate_status": duplicate.status,
+                    "duplicate_sha256": sha256,
                 })
         raise _capacity_error(settings)
 
@@ -430,8 +455,7 @@ def _capacity_error(settings: Settings) -> HTTPException:
     )
 
 
-# 状态监控与全局任务条只关心"还在动"的任务；终态任务（已完成/失败/取消）交给历史页。
-# 轮询接口用 active_only=True 只拉这些状态，避免万级历史任务每次全量加载。
+# 兼容旧 active_only 调用的范围；新任务监控用互斥 group 与 terminal_since 展示窗口。
 ACTIVE_TASK_STATUSES = {
     TaskStatus.CREATED.value,
     TaskStatus.QUEUED.value,
@@ -441,6 +465,26 @@ ACTIVE_TASK_STATUSES = {
     TaskStatus.NEEDS_REVIEW.value,
     TaskStatus.PAUSED.value,
 }
+
+
+def task_group_expression(group: TaskGroup):
+    """Mutually exclusive list groups; legacy active_only keeps its old scope."""
+    from sqlalchemy import true
+    export_status = func.json_extract(TaskRecord.export_state_json, "$.status")
+    export_attention = func.coalesce(
+        and_(TaskRecord.status == "completed", export_status.in_(["failed", "needs_rebind"])), False,
+    )
+    export_running = func.coalesce(
+        and_(TaskRecord.status == "completed", export_status.in_(["awaiting_confirmation", "pending", "exporting"])), False,
+    )
+    return {
+        "all": true(),
+        "active": or_(TaskRecord.status.in_(["created", "queued", "processing", "validating", "paused"]), export_running),
+        "pending": or_(TaskRecord.status.in_(["waiting_for_template", "needs_review"]), export_attention),
+        "completed": and_(TaskRecord.status == "completed", ~export_attention, ~export_running),
+        "failed": TaskRecord.status == "failed",
+        "cancelled": TaskRecord.status == "cancelled",
+    }[group]
 
 
 def task_name_matches(search: str):
@@ -458,6 +502,16 @@ def normalize_task_since(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
+def task_terminal_window_expression(since: datetime):
+    """Hide only quiet terminal records; unfinished/actionable exports stay visible.
+
+    Use the displayed update time: completion can precede a later export or review,
+    and cancellation has no separate completion timestamp. This is display-only.
+    """
+    quiet_terminal = or_(task_group_expression("completed"), TaskRecord.status == "cancelled")
+    return or_(~quiet_terminal, TaskRecord.updated_at >= normalize_task_since(since))
+
+
 def list_tasks(
     session: Session,
     *,
@@ -469,11 +523,15 @@ def list_tasks(
     search: str | None = None,
     template_id: str | None = None,
     since: datetime | None = None,
+    terminal_since: datetime | None = None,
+    task_ids: list[str] | None = None,
+    group: TaskGroup | None = None,
 ) -> list[TaskRecord]:
     """任务列表。
 
     limit/offset 分页；active_only 只拉还在动的任务（全局任务条/状态监控轮询）；
-    status/search/template_id/since 供历史页服务端筛选，避免万级历史全量拉进前端内存。
+    status/search/template_id/since 供历史页服务端筛选；terminal_since 只收起安静终态，
+    与所有筛选取交集后再分页，避免把整表拉入内存或只过滤当前一页。
     """
     # created_at 可能同一毫秒写入多条；增加主键作为稳定次序，避免 offset 翻页时
     # 同时间任务在两页之间重复或遗漏。
@@ -481,10 +539,15 @@ def list_tasks(
         TaskRecord.created_at.desc(),
         TaskRecord.id.desc(),
     )
+    if task_ids is not None:
+        # An explicitly empty scope must stay empty, rather than become history.
+        statement = statement.where(TaskRecord.id.in_(list(dict.fromkeys(task_ids))))
     if active_only:
         statement = statement.where(
             TaskRecord.status.in_(ACTIVE_TASK_STATUSES)
         )
+    if group is not None:
+        statement = statement.where(task_group_expression(group))
     from document_pipeline_api.services.task_exports import archive_pending_expression, pending_export_expression
     if export_pending:
         statement = statement.where(pending_export_expression())
@@ -500,6 +563,8 @@ def list_tasks(
         statement = statement.where(TaskRecord.template_id == template_id)
     if since is not None:
         statement = statement.where(TaskRecord.updated_at >= normalize_task_since(since))
+    if terminal_since is not None:
+        statement = statement.where(task_terminal_window_expression(terminal_since))
     if offset:
         statement = statement.offset(offset)
     statement = statement.limit(limit)
@@ -542,22 +607,31 @@ def retry_task(
     session: Session,
     settings: Settings,
     task_id: str,
-    *, use_current_settings: bool = False,
+    *, use_current_settings: bool = False, expected_status: str | None = None,
 ) -> TaskRecord:
     task = session.get(TaskRecord, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="没有找到这个任务。")
-    if task.status != TaskStatus.FAILED.value:
-        raise HTTPException(status_code=409, detail="只有失败任务可以重试。")
-    try:
-        next_state = TaskState(status=TaskStatus(task.status)).transition_to(
-            TaskStatus.QUEUED
+    previous_status = task.status
+    previous_updated_at = task.updated_at
+    if expected_status is not None and previous_status != expected_status:
+        raise HTTPException(status_code=409, detail="任务状态已变化，请刷新后重试。")
+    if previous_status not in RETRYABLE_TASK_STATUSES:
+        raise HTTPException(status_code=409, detail="只有失败或已取消的任务可以重试。")
+
+    target = TaskStatus.QUEUED
+    if previous_status == TaskStatus.CANCELLED.value:
+        existing_result = session.scalar(
+            select(ExtractionRecord.task_id).where(ExtractionRecord.task_id == task_id)
         )
-    except InvalidTaskTransition as error:
-        raise HTTPException(status_code=409, detail="只有失败任务可以重试。") from error
+        if existing_result is not None or session.get(FileCurrentDataRecord, task_id) is not None:
+            target = (TaskStatus.WAITING_FOR_TEMPLATE if task.pending_reason == "target_table"
+                      else TaskStatus.NEEDS_REVIEW)
+    next_state = TaskState(status=TaskStatus(previous_status)).transition_to(target)
 
     policy_values = {}
-    if use_current_settings:
+    capacity_conditions = ()
+    if use_current_settings and target == TaskStatus.QUEUED:
         from document_pipeline_api.storage_paths import resolve_task_storage_path
         policy = policy_from_settings(session)
         try:
@@ -566,16 +640,21 @@ def retry_task(
             raise HTTPException(status_code=422, detail=str(error)) from error
         policy_values = {"input_policy_json": policy.model_dump_json(), "input_plan_json": prepared.scope.model_dump_json(),
                          "processing_units": max(1, sum(unit.text is None for unit in prepared.units))}
+    now = utc_now()
+    if target == TaskStatus.QUEUED:
+        capacity_conditions = _capacity_conditions(
+            settings,
+            additional_bytes=task.size_bytes,
+            additional_pages=policy_values.get("processing_units", task.processing_units or task.page_count),
+        )
+        policy_values.update(started_at=now, pending_reason=None)
     result = session.execute(
         update(TaskRecord)
         .where(
             TaskRecord.id == task_id,
-            TaskRecord.status == TaskStatus.FAILED.value,
-            *_capacity_conditions(
-                settings,
-                additional_bytes=task.size_bytes,
-                additional_pages=policy_values.get("processing_units", task.processing_units or task.page_count),
-            ),
+            TaskRecord.status == previous_status,
+            TaskRecord.updated_at == previous_updated_at,
+            *capacity_conditions,
         )
         .values(
             **policy_values,
@@ -585,15 +664,14 @@ def retry_task(
             failure_code=None,
             failure_message=None,
             failure_detail=None,
-            # 重试后计时从零重新开始：重置本次处理尝试的开始时间
-            started_at=utc_now(),
-            updated_at=utc_now(),
+            updated_at=now,
         )
     )
     if result.rowcount != 1:
         session.rollback()
         current = session.get(TaskRecord, task_id)
-        if current is None or current.status != TaskStatus.FAILED.value:
+        if (target != TaskStatus.QUEUED or current is None
+                or current.status != previous_status or current.updated_at != previous_updated_at):
             raise HTTPException(status_code=409, detail="任务状态已变化，请刷新后重试。")
         raise _capacity_error(settings)
     session.commit()
@@ -607,27 +685,44 @@ def retry_tasks(
     session: Session,
     settings: Settings,
     task_ids: list[str],
-) -> list[str]:
-    """批量重试失败任务；每个任务独立计容量，超出容量的任务跳过并返回已重试列表。"""
-    if not task_ids:
-        return []
-    failed_ids = list(
-        session.scalars(
-            select(TaskRecord.id).where(
-                TaskRecord.id.in_(task_ids),
-                TaskRecord.status == TaskStatus.FAILED.value,
-            )
-        )
-    )
-    retried: list[str] = []
-    for task_id in failed_ids:
-        try:
-            retry_task(session, settings, task_id)
-        except HTTPException:
-            session.rollback()
+) -> TaskBatchRetryResult:
+    """Keep partial successes and a truthful reason for each skipped request."""
+    result = TaskBatchRetryResult()
+    seen: set[str] = set()
+    messages = {
+        "duplicate": "同一任务在本次请求中重复，未重复提交。",
+        "not_found": "任务已不存在。",
+        "not_failed": "只有失败或已取消的任务可以重试。",
+        "state_changed": "任务状态已变化，请刷新后重试。",
+        "capacity": "当前待处理容量不足，请稍后重试。",
+        "rejected": "本次重试未获接受，请单独重试以查看详情。",
+    }
+    for task_id in task_ids:
+        reason = None
+        if task_id in seen:
+            reason = "duplicate"
+        else:
+            seen.add(task_id)
+            # Read the current state after earlier attempts in the same batch.
+            session.expire_all()
+            task = session.get(TaskRecord, task_id)
+            if task is None:
+                reason = "not_found"
+            elif task.status not in RETRYABLE_TASK_STATUSES:
+                reason = "not_failed"
+        if reason is not None:
+            result.skipped_tasks.append(TaskRetrySkipped(task_id=task_id, reason=reason, message=messages[reason]))
             continue
-        retried.append(task_id)
-    return retried
+        try:
+            retry_task(session, settings, task_id, expected_status=task.status)
+        except HTTPException as error:
+            session.rollback()
+            reason = {404: "not_found", 409: "state_changed", 429: "capacity"}.get(error.status_code, "rejected")
+            result.skipped_tasks.append(TaskRetrySkipped(task_id=task_id, reason=reason, message=messages[reason]))
+        else:
+            result.retried.append(task_id)
+    result.skipped = len(result.skipped_tasks)
+    return result
 
 
 def select_task_template(
@@ -636,6 +731,8 @@ def select_task_template(
     task_id: str,
     template_id: str,
 ) -> TaskRecord:
+    begin_write_snapshot(session)
+    session.expire_all()
     task = session.get(TaskRecord, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="没有找到这个任务。")
@@ -643,6 +740,8 @@ def select_task_template(
         raise HTTPException(status_code=409, detail="这个任务当前不需要选择模板。")
     if session.get(ExtractionRecord, task_id) is not None or session.get(FileCurrentDataRecord, task_id) is not None:
         raise HTTPException(status_code=409, detail="这份文件已有提取结果，请确认已有数据；不能重新选择模板覆盖初始提取证据。")
+    if pending_details_for_task(task, session)["pending_action"] != "select_template":
+        raise HTTPException(status_code=409, detail="这个任务当前需要其他确认，请刷新任务状态。")
 
     candidates = json.loads(task.candidate_templates_json)
     candidate = next(
@@ -695,10 +794,12 @@ def select_task_template(
 
 
 def accept_task_scope(session: Session, settings: Settings, task_id: str) -> TaskRecord:
+    begin_write_snapshot(session)
+    session.expire_all()
     task = session.get(TaskRecord, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="没有找到这个任务。")
-    if task.status != TaskStatus.WAITING_FOR_TEMPLATE.value or task.pending_reason != "input_scope" or not task.input_policy_json:
+    if pending_details_for_task(task, session)["pending_action"] != "confirm_input_scope" or not task.input_policy_json:
         raise HTTPException(status_code=409, detail="这个任务当前不需要确认读取范围。")
     policy = InputPolicy.model_validate_json(task.input_policy_json)
     policy.accept_partial = True
@@ -706,7 +807,7 @@ def accept_task_scope(session: Session, settings: Settings, task_id: str) -> Tas
     result = session.execute(update(TaskRecord).where(
         TaskRecord.id == task_id,
         TaskRecord.status == TaskStatus.WAITING_FOR_TEMPLATE.value,
-        TaskRecord.pending_reason == "input_scope",
+        TaskRecord.pending_reason == task.pending_reason,
         *_capacity_conditions(settings, additional_bytes=task.size_bytes, additional_pages=task.processing_units or task.page_count),
     ).values(input_policy_json=policy.model_dump_json(), pending_reason=None,
              status=TaskStatus.QUEUED.value, started_at=utc_now(), updated_at=utc_now()))
@@ -837,6 +938,11 @@ def _delete_task_records(session: Session, task_ids: list[str]) -> None:
     if not task_ids:
         return
     from document_pipeline_api.models import DataRowRevisionRecord, FileCurrentDataRecord, FileRevisionRecord
+    session.execute(delete(SystemSettingRecord).where(
+        SystemSettingRecord.key.startswith(PENDING_DUPLICATE_PREFIX),
+        func.json_valid(SystemSettingRecord.value),
+        func.json_extract(SystemSettingRecord.value, "$.existingTaskId").in_(task_ids),
+    ))
     session.execute(delete(DataRowRevisionRecord).where(DataRowRevisionRecord.task_id.in_(task_ids)))
     session.execute(delete(FileRevisionRecord).where(FileRevisionRecord.task_id.in_(task_ids)))
     session.execute(delete(DataRowRecord).where(DataRowRecord.task_id.in_(task_ids)))
@@ -875,10 +981,16 @@ def delete_task(session: Session, settings: Settings, task_id: str) -> int:
 
     旧接口保留行数固定返回 0；独立合并/导入的数据不属于此文件。
     """
+    # The file lock excludes relocation/cleanup, but retries and worker claims
+    # use database writes. Hold their write boundary before deciding eligibility.
+    begin_write_snapshot(session)
+    session.expire_all()
     task = session.get(TaskRecord, task_id)
     if task is None:
+        session.rollback()
         raise HTTPException(status_code=404, detail="没有找到这个任务。")
     if task.status not in DELETABLE_TASK_STATUSES:
+        session.rollback()
         raise HTTPException(
             status_code=409,
             detail="只有已完成、失败、已取消、待选模板或已暂停的任务可以删除。",
@@ -890,7 +1002,7 @@ def delete_task(session: Session, settings: Settings, task_id: str) -> int:
 
 @guard_file_operation
 def delete_tasks_batch(
-    session: Session, settings: Settings, task_ids: list[str]
+    session: Session, settings: Settings, task_ids: list[str], *, pending_ids: list[str] | None = None,
 ) -> tuple[int, int]:
     """批量删除任务：仅删除可删除状态的任务。
 
@@ -898,8 +1010,10 @@ def delete_tasks_batch(
     由调用方把 skipped 数如实返回给前端，避免"显示删了 N 个、实际删更少"。
     单次事务完成（含批量确认弹窗一次即可删除全部选中任务）。
     """
-    if not task_ids:
+    if not task_ids and not pending_ids:
         return 0, 0
+    begin_write_snapshot(session)
+    session.expire_all()
     tasks = list(
         session.scalars(select(TaskRecord).where(TaskRecord.id.in_(task_ids)))
     )
@@ -908,19 +1022,28 @@ def delete_tasks_batch(
         for task in tasks
         if task.status in DELETABLE_TASK_STATUSES
     ]
-    if not deletable:
+    if not deletable and not pending_ids:
+        session.rollback()
         raise HTTPException(
             status_code=409,
             detail="只有已完成、失败、已取消、待选模板或已暂停的任务可以删除。",
         )
-    _delete_files_and_records(session, settings, deletable)
-    clear_pause_if_queue_empty(session)
+    if pending_ids:
+        session.execute(delete(SystemSettingRecord).where(SystemSettingRecord.key.in_(
+            [PENDING_DUPLICATE_PREFIX + item_id for item_id in pending_ids])))
+    if deletable:
+        _delete_files_and_records(session, settings, deletable)
+        clear_pause_if_queue_empty(session)
+    else:
+        session.commit()
     return len(deletable), 0
 
 
 @guard_file_operation
 def clear_history(session: Session, settings: Settings) -> int:
     """清理全部历史任务：已完成/失败/取消/待确认，保留进行中任务及独立数据。"""
+    begin_write_snapshot(session)
+    session.expire_all()
     tasks = list(
         session.scalars(
             select(TaskRecord).where(
@@ -929,6 +1052,7 @@ def clear_history(session: Session, settings: Settings) -> int:
         )
     )
     if not tasks:
+        session.rollback()
         return 0
     _delete_files_and_records(session, settings, tasks)
     return len(tasks)

@@ -4,6 +4,8 @@ param(
     [string]$Version = "",
     [string]$DistRoot = "",
     [string]$TestRoot = "",
+    [string]$TemporaryParent = "",
+    [string]$EvidenceParent = "",
     [int]$Port = 18767,
     [int]$ProcessTimeoutSeconds = 120
 )
@@ -14,8 +16,10 @@ $projectDirectory = Get-Item -LiteralPath $projectRoot -Force
 $realProjectDirectory = $projectDirectory.ResolveLinkTarget($true)
 if ($realProjectDirectory) { $projectRoot = [IO.Path]::GetFullPath($realProjectDirectory.FullName) }
 $localRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot ".local"))
-$evidenceParent = Join-Path $localRoot "evidence\v0.6.0\2026-09-30-production-lifecycle"
-$temporaryParent = Join-Path $localRoot "tmp\production-lifecycle"
+$evidenceBoundary = Join-Path $localRoot "evidence"
+$temporaryBoundary = Join-Path $localRoot "tmp"
+$evidenceParent = if ($EvidenceParent) { [IO.Path]::GetFullPath($EvidenceParent) } else { Join-Path $evidenceBoundary "v0.6.0\2026-09-30-production-lifecycle" }
+$temporaryParent = if ($TemporaryParent) { [IO.Path]::GetFullPath($TemporaryParent) } else { Join-Path $temporaryBoundary "production-lifecycle" }
 $python = Join-Path $projectRoot "apps\api\.venv\Scripts\python.exe"
 $helper = Join-Path $PSScriptRoot "verify-packaged-business.py"
 $runId = ""
@@ -397,14 +401,20 @@ if (-not $TestRoot) {
 }
 $temporaryParent = Get-FullPath $temporaryParent
 $evidenceParent = Get-FullPath $evidenceParent
-if (-not (Test-PathWithin $testRootPath $temporaryParent)) { throw "TestRoot must be under this project's .local/tmp/production-lifecycle." }
+if ($temporaryParent -ne (Get-FullPath $temporaryBoundary) -and -not (Test-PathWithin $temporaryParent $temporaryBoundary)) {
+    throw "TemporaryParent must remain under this project's .local/tmp."
+}
+if ($evidenceParent -ne (Get-FullPath $evidenceBoundary) -and -not (Test-PathWithin $evidenceParent $evidenceBoundary)) {
+    throw "EvidenceParent must remain under this project's .local/evidence."
+}
+if (-not (Test-PathWithin $testRootPath $temporaryParent)) { throw "TestRoot must be under the selected TemporaryParent." }
 if (-not (Test-PathWithin $evidencePath $evidenceParent)) { throw "Evidence path must remain under this project's production-lifecycle evidence root." }
-[void][IO.Directory]::CreateDirectory($temporaryParent)
-[void][IO.Directory]::CreateDirectory($evidenceParent)
 Assert-NoReparseAncestors $temporaryParent $projectRoot
 Assert-NoReparseAncestors $evidenceParent $projectRoot
 Assert-NoReparseAncestors $testRootPath $projectRoot
 Assert-NoReparseAncestors $evidencePath $projectRoot
+[void][IO.Directory]::CreateDirectory($temporaryParent)
+[void][IO.Directory]::CreateDirectory($evidenceParent)
 New-Item -ItemType Directory -Path $testRootPath -ErrorAction Stop | Out-Null
 New-Item -ItemType Directory -Path $evidencePath -ErrorAction Stop | Out-Null
 $script:evidenceRoot = $evidencePath
@@ -470,7 +480,7 @@ try {
         "--project-root", $projectRoot
     )
     foreach ($relativeSource in @(
-        "packaging/installer.nsi", "packaging/app.ico", "packaging/uninstall.ico",
+        "packaging/installer.nsi", "packaging/purge-option.nsh", "packaging/app.ico", "packaging/uninstall.ico",
         "packaging/write-uninstall-list.ps1"
     )) { $sourceBindingArgs += @("--path", $relativeSource) }
     Invoke-Step "bind-smoke-installer-inputs-to-candidate-source" {

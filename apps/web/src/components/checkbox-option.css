@@ -1,0 +1,11 @@
+.checkbox-options { display: grid; gap: 8px; min-width: 0; }
+.checkbox-option { display: flex; align-items: flex-start; gap: 12px; padding: 14px; min-width: 0; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--card); cursor: pointer; transition: border-color var(--dur-control), background var(--dur-control); }
+.checkbox-option.is-selected { background: var(--muted); border-color: var(--border-strong); }
+.checkbox-option:hover { border-color: var(--foreground); }
+.checkbox-option:focus-within { outline: 2px solid var(--ring); outline-offset: 2px; }
+.checkbox-option input[type=checkbox] { accent-color: var(--primary); width: 16px; height: 16px; flex: none; margin: 3px 0 0; cursor: pointer; }
+.checkbox-option:has(input:disabled) { cursor: wait; }
+.checkbox-option-copy { display: grid; gap: 6px; min-width: 0; flex: 1; }
+.checkbox-option-name { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: var(--text-body); font-weight: 600; overflow-wrap: anywhere; }
+.checkbox-option-description { display: block; font-size: var(--text-help); color: var(--muted-foreground); line-height: 1.7; overflow-wrap: anywhere; }
+@media(prefers-reduced-motion:reduce) { .checkbox-option { transition: none; } }

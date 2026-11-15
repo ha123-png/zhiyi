@@ -6,7 +6,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AssistantProvider,
   useAssistantPageContext,
@@ -17,7 +17,9 @@ import {
   AssistantTrigger,
 } from "./AssistantSurface";
 import { AnalysisCard } from "./AnalysisCard";
-import type { ThreadDetail } from "./types";
+import type { ThreadDetail, ToolRecord } from "./types";
+import { consentKey, readServiceConsentState, saveServiceConsent, serviceConsentKey, serviceConsentStorageKey, sessionConsentRevision } from "./consent";
+import { assistantBase } from "./api";
 
 let posted: Record<string, unknown>[];
 let stored: ThreadDetail | null;
@@ -52,6 +54,7 @@ const remote = {
   is_remote: true,
   is_active: true,
 };
+let availableProfiles = [local, remote];
 function ContextPage() {
   useAssistantPageContext("test", {
     table_id: "t",
@@ -60,17 +63,20 @@ function ContextPage() {
   });
   return null;
 }
-function Shell() {
+function Shell({ showTrigger = true }: { showTrigger?: boolean } = {}) {
   return (
     <AssistantProvider>
       <ContextPage />
-      <AssistantPage />
-      <AssistantTrigger />
+      <AssistantPage focusComposer={!showTrigger} />
+      {showTrigger && <AssistantTrigger />}
       <AssistantDrawer />
     </AssistantProvider>
   );
 }
 beforeEach(() => {
+  localStorage.clear();
+  sessionStorage.clear();
+  availableProfiles = [local, remote];
   posted = [];
   stored = null;
   authorizationCalls = [];
@@ -96,7 +102,7 @@ beforeEach(() => {
           (query.has("ids") ? query.getAll("ids").includes(r.id) : r.name.includes(query.get("search") || ""))));
       }
       if (url.endsWith("/models/profiles"))
-        return Response.json([local, remote]);
+        return Response.json(availableProfiles);
       if (url.endsWith("/assistant/settings"))
         return Response.json({ profile_id: null });
       if (url.endsWith("/assistant/threads/thread/authorization") && method === "PUT") {
@@ -159,8 +165,123 @@ beforeEach(() => {
     }),
   );
 });
+afterEach(() => vi.restoreAllMocks());
+
+async function selectCloud() {
+  fireEvent.click(screen.getByRole("button", { name: "对话设置" }));
+  await screen.findByRole("option", { name: /提取云模型/ });
+  fireEvent.change(screen.getByRole("combobox", { name: "问知意模型方案" }), { target: { value: "cloud" } });
+  fireEvent.click(screen.getByRole("button", { name: "关闭对话设置" }));
+}
+
+function rememberCloud() {
+  fireEvent.click(screen.getByRole("checkbox", { name: "在此设备记住对此模型服务的允许" }));
+  fireEvent.click(screen.getByRole("button", { name: "允许并记住" }));
+}
 
 describe("问知意", () => {
+  it("distinguishes a failed history search from an empty list and retries with the same search", async () => {
+    const fetchBefore = globalThis.fetch;
+    let fail = true;
+    vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+      if (fail && String(input).includes("/assistant/threads?search="))
+        return Response.json({ detail: "合成的列表读取失败" }, { status: 503 });
+      return fetchBefore(input, init);
+    }));
+    render(<Shell />);
+    await screen.findByRole("button", { name: "重新读取列表" });
+    expect(screen.queryByText("发送第一条消息后，便会保存在这里。")).not.toBeInTheDocument();
+    const search = screen.getByRole("textbox", { name: "搜索对话" });
+    fireEvent.change(search, { target: { value: "保留筛选" } });
+    await screen.findByRole("button", { name: "重新读取列表" });
+    expect(screen.queryByText("没有匹配的对话")).not.toBeInTheDocument();
+    fail = false;
+    fireEvent.click(screen.getByRole("button", { name: "重新读取列表" }));
+    expect(search).toHaveFocus();
+    expect(search).toHaveValue("保留筛选");
+    await screen.findByText("没有匹配的对话");
+  });
+
+  it("shows thread loading and retries a failed read without replacing it with a new-conversation welcome", async () => {
+    stored = { id: "thread", title: "合成历史对话", profile_id: "local", archived: false, updated_at: "2026-09-13T00:00:00Z",
+      messages: [{ id: "answer", role: "assistant", parts: [{ type: "text", text: "恢复的合成回答" }], context: {}, created_at: "2026-09-13T00:00:00Z" }],
+      runs: [], tools: [] };
+    const fetchBefore = globalThis.fetch;
+    let release!: () => void;
+    let fail = true;
+    const delayed = new Promise<void>(resolve => { release = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+      if (String(input).endsWith("/assistant/threads/thread") && fail) {
+        await delayed;
+        return Response.json({ detail: "合成的读取失败" }, { status: 503 });
+      }
+      return fetchBefore(input, init);
+    }));
+    render(<Shell />);
+    fireEvent.click(await screen.findByText("合成历史对话"));
+    expect(screen.getByText("正在读取对话…")).toHaveAttribute("role", "status");
+    expect(screen.queryByText("把问题交给知意")).not.toBeInTheDocument();
+    await act(async () => release());
+    const retry = await screen.findByRole("button", { name: "重新读取对话" });
+    expect(screen.queryByText("把问题交给知意")).not.toBeInTheDocument();
+    const composer = screen.getByRole("textbox", { name: "向问知意提问" });
+    fireEvent.change(composer, { target: { value: "读取失败时保留的草稿" } });
+    expect(screen.getByRole("button", { name: "发送问题" })).toBeDisabled();
+    fail = false;
+    fireEvent.click(retry);
+    await screen.findByText("恢复的合成回答");
+    expect(composer).toHaveValue("读取失败时保留的草稿");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("ignores a failed thread response after the user has moved to a new conversation", async () => {
+    stored = { id: "thread", title: "即将失败的旧对话", profile_id: "local", archived: false, updated_at: "2026-09-13T00:00:00Z",
+      messages: [], runs: [], tools: [] };
+    const fetchBefore = globalThis.fetch;
+    let release!: () => void;
+    const delayed = new Promise<void>(resolve => { release = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+      if (String(input).endsWith("/assistant/threads/thread")) {
+        await delayed;
+        return Response.json({ detail: "旧对话读取失败" }, { status: 503 });
+      }
+      return fetchBefore(input, init);
+    }));
+    render(<Shell />);
+    fireEvent.click(await screen.findByText("即将失败的旧对话"));
+    fireEvent.click(screen.getByRole("button", { name: "新对话" }));
+    expect(screen.getByText("把问题交给知意")).toBeInTheDocument();
+    await act(async () => release());
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重新读取对话" })).not.toBeInTheDocument();
+  });
+
+  it("retries failed resource filtering in place and preserves search focus and selected scope", async () => {
+    const fetchBefore = globalThis.fetch;
+    let failSearch = true;
+    vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+      const url = String(input);
+      if (failSearch && url.includes("/assistant/resources") && new URL(url, "http://localhost").searchParams.get("search"))
+        return Response.json({ detail: "合成的资料列表失败" }, { status: 503 });
+      return fetchBefore(input, init);
+    }));
+    render(<Shell />);
+    fireEvent.click(screen.getByRole("button", { name: "对话设置" }));
+    fireEvent.click(await screen.findByRole("checkbox", { name: "合成数据" }));
+    const search = screen.getByRole("textbox", { name: "搜索可选资料" });
+    fireEvent.change(search, { target: { value: "合成" } });
+    await screen.findByRole("button", { name: "重新读取资料" });
+    expect(screen.getByRole("checkbox", { name: "合成数据" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "合成数据" })).toBeDisabled();
+    expect(screen.queryByText("还没有这类资料。")).not.toBeInTheDocument();
+    failSearch = false;
+    fireEvent.click(screen.getByRole("button", { name: "重新读取资料" }));
+    expect(search).toHaveFocus();
+    expect(search).toHaveValue("合成");
+    await waitFor(() => expect(screen.getByRole("checkbox", { name: "合成数据" })).toBeEnabled());
+    expect(screen.getByRole("checkbox", { name: "合成数据" })).toBeChecked();
+  });
+
   it("synchronizes a restored authorization snapshot before approving a pending preview", async () => {
     const pending = {id: "pending-tool", name: "propose_task_control", status: "pending",
       result: {kind: "task_control", action: "pause", filename: "待处理.pdf", expected_status: "queued"}};
@@ -219,7 +340,7 @@ describe("问知意", () => {
     expect(screen.getByRole("button", { name: "只读分析" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByText("下一条使用")).toBeVisible();
     fireEvent.change(screen.getByRole("combobox", { name: "问知意模型方案" }), { target: { value: "local" } });
-    expect(screen.getByText(/上次回答使用：cloud-original/)).toBeVisible();
+    expect(screen.getByText(/上次回答使用 cloud-original/)).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "关闭对话设置" }));
     fireEvent.change(screen.getByRole("textbox", { name: "向问知意提问" }), { target: { value: "继续" } });
     fireEvent.click(screen.getByRole("button", { name: "发送问题" }));
@@ -253,7 +374,7 @@ describe("问知意", () => {
     expect(await screen.findByText(prose)).toBeVisible();
     expect(screen.queryByRole("button", { name: "文字说明" })).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole("textbox", { name: "向问知意提问" }), { target: { value: "未发送的草稿" } });
-    fireEvent.click(screen.getByRole("button", { name: "数据与来源" }));
+    fireEvent.click(screen.getByRole("button", { name: "来源" }));
     fireEvent.click(screen.getByRole("button", { name: "按最新数据重新分析" }));
     expect(await screen.findByText(/更新于/)).toBeVisible();
     expect(refreshBodies).toHaveLength(1);
@@ -318,7 +439,7 @@ describe("问知意", () => {
   it("supports keyboard resource tabs and distinguishes an empty archive", async () => {
     render(<Shell />);
     fireEvent.click(screen.getByRole("button", { name: "已归档" }));
-    expect(screen.getByText("暂无归档对话。")).toBeInTheDocument();
+    expect(await screen.findByText("暂无归档对话。")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "对话设置" }));
     await screen.findByRole("checkbox", { name: "第二张表" });
     fireEvent.keyDown(screen.getByRole("tab", { name: "数据表" }), { key: "ArrowRight" });
@@ -328,6 +449,55 @@ describe("问知意", () => {
     fireEvent.keyDown(screen.getByRole("tab", { name: "文件" }), { key: "End" });
     await screen.findByRole("checkbox", { name: "收据模板" });
   });
+  it.each([
+    { data: { table_id: "private-table-xyz", row_id: 714220, invoice_id: "ORD-001" } },
+    { text: '{"table_id":"private-table-xyz","row_id":714220,"invoice_id":"ORD-001"}' },
+  ])("summarizes a saved result without exposing its internal JSON and keeps the answer and original", async result => {
+    const saved = { id: "saved", name: "read_tool_result", status: "completed", result: result as unknown as ToolRecord["result"] };
+    const original = { id: "original", name: "read_original_page", status: "completed",
+      result: { page: 1, original: { kind: "original", id: "private-original-id" } } };
+    stored = { id: "thread", title: "资料回读", profile_id: "local", archived: false,
+      updated_at: "2026-09-13T00:00:00Z", runs: [], tools: [saved, original], messages: [
+        { id: "a", role: "assistant", context: {}, created_at: "2026-09-13T00:00:00Z",
+          parts: [{ type: "tool", ...saved }, { type: "tool", ...original }, { type: "text", text: "订单编号是 ORD-001。" }] },
+      ] };
+    const navigation = vi.fn();
+    window.addEventListener("zhiyi:assistant-navigate", navigation);
+    try {
+      render(<Shell />);
+      fireEvent.click(await screen.findByRole("button", { name: /资料回读.*2026/ }));
+      expect(await screen.findByText("订单编号是 ORD-001。")).toBeVisible();
+      fireEvent.click(screen.getByRole("button", { name: "已查阅资料与处理过程 · 2 步" }));
+      const oldRawDisclosure = screen.queryByRole("button", { name: "已读取的资料" });
+      if (oldRawDisclosure) fireEvent.click(oldRawDisclosure);
+      expect(screen.getByText("已读取保存的资料。")).toBeInTheDocument();
+      expect(screen.queryByText(/private-table-xyz|714220|table_id|row_id/)).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "查看原件" }));
+      expect((navigation.mock.calls[0][0] as CustomEvent).detail).toEqual({ kind: "original", id: "private-original-id" });
+    } finally {
+      window.removeEventListener("zhiyi:assistant-navigate", navigation);
+    }
+  });
+
+  it("labels older change previews by preview position while keeping business values", async () => {
+    const tool = { id: "old-change", name: "propose_changes", status: "pending", result: {
+      table_name: "采购", columns: { invoice_id: "订单编号", amount: "金额" }, affected: [
+        { row_id: 714220, version: 1, before: { invoice_id: "ORD-001", amount: 10 }, after: { invoice_id: "ORD-002", amount: 11 } },
+        { row_id: 714999, version: 1, before: { invoice_id: "ORD-003", amount: 20 }, after: { invoice_id: "ORD-004", amount: 21 } },
+      ] } as unknown as ToolRecord["result"] };
+    stored = { id: "thread", title: "历史资料修改", profile_id: "local", archived: false,
+      updated_at: "2026-09-13T00:00:00Z", runs: [], tools: [tool], messages: [
+        { id: "a", role: "assistant", context: {}, created_at: "2026-09-13T00:00:00Z", parts: [{ type: "tool", ...tool }] },
+      ] };
+    render(<Shell />);
+    fireEvent.click(await screen.findByRole("button", { name: /历史资料修改.*2026/ }));
+    expect(await screen.findByText(/将修改.*采购.*2\s*条记录/)).toBeInTheDocument();
+    expect(screen.getAllByRole("cell", { name: "预览记录 1" })).toHaveLength(2);
+    expect(screen.getAllByRole("cell", { name: "预览记录 2" })).toHaveLength(2);
+    expect(screen.getByRole("cell", { name: "ORD-004" })).toBeInTheDocument();
+    expect(screen.queryByText(/714220|714999/)).not.toBeInTheDocument();
+  });
+
   it("shows an operation failure without hiding it behind a process disclosure", async () => {
     const failed = { id: "failed-tool", name: "read_resource", status: "failed", result: { error: "所选资料已删除，请重新选择资料范围。" } };
     stored = {
@@ -396,6 +566,73 @@ describe("问知意", () => {
     expect(posted).toHaveLength(0);
   });
 
+  it.each(["close button", "Escape", "backdrop", "native close"])("returns focus to the quick-ask opener after %s", async closeWith => {
+    render(<Shell />);
+    const opener = screen.getByRole("button", { name: "问知意" });
+    opener.focus();
+    fireEvent.click(opener);
+    const drawer = screen.getByRole("dialog", { name: "快捷问知意" });
+    expect(within(drawer).getByRole("textbox", { name: "向问知意提问" })).toHaveFocus();
+    if (closeWith === "close button") {
+      const closeButton = within(drawer).getByRole("button", { name: "关闭快捷问知意" });
+      closeButton.focus();
+      fireEvent.click(closeButton);
+    } else if (closeWith === "Escape") {
+      fireEvent(drawer, new Event("cancel", { bubbles: false, cancelable: true }));
+    } else if (closeWith === "backdrop") {
+      fireEvent.click(drawer);
+    } else {
+      act(() => (drawer as HTMLDialogElement).close());
+    }
+    expect(drawer).not.toHaveAttribute("open");
+    expect(opener).toBeVisible();
+    expect(opener).toHaveFocus();
+    expect(posted).toHaveLength(0);
+  });
+
+  it("leaves existing page focus alone while the quick-ask drawer starts closed", async () => {
+    render(<><button autoFocus>合成设置项</button><Shell /></>);
+    await waitFor(() => expect(fetch).toHaveBeenCalled());
+    expect(screen.getByRole("button", { name: "合成设置项" })).toHaveFocus();
+  });
+
+  it("hands focus and the draft to the new composer instead of the removed quick-ask opener", () => {
+    const view = render(<Shell />);
+    const opener = screen.getByRole("button", { name: "问知意" });
+    opener.focus();
+    fireEvent.click(opener);
+    const oldComposer = screen.getByRole("textbox", { name: "向问知意提问" });
+    fireEvent.change(oldComposer, { target: { value: "展开后继续的合成草稿" } });
+    const focusOpener = vi.spyOn(opener, "focus");
+    const nativeFocus = HTMLElement.prototype.focus;
+    // Native modal dialogs make the destination page inert until close().
+    // jsdom's dialog shim does not implement that restriction.
+    const modalFocus = vi.spyOn(HTMLElement.prototype, "focus").mockImplementation(function (this: HTMLElement, options?: FocusOptions) {
+      const modal = document.querySelector("dialog[open]");
+      if (!modal || modal.contains(this)) nativeFocus.call(this, options);
+    });
+    // App removes AssistantTrigger when navigation reaches the assistant page.
+    const onNavigate = vi.fn(() => view.rerender(<Shell showTrigger={false} />));
+    window.addEventListener("zhiyi:assistant-navigate", onNavigate);
+    try {
+      const expand = screen.getByRole("button", { name: "展开到问知意页面" });
+      expand.focus();
+      fireEvent.click(expand);
+      expect(onNavigate).toHaveBeenCalledOnce();
+      expect(opener).not.toBeInTheDocument();
+      expect(focusOpener).not.toHaveBeenCalled();
+      expect(view.container.querySelector("dialog.ask-drawer")).not.toHaveAttribute("open");
+      const newComposer = screen.getByRole("textbox", { name: "向问知意提问" });
+      expect(newComposer).not.toBe(oldComposer);
+      expect(newComposer).toHaveValue("展开后继续的合成草稿");
+      expect(newComposer).toHaveFocus();
+      expect(modalFocus).toHaveBeenLastCalledWith({ preventScroll: true });
+    } finally {
+      window.removeEventListener("zhiyi:assistant-navigate", onNavigate);
+      modalFocus.mockRestore();
+    }
+  });
+
   it("keeps selected-row scope and the same conversation across drawer and page", async () => {
     render(<Shell />);
     await waitFor(() => expect(fetch).toHaveBeenCalled());
@@ -445,7 +682,7 @@ describe("问知意", () => {
     if (!screen.queryByRole("button", { name: "附加当前页面" }))
       fireEvent.click(screen.getByRole("button", { name: "对话设置" }));
     fireEvent.click(screen.getByRole("button", { name: "附加当前页面" }));
-    fireEvent.click(screen.getByRole("button", { name: "清除范围" }));
+    fireEvent.click(screen.getByRole("button", { name: "清除资料范围" }));
     fireEvent.change(screen.getByRole("combobox", { name: "问知意模型方案" }), {
       target: { value: "cloud" },
     });
@@ -455,22 +692,324 @@ describe("问知意", () => {
       target: { value: "你好" },
     });
     expect(screen.getByRole("button", { name: "发送问题" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("checkbox", { name: /允许这段对话向/ }));
+    fireEvent.click(screen.getByRole("button", { name: "允许这段对话" }));
     fireEvent.click(screen.getByRole("button", { name: "发送问题" }));
     await screen.findByText("保存的回答");
     expect(posted[0].remote_consent).toBe("cloud:1");
     expect(posted[0].context).toEqual({});
-    expect(screen.queryByRole("checkbox", {name:/允许这段对话向/})).not.toBeInTheDocument();
+    expect(screen.queryByRole("group", {name:"远程模型传输确认"})).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole("textbox", {name:"向问知意提问"}), {target:{value:"继续"}});
     await waitFor(() => expect(screen.getByRole("button", {name:"发送问题"})).toBeEnabled());
     fireEvent.click(screen.getByRole("button", {name:"发送问题"}));
     await waitFor(() => expect(posted).toHaveLength(2));
     expect(posted[1].remote_consent).toBe("cloud:1");
     fireEvent.click(screen.getByRole("button", {name:"对话设置"}));
-    await waitFor(() => expect(screen.getByRole("button", {name:"撤销授权"})).toBeEnabled());
-    fireEvent.click(screen.getByRole("button", {name:"撤销授权"}));
+    await waitFor(() => expect(screen.getByRole("button", {name:"撤销对此服务的允许"})).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", {name:"撤销对此服务的允许"}));
     fireEvent.click(screen.getByRole("button", {name:"关闭对话设置"}));
-    expect(screen.getByRole("checkbox", {name:/允许这段对话向/})).not.toBeChecked();
+    expect(screen.getByRole("button", {name:"允许这段对话"})).toBeEnabled();
+    expect(readServiceConsentState(serviceConsentStorageKey(assistantBase)).keys).toEqual([]);
+  });
+
+  it("requires an explicit remember choice and carries it across a browser session without widening context", async () => {
+    const first = render(<Shell />);
+    await selectCloud();
+    const storageKey = serviceConsentStorageKey(assistantBase);
+    const remember = screen.getByRole("checkbox", { name: "在此设备记住对此模型服务的允许" });
+    expect(remember).not.toBeChecked();
+    fireEvent.click(remember);
+    expect(localStorage.getItem(storageKey)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "允许并记住" }));
+    expect(readServiceConsentState(storageKey).keys).toEqual([serviceConsentKey(remote)]);
+    first.unmount();
+    sessionStorage.clear();
+    render(<Shell />);
+    await selectCloud();
+    expect(screen.queryByRole("group", { name: "远程模型传输确认" })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "向问知意提问" }), { target: { value: "新对话" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送问题" }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]).toMatchObject({ remote_consent: "cloud:1", context: {} });
+  });
+
+  it("keeps selected rows and read-only permissions when a remembered service is used", async () => {
+    render(<Shell />);
+    await selectCloud();
+    rememberCloud();
+    fireEvent.click(screen.getByRole("button", { name: "对话设置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "附加当前页面" }));
+    fireEvent.click(screen.getByRole("button", { name: "只读分析" }));
+    fireEvent.click(screen.getByRole("button", { name: "关闭对话设置" }));
+    expect(screen.queryByRole("group", { name: "远程模型传输确认" })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "向问知意提问" }), { target: { value: "只分析所选记录" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送问题" }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0].context).toEqual({ table_id: "t", table_name: "合成数据", row_ids: [1, 2, 3], mode: "read" });
+    expect(posted[0].remote_consent).toBe("cloud:1");
+    fireEvent.click(screen.getByRole("button", { name: "对话设置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "撤销对此服务的允许" }));
+    await waitFor(() => expect(authorizationCalls.at(-1)?.body).toMatchObject({
+      remote_authorized: false, context: { table_id: "t", row_ids: [1, 2, 3], mode: "read" },
+    }));
+  });
+
+  it("reconfirms when the same profile changes service path or model", async () => {
+    const first = render(<Shell />);
+    await selectCloud();
+    rememberCloud();
+    first.unmount();
+    availableProfiles = [local, { ...remote, version: 2, base_url: "https://models.example.test/tenant-b/v1" }];
+    const second = render(<Shell />);
+    await selectCloud();
+    expect(screen.getByRole("group", { name: "远程模型传输确认" })).toHaveTextContent("tenant-b");
+    expect(screen.getByRole("checkbox", { name: "在此设备记住对此模型服务的允许" })).not.toBeChecked();
+    rememberCloud();
+    second.unmount();
+    availableProfiles = [local, { ...remote, version: 3, base_url: "https://models.example.test/tenant-b/v1", model_name: "new-target" }];
+    render(<Shell />);
+    await selectCloud();
+    expect(screen.getByRole("button", { name: "允许这段对话" })).toBeEnabled();
+  });
+
+  it("revokes remembered and old scoped session grants together, including across reload", async () => {
+    const sessionKey = `zhiyi:remote-consent:${assistantBase}`;
+    sessionStorage.setItem(sessionKey, JSON.stringify([
+      consentKey("thread", remote, {}), consentKey("another", remote, { table_id: "t" }),
+      JSON.stringify(["legacy", remote.id, 1, remote.base_url, {}]),
+    ]));
+    const first = render(<Shell />);
+    await selectCloud();
+    rememberCloud();
+    fireEvent.click(screen.getByRole("button", { name: "对话设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "撤销对此服务的允许" }));
+    expect(JSON.parse(sessionStorage.getItem(sessionKey) || "[]")).toEqual([]);
+    expect(readServiceConsentState(serviceConsentStorageKey(assistantBase)).keys).toEqual([]);
+    first.unmount();
+    render(<Shell />);
+    await selectCloud();
+    expect(screen.getByRole("button", { name: "允许这段对话" })).toBeEnabled();
+    expect(screen.getByRole("checkbox", { name: "在此设备记住对此模型服务的允许" })).not.toBeChecked();
+  });
+
+  it("uses only temporary approval and explains when browser storage is unavailable", async () => {
+    render(<Shell />);
+    await selectCloud();
+    const unavailable = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new DOMException("blocked", "SecurityError"); });
+    rememberCloud();
+    expect(screen.getByRole("status")).toHaveTextContent("浏览器未能记住此选择");
+    fireEvent.change(screen.getByRole("textbox", { name: "向问知意提问" }), { target: { value: "本次允许" } });
+    expect(screen.getByRole("button", { name: "发送问题" })).toBeEnabled();
+    expect(localStorage.getItem(serviceConsentStorageKey(assistantBase))).toBeNull();
+    unavailable.mockRestore();
+  });
+
+  it("applies another window's revocation to the current conversation", async () => {
+    render(<Shell />);
+    await selectCloud();
+    rememberCloud();
+    fireEvent.change(screen.getByRole("textbox", { name: "向问知意提问" }), { target: { value: "先提问" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送问题" }));
+    await screen.findByText("保存的回答");
+    const key = serviceConsentStorageKey(assistantBase);
+    localStorage.removeItem(key);
+    act(() => window.dispatchEvent(new StorageEvent("storage", { key, newValue: null })));
+    expect(screen.getByRole("button", { name: "允许这段对话" })).toBeEnabled();
+    await waitFor(() => expect(authorizationCalls.at(-1)?.body.remote_authorized).toBe(false));
+  });
+
+  it.each(["another window", "this window"])("revokes a late first run after consent is withdrawn in %s", async (origin) => {
+    const fetchBefore = globalThis.fetch;
+    let release!: () => void;
+    const delayed = new Promise<void>(resolve => { release = resolve; });
+    const order: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/assistant/runs") && init?.method === "POST") {
+        const response = await fetchBefore(input, init);
+        stored!.runs[0].status = "running";
+        await delayed;
+        order.push("run-response");
+        return response;
+      }
+      if (url.endsWith("/authorization") && init?.method === "PUT") {
+        order.push("authorization");
+        const body = JSON.parse(String(init.body));
+        if (!body.remote_authorized) stored!.runs[0].status = "cancelled";
+      }
+      if (url.endsWith("/assistant/threads/thread")) order.push("thread-read");
+      return fetchBefore(input, init);
+    }));
+    render(<Shell />);
+    await selectCloud();
+    if (origin === "another window") rememberCloud();
+    else fireEvent.click(screen.getByRole("button", { name: "允许这段对话" }));
+    const composer = screen.getByRole("textbox", { name: "向问知意提问" });
+    expect(composer).toHaveFocus();
+    fireEvent.change(composer, { target: { value: "等待模型连接" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送问题" }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+    if (origin === "another window") {
+      const key = serviceConsentStorageKey(assistantBase);
+      saveServiceConsent(key, serviceConsentKey(remote), false);
+      act(() => window.dispatchEvent(new StorageEvent("storage", { key })));
+    } else {
+      fireEvent.click(screen.getByRole("button", { name: "对话设置" }));
+      const revoke = screen.getByRole("button", { name: "撤销对此服务的允许" });
+      expect(revoke).toBeEnabled();
+      fireEvent.click(revoke);
+      expect(screen.getByRole("group", { name: "模型服务传输允许" })).toHaveFocus();
+      fireEvent.click(screen.getByRole("button", { name: "关闭对话设置" }));
+    }
+    expect(authorizationCalls).toHaveLength(0);
+    await act(async () => release());
+    await waitFor(() => expect(authorizationCalls.at(-1)?.body.remote_authorized).toBe(false));
+    expect(order.slice(0, 3)).toEqual(["run-response", "authorization", "thread-read"]);
+    expect(authorizationCalls.every(call => call.body.remote_authorized === false)).toBe(true);
+    expect(stored!.runs[0].status).toBe("cancelled");
+    await waitFor(() => expect(screen.getByRole("button", { name: "允许这段对话" })).toBeEnabled());
+    expect(JSON.parse(sessionStorage.getItem(`zhiyi:remote-consent:${assistantBase}`) || "[]")).toEqual([]);
+    fireEvent.change(composer, { target: { value: "继续" } });
+    expect(screen.getByRole("button", { name: "发送问题" })).toBeDisabled();
+  });
+
+  it("repeats revocation after an existing thread's late run even if an earlier revoke already succeeded", async () => {
+    render(<Shell />);
+    await selectCloud();
+    rememberCloud();
+    fireEvent.change(screen.getByRole("textbox", { name: "向问知意提问" }), { target: { value: "第一轮" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送问题" }));
+    await screen.findByText("保存的回答");
+    const fetchBefore = globalThis.fetch;
+    let release!: () => void;
+    const delayed = new Promise<void>(resolve => { release = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+      const response = await fetchBefore(input, init);
+      if (String(input).endsWith("/assistant/runs") && init?.method === "POST") {
+        await delayed;
+        stored!.runs[0].status = "running";
+      } else if (String(input).endsWith("/authorization") && !JSON.parse(String(init?.body)).remote_authorized) {
+        stored!.runs[0].status = "cancelled";
+      }
+      return response;
+    }));
+    fireEvent.change(screen.getByRole("textbox", { name: "向问知意提问" }), { target: { value: "第二轮延迟" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送问题" }));
+    await waitFor(() => expect(posted).toHaveLength(2));
+    const key = serviceConsentStorageKey(assistantBase);
+    saveServiceConsent(key, serviceConsentKey(remote), false);
+    act(() => window.dispatchEvent(new StorageEvent("storage", { key })));
+    await waitFor(() => expect(authorizationCalls.at(-1)?.body.remote_authorized).toBe(false));
+    const beforeResponse = authorizationCalls.length;
+    await act(async () => release());
+    await waitFor(() => expect(authorizationCalls.length).toBeGreaterThan(beforeResponse));
+    expect(authorizationCalls.at(-1)?.body.remote_authorized).toBe(false);
+    expect(stored!.runs[0].status).toBe("cancelled");
+  });
+
+  it("does not revoke a pending request when another window withdraws permission for a different profile", async () => {
+    const fetchBefore = globalThis.fetch;
+    let release!: () => void;
+    const delayed = new Promise<void>(resolve => { release = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+      const response = await fetchBefore(input, init);
+      if (String(input).endsWith("/assistant/runs") && init?.method === "POST") await delayed;
+      return response;
+    }));
+    render(<Shell />);
+    await selectCloud();
+    rememberCloud();
+    fireEvent.change(screen.getByRole("textbox", { name: "向问知意提问" }), { target: { value: "保留当前模型允许" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送问题" }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+    const key = serviceConsentStorageKey(assistantBase);
+    saveServiceConsent(key, serviceConsentKey({ ...remote, id: "unrelated" }), false);
+    act(() => window.dispatchEvent(new StorageEvent("storage", { key })));
+    await act(async () => release());
+    await screen.findByText("保存的回答");
+    expect(authorizationCalls.filter(call => call.body.remote_authorized === false)).toEqual([]);
+    expect(screen.queryByRole("group", { name: "远程模型传输确认" })).not.toBeInTheDocument();
+  });
+
+  it("does not restore a dormant scoped grant after another window revoked the profile", async () => {
+    const key = serviceConsentStorageKey(assistantBase);
+    const state = saveServiceConsent(key, serviceConsentKey(remote), true, false).state;
+    const oldGrant = consentKey("thread", remote, {}, sessionConsentRevision(state, remote.id));
+    sessionStorage.setItem(`zhiyi:remote-consent:${assistantBase}`, JSON.stringify([oldGrant]));
+    saveServiceConsent(key, serviceConsentKey(remote), false);
+    stored = { id: "thread", title: "旧窗口的对话", profile_id: "cloud", archived: false, updated_at: "2026-09-13T00:00:00Z",
+      messages: [], runs: [], tools: [] };
+    render(<Shell />);
+    fireEvent.click(await screen.findByText("旧窗口的对话"));
+    await screen.findByRole("button", { name: "允许这段对话" });
+    fireEvent.change(screen.getByRole("textbox", { name: "向问知意提问" }), { target: { value: "旧许可不能沿用" } });
+    expect(screen.getByRole("button", { name: "发送问题" })).toBeDisabled();
+    await waitFor(() => expect(authorizationCalls.at(-1)?.body.remote_authorized).toBe(false));
+  });
+
+  it("lets the user retry a failed revocation while a late run is still active", async () => {
+    const fetchBefore = globalThis.fetch;
+    let release!: () => void;
+    const delayed = new Promise<void>(resolve => { release = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/assistant/runs") && init?.method === "POST") {
+        const response = await fetchBefore(input, init);
+        stored!.runs[0].status = "running";
+        await delayed;
+        return response;
+      }
+      if (url.endsWith("/authorization") && init?.method === "PUT" && !failAuthorizationSync) {
+        await fetchBefore(input, init);
+        stored!.runs[0].status = "cancelled";
+        return Response.json({ authorization_revision: authorizationCalls.length, invalidated_tools: 0, cancelled_runs: 1 });
+      }
+      return fetchBefore(input, init);
+    }));
+    render(<Shell />);
+    await selectCloud();
+    rememberCloud();
+    fireEvent.change(screen.getByRole("textbox", { name: "向问知意提问" }), { target: { value: "撤销需要重试" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送问题" }));
+    await waitFor(() => expect(posted).toHaveLength(1));
+    const key = serviceConsentStorageKey(assistantBase);
+    saveServiceConsent(key, serviceConsentKey(remote), false);
+    act(() => window.dispatchEvent(new StorageEvent("storage", { key })));
+    failAuthorizationSync = true;
+    await act(async () => release());
+    await screen.findByText(/未能同步撤销的云端允许，请在对话设置中重试/);
+    fireEvent.click(screen.getByRole("button", { name: "对话设置" }));
+    const retry = await screen.findByRole("button", { name: "重试同步" });
+    expect(retry).toBeEnabled();
+    expect(screen.getByRole("button", { name: "停止回答" })).toBeEnabled();
+    failAuthorizationSync = false;
+    fireEvent.click(retry);
+    await waitFor(() => expect(stored!.runs[0].status).toBe("cancelled"));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "停止回答" })).not.toBeInTheDocument());
+    expect(authorizationCalls.every(call => call.body.remote_authorized === false)).toBe(true);
+  });
+
+  it("keeps revocation after a reload when session grant replacement and durable updates fail", async () => {
+    const first = render(<Shell />);
+    await selectCloud();
+    rememberCloud();
+    const set = Storage.prototype.setItem;
+    const remove = Storage.prototype.removeItem;
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, name, value) {
+      if (this === localStorage || name === `zhiyi:remote-consent:${assistantBase}`) throw new DOMException("blocked", "SecurityError");
+      set.call(this, name, value);
+    });
+    vi.spyOn(Storage.prototype, "removeItem").mockImplementation(function (this: Storage, name) {
+      if (this === localStorage) throw new DOMException("blocked", "SecurityError");
+      remove.call(this, name);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "对话设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "撤销对此服务的允许" }));
+    expect(screen.getAllByRole("status").some(node => node.textContent?.includes("刷新后仍有效"))).toBe(true);
+    first.unmount();
+    render(<Shell />);
+    await selectCloud();
+    expect(screen.getByRole("button", { name: "允许这段对话" })).toBeEnabled();
+    expect(readServiceConsentState(serviceConsentStorageKey(assistantBase)).keys).toEqual([]);
   });
 
   it("renders historical numeric snapshots and closes only the nested chart dialog", async () => {

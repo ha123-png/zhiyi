@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "publication_scope": "product",
+  "current_version": "v0.7.0",
+  "authoritative_current_document": "docs/INDEX.md",
+  "entries": [
+    {
+      "path": "README.md"
+    },
+    {
+      "path": "CHANGELOG.md"
+    },
+    {
+      "path": "LICENSE"
+    },
+    {
+      "path": "NOTICE"
+    },
+    {
+      "path": "CONTRIBUTING.md"
+    },
+    {
+      "path": "SECURITY.md"
+    },
+    {
+      "path": "docs/INDEX.md"
+    },
+    {
+      "path": "docs/PRIVACY.md"
+    },
+    {
+      "path": "docs/QUICK_START.md"
+    },
+    {
+      "path": "docs/功能说明.md"
+    },
+    {
+      "path": "docs/升级使用说明.md"
+    },
+    {
+      "path": "docs/开发/API与MCP授权边界.md"
+    },
+    {
+      "path": "docs/开发/README.md"
+    },
+    {
+      "path": "docs/版本说明/v0.5.0.md"
+    },
+    {
+      "path": "docs/版本说明/v0.6.0.md"
+    },
+    {
+      "path": "docs/版本说明/v0.7.0.md"
+    },
+    {
+      "path": "scripts/INDEX.md"
+    }
+  ],
+  "current_docs": [
+    "README.md",
+    "docs/INDEX.md",
+    "docs/PRIVACY.md",
+    "docs/QUICK_START.md",
+    "docs/功能说明.md",
+    "docs/升级使用说明.md",
+    "docs/开发/API与MCP授权边界.md",
+    "docs/开发/README.md",
+    "docs/版本说明/v0.7.0.md",
+    "scripts/INDEX.md"
+  ]
+}

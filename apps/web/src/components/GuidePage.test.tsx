@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { GuidePage } from "./GuidePage";
 import { getGuideIndex, getGuideTopic } from "../api";
@@ -32,5 +32,51 @@ describe("shared handbook", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("服务暂时不可用");
     fireEvent.click(screen.getByRole("button", { name: "重新读取" }));
     await waitFor(() => expect(screen.getByText("最新使用说明")).toBeVisible());
+  });
+
+  it("shows an explicit empty topic message while keeping its next-step link", async () => {
+    vi.clearAllMocks();
+    vi.mocked(getGuideIndex).mockResolvedValue({ version: "0.5.0", topics: [topic] });
+    vi.mocked(getGuideTopic).mockResolvedValue({ ...topic, sections: [] });
+    const navigate = vi.fn();
+    render(<GuidePage onNavigate={navigate} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "数据怎样流动" }));
+    expect(await screen.findByText("这个主题暂时没有正文内容。")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "打开当前数据" }));
+    expect(navigate).toHaveBeenCalledWith("tables");
+  });
+
+  it("distinguishes an empty handbook from its initial loading state and can reread it", async () => {
+    vi.clearAllMocks();
+    let finishRead!: (value: Awaited<ReturnType<typeof getGuideIndex>>) => void;
+    vi.mocked(getGuideIndex)
+      .mockImplementationOnce(() => new Promise(resolve => { finishRead = resolve; }))
+      .mockResolvedValueOnce({ version: "0.5.0", topics: [] });
+
+    render(<GuidePage onNavigate={vi.fn()} />);
+
+    expect(screen.getByRole("status")).toHaveTextContent("正在读取目录");
+    await act(async () => { finishRead({ version: "0.5.0", topics: [] }); });
+    expect(screen.getByRole("status")).toHaveTextContent("手册目录还没有内容");
+    expect(screen.queryByText("正在读取目录…")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "重新读取目录" }));
+    await waitFor(() => expect(getGuideIndex).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("手册目录还没有内容"));
+  });
+
+  it("retries a failed handbook index read without showing an empty directory", async () => {
+    vi.clearAllMocks();
+    vi.mocked(getGuideIndex)
+      .mockRejectedValueOnce(new Error("synthetic guide index failure"))
+      .mockResolvedValueOnce({ version: "0.5.0", topics: [topic] });
+
+    render(<GuidePage onNavigate={vi.fn()} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("synthetic guide index failure");
+    expect(screen.queryByText("手册目录还没有内容")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重新读取" }));
+    expect(await screen.findByRole("button", { name: "数据怎样流动" })).toBeInTheDocument();
   });
 });

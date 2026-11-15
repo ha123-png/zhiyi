@@ -5,8 +5,24 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { expect, it } from "vitest";
-import { useConversationScroll } from "./Interaction";
+import { afterEach, expect, it, vi } from "vitest";
+import { useConversationScroll, usePanelWidth } from "./Interaction";
+
+afterEach(() => vi.restoreAllMocks());
+
+function ResizablePanel() {
+  const panel = usePanelWidth("test-width", 200, 150, 360);
+  return <div style={{ width: panel.width }} data-testid="panel"><div {...panel.separator} aria-label="调整面板宽度" /></div>;
+}
+
+it("opens and resizes panels when the browser denies preference storage", () => {
+  vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new DOMException("blocked", "SecurityError"); });
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new DOMException("blocked", "SecurityError"); });
+  render(<ResizablePanel />);
+  expect(screen.getByTestId("panel")).toHaveStyle({ width: "200px" });
+  fireEvent.keyDown(screen.getByRole("separator", { name: "调整面板宽度" }), { key: "ArrowRight" });
+  expect(screen.getByTestId("panel")).toHaveStyle({ width: "216px" });
+});
 
 function Conversation({
   text,

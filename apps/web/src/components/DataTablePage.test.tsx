@@ -26,7 +26,7 @@ function sourceCard(index: number, pending = false) {
 
 describe("DataTablePage", () => {
   it.each(["1,23", "0x10", "   ", "1.0000000000000001", "9007199254740991.1", "9e30"])(
-    "keeps invalid or unsafe numeric draft %j without sending a PATCH",
+    "saves manual text %j in a numeric column without coercing it",
     async (input) => {
       const writes: string[] = [];
       vi.stubGlobal("fetch", vi.fn(async (url: string | URL, init?: RequestInit) => {
@@ -50,9 +50,9 @@ describe("DataTablePage", () => {
       fireEvent.input(editor);
       fireEvent.keyDown(editor, { key: "Enter" });
 
-      expect(await screen.findByLabelText("未保存输入：发票 · 行 1 · 合计金额")).toHaveValue(input);
-      expect(writes).toHaveLength(0);
-      expect(await screen.findByRole("alert")).toHaveTextContent(/标准数字|精度|大整数/);
+      await waitFor(() => expect(writes).toHaveLength(1));
+      expect(JSON.parse(writes[0]).changes).toEqual({ total_amount: input });
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     },
   );
 
@@ -139,7 +139,9 @@ describe("DataTablePage", () => {
         review_pending: true, values: { seller_name: "待核对内容", source_filename: "合成资料.txt" }, created_at: "", updated_at: "" }] });
     }));
     render(<DataTablePage />);
-    expect(await screen.findByText("本页有 1 条来源待核对的数据")).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "仓库事项" }));
+    expect(screen.getByText("本页有 1 条来源待核对的数据")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "关闭仓库事项" }));
     fireEvent.click(screen.getByRole("button", { name: "卡片" }));
     expect(await screen.findByText("来源待核对", { selector: ".badge" })).toBeInTheDocument();
     expect(screen.queryByText("本页有 1 条来源待核对的数据")).not.toBeInTheDocument();
@@ -154,21 +156,29 @@ describe("DataTablePage", () => {
       const params = new URL(url, "http://localhost").searchParams;
       const size = Number(params.get("page_size") || 10);
       const page = Number(params.get("page") || 1);
-      if (url.includes("/source-cards?")) return response({table_id: table.id, page, page_size: 6, total: 8, row_count: 8000,
-        groups: Array.from({length: 8}, (_, i) => sourceCard(i + 1)).slice((page - 1) * 6, page * 6)});
+      if (url.includes("/source-cards?")) return response({table_id: table.id, page, page_size: size, total: 14, row_count: 14000,
+        groups: Array.from({length: 14}, (_, i) => sourceCard(i + 1)).slice((page - 1) * size, page * size)});
       sizes.push(size);
       return response({ ...table, row_count: 6, columns, presentation: { mode: "card", primary_fields: [], collapsed_fields: [] }, page, page_size: size,
         rows: Array.from({ length: 6 }, (_, i) => ({ id: i + 1, task_id: null, item_index: i, version: 1, values: { seller_name: `记录${i + 1}` }, created_at: "", updated_at: "" })).slice((page - 1) * size, page * size) });
     }));
     render(<DataTablePage />);
-    await waitFor(() => expect(screen.getAllByRole("article")).toHaveLength(6));
+    await waitFor(() => expect(screen.getAllByRole("article")).toHaveLength(3));
     expect(sizes.at(-1)).toBe(10);
     fireEvent.click(screen.getByRole("button", { name: "下一页来源" }));
-    await waitFor(() => expect(screen.getAllByRole("article")).toHaveLength(2));
-    expect(screen.getAllByRole("article")[0]).toHaveTextContent("记录7");
+    await waitFor(() => expect(screen.getAllByRole("article")[0]).toHaveTextContent("记录4"));
+    const jump = screen.getByRole("spinbutton", { name: "跳转页码来源" });
+    fireEvent.change(jump, { target: { value: "6" } });
+    expect(screen.getByRole("button", { name: "跳转" })).toBeDisabled();
+    fireEvent.change(jump, { target: { value: "5" } });
+    fireEvent.click(screen.getByRole("button", { name: "跳转" }));
+    await waitFor(() => expect(screen.getAllByRole("article")[0]).toHaveTextContent("记录13"));
+    expect(screen.getAllByRole("article")).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "下一页来源" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "表格" }));
     await waitFor(() => expect(sizes.at(-1)).toBe(10));
     expect(screen.queryByRole("article")).not.toBeInTheDocument();
+    expect(await screen.findByRole("cell", { name: /记录1$/ })).toBeInTheDocument();
   });
 
   beforeEach(() => {
@@ -289,8 +299,9 @@ describe("DataTablePage", () => {
     if (failure === 'conflict') expect(alert).toHaveTextContent('本次修改未保存');
     const restored = await screen.findByRole('cell', {name: `编辑 合计金额，当前值 ${amount}`});
     expect(restored).toHaveTextContent(String(amount));
+    fireEvent.click(screen.getByRole('button', {name: '仓库事项'}));
     expect(screen.getByLabelText('未保存输入：发票 · 行 1 · 合计金额')).toHaveValue('17');
-    fireEvent.click(screen.getByRole('button', {name: '关闭通知'}));
+    fireEvent.click(screen.getByRole('button', {name: '关闭仓库事项'}));
     expect(restored).toHaveTextContent(String(amount));
     fireEvent.click(restored);
     const next = restored.querySelector('[contenteditable="true"]')!;
@@ -316,7 +327,7 @@ describe("DataTablePage", () => {
       if (url.endsWith('/rows/1') && init?.method === 'PATCH') {
         writes += 1;
         await Promise.resolve();
-        if (writes < 3) {
+        if (writes < 4) {
           if (failure === 'network') throw new TypeError('offline');
           seller = '他人已保存的备注'; version += 1;
           return new Response(JSON.stringify({detail: '这行数据已经更新'}), {status: 409});
@@ -340,30 +351,37 @@ describe("DataTablePage", () => {
     };
     await edit('销售方', seller, longText);
     const draftLabel = '未保存输入：发票 · 行 1 · 销售方';
-    const draft = await screen.findByLabelText(draftLabel);
+    const openNotices = async () => fireEvent.click(await screen.findByRole('button', {name: '仓库事项'}));
+    const closeNotices = () => fireEvent.click(screen.getByRole('button', {name: '关闭仓库事项'}));
+    await openNotices();
+    const draft = screen.getByLabelText(draftLabel);
     expect(draft).toHaveValue(longText);
     expect(draft).toHaveAttribute('readonly');
     expect(document.querySelector('img[src="x"]')).toBeNull();
-    fireEvent.click(screen.getByText('未保存输入（1）· 展开查看或复制'));
-    fireEvent.click(screen.getByRole('button', {name: '关闭通知'}));
-    expect(draft).toHaveValue(longText);
+    closeNotices();
+    expect(screen.queryByRole('dialog', {name: '仓库事项'})).not.toBeInTheDocument();
     const restored = await screen.findByRole('cell', {name: `编辑 销售方，当前值 ${seller}`});
     expect(restored).toHaveTextContent(seller);
-    await edit('合计金额', '16', '不是数字');
-    expect(await screen.findByLabelText('未保存输入：发票 · 行 1 · 合计金额')).toHaveValue('不是数字');
+    await edit('合计金额', '16', '待保存的金额');
+    await openNotices();
+    expect(await screen.findByLabelText('未保存输入：发票 · 行 1 · 合计金额')).toHaveValue('待保存的金额');
     expect(screen.getByLabelText(draftLabel)).toHaveValue(longText);
+    closeNotices();
     await edit('销售方', seller, longText + '第二次输入');
+    await openNotices();
     await waitFor(() => expect(screen.getByLabelText(draftLabel)).toHaveValue(longText + '第二次输入'));
     expect(screen.getAllByLabelText(/^未保存输入：/)).toHaveLength(2);
+    closeNotices();
     await edit('销售方', seller, '重新核对后的备注');
     await screen.findByRole('cell', {name: '编辑 销售方，当前值 重新核对后的备注'});
+    await openNotices();
     expect(screen.queryByLabelText(draftLabel)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', {name: '丢弃未保存输入：发票 · 行 1 · 合计金额'}));
     expect(screen.queryByLabelText(/^未保存输入：/)).not.toBeInTheDocument();
     expect(screen.getByRole('cell', {name: '编辑 合计金额，当前值 16'})).toHaveTextContent('16');
   });
 
-  it("shows one collapsed source disclosure for multiple partial rows from the same task", async () => {
+  it("shows one source disclosure in the notices for multiple partial rows from the same task", async () => {
     const originalFetch = globalThis.fetch;
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
       const original = await originalFetch(String(input), init);
@@ -380,8 +398,8 @@ describe("DataTablePage", () => {
       return response(data);
     }));
     render(<DataTablePage />);
-    const summary = await screen.findByText("本页有局部读取的数据 · 查看来源范围");
-    expect(summary.closest("details")).not.toHaveAttribute("open");
+    fireEvent.click(await screen.findByRole("button", { name: "仓库事项" }));
+    expect(screen.getByRole("dialog", { name: "仓库事项" })).toHaveTextContent("本页有局部读取的数据");
     expect(screen.getAllByText("长发票.pdf · 局部读取")).toHaveLength(1);
     expect(screen.getByText(/第 2–9 页/)).toHaveTextContent("达到设置的读取上限");
   });
@@ -454,13 +472,13 @@ describe("DataTablePage", () => {
     const {container} = render(<DataTablePage />);
     await screen.findByText("资料1.pdf");
     const bar = container.querySelector(".row-actions-bar");
-    const action = screen.getByRole("button", {name: "清空选中来源数据"});
-    expect(action).toBeDisabled();
+    expect(screen.getByRole("button", {name: "清空来源"})).toBeDisabled();
     fireEvent.click(screen.getByRole("checkbox", {name: "选择完整来源 资料1.pdf"}));
     expect(container.querySelector(".row-actions-bar")).toBe(bar);
+    const action = screen.getByRole("button", {name: "清空来源"});
     expect(action).toBeEnabled();
     fireEvent.click(action);
-    const confirm = screen.getByRole("dialog", {name: "清空选中来源数据"});
+    const confirm = screen.getByRole("dialog", {name: "清空来源"});
     expect(confirm).toHaveTextContent("1000 条当前记录");
     expect(within(confirm).getByRole("list", {name: "将清空的完整来源"})).toHaveTextContent("资料1.pdf · 1000 条");
     expect(confirm).toHaveTextContent("文件原件和修订历史保留");
@@ -479,12 +497,12 @@ describe("DataTablePage", () => {
     }));
     render(<DataTablePage />);
     await screen.findByText("372");
-    fireEvent.click(screen.getByRole("button", {name: "字段"}));
+    fireEvent.click(screen.getByRole("button", {name: "字段设置"}));
     fireEvent.click(screen.getByRole("button", {name: "删除附加列 备注"}));
     const confirm = screen.getByRole("dialog", {name: "删除附加列“备注”？"});
     expect(confirm).toHaveTextContent("没有当前值");
     fireEvent.click(within(confirm).getByRole("button", {name: "确认删除"}));
-    expect(await screen.findByRole("alert")).toHaveTextContent("这一列仍有当前数据，不能删除");
+    expect(await within(confirm).findByRole("alert")).toHaveTextContent("这一列仍有当前数据，不能删除");
     expect(confirm).toBeInTheDocument();
   });
 
@@ -524,6 +542,9 @@ describe("DataTablePage", () => {
       fireEvent.click(screen.getByRole("checkbox", {name: "勾选此行加入批量"}));
       expect(screen.getByRole("button", {name: "删除选中"})).toBeEnabled();
       fireEvent.change(screen.getByRole("textbox", {name: "搜索当前表"}), {target: {value: search}});
+      // A changed scope must not expose the previous query's rows or actions.
+      expect(screen.queryByRole("button", {name: "删除选中"})).not.toBeInTheDocument();
+      await screen.findByRole("checkbox", {name: "勾选此行加入批量"});
       expect(screen.getByRole("button", {name: "删除选中"})).toBeDisabled();
       expect(screen.getByRole("checkbox", {name: "勾选此行加入批量"})).not.toBeChecked();
       expect(screen.getByRole("status")).toHaveTextContent("搜索范围已改变，已清除之前的选择。");
@@ -596,7 +617,7 @@ describe("DataTablePage", () => {
     fireEvent.click(screen.getByRole('button', {name: '分 Sheet'}));
     fireEvent.change(screen.getByRole('combobox', {name: '分组方式'}), {target: {value: 'none'}});
     fireEvent.click(screen.getByRole('button', {name: '应用分组'}));
-    expect(await screen.findByText('已取消分组，数据未改变。')).toBeInTheDocument();
+    expect(await screen.findByText('已取消分组。')).toBeInTheDocument();
     expect(clear).toHaveBeenCalledOnce();
     expect(screen.getByText('372')).toBeInTheDocument();
   });
@@ -618,7 +639,7 @@ describe("DataTablePage", () => {
     fireEvent.click(screen.getByRole('button', {name: '分 Sheet'}));
     fireEvent.change(screen.getByRole('combobox', {name: '分组方式'}), {target: {value: 'none'}});
     fireEvent.click(screen.getByRole('button', {name: '应用分组'}));
-    await screen.findByText('已取消分组，数据未改变。');
+    await screen.findByText('已取消分组。');
     finishPage?.(new Response(JSON.stringify([{...categories[0], id: 'late', name: '过期分类'}])));
     await waitFor(() => expect(screen.queryByRole('button', {name: /分类/})).not.toBeInTheDocument());
     expect(screen.getByText('372')).toBeInTheDocument();
@@ -658,7 +679,7 @@ describe("DataTablePage", () => {
     fireEvent.click(await screen.findByRole("button", { name: "合并表" }));
     fireEvent.click(screen.getByRole("checkbox", { name: /发票/ }));
     fireEvent.click(screen.getByRole("checkbox", { name: /收据/ }));
-    fireEvent.change(screen.getByRole("textbox", { name: "新表名称" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: "合并表名称" }), {
       target: { value: "合并结果" },
     });
     fireEvent.click(screen.getByRole("button", { name: "确认合并" }));

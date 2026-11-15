@@ -56,6 +56,8 @@ def main():
         provider.close()
         (root / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps({"calls": report["calls"], "passed": sum(case["success"] for case in report["cases"]), "report": str(root / "report.json")}))
+    expected_cases = 1 if args.partial_only else 2
+    return 0 if len(report["cases"]) == expected_cases and all(case["success"] for case in report["cases"]) else 1
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

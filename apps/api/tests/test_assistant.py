@@ -23,7 +23,8 @@ from document_pipeline_api.model_providers.conversation import ConversationProvi
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
+    monkeypatch.setattr("document_pipeline_api.api.assistant.read_loaded_context_lengths", lambda *_: {})
     app = create_app(
         Settings(
             database_url=f"sqlite:///{tmp_path / 'document-pipeline.db'}",
@@ -228,6 +229,10 @@ def test_chart_rejects_invented_metrics_and_partial_pie(client):
                 )
 
 
+def final_answer(text, kind="general"):
+    return {"type": "tool", "id": "finish", "name": "finish_answer", "arguments": {"kind": kind, "text": text}}
+
+
 class ScriptedProvider:
     requests = []
     plan = []
@@ -239,7 +244,7 @@ class ScriptedProvider:
     def close(self):
         pass
 
-    def stream(self, messages, tools):
+    def stream(self, messages, tools, **options):
         self.requests.append(json.loads(json.dumps(messages)))
         steps = self.plan
         if self.step < len(steps):
@@ -248,7 +253,7 @@ class ScriptedProvider:
             for event in events:
                 yield event
         else:
-            yield {"type": "text", "text": "这是回答。"}
+            yield final_answer("这是回答。")
 
 
 def select_profile(client, remote=False):
@@ -307,6 +312,50 @@ def test_chat_persists_without_changing_extraction_default(client):
     )
     assert send(client, p, thread_id=detail["id"]).status_code == 409
     assert len(client.get("/api/v1/assistant/threads?archived=true").json()) == 1
+
+
+@pytest.mark.parametrize(("manual_limit", "reported", "expected"), [
+    (None, 100_000, 100_000),
+    (200_000, 100_000, 100_000),
+    (8192, 100_000, 8192),
+    (None, None, 8192),
+])
+def test_chat_budget_uses_loaded_model_and_respects_manual_cap(client, monkeypatch, manual_limit, reported, expected):
+    seen = []
+
+    class CaptureBudget(ScriptedProvider):
+        def __init__(self, settings, cancel):
+            super().__init__(settings, cancel)
+            seen.append(settings.model_context_length)
+
+    client.app.state.conversation_factory = CaptureBudget
+    profile = select_profile(client)
+    assert profile["context_policy"] == "auto"
+    if manual_limit is not None:
+        response = client.post("/api/v1/models/profiles", json={
+            "name": "手动预算",
+            "provider": profile["provider"],
+            "base_url": profile["base_url"],
+            "model_name": profile["model_name"],
+            "context_length": manual_limit,
+        })
+        assert response.status_code == 201, response.text
+        profile = response.json()
+    monkeypatch.setattr(
+        "document_pipeline_api.api.assistant.read_loaded_context_lengths",
+        lambda *_: {profile["model_name"]: reported} if reported else {},
+    )
+    question = "上下文" * 2500
+    started = send(client, profile, text=question)
+    assert started.status_code == 200, started.text
+    payload = started.json()
+    events = client.get(f"/api/v1/assistant/runs/{payload['run_id']}/events").text
+    assert seen == [expected]
+    if expected == 8192:
+        assert "8,192 Token" in events
+        assert ("手动设置的上限" if manual_limit else "方案的自动预算") in events
+    else:
+        assert "run.completed" in events, events
 
 
 def test_cloud_consent_each_send_and_context_change_omits_old_business_history(client):

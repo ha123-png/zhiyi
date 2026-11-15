@@ -31,6 +31,15 @@ export type TaskStatus =
   | "cancelled"
   | "failed";
 
+export type TaskGroup = "all" | "active" | "completed" | "pending" | "failed" | "cancelled";
+export type TaskTimeWindow = "day" | "week" | "all";
+export type TaskPendingAction = "select_template" | "confirm_input_scope" | "confirm_target_table";
+export interface BatchRetryResult {
+  retried: string[];
+  skipped: number;
+  skipped_tasks?: Array<{ task_id: string; reason: "not_found" | "not_failed" | "state_changed" | "capacity" | "rejected" | "duplicate"; message: string }>;
+}
+
 export type TemplateMode = "smart" | "manual" | "invoice" | "delivery";
 
 export interface SourceRange {
@@ -88,7 +97,10 @@ export interface Task {
   planned_scope?: InputScope | null;
   match_scope?: InputScope | null;
   autonomous_fallback?: boolean;
-  pending_reason?: string | null;
+  pending_reason?: "template" | "input_scope" | "target_table" | "unknown" | null;
+  pending_action?: TaskPendingAction | null;
+  pending_review_version?: number | null;
+  has_result?: boolean;
   archive_pending?: boolean;
   file_export?: FileExportState | null;
   file_name?: FileNameState | null;
@@ -118,6 +130,7 @@ export interface Task {
 
 /** 历史页统计：各状态任务计数（SQL 聚合，不加载任务全表）。 */
 export interface TaskSummary {
+  group_counts?: Record<TaskGroup, number>;
   cancelled?: number;
   active?: number;
   waiting_for_action?: number;
@@ -158,6 +171,7 @@ export interface BackupStatus {
   uploads_size_bytes: number;
   restore_state: "succeeded" | "failed" | null;
   restore_message: string | null;
+  restore_completed_at?: number | null;
 }
 
 export interface RestoreResult {
@@ -254,6 +268,7 @@ export interface LocalModelList {
   provider: string;
   available: string[];
   loaded: string[];
+  loaded_context_lengths?: Record<string, number>;
 }
 
 export interface ComponentStatus {
@@ -332,6 +347,8 @@ export interface Extraction {
     message: string;
     severity: "warning" | "error";
     ignored?: boolean;
+    not_checked?: boolean;
+    raw_value?: TemplateValue;
   }>;
   evidence?: Array<{
     field_path: string;
@@ -489,6 +506,7 @@ export interface DataRowRevision {
 }
 
 export interface DataTableRead {
+  merge_sources?: string[] | null;
   grouping_fields?: string[];
   file_count?: number;
   collection_kind?: "table" | "files";
@@ -502,6 +520,7 @@ export interface DataTableRead {
 }
 
 export interface DataRowRead {
+  source_table_id?: string | null;
   is_header_only?: boolean;
   shared_header_keys?: string[] | null;
   review_pending?: boolean | null;
@@ -528,6 +547,7 @@ export interface SourceCardPage {
 }
 export interface SourceCardDetail extends SourceCard {
   page: number; page_size: number; total: number; header: Record<string, unknown>; schema: TableColumnDef[]; rows: DataRowRead[];
+  validation_issues?: Extraction["validation_issues"];
 }
 
 export interface TableColumnDef {

@@ -3,6 +3,8 @@ from pathlib import Path
 import sys
 import threading
 import json
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import pytest
 
@@ -111,8 +113,11 @@ def test_stop_waits_for_supervisor_state_after_api_startup_race(
     server = _ControlServer(("127.0.0.1", 0), _ControlHandler)
     server.token = "x" * 32
     server.stop_event = threading.Event()
+    server.maintenance_event = threading.Event()
     server.restore_lock = threading.Lock()
     server.restore_name = None
+    server.accepting_maintenance = False
+    server.maintenance_token = None
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     lock_ready = threading.Event()
@@ -172,8 +177,11 @@ def test_restore_request_is_authenticated_and_delivered_to_supervisor(
     server = _ControlServer(("127.0.0.1", 0), _ControlHandler)
     server.token = "x" * 32
     server.stop_event = threading.Event()
+    server.maintenance_event = threading.Event()
     server.restore_lock = threading.Lock()
     server.restore_name = None
+    server.accepting_maintenance = False
+    server.maintenance_token = None
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     (runtime_dir / "supervisor.json").write_text(
@@ -187,11 +195,46 @@ def test_restore_request_is_authenticated_and_delivered_to_supervisor(
         encoding="utf-8",
     )
     try:
-        assert request_restore(data_dir, "20260810T000000000000Z.dpbak")
-        assert server.restore_name == "20260810T000000000000Z.dpbak"
+        name = "20260810T000000000000Z.dpbak"
+        # A real supervisor opens maintenance admission only after readiness.
+        assert not request_restore(data_dir, name)
+        assert server.restore_name is None
+        with server.restore_lock:
+            server.accepting_maintenance = True
+        unauthorized = Request(
+            f"http://127.0.0.1:{server.server_port}/restore",
+            data=json.dumps({"name": name}).encode("utf-8"),
+            method="POST",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        with pytest.raises(HTTPError) as rejected:
+            urlopen(unauthorized, timeout=2)
+        assert rejected.value.code == 404
+        rejected.value.close()
+        assert server.restore_name is None
+        assert not server.maintenance_event.is_set()
+        assert not server.stop_event.is_set()
+
+        assert request_restore(data_dir, name)
+        assert server.restore_name == name
+        assert not request_restore(data_dir, "20260811T000000000000Z.dpbak")
+        assert server.restore_name == name
+        assert server.maintenance_event.wait(2)
+        assert not server.stop_event.is_set()
+
+        stop = Request(
+            f"http://127.0.0.1:{server.server_port}/stop",
+            method="POST",
+            headers={"Authorization": f"Bearer {server.token}"},
+        )
+        with urlopen(stop, timeout=2) as response:
+            assert response.status == 204
+        assert server.stop_event.wait(1)
     finally:
+        server.stop_event.set()
         server.shutdown()
         server.server_close()
+        thread.join(timeout=2)
 
 
 @pytest.mark.parametrize("mode", ["backup", "restore"])

@@ -72,14 +72,3 @@ def render_pdf_pages(
     finally:
         document.close()
     return rendered
-
-
-def render_single_page_pdf(pdf_path: Path, output_path: Path, scale: float = 3.0) -> Path:
-    pages = render_pdf_pages(
-        pdf_path,
-        output_path.parent,
-        max_pages=1,
-        scale=scale,
-    )
-    pages[0].replace(output_path)
-    return output_path

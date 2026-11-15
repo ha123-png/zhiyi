@@ -62,7 +62,7 @@ def _headers(session, table_id, keys, columns):
     return result
 
 
-def _preview_fields(columns, values, search=''):
+def _preview_fields(columns, values, search='', *, limit=3):
     selected = []
     query = search.strip().casefold()
     if query:
@@ -80,7 +80,7 @@ def _preview_fields(columns, values, search=''):
             value = ('…' if start else '') + value[start:start + 180] + ('…' if start + 180 < len(value) else '')
         selected.append({'key': column['key'], 'label': column['label'],
                          'value': value, 'truncated': truncated})
-        if len(selected) == 3:
+        if len(selected) == limit:
             break
     return selected
 
@@ -88,6 +88,8 @@ def _preview_fields(columns, values, search=''):
 def list_source_cards(session, table_id, *, scope=None, page=1, page_size=6):
     from document_pipeline_api.services.data_tables import table_columns
     selection = prepare_export_selection(session, table_id, scope)
+    if selection.table.merge_sources is not None:
+        raise HTTPException(409, "请在原表查看来源卡片。")
     identity = source_identity_expression()
     grouped = select(identity.label('source_key'), func.min(DataRowRecord.id).label('first_id'),
         func.count().label('matches')).where(*selection.predicates).group_by(identity).subquery()
@@ -113,7 +115,7 @@ def list_source_cards(session, table_id, *, scope=None, page=1, page_size=6):
         card['matched_row_count'] = group.matches
         card['complete'] = group.matches == card['row_count']
         card['preview_items'] = previews[group.source_key]
-        card['preview_header'] = _preview_fields([column for column in card['schema'] if column['section'] == 'header'], card['header'], scope.search if scope else '')
+        card['preview_header'] = _preview_fields([column for column in card['schema'] if column['section'] == 'header'], card['header'], scope.search if scope else '', limit=6)
         del card['header'], card['schema']
     return stringify_unsafe_integers({'table_id': table_id, 'page': page, 'page_size': page_size, 'total': total,
             'row_count': selection.row_count, 'groups': [cards[key] for key in keys]})
@@ -122,6 +124,8 @@ def list_source_cards(session, table_id, *, scope=None, page=1, page_size=6):
 def source_card_details(session, table_id, source_key, *, scope=None, page=1, page_size=20):
     from document_pipeline_api.services.data_tables import table_columns
     selection = prepare_export_selection(session, table_id, scope)
+    if selection.table.merge_sources is not None:
+        raise HTTPException(409, "请在原表查看来源卡片。")
     source_key = parse_source_key(source_key)
     identity = source_identity_expression()
     predicates = [*selection.predicates, identity == source_key]
@@ -132,7 +136,10 @@ def source_card_details(session, table_id, source_key, *, scope=None, page=1, pa
     # Header-only carrier rows are editable source records, not fake details.
     rows = session.scalars(select(DataRowRecord).where(*predicates).order_by(DataRowRecord.item_index, DataRowRecord.id)
         .offset((page - 1) * page_size).limit(page_size)).all()
+    current = session.get(FileCurrentDataRecord, card['task_id']) if card['task_id'] else None
+    issues = json.loads(current.validation_json) if current is not None else []
     return stringify_unsafe_integers({**card, 'page': page, 'page_size': page_size, 'total': total,
+            'validation_issues': issues,
             'matched_row_count': total, 'complete': total == card['row_count'],
             'rows': [data_row_read(row).model_dump(mode='json') for row in rows]})
 
@@ -141,8 +148,10 @@ def clear_source_cards(session, table_id, sources, *, scope=None, edit_session_i
     """Clear exactly the reviewed complete sources; retain evidence and history."""
     from document_pipeline_api.services.read_snapshot import begin_write_snapshot
     from document_pipeline_api.services.data_tables import table_columns, delete_rows
+    from document_pipeline_api.services.merged_tables import require_writable
     begin_write_snapshot(session)
     selection = prepare_export_selection(session, table_id, scope)
+    require_writable(selection.table)
     expected = {parse_source_key(source['id']): source['version'] for source in sources}
     if not expected or len(expected) != len(sources):
         raise HTTPException(422, '请选择不同的文件或来源。')

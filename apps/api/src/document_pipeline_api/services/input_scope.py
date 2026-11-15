@@ -261,6 +261,12 @@ def xlsx_units(path: Path, settings: Settings) -> Iterator[InputUnit]:
                     raise UnsupportedTextFileError(f"Excel 工作表超过安全上限 {settings.max_import_columns} 列。")
                 if (sheet.max_row or 0) + total_rows > settings.max_import_rows:
                     raise UnsupportedTextFileError(f"Excel 文档超过安全上限 {settings.max_import_rows} 行。")
+                from document_pipeline_api.services.xlsx_numbers import XlsxNumericError, validate_xlsx_numbers
+                try:
+                    validate_xlsx_numbers(sheet, formulas_as_text=True,
+                                          max_row=settings.max_import_rows + 1, max_column=settings.max_import_columns)
+                except XlsxNumericError as error:
+                    raise UnsupportedTextFileError(str(error)) from error
                 # Some producers write A1:A1 even when later cells exist. Do not
                 # trust that hint as a data boundary: read the actual worksheet XML.
                 sheet.reset_dimensions()

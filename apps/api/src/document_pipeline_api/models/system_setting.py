@@ -6,6 +6,9 @@ from sqlalchemy.orm import Mapped, mapped_column
 from document_pipeline_api.db import Base
 from document_pipeline_api.models.task import utc_now
 
+PENDING_DUPLICATE_PREFIX = "pending-duplicate:"
+PENDING_DUPLICATE_ID_PATTERN = r"^[a-zA-Z0-9-]{1,44}$"
+
 
 class SystemSettingRecord(Base):
     """本地偏好设置键值对（格式转换开关等），不进入任务快照。"""

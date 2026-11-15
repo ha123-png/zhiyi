@@ -62,6 +62,9 @@ from document_pipeline_api.services.data_views import (
 from document_pipeline_api.services.table_scope import TableExportScope, prepare_export_selection
 
 
+from document_pipeline_api.api.numeric_body import validate_numeric_body
+
+
 router = APIRouter(prefix="/tables", tags=["tables"])
 SessionDependency = Annotated[Session, Depends(get_session)]
 
@@ -200,7 +203,7 @@ def remove_custom_column(
     delete_custom_column(session, table_id, column_key)
 
 
-@router.patch("/{table_id}/rows/{row_id}", response_model=DataRowRead)
+@router.patch("/{table_id}/rows/{row_id}", response_model=DataRowRead, dependencies=[Depends(validate_numeric_body)])
 def edit_row(
     table_id: str,
     row_id: int,
@@ -210,7 +213,7 @@ def edit_row(
     return update_data_row(session, table_id, row_id, request)
 
 
-@router.post("/{table_id}/rows", response_model=DataRowRead, status_code=201)
+@router.post("/{table_id}/rows", response_model=DataRowRead, status_code=201, dependencies=[Depends(validate_numeric_body)])
 def create_row(
     table_id: str,
     request: RowCreate,
@@ -332,8 +335,9 @@ def view(
 
 
 @router.get("/{table_id}/export.xlsx", response_class=StreamingResponse)
-def export(table_id: str, session: SessionDependency, scope: ExportScopeDependency) -> StreamingResponse:
-    return export_data_table(session, table_id, scope=scope)
+def export(table_id: str, session: SessionDependency, scope: ExportScopeDependency,
+           columns: Annotated[list[str] | None, Query()] = None) -> StreamingResponse:
+    return export_data_table(session, table_id, scope=scope, columns=columns)
 
 
 @router.get("/{table_id}/export.zip", response_class=StreamingResponse)
@@ -347,8 +351,15 @@ def export_files_pack(table_id: str, session: SessionDependency, scope: ExportSc
 
 
 @router.get("/{table_id}/export-views.xlsx", response_class=StreamingResponse)
-def export_views(table_id: str, session: SessionDependency, scope: ExportScopeDependency) -> StreamingResponse:
-    return export_data_table_views(session, table_id, scope=scope)
+def export_views(table_id: str, session: SessionDependency, scope: ExportScopeDependency,
+                 columns: Annotated[list[str] | None, Query()] = None) -> StreamingResponse:
+    return export_data_table_views(session, table_id, scope=scope, columns=columns)
+
+
+@router.get("/{table_id}/export-notes.xlsx", response_class=StreamingResponse)
+def export_notes(table_id: str, session: SessionDependency, revisions: bool = False, input_scope: bool = False) -> StreamingResponse:
+    from document_pipeline_api.services.table_export_notes import export_table_notes
+    return export_table_notes(session, table_id, revisions=revisions, input_scope=input_scope)
 
 
 @router.get("/{table_id}/export.csv", response_class=StreamingResponse)

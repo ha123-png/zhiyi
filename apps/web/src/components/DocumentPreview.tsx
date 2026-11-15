@@ -28,7 +28,6 @@ interface DocumentPreviewProps {
   url: string;
   onPageCount?: (count: number) => void;
   flowPages?: boolean;
-  showDownload?: boolean;
   bookmark?: DocumentPreviewBookmark;
   onBookmarkChange?: (bookmark: DocumentPreviewBookmark) => void;
 }
@@ -83,9 +82,8 @@ function PreviewSession(props: DocumentPreviewProps) {
       scroll.removeEventListener("scroll", remember);
     };
   }, [save]);
-  return <PreviewContext.Provider value={value}><div ref={root} className="document-preview-with-download">
+  return <PreviewContext.Provider value={value}><div ref={root} className="document-preview-content">
     <DocumentContent {...props} />
-    {props.showDownload !== false && <a className="original-download btn secondary sm" href={props.url} download={props.filename}>下载完整原件</a>}
   </div></PreviewContext.Provider>;
 }
 
@@ -216,7 +214,11 @@ function TextDocument({ filename, scale, url }: DocumentPreviewProps) {
   if (error) return <PreviewError error={error} />;
   if (!data) return <div className="document-preview-loading">正在读取原文件…</div>;
   return <article aria-label={`原文件：${filename}`} className="document-text-preview" style={{ fontSize: `${scale}rem` }}>
-    {data.kind === "markdown" ? <div className="document-markdown-preview"><ReactMarkdown remarkPlugins={[remarkGfm]}>{data.text}</ReactMarkdown></div> : <pre>{data.text}</pre>}
+    {data.kind === "markdown" ? <div className="document-markdown-preview"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+      img: ({ alt }) => <span>[图片：{alt || "未加载外部图片"}]</span>,
+      a: ({ children, href }) => <a href={href?.startsWith("https://") || href?.startsWith("http://") ? href : undefined}
+        target="_blank" rel="noopener noreferrer">{children}</a>,
+    }}>{data.text}</ReactMarkdown></div> : <pre>{data.text}</pre>}
     {data.truncated && data.next_offset == null && <div className="document-preview-note">预览仅显示开头 {data.text.length.toLocaleString("zh-CN")} 个字符；这不是模型的读取范围。</div>}
     {previousError && <div className="document-preview-error" role="alert">{previousError}</div>}
     <PageControls offset={offset} next={data.next_offset} onMove={(next) => { previousSeqRef.current += 1; previousControllerRef.current?.abort(); setResolvingPrevious(false); move(next); }} previous={previous}

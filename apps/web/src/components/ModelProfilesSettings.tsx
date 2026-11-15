@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Archive, Check, ChevronDown, Eye, EyeOff, Loader2, Pencil, Plus, Zap } from "lucide-react";
+import { Archive, Check, Eye, EyeOff, Loader2, Pencil, Plus, Zap } from "lucide-react";
 import {
   activateModelProfile,
   archiveModelProfile,
@@ -11,6 +11,7 @@ import {
 import type { ModelProfile, ModelProfileDraft, ModelProbeResult, ModelProviderName } from "../types";
 import { useUnsavedChanges } from "../useUnsavedChanges";
 import { Icon } from "./Icon";
+import { CollapseChevron } from "./CollapseChevron";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { Toast, useToast } from "./Toast";
 
@@ -48,7 +49,6 @@ function inferPreset(draft: Pick<ModelProfileDraft, "provider" | "base_url">): S
   if (draft.base_url.includes(".aliyuncs.com")) return "aliyun";
   if (draft.provider === "lm_studio") return "lm_studio";
   if (draft.provider === "ollama") return "ollama";
-  if (draft.base_url.includes("dashscope.aliyuncs.com") || draft.base_url.includes("maas.aliyuncs.com")) return "aliyun";
   if (draft.base_url.includes("api.openai.com")) return "openai";
   return "custom";
 }
@@ -332,22 +332,14 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
 
   return (
     <>
-      <div className="callout info callout-sm" style={{ marginBottom: 16 }}>
-        本地方案的请求预算应与模型实际加载容量一致；云端方案独立设置。新设置用于后续请求，已有任务保留原方案快照。
-        云端方案的"文件离开本机"确认会在激活（使用）时弹出。
-      </div>
+      <p className="small muted">配置用于之后的请求；云端方案启用前需确认发送范围。</p>
       {unsaved.dialog}
       {error && <div className="callout danger">{error}</div>}
-      {message && <div className="callout success">{message}</div>}
+      {message && <p className="small muted" role="status">{message}</p>}
       {probeState.result && (
         <div
-          className={`callout ${
-            !probeState.result.connected
-              ? "danger"
-              : probeState.result.model_listed === false
-                ? "warning"
-                : "success"
-          }`}
+          className={!probeState.result.connected ? "small danger-text" : "small muted"}
+          role={probeState.result.connected ? "status" : "alert"}
         >
           {probeState.result.message}
           {probeState.result.connected && probeState.result.model_listed === false && (
@@ -420,13 +412,13 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
           <span className="form-label">多模态能力</span>
           <div className="multimodal-status">
             {draft.multimodal === false ? (
-              <span className="badge danger">仅文本</span>
+              <span className="badge muted">仅文本</span>
             ) : draft.multimodal === true ? (
-              <span className="badge success">支持图片</span>
+              <span className="badge muted">支持图片</span>
             ) : (
               <span className="badge muted">未验证</span>
             )}
-            <span className="small muted">由真实图片请求判定。连接或接口异常只会显示“未验证”，不会误判为仅文本；仅文本方案可处理纯文本和 Office 正文；包含图片的输入需要多模态模型。</span>
+            <span className="small muted">处理图片或扫描件前，请确认模型支持图片。</span>
           </div>
         </div>
         <div className="form-field" style={{ alignSelf: "flex-end" }}>
@@ -449,7 +441,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
         aria-expanded={advancedOpen}
       >
         <span>高级设置</span>
-        <Icon icon={ChevronDown} size={14} />
+        <CollapseChevron expanded={advancedOpen} />
       </button>
       <div className={`collapse${advancedOpen ? " open" : ""}`} inert={!advancedOpen} aria-hidden={!advancedOpen}>
         <div className="collapse-content">
@@ -459,8 +451,7 @@ export function ModelProfilesSettings({ onActiveProfileChanged }: { onActiveProf
               <input id="model-profile-context" className="form-input" type="number" min={1024} max={2000000}
                 value={draft.context_length ?? ""} placeholder="自动选择，可填写服务实际容量"
                 onChange={event => updateDraft({ context_length: event.target.value === "" ? null : Number(event.target.value) })} />
-              <div className="small muted">这是知意的请求预算，不会改变本地模型加载设置。留空时，已知云端参考模型容量；未知远端默认 32,768，本机默认 8,192。可按服务实际容量调整。
-                {selected?.context_policy === "auto" && <span> 当前自动预算：{selected.context_length.toLocaleString()}。</span>}</div>
+              <div className="small muted">留空时，问知意优先使用本机 LM Studio 或 Ollama 报告的已加载容量。读不到时，本机按 8,192 估算。云端自动预算参考已知模型容量，未知服务按 32,768 估算。手填数值会限制知意的请求大小。</div>
             </div>
             <div className="form-field">
               <label className="form-label" htmlFor="model-profile-temperature">温度（可选）</label>

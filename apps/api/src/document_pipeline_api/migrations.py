@@ -73,7 +73,6 @@ EXPECTED_SCHEMA = {
         "elapsed_seconds",
         "result_json",
         "validation_json",
-        "rule_engine_version",
         "evidence_json",
         "input_scope_json",
         "created_at",
@@ -477,7 +476,10 @@ for _table, _columns in ASSISTANT_AUTH_SCHEMA.items():
 SCHEMA_REVISIONS["0045_assistant_authorization"] = SCHEMA_REVISIONS["0044_revision_details"]
 EXPECTED_SCHEMA["tasks"].add("upload_intent_json")
 SCHEMA_REVISIONS["0046_upload_intent"] = SCHEMA_REVISIONS["0045_assistant_authorization"]
+EXPECTED_SCHEMA["data_tables"].add("merge_sources_json")
+SCHEMA_REVISIONS["0047_live_table_merge"] = SCHEMA_REVISIONS["0046_upload_intent"]
 COLUMNS_INTRODUCED_BY_REVISION = {
+    "0047_live_table_merge": {"data_tables": {"merge_sources_json"}},
     "0046_upload_intent": {"tasks": {"upload_intent_json"}},
     "0045_assistant_authorization": ASSISTANT_AUTH_SCHEMA,
     "0044_revision_details": {**REVISION_DETAIL_SCHEMA, "file_revisions": REVISION_COUNTS},

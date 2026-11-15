@@ -1,4 +1,5 @@
 from io import BytesIO, StringIO
+from itertools import groupby
 import csv
 import json
 import re
@@ -21,6 +22,9 @@ from document_pipeline_api.services.current_data import row_values, row_values_e
 from document_pipeline_api.services.cell_values import import_cell, infer_import_type
 from document_pipeline_api.services.excel_values import safe_excel_value
 from document_pipeline_api.services.table_scope import prepare_export_selection
+from document_pipeline_api.services.merged_tables import (
+    export_records, merge_columns, merge_order, merged_values, require_writable, table_membership,
+)
 from document_pipeline_api.domain.tasks import TaskStatus
 from document_pipeline_api.models import (
     TemplateRecord,
@@ -48,10 +52,7 @@ from document_pipeline_api.schemas.extraction import (
     DocumentKind,
     TemplateExtraction,
 )
-from document_pipeline_api.services.data_rows import (
-    BUILTIN_HEADER_KEYS,
-    data_row_read,
-)
+from document_pipeline_api.services.data_rows import data_row_read
 from document_pipeline_api.services.templates import (
     get_template,
     get_template_version,
@@ -63,6 +64,11 @@ BUILTIN_TEMPLATE_VERSION = "builtin-v1"
 TABLE_NAMES = {
     "invoice": "发票",
     "delivery": "送货单",
+}
+_BUILTIN_HEADER_KEYS = {
+    "document_type", "seller_name", "buyer_name", "seller_tax_id", "buyer_tax_id",
+    "seller_contact", "buyer_contact", "buyer_address", "document_number", "document_date",
+    "amount_before_tax", "tax_amount", "total_amount", "total_quantity", "remarks",
 }
 # 内置表行数据用发票系存储键，而模板 item 字段用 amount/tax_amount；
 # 展示/导出时把模板 item 键别名到真实存储键，避免"模板说金额、行里存 item_amount"对不上。
@@ -135,6 +141,11 @@ def confirm_task(
     filename: str | None = None,
 ) -> ConfirmationRead:
     from document_pipeline_api.models import FileCurrentDataRecord
+    from document_pipeline_api.services.read_snapshot import begin_write_snapshot
+
+    # Keep the status/version/validation checks and confirmation on one write
+    # snapshot; a concurrent edit must not be approved from this older read.
+    begin_write_snapshot(session)
     task = session.get(TaskRecord, task_id)
     extraction = session.get(ExtractionRecord, task_id)
     if task is None or extraction is None:
@@ -176,8 +187,9 @@ def confirm_task(
     session.execute(update(DataRowRecord).where(DataRowRecord.task_id == task_id).values(review_pending=False))
     from document_pipeline_api.services.file_names import confirm_file_name
     confirm_file_name(task, filename)
+    confirmation = get_confirmation(session, task_id)
     session.commit()
-    return get_confirmation(session, task_id)
+    return confirmation
 
 
 def materialize_task_result(
@@ -228,6 +240,7 @@ def list_data_tables(session: Session) -> list[DataTableRead]:
         .outerjoin(row_counts, DataTableRecord.id == row_counts.c.table_id)
         .order_by(DataTableRecord.created_at.desc())
     ).all()
+    counts = {table.id: count for table, count in records}
     return [
         DataTableRead(
             grouping_fields=json.loads(table.grouping_json or '[]'),
@@ -238,7 +251,8 @@ def list_data_tables(session: Session) -> list[DataTableRead]:
             template_key=table.template_key,
             template_version=table.template_version,
             document_kind=table.document_kind,
-            row_count=row_count,
+            row_count=sum(counts.get(source, 0) for source in table.merge_sources) if table.merge_sources is not None else row_count,
+            merge_sources=table.merge_sources,
             created_at=table.created_at,
         )
         for table, row_count in records
@@ -259,17 +273,36 @@ def get_data_table(
     table = session.get(DataTableRecord, table_id)
     if table is None:
         raise HTTPException(status_code=404, detail="没有找到这个数据表。")
-    row_query = select(DataRowRecord).where(DataRowRecord.table_id == table_id)
-    count_query = select(func.count(DataRowRecord.id)).where(DataRowRecord.table_id == table_id)
+    membership = table_membership(table)
+    row_query = select(DataRowRecord).where(membership)
+    count_query = select(func.count(DataRowRecord.id)).where(membership)
     if search:
         from document_pipeline_api.services.current_data import row_search_predicate
         row_query = row_query.where(row_search_predicate(search))
         count_query = count_query.where(row_search_predicate(search))
     rows = [] if table.collection_kind == "files" else session.scalars(
-        row_query.order_by(*_row_order()).offset((page - 1) * page_size).limit(page_size)
+        row_query.order_by(*merge_order(table), *_row_order()).offset((page - 1) * page_size).limit(page_size)
     ).all()
     row_count = session.scalar(count_query)
+    sources = table.merge_sources
+    if sources is not None:
+        columns, key_maps = merge_columns(session, sources)
+        result_rows = []
+        for source_id, source_group in groupby(rows, key=lambda row: row.table_id):
+            source_rows = list(source_group)
+            source = session.get(DataTableRecord, source_id)
+            key_map = key_maps[source_id]
+            for row, source_read in zip(source_rows, data_rows_read(session, source, source_rows), strict=True):
+                result_rows.append(source_read.model_copy(update={
+                    "source_table_id": source_id,
+                    "values": merged_values(row, key_maps),
+                    "shared_header_keys": [key_map[key] for key in source_read.shared_header_keys if key in key_map],
+                }))
+    else:
+        columns = table_columns(session, table)
+        result_rows = data_rows_read(session, table, rows)
     return DataTableDetail(
+        merge_sources=sources,
         grouping_fields=json.loads(table.grouping_json or '[]'),
         collection_kind=table.collection_kind,
         file_count=session.scalar(select(func.count()).select_from(FileCurrentDataRecord).where(
@@ -282,10 +315,10 @@ def get_data_table(
         document_kind=table.document_kind,
         row_count=row_count or 0,
         created_at=table.created_at,
-        columns=table_columns(session, table),
+        columns=columns,
         page=page,
         page_size=page_size,
-        rows=data_rows_read(session, table, rows) if table.collection_kind != "files" else [],
+        rows=result_rows,
     )
 
 
@@ -314,6 +347,8 @@ def table_columns(session: Session, table: DataTableRecord) -> list[ColumnDef]:
     暂时全空也必须保留，否则用户只填写字段 1 后字段 2 会从界面消失。"""
     if table.collection_kind == "files":
         return []
+    if table.merge_sources_json is not None:
+        return merge_columns(session, table.merge_sources)[0]
     if table.columns_json:
         return _current_field_order(session, table, [ColumnDef(**column) for column in json.loads(table.columns_json)])
     if table.document_kind != DocumentKind.CUSTOM.value:
@@ -324,7 +359,7 @@ def table_columns(session: Session, table: DataTableRecord) -> list[ColumnDef]:
             ColumnDef(
                 key=key,
                 label=label,
-                section="header" if key in BUILTIN_HEADER_KEYS else "item",
+                section="header" if key in _BUILTIN_HEADER_KEYS else "item",
             )
             for key, label in COLUMN_LABELS.items()
             if key not in ("source_filename", "item_index")
@@ -382,6 +417,7 @@ def add_custom_column(
         raise HTTPException(status_code=404, detail="没有找到这个数据表。")
     from document_pipeline_api.services.file_collections import require_tabular
     require_tabular(table)
+    require_writable(table)
     normalized = label.strip()
     columns = _persisted_columns(session, table)
     identity = " ".join(normalized.split()).casefold()
@@ -411,6 +447,7 @@ def delete_custom_column(session: Session, table_id: str, column_key: str) -> No
         raise HTTPException(status_code=404, detail="没有找到这个数据表。")
     from document_pipeline_api.services.file_collections import require_tabular
     require_tabular(table)
+    require_writable(table)
     columns = _persisted_columns(session, table)
     target = next((column for column in columns if column.key == column_key), None)
     if target is None:
@@ -481,7 +518,7 @@ def _row_order() -> list[object]:
     ]
 
 
-def export_data_table(session: Session, table_id: str, *, scope=None) -> StreamingResponse:
+def export_data_table(session: Session, table_id: str, *, scope=None, columns=None) -> StreamingResponse:
     selection = prepare_export_selection(session, table_id, scope)
     table = selection.table
     if table.collection_kind == "files":
@@ -492,18 +529,15 @@ def export_data_table(session: Session, table_id: str, *, scope=None) -> Streami
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = _unique_sheet_name(table.name, set())
-    keys, labels = _export_columns(session, table)
-    from document_pipeline_api.services.export_scope import WorkbookInputScopes
-    scopes = WorkbookInputScopes()
+    keys, labels = _excel_columns(session, table, columns)
     rows = session.scalars(
         select(DataRowRecord).where(*selection.predicates)
-        .order_by(*_row_order()).execution_options(yield_per=1000)
+        .order_by(*merge_order(table), *_row_order()).execution_options(yield_per=1000)
     )
     column_defs = {column.key: column for column in table_columns(session, table)}
-    _populate_export_sheet(sheet, rows, keys, labels, column_defs, scopes)
+    _populate_export_sheet(sheet, export_records(session, table, rows, include_table_name="__zhiyi_source_table" in keys), keys, labels, column_defs)
 
     output = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
-    scopes.finish(workbook)
     workbook.save(output)
     output.seek(0)
     filename = f"{table.name}{selection.suffix}.xlsx"
@@ -516,7 +550,7 @@ def export_data_table(session: Session, table_id: str, *, scope=None) -> Streami
     )
 
 
-def export_data_table_views(session: Session, table_id: str, *, scope=None) -> StreamingResponse:
+def export_data_table_views(session: Session, table_id: str, *, scope=None, columns=None) -> StreamingResponse:
     """Apply the current selection inside each saved grouping, including unmatched rows."""
     from document_pipeline_api.services.data_views import refresh_data_views
     refresh_data_views(session, table_id)
@@ -524,6 +558,7 @@ def export_data_table_views(session: Session, table_id: str, *, scope=None) -> S
     table = selection.table
     from document_pipeline_api.services.file_collections import require_tabular
     require_tabular(table)
+    require_writable(table)
     views = session.scalars(
         select(DataViewRecord)
         .where(DataViewRecord.table_id == table_id)
@@ -533,12 +568,10 @@ def export_data_table_views(session: Session, table_id: str, *, scope=None) -> S
         raise HTTPException(status_code=422, detail="当前数据表还没有分 Sheet 视图。")
     if scope is not None and scope.view_id:
         views = [view for view in views if view.id == scope.view_id]
-    keys, labels = _export_columns(session, table)
+    keys, labels = _excel_columns(session, table, columns)
     column_defs = {column.key: column for column in table_columns(session, table)}
     workbook = Workbook()
     workbook.remove(workbook.active)
-    from document_pipeline_api.services.export_scope import WorkbookInputScopes
-    scopes = WorkbookInputScopes()
     used_names: set[str] = set()
     matching = []
     for view in views:
@@ -553,17 +586,16 @@ def export_data_table_views(session: Session, table_id: str, *, scope=None) -> S
             .where(*selection.predicates, predicate)
             .order_by(*_row_order()).execution_options(yield_per=1000))
         sheet = workbook.create_sheet(_unique_sheet_name(view.name, used_names))
-        _populate_export_sheet(sheet, rows, keys, labels, column_defs, scopes)
+        _populate_export_sheet(sheet, rows, keys, labels, column_defs)
     unmatched_predicate = ~func.coalesce(or_(*matching), False) if matching else True
     if session.scalar(select(DataRowRecord.id).where(*selection.predicates, unmatched_predicate).limit(1)):
         unmatched = session.scalars(select(DataRowRecord).where(*selection.predicates, unmatched_predicate)
                                   .order_by(*_row_order()).execution_options(yield_per=1000))
         sheet = workbook.create_sheet(_unique_sheet_name("未分组", used_names))
-        _populate_export_sheet(sheet, unmatched, keys, labels, column_defs, scopes)
+        _populate_export_sheet(sheet, unmatched, keys, labels, column_defs)
     if not workbook.worksheets:
-        _populate_export_sheet(workbook.create_sheet("无匹配数据"), [], keys, labels, column_defs, scopes)
+        _populate_export_sheet(workbook.create_sheet("无匹配数据"), [], keys, labels, column_defs)
     output = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
-    scopes.finish(workbook)
     workbook.save(output)
     output.seek(0)
     filename = f"{table.name}{selection.suffix}-分Sheet.xlsx"
@@ -588,7 +620,18 @@ def _unique_sheet_name(raw: str, used: set[str]) -> str:
     return name
 
 
-def _populate_export_sheet(sheet, rows, keys, labels, column_defs, scopes) -> None:
+def _excel_columns(session, table, columns):
+    if columns is None:
+        return _export_columns(session, table)
+    labels = {column.key: column.label for column in table_columns(session, table)}
+    if table.merge_sources is not None:
+        labels["__zhiyi_source_table"] = "原表"
+    if any(key not in labels for key in columns):
+        raise HTTPException(409, "导出列已变化，请刷新数据表后重试。")
+    return list(dict.fromkeys(columns)), labels
+
+
+def _populate_export_sheet(sheet, rows, keys, labels, column_defs) -> None:
     header_fill = PatternFill("solid", fgColor="F0FDF4")
     for index, key in enumerate(keys, start=1):
         cell = sheet.cell(row=1, column=index, value=safe_excel_value(labels[key]))
@@ -608,7 +651,6 @@ def _populate_export_sheet(sheet, rows, keys, labels, column_defs, scopes) -> No
                 # Preserve literal error-looking text without adding an apostrophe.
                 cell.data_type = "s"
         row_number += 1
-        scopes.record(sheet, row_number, record, keys, {key for key, column in column_defs.items() if column.section == "header"})
         for index, value in enumerate(values):
             max_widths[index] = max(max_widths[index], _display_width(value))
         group_key = record.task_id or values_map.get("__row_group")
@@ -744,6 +786,9 @@ def _export_columns(
     session: Session,
     table: DataTableRecord,
 ) -> tuple[list[str], dict[str, str]]:
+    if table.merge_sources_json is not None:
+        columns = table_columns(session, table)
+        return [column.key for column in columns], {column.key: column.label for column in columns}
     present = _present_row_keys(session, table.id)
     if table.columns_json:
         columns = json.loads(table.columns_json)
@@ -798,11 +843,12 @@ def _table_read(
     if row_count is None:
         row_count = (
             session.scalar(
-                select(func.count(DataRowRecord.id)).where(DataRowRecord.table_id == table.id)
+                select(func.count(DataRowRecord.id)).where(table_membership(table))
             )
             or 0
         )
     return DataTableRead(
+        merge_sources=table.merge_sources,
         grouping_fields=json.loads(table.grouping_json or '[]'),
         collection_kind=table.collection_kind,
         file_count=session.scalar(select(func.count()).select_from(FileCurrentDataRecord).where(
@@ -829,8 +875,13 @@ def rename_table(session: Session, table_id: str, name: str) -> DataTableRead:
 
 def delete_table(session: Session, table_id: str) -> None:
     from document_pipeline_api.models import FileCurrentDataRecord
+    from document_pipeline_api.services.read_snapshot import begin_write_snapshot
+    # The complete row inventory belongs to the same write snapshot as its
+    # removal; a new file must not arrive between enumeration and deletion.
+    begin_write_snapshot(session)
     table = session.get(DataTableRecord, table_id)
     if table is None:
+        session.rollback()
         raise HTTPException(404, "没有找到这个数据表。")
     row_ids = session.scalars(select(DataRowRecord.id).where(DataRowRecord.table_id == table_id)).all()
     if row_ids:
@@ -891,6 +942,7 @@ def add_row(
         raise HTTPException(status_code=404, detail="没有找到这个数据表。")
     from document_pipeline_api.services.file_collections import require_tabular
     require_tabular(table)
+    require_writable(table)
     from document_pipeline_api.services.current_data import check_column_values
     check_column_values(values, [column.model_dump() for column in table_columns(session, table)])
     cleaned = dict(values)
@@ -933,6 +985,7 @@ def delete_rows(session: Session, table_id: str, row_ids: list[int], *,
     table = session.get(DataTableRecord, table_id)
     if table is None:
         raise HTTPException(404, "没有找到这个数据表。")
+    require_writable(table)
     rows = session.scalars(select(DataRowRecord).where(DataRowRecord.table_id == table_id, DataRowRecord.id.in_(row_ids))).all()
     if set(row_ids) != {row.id for row in rows}:
         raise HTTPException(404, "部分数据行不存在或不属于这张表。")
@@ -969,107 +1022,21 @@ def merge_tables(
     begin_write_snapshot(session)
     if len(set(table_ids)) != len(table_ids):
         raise HTTPException(422, "合并时同一张表只能选择一次。")
-    tables: list[DataTableRecord] = []
+    from document_pipeline_api.services.file_collections import require_tabular
     for table_id in table_ids:
         table = session.get(DataTableRecord, table_id)
         if table is None:
-            raise HTTPException(status_code=404, detail="没有找到数据表。")
-        from document_pipeline_api.services.file_collections import require_tabular
+            raise HTTPException(404, "没有找到数据表。")
         require_tabular(table)
-        tables.append(table)
-    # 字段并集按用户看到的列名判断，而不是内部 key，也不按“第几次出现”
-    # 再拆列。同名字段无论来自内置模板、导入表还是历史表，都只能成为一列。
-    columns_by_label: dict[str, ColumnDef] = {}
-    source_key_maps: dict[str, dict[str, str]] = {}
-    for table in tables:
-        key_map: dict[str, str] = {}
-        source_labels: set[str] = set()
-        for column in table_columns(session, table):
-            normalized_label = " ".join(column.label.split()).casefold()
-            if normalized_label in source_labels:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"数据表“{table.name}”存在重复列名“{column.label}”，"
-                        "为避免丢失信息，请先重命名后再合并。"
-                    ),
-                )
-            source_labels.add(normalized_label)
-            canonical = columns_by_label.get(normalized_label)
-            if canonical is not None and (canonical.value_type != column.value_type or canonical.section != column.section):
-                raise HTTPException(409, f"同名字段“{column.label}”的类型或文件/明细归属不同，请先明确字段含义并重命名，再合并。")
-            if canonical is None:
-                # 合并表拥有自己的列身份。不同来源表可能碰巧复用同一内部 key，
-                # 若直接沿用就会让两个不同列互相串值。
-                canonical = column.model_copy(
-                    update={"key": f"merged_{uuid4().hex[:12]}"}
-                )
-                columns_by_label[normalized_label] = canonical
-            key_map[column.key] = canonical.key
-        source_key_maps[table.id] = key_map
-    columns = list(columns_by_label.values())
+        require_writable(table)
+    merge_columns(session, table_ids, validate=True)
+    identifier = str(uuid4())
     merged = DataTableRecord(
-        id=str(uuid4()),
-        name=name,
-        template_key=f"merged-{uuid4().hex[:12]}",
-        template_version="1",
-        document_kind=DocumentKind.CUSTOM.value,
-        columns_json=json.dumps(
-            [column.model_dump() for column in columns],
-            ensure_ascii=False,
-        ),
+        id=identifier, name=name, template_key=f"merged-{identifier}",
+        template_version="1", document_kind=DocumentKind.CUSTOM.value,
+        merge_sources_json=json.dumps(table_ids),
     )
     session.add(merged)
-    session.flush()
-    index = 1
-    created_batch = []
-
-    def persist_batch():
-        session.flush()
-        session.add_all([DataRowRevisionRecord(
-            row_id=created.id, table_id=merged.id, task_id=None, version=1,
-            operation="merge_create", before_json=None, after_json=created.row_json, editor="merge",
-        ) for created in created_batch])
-        session.flush()
-        created_batch.clear()
-
-    for table in tables:
-        for row in session.scalars(
-            select(DataRowRecord)
-            .where(DataRowRecord.table_id == table.id)
-            .order_by(DataRowRecord.id).execution_options(yield_per=500)
-        ):
-            source_values = row_values(row)
-            source_group = row.task_id or source_values.get("__row_group") or f"row-{row.id}"
-            merged_row: dict[str, object | None] = {}
-            # 只复制这张来源表列契约内的值。历史行 JSON 可能残留旧模板内部键，
-            # 它们不是用户看到的列，绝不能越过“列名并集”混入合并结果。
-            for source_key, canonical_key in source_key_maps[table.id].items():
-                if source_key in source_values:
-                    merged_row[canonical_key] = source_values[source_key]
-            created = DataRowRecord(
-                table_id=merged.id,
-                # 合并表是来源行的独立副本。继续复用 task_id 会违反
-                # uq_data_row_task_item；用内部行组保留界面/XLSX 合并语义。
-                task_id=None,
-                item_index=index,
-                row_json=json.dumps(merged_row, ensure_ascii=False),
-                input_scope_json=row.input_scope_json,
-                review_pending=row.review_pending,
-                row_version=1,
-            )
-            merged_values = row_values(created)
-            # This is an independent identity, not a growing chain of parents.
-            import hashlib
-            merged_values["__row_group"] = hashlib.sha256(json.dumps(
-                [table.id, source_group], ensure_ascii=False).encode()).hexdigest()
-            created.row_json = json.dumps(merged_values, ensure_ascii=False)
-            session.add(created)
-            created_batch.append(created)
-            if len(created_batch) >= 500:
-                persist_batch()
-            index += 1
-    persist_batch()
     session.commit()
     return _table_read(session, merged)
 
@@ -1080,8 +1047,8 @@ def export_data_table_csv(session: Session, table_id: str, *, scope=None) -> Str
     from document_pipeline_api.services.file_collections import require_tabular
     require_tabular(table)
     keys, labels = _export_columns(session, table)
-    scoped = table_has_input_scopes(session, table_id, predicates=selection.predicates)
-    pending = table_has_pending_reviews(session, table_id, predicates=selection.predicates)
+    scoped = table_has_input_scopes(session, table_id, predicates=selection.predicates, include_sources=bool(table.merge_sources))
+    pending = table_has_pending_reviews(session, table_id, predicates=selection.predicates, include_sources=bool(table.merge_sources))
     if pending and REVIEW_LABEL in labels.values():
         raise HTTPException(422, "业务列名与知意来源状态说明列冲突，请重命名该业务列后导出。")
     if scoped and SCOPE_LABEL in labels.values():
@@ -1101,10 +1068,10 @@ def export_data_table_csv(session: Session, table_id: str, *, scope=None) -> Str
     row_jsons = session.scalars(
         select(DataRowRecord)
         .where(*selection.predicates)
-        .order_by(*_row_order())
+        .order_by(*merge_order(table), *_row_order())
         .execution_options(yield_per=1000)
     )
-    for row_json in row_jsons:
+    for row_json in export_records(session, table, row_jsons):
         row = export_row_values(row_json)
         write_csv_row([_csv_safe(row.get(key)) for key in keys] + ([csv_scope_value(row)] if scoped else []) + (["待核对" if row.get(REVIEW_KEY) else ""] if pending else []))
     output.seek(0)
@@ -1132,10 +1099,10 @@ def export_data_table_json(session: Session, table_id: str, *, scope=None) -> St
     row_jsons = session.scalars(
         select(DataRowRecord)
         .where(*selection.predicates)
-        .order_by(*_row_order())
+        .order_by(*merge_order(table), *_row_order())
         .execution_options(yield_per=1000)
     )
-    for row_json in row_jsons:
+    for row_json in export_records(session, table, row_jsons):
         if not first:
             output.write(b",")
         output.write(json.dumps(export_row_values(row_json), ensure_ascii=False).encode("utf-8"))
@@ -1213,7 +1180,7 @@ def parse_import_rows(
             except ValueError as error:
                 raise ImportFileError(str(error)) from error
         workbook = load_workbook(BytesIO(content), read_only=False, data_only=True)
-        formula_workbook = load_workbook(BytesIO(content), read_only=False, data_only=False)
+        formula_workbook = load_workbook(BytesIO(content), read_only=True, data_only=False)
         try:
             if workbook.properties.subject == "zhiyi:per-file-export:v1":
                 raise ImportFileError("这是按文件阅读的导出工作簿，不能作为统一字段表直接导入。请先整理需要的数据为单行表头的普通工作表。")
@@ -1226,11 +1193,20 @@ def parse_import_rows(
             if not sheets:
                 return []
             sheet = workbook[sheet_name or sheets[0]]
-            formula_sheet = formula_workbook[sheet.title]
+            # Normal mode renames duplicate titles; read-only mode preserves
+            # them. Both worksheet lists exclude chartsheets and retain order.
+            if len(workbook.worksheets) != len(formula_workbook.worksheets):
+                raise ImportFileError("Excel 工作表结构不一致，无法核对原始数值。")
+            formula_sheet = formula_workbook.worksheets[workbook.worksheets.index(sheet)]
+            from document_pipeline_api.services.xlsx_numbers import XlsxNumericError, validate_xlsx_numbers
+            try:
+                validate_xlsx_numbers(formula_sheet)
+            except XlsxNumericError as error:
+                raise ImportFileError(str(error)) from error
+            formula_sheet.reset_dimensions()
             for row in formula_sheet.iter_rows():
                 for formula_cell in row:
-                    cached_cell = sheet[formula_cell.coordinate]
-                    if formula_cell.data_type == "f" and cached_cell.value is None:
+                    if formula_cell.data_type == "f" and sheet[formula_cell.coordinate].value is None:
                         raise ImportFileError(
                             "Excel 包含尚无计算结果缓存的公式；知意不会自行执行公式，请先在表格软件中计算并另存为值后导入。"
                         )
@@ -1348,6 +1324,7 @@ def import_table_rows(
         raise HTTPException(status_code=404, detail="没有找到这个数据表。")
     from document_pipeline_api.services.file_collections import require_tabular
     require_tabular(table)
+    require_writable(table)
     columns = table_columns(session, table)
     imported_header_labels = set(rows[0].get("__header_labels") or []) if rows else set()
     duplicate_headers = [

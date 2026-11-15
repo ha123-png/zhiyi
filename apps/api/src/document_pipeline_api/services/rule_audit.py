@@ -69,6 +69,7 @@ def audit_rule_engine(session: Session) -> RuleAuditReport:
                 result=result,
                 template_id=extraction.template_id,
                 template_version=extraction.template_version,
+                manual_revision=current.current_version > 0,
             )
             current_issues = ([_summarize(issue) for issue in evaluation.issues + input_scope_issues(extraction.input_scope_json)]
                               if current.has_data else [])

@@ -55,6 +55,5 @@ export interface DashboardOverview {
   model_usage: ModelUsage & {
     by_purpose: (ModelUsage & { purpose: string; model: string; provider: string })[];
     coverage_start: string | null;
-    history_note: string;
   };
 }

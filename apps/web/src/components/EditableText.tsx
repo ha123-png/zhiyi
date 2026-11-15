@@ -1,7 +1,8 @@
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useLayoutEffect, useRef } from "react";
 
 interface EditableTextProps {
   editing: boolean;
+  ariaLabel?: string;
   value: string;
   onCommit: (raw: string) => void;
   onCancel?: () => void;
@@ -10,17 +11,23 @@ interface EditableTextProps {
 
 /**
  * 可编辑文本：单击后进入 contentEditable，内容始终保留，
- * 进入编辑时自动聚焦并把光标放到文字末尾，避免“点了变空白”。
+ * 短文本定位到末尾，长内容从开头显示。
  * Enter 提交、Esc 取消、失焦提交。
  */
 export function EditableText({
   editing,
+  ariaLabel,
   value,
   onCommit,
   onCancel,
   className,
 }: EditableTextProps) {
   const ref = useRef<HTMLElement | null>(null);
+  // Keep React's child stable too, so refreshed facts cannot replace the browser's draft.
+  const renderedValue = useRef(value);
+  const wasEditing = useRef(false);
+  if (!editing || !wasEditing.current) renderedValue.current = value;
+  wasEditing.current = editing;
   // Esc 取消时抑制随后 blur 触发的 commit，避免"Esc 反而保存"
   const cancelledRef = useRef(false);
 
@@ -31,16 +38,19 @@ export function EditableText({
     if (!editing && ref.current) ref.current.textContent = value;
   }, [editing, value]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!editing || !ref.current) return;
     const el = ref.current;
-    el.focus();
+    el.focus({ preventScroll: true });
     const range = document.createRange();
     range.selectNodeContents(el);
-    range.collapse(false);
+    const original = el.textContent ?? "";
+    const longValue = original.length > 72 || original.includes("\n");
+    range.collapse(longValue);
     const selection = window.getSelection();
     selection?.removeAllRanges();
     selection?.addRange(range);
+    if (longValue) { el.scrollLeft = 0; el.scrollTop = 0; }
   }, [editing]);
 
   return (
@@ -48,6 +58,8 @@ export function EditableText({
       ref={ref as React.RefObject<HTMLSpanElement>}
       className={className}
       contentEditable={editing}
+      role={editing && ariaLabel ? "textbox" : undefined}
+      aria-label={editing ? ariaLabel : undefined}
       suppressContentEditableWarning
       onBlur={(event) => {
         if (cancelledRef.current) {
@@ -57,6 +69,7 @@ export function EditableText({
         onCommit(event.currentTarget.textContent ?? "");
       }}
       onKeyDown={(event) => {
+        if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
         if (event.key === "Enter") {
           event.preventDefault();
           event.currentTarget.blur();
@@ -73,7 +86,7 @@ export function EditableText({
         }
       }}
     >
-      {value}
+      {renderedValue.current}
     </span>
   );
 }

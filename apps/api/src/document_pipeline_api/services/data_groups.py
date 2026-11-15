@@ -63,8 +63,14 @@ def shared_header_values(session, table_id, keys, columns):
     expressions = []
     for column in headers:
         path = '$."' + column.key.replace('\\', '\\\\').replace('"', '\\"') + '"'
-        encoded = func.json_array(func.coalesce(func.json_type(DataRowRecord.row_json, path), 'null'),
-                                  func.json_extract(DataRowRecord.row_json, path))
+        kind = func.coalesce(func.json_type(DataRowRecord.row_json, path), 'null')
+        # json_extract can round integers above int64, and json_array formats
+        # doubles with fewer digits. Compare and transport their original JSON
+        # tokens as ordinary SQL text, retaining the separate scalar type.
+        numeric_token = DataRowRecord.row_json.op('->')(path).op('||')('')
+        value = case((kind.in_(['integer', 'real']), numeric_token),
+                     else_=func.json_extract(DataRowRecord.row_json, path))
+        encoded = func.json_array(kind, value)
         expressions.extend([func.count(func.distinct(encoded)), func.min(encoded)])
     result = {}
     for key, *cells in session.execute(select(identity, *expressions).where(
@@ -74,7 +80,8 @@ def shared_header_values(session, table_id, keys, columns):
             variants, encoded = cells[index * 2:index * 2 + 2]
             if variants == 1:
                 kind, value = json.loads(encoded)
-                result[key][column.key] = True if kind == 'true' else False if kind == 'false' else value
+                result[key][column.key] = (json.loads(value) if kind in {'integer', 'real'}
+                                          else True if kind == 'true' else False if kind == 'false' else value)
     return result
 
 

@@ -213,23 +213,31 @@ def test_manual_row_rejects_fields_outside_column_contract(tmp_path) -> None:
         assert client.get(f"/api/v1/tables/{table['id']}").json()["row_count"] == 0
 
 
-@pytest.mark.parametrize("changes", [
-    {"total_amount": "bad-number"}, {"total_amount": True},
-    {"seller_name": 123}, {"document_date": "2026-02-30"},
+@pytest.mark.parametrize("changes,manual_status", [
+    ({"total_amount": "bad-number"}, 200), ({"total_amount": True}, 422),
+    ({"seller_name": 123}, 422), ({"document_date": "2026-02-30"}, 200),
 ])
-def test_independent_writes_obey_column_types_and_fail_atomically(tmp_path, changes):
+def test_independent_edits_preserve_manual_text_and_reject_other_invalid_types_atomically(tmp_path, changes, manual_status):
     with _client(tmp_path) as client:
         table = _create_manual_table(client)
         created = client.post(f"/api/v1/tables/{table['id']}/rows", json={"values": changes})
         assert created.status_code == 422
         row = _add_row(client, table["id"], seller_name="原值", total_amount=0)
-        patched = client.patch(f"/api/v1/tables/{table['id']}/rows/{row['id']}",
-            json={"expected_version": row["version"], "changes": {"seller_name": "不能部分保存", **changes}})
-        assert patched.status_code == 422
+        patch_url = f"/api/v1/tables/{table['id']}/rows/{row['id']}"
+        edits = {"seller_name": "同时保存的字段", **changes}
+        payload = {"expected_version": row["version"], "changes": edits}
+        external = client.patch(patch_url, json={**payload, "editor": "integration-api"})
+        assert external.status_code == 422
+        patched = client.patch(patch_url, json=payload)
+        assert patched.status_code == manual_status
         current = client.get(f"/api/v1/tables/{table['id']}").json()["rows"]
         assert len(current) == 1
-        assert current[0]["values"] == row["values"]
-        assert current[0]["version"] == row["version"]
+        if manual_status == 200:
+            assert current[0]["values"] == {**row["values"], **edits}
+            assert current[0]["version"] == row["version"] + 1
+        else:
+            assert current[0]["values"] == row["values"]
+            assert current[0]["version"] == row["version"]
 
 
 @pytest.mark.parametrize("conflict", [{"value_type": "text"}, {"section": "item"}])
@@ -248,31 +256,51 @@ def test_merge_rejects_incompatible_same_label_without_creating_table(tmp_path, 
         assert {table["id"] for table in client.get("/api/v1/tables").json()} == {first["id"], second["id"]}
 
 
-def test_merge_keeps_independent_snapshot_across_batch_boundaries(tmp_path):
+def test_merge_reads_live_sources_without_copies_or_write_through(tmp_path):
     from sqlalchemy import func, select
     from document_pipeline_api.models import DataRowRevisionRecord
+
     with _client(tmp_path) as client:
         first, second = _create_manual_table(client, "A"), _create_manual_table(client, "B")
-        with client.app.state.session_factory() as session:
-            session.add_all(DataRowRecord(table_id=first["id"], item_index=index,
-                row_json=json.dumps({"seller_name": "甲", "total_amount": index})) for index in range(1, 503))
-            session.commit()
-        _add_row(client, second["id"], seller_name="乙", total_amount=3)
-        response = client.post("/api/v1/tables/merge", json={"table_ids": [first["id"], second["id"]], "name": "C"})
+        a = _add_row(client, first["id"], seller_name="甲", total_amount=2)
+        b = _add_row(client, second["id"], seller_name="乙", total_amount=3)
+        response = client.post("/api/v1/tables/merge", json={"table_ids": [second["id"], first["id"]], "name": "C"})
         assert response.status_code == 201, response.text
         merged = response.json()
-        assert merged["row_count"] == 503
+        assert merged["merge_sources"] == [second["id"], first["id"]]
+        assert merged["row_count"] == 2
+        url = f"/api/v1/tables/{merged['id']}"
         with client.app.state.session_factory() as session:
-            assert session.scalar(select(func.count()).select_from(DataRowRevisionRecord)
-                .where(DataRowRevisionRecord.table_id == merged["id"])) == 503
-        detail = client.get(f"/api/v1/tables/{merged['id']}").json()
+            for model in (DataRowRecord, DataRowRevisionRecord):
+                assert session.scalar(select(func.count()).select_from(model)
+                    .where(model.table_id == merged["id"])) == 0
+        detail = client.get(url).json()
         seller = next(column["key"] for column in detail["columns"] if column["label"] == "销售方")
-        row = detail["rows"][0]
-        assert client.patch(f"/api/v1/tables/{merged['id']}/rows/{row['id']}",
-            json={"expected_version": row["version"], "changes": {seller: "独立修改"}}).status_code == 200
-        assert client.get(f"/api/v1/tables/{first['id']}").json()["rows"][0]["values"]["seller_name"] == "甲"
+        assert [(row["id"], row["source_table_id"], row["values"][seller]) for row in detail["rows"]] == [
+            (b["id"], second["id"], "乙"), (a["id"], first["id"], "甲"),
+        ]
+        assert client.get(url, params={"page": 2, "page_size": 1}).json()["rows"][0]["id"] == a["id"]
+        assert client.get(f"/api/v1/assistant/references/tables/{merged['id']}/rows/{a['id']}",
+                          params={"page_size": 1}).json()["page"] == 2
+        assert client.patch(f"{url}/rows/{a['id']}", json={
+            "expected_version": a["version"], "changes": {seller: "错误写入"},
+        }).status_code == 409
+        assert client.post(f"{url}/rows", json={"values": {}}).status_code == 409
+        sheet = {"file": ("新增.csv", "销售方\n新增\n".encode("utf-8"), "text/csv")}
+        rejected = client.post(f"{url}/import", files=sheet)
+        assert rejected.status_code == 409
+        assert "原表" in rejected.json()["detail"]
+        assert client.patch(f"/api/v1/tables/{first['id']}/rows/{a['id']}", json={
+            "expected_version": a["version"], "changes": {"seller_name": "已更新"},
+        }).status_code == 200
+        assert client.post(f"/api/v1/tables/{first['id']}/import", files=sheet).status_code == 200
+        assert [row["values"][seller] for row in client.get(url).json()["rows"]] == ["乙", "已更新", "新增"]
+        assert client.get(url, params={"search": "已更新"}).json()["row_count"] == 1
+        assert [row[seller] for row in client.get(f"{url}/export.json").json()] == ["乙", "已更新", "新增"]
         assert client.delete(f"/api/v1/tables/{first['id']}").status_code == 204
-        assert client.get(f"/api/v1/tables/{merged['id']}").json()["row_count"] == 503
+        assert client.get(url).json()["row_count"] == 1
+        assert client.delete(url).status_code == 204
+        assert client.get(f"/api/v1/tables/{second['id']}").json()["rows"][0]["id"] == b["id"]
 
 
 def test_merge_tables_union_columns_and_rows(tmp_path) -> None:
@@ -686,14 +714,10 @@ def test_merge_real_task_backed_tables_does_not_reuse_unique_task_identity(tmp_p
             session.add(task)
             session.flush()
             session.add(FileCurrentDataRecord(task_id=task.id, table_id=first["id"], header_json='{"seller_name":"甲"}'))
-            session.add(
-                DataRowRecord(
-                    table_id=first["id"],
-                    task_id="source-task",
-                    item_index=1,
-                    row_json='{}',
-                    row_version=1,
-                )
+            session.add_all(
+                DataRowRecord(table_id=first["id"], task_id="source-task", item_index=index,
+                              row_json=json.dumps({"name": name}), row_version=1)
+                for index, name in enumerate(("货品甲", "货品乙"), 1)
             )
             session.commit()
         _add_row(client, second["id"], seller_name="乙")
@@ -703,7 +727,14 @@ def test_merge_real_task_backed_tables_does_not_reuse_unique_task_identity(tmp_p
         )
     assert merged.status_code == 201, merged.text
     detail = client.get(f"/api/v1/tables/{merged.json()['id']}").json()
-    assert all(row["task_id"] is None for row in detail["rows"])
+    columns = {column["label"]: column["key"] for column in detail["columns"]}
+    seller_key = columns["销售方"]
+    product_key = next(column["key"] for column in detail["columns"] if column["section"] == "item")
+    rows = detail["rows"]
+    assert [row["task_id"] for row in rows] == ["source-task", "source-task", None]
+    assert all(seller_key in row["shared_header_keys"] for row in rows[:2])
+    assert all(product_key not in row["shared_header_keys"] for row in rows[:2])
+    assert {row["values"][product_key] for row in rows[:2]} == {"货品甲", "货品乙"}
 
 
 def test_import_enforces_row_limit(tmp_path) -> None:

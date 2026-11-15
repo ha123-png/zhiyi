@@ -4,7 +4,7 @@ from collections import defaultdict
 from bisect import insort
 from types import SimpleNamespace
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 import json
 import math
 import re
@@ -17,6 +17,8 @@ from sqlalchemy import select
 from document_pipeline_api.services.current_data import row_values
 from document_pipeline_api.models import DataRowRecord, DataTableRecord
 from document_pipeline_api.services.data_tables import table_columns
+from document_pipeline_api.services.merged_tables import merge_columns, merged_values, table_membership
+from document_pipeline_api.schemas.json_numbers import MAX_SAFE_JSON_INTEGER
 
 
 class Strict(BaseModel):
@@ -26,7 +28,7 @@ class Strict(BaseModel):
 class Filter(Strict):
     field: str
     op: Literal["eq", "ne", "contains", "gt", "gte", "lt", "lte", "empty"] = "eq"
-    value: str | float | bool | None = None
+    value: str | int | float | bool | None = None
 
 
 class Metric(Strict):
@@ -154,7 +156,9 @@ def analyze(session, request: AnalysisRequest):
         raise HTTPException(404, "没有找到这张表。")
     from document_pipeline_api.services.file_collections import require_tabular
     require_tabular(table)
-    columns = {c.key: c for c in table_columns(session, table)}
+    sources = table.merge_sources
+    definitions, key_maps = merge_columns(session, sources) if sources is not None else (table_columns(session, table), None)
+    columns = {c.key: c for c in definitions}
     fields = (
         request.dimensions
         + [f.field for f in request.filters]
@@ -191,7 +195,7 @@ def analyze(session, request: AnalysisRequest):
     if request.time_bucket and not request.dimensions:
         raise HTTPException(422, "时间分桶需要指定日期维度。")
     query = (
-        select(DataRowRecord).where(DataRowRecord.table_id == table.id).order_by(DataRowRecord.id)
+        select(DataRowRecord).where(table_membership(table)).order_by(DataRowRecord.id)
     )
     if request.row_ids is not None:
         query = query.where(DataRowRecord.id.in_(request.row_ids))
@@ -220,7 +224,7 @@ def analyze(session, request: AnalysisRequest):
         or c.key.rsplit(".", 1)[-1].casefold() in {"currency", "currency_code", "unit", "measurement_unit"})
     candidates, candidate_values, seen_documents = [], {}, set()
     for record in session.scalars(query.execution_options(yield_per=100)):
-        values = row_values(record)
+        values = merged_values(record, key_maps) if key_maps is not None else row_values(record)
         if not all(matches(values.get(f.field), f) for f in request.filters):
             continue
         light = SimpleNamespace(id=record.id, task_id=record.task_id, row_version=record.row_version,
@@ -355,6 +359,7 @@ def analyze(session, request: AnalysisRequest):
         buckets[()] = []
     invalid = defaultdict(set)
     inferred = set()
+    approximated = set()
 
     def calculate(entries, metric):
         entries = list(entries)
@@ -401,15 +406,26 @@ def analyze(session, request: AnalysisRequest):
             inferred.add(metric.field)
         if not nums:
             return None
-        value = {
-            "sum": lambda: sum(nums),
-            "avg": lambda: sum(nums) / len(nums),
-            "min": lambda: min(nums),
-            "max": lambda: max(nums),
-        }[metric.op]()
+        # Decimal's default 28 digits can lose a small remainder when large
+        # values cancel. Keep the complete sum before checking the JSON boundary.
+        with localcontext() as decimal_context:
+            decimal_context.prec = max(28, max(n.adjusted() for n in nums)
+                - min(n.as_tuple().exponent for n in nums) + len(str(len(nums))) + 1)
+            value = {
+                "sum": lambda: sum(nums),
+                "avg": lambda: sum(nums) / len(nums),
+                "min": lambda: min(nums),
+                "max": lambda: max(nums),
+            }[metric.op]()
         result = float(value)
         if not math.isfinite(result):
             raise HTTPException(422, "计算结果超出图表可表示的数值范围，请缩小范围或核对异常数值。")
+        if value.copy_abs() > MAX_SAFE_JSON_INTEGER or (
+            metric.op != "avg" and Decimal(str(result)) != value
+        ):
+            raise HTTPException(422, "计算结果超出图表可保持的数值精度，已停止显示近似统计。请查看原始记录，或导出 JSON 保留完整数值。")
+        if metric.op == "avg" and Decimal(str(result)) != value:
+            approximated.add(metric.field)
         return result
 
     totals = {key: calculate(rows, metric) for metric, key in zip(request.metrics, metric_keys)}
@@ -437,6 +453,9 @@ def analyze(session, request: AnalysisRequest):
     ]
     warnings += [
         f"{columns[k].label}：本次按可解释的数值分析，未修改原字段类型。" for k in inferred
+    ]
+    warnings += [
+        f"{columns[k].label}：平均值按图表数值精度近似显示；原始记录和 JSON 导出保留原值。" for k in approximated
     ]
     if request.grain == "auto" and any(
         m.field and columns[m.field].section == "header" for m in request.metrics

@@ -1,6 +1,6 @@
 import { useId, useState, type ReactNode } from "react";
-import { ChevronDown } from "lucide-react";
-import { Icon } from "./Icon";
+import { CollapseChevron } from "./CollapseChevron";
+import "./disclosure.css";
 
 export function Disclosure({ title, children, className = "", defaultOpen = false, onOpen }: {
   title: ReactNode; children: ReactNode; className?: string; defaultOpen?: boolean; onOpen?: () => void;
@@ -9,7 +9,7 @@ export function Disclosure({ title, children, className = "", defaultOpen = fals
   const id = useId();
   return <section className={`disclosure ${className}`}>
     <button className="disclosure-trigger" type="button" aria-expanded={open} aria-controls={id} onClick={() => { if (!open) onOpen?.(); setOpen(!open); }}>
-      <span>{title}</span><Icon icon={ChevronDown} size={14} className={open ? "disclosure-arrow open" : "disclosure-arrow"} />
+      <span>{title}</span><CollapseChevron expanded={open} />
     </button>
     <div className={`collapse${open ? " open" : ""}`} id={id} inert={!open}>
       <div className="collapse-content"><div className="disclosure-body">{children}</div></div>

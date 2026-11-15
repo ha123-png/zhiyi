@@ -1,10 +1,36 @@
 import re
+import math
+from decimal import Decimal, InvalidOperation, localcontext
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 
 Severity = Literal["warning", "error"]
+
+
+def _lossless_rule_float(value):
+    # Rule configuration is a JSON-number/float contract shared with the UI.
+    # Do not silently round an integer or numeric string before validation.
+    # Existing float snapshots remain readable; already-lost digits cannot be
+    # recovered by this validator.
+    if isinstance(value, (int, str)) and not isinstance(value, bool):
+        try:
+            converted = float(value)
+            with localcontext():
+                original = Decimal(str(value))
+        except (ValueError, InvalidOperation, OverflowError):
+            return value  # Preserve the schema's normal invalid-number error.
+        if math.isfinite(converted) and original.is_finite():
+            changed = original != Decimal(str(converted))
+            if original == original.to_integral_value():
+                changed = changed or original != Decimal.from_float(converted)
+            if changed:
+                raise ValueError("规则数值精度超出可无损保存范围，请使用当前支持的数字精度。")
+    return value
+
+
+RuleNumber = Annotated[float, BeforeValidator(_lossless_rule_float)]
 
 
 class FieldExpression(BaseModel):
@@ -38,7 +64,7 @@ class ConstantExpression(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     op: Literal["constant"]
-    value: float
+    value: RuleNumber
 
 
 class BinaryExpression(BaseModel):
@@ -73,8 +99,8 @@ class RangeRule(BaseModel):
 
     kind: Literal["range"]
     field: str
-    minimum: float | None = None
-    maximum: float | None = None
+    minimum: RuleNumber | None = None
+    maximum: RuleNumber | None = None
     severity: Severity = "error"
 
     @field_validator("field")
@@ -100,7 +126,7 @@ class EnumRule(BaseModel):
 
     kind: Literal["enum"]
     field: str
-    values: list[str | float | bool] = Field(min_length=1, max_length=100)
+    values: list[str | RuleNumber | bool] = Field(min_length=1, max_length=100)
     severity: Severity = "error"
 
     @field_validator("field")
@@ -140,7 +166,7 @@ class EquationRule(BaseModel):
     kind: Literal["equation"]
     left: RuleExpression
     right: RuleExpression
-    tolerance: float = Field(default=0.01, ge=0, le=1_000_000)
+    tolerance: RuleNumber = Field(default=0.01, ge=0, le=1_000_000)
     field: str
     severity: Severity = "error"
 

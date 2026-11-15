@@ -14,24 +14,10 @@ from document_pipeline_api.models import DataTableRecord, DataRowRecord
 
 
 from verify_assistant_scale_memory import process_memory as memory
+from verify_assistant_isolation import require_bound_server, reserve_report, validate_loopback_url, validate_paths
 
 
-def main():
-    parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--url", default="http://127.0.0.1:18814")
-    parser.add_argument("--model", default="qwen3.6-flash")
-    parser.add_argument(
-        "--base-url", default="https://dashscope.aliyuncs.com/compatible-mode/v1"
-    )
-    parser.add_argument("--key-file", type=Path)
-    parser.add_argument("--pid", type=int, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
-    root = args.data_dir.resolve()
-    if not root.is_relative_to(Path(__file__).resolve().parents[1] / ".local"):
-        parser.error("Only workspace .local synthetic data is allowed")
-    engine = build_engine(f"sqlite:///{root / 'document-pipeline.db'}")
+def prepare_scale_tables(engine):
     with Session(engine) as session:
         if not session.get(DataTableRecord, "ask-synthetic"):
             raise RuntimeError("Start the isolated verification server first")
@@ -83,11 +69,31 @@ def main():
                     ],
                 )
             session.commit()
+
+
+def main():
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument("--url", default="http://127.0.0.1:18814")
+    parser.add_argument("--model", default="qwen3.6-flash")
+    parser.add_argument(
+        "--base-url", default="https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+    parser.add_argument("--key-file", type=Path)
+    parser.add_argument("--pid", type=int, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    project = Path(__file__).resolve().parents[1]
+    root, output = validate_paths(project, args.data_dir, args.output)
+    base_url = validate_loopback_url(args.url)
+    reserve_report(output)
+    engine = build_engine(f"sqlite:///{root / 'document-pipeline.db'}")
     reports = []
-    args.output.parent.mkdir(parents=True, exist_ok=True)
     with httpx.Client(
-        base_url=args.url + "/api/v1", timeout=240, trust_env=False
+        base_url=base_url + "/api/v1", timeout=240, trust_env=False, follow_redirects=False
     ) as client:
+        require_bound_server(engine, client)
+        prepare_scale_tables(engine)
         response = client.post(
             "/models/profiles",
             json={
@@ -248,7 +254,7 @@ def main():
                 ),
             }
             reports.append(report)
-            args.output.write_text(
+            output.write_text(
                 json.dumps(reports, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             print(
@@ -284,7 +290,7 @@ def main():
                 ),
             }
             reports.append(follow)
-            args.output.write_text(
+            output.write_text(
                 json.dumps(reports, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             print(

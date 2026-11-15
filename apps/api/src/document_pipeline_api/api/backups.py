@@ -47,6 +47,7 @@ class BackupStatus(BaseModel):
     uploads_size_bytes: int
     restore_state: str | None = None
     restore_message: str | None = None
+    restore_completed_at: float | None = None
 
 
 class RestoreResult(BaseModel):
@@ -129,14 +130,18 @@ def backup_status(request: Request) -> BackupStatus:
     last = backups[-1] if backups else None
     restore_state = None
     restore_message = None
+    restore_completed_at = None
     restore_result = settings.storage_dir.parent / "runtime" / "restore-result.json"
     try:
         if restore_result.is_file() and restore_result.stat().st_size <= 4096:
             payload = json.loads(restore_result.read_text(encoding="utf-8"))
-            if payload.get("state") in {"succeeded", "failed"}:
+            if isinstance(payload, dict) and payload.get("state") in ("succeeded", "failed"):
                 restore_state = payload["state"]
                 restore_message = str(payload.get("message") or "")[:500]
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                completed_at = payload.get("completed_at")
+                if type(completed_at) in (int, float) and 0 < completed_at < 1e12:
+                    restore_completed_at = completed_at
+    except (OSError, ValueError):
         pass
     return BackupStatus(
         backup_dir=str(backup_dir),
@@ -152,6 +157,7 @@ def backup_status(request: Request) -> BackupStatus:
         uploads_size_bytes=_dir_size(settings.storage_dir),
         restore_state=restore_state,
         restore_message=restore_message,
+        restore_completed_at=restore_completed_at,
     )
 
 

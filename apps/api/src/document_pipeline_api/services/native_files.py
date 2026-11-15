@@ -7,6 +7,7 @@ from contextlib import ExitStack, contextmanager
 import ctypes
 from ctypes import wintypes
 import json
+import math
 import mimetypes
 import os
 from pathlib import Path
@@ -174,23 +175,31 @@ def consume_import_ticket(data_dir: Path, token: str):
     claimed = path.with_suffix(".claimed")
     claimed_owned = False
     try:
-        validate_local_path(path)
-        path.rename(claimed)  # Windows no-replace; one consumer owns the ticket.
-        claimed_owned = True
-        value = json.loads(claimed.read_text(encoding="utf-8"))
-        if value["expires"] < time.time() or value.get("generation") != dataset_generation(data_dir):
-            raise ValueError
-    except (OSError, ValueError, KeyError):
-        if claimed_owned:
-            claimed.unlink(missing_ok=True)
-        raise CopyExportError("invalid_ticket", "文件选择已失效或已导入，请重新选择文件。") from None
-    try:
-        with import_source(Path(value["path"])) as source:
+        try:
+            validate_local_path(path)
+            path.rename(claimed)  # Windows no-replace; one consumer owns the ticket.
+            claimed_owned = True
+            value = json.loads(claimed.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError
+            expires = value["expires"]
+            if (isinstance(expires, bool) or not isinstance(expires, (int, float))
+                    or (isinstance(expires, float) and not math.isfinite(expires))):
+                raise ValueError
+            source_path = value["path"]
+            if not isinstance(source_path, str) or not source_path or "\x00" in source_path:
+                raise ValueError
+            if expires < time.time() or value.get("generation") != dataset_generation(data_dir):
+                raise ValueError
+        except (OSError, ValueError, KeyError, TypeError):
+            raise CopyExportError("invalid_ticket", "文件选择已失效或已导入，请重新选择文件。") from None
+        with import_source(Path(source_path)) as source:
             if not matches_source(source, value):
                 raise CopyExportError("source_changed", "文件在选择后已发生变化，请重新选择。")
             yield source, value
     finally:
-        claimed.unlink(missing_ok=True)
+        if claimed_owned:
+            claimed.unlink(missing_ok=True)
 
 
 def renew_import_ticket(data_dir: Path, verified_origin: dict) -> str:

@@ -1,0 +1,45 @@
+.validation-panel {
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  overflow: hidden;
+}
+.validation-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 12px 16px;
+  color: var(--foreground);
+  font-size: .9375rem;
+  font-weight: 500;
+}
+.validation-alert-icon { color: var(--destructive-text); }
+[data-review-field]:focus-within {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+button.validation-panel-head:hover { background: var(--muted); }
+.validation-caret { margin-left: auto; color: var(--muted-foreground); }
+.validation-panel-body {
+  margin: 0;
+  padding: 0 16px;
+  max-height: 320px;
+  overflow-y: auto;
+  list-style: none;
+}
+.validation-panel-body:empty { padding: 0; }
+.validation-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+  font-size: .875rem;
+}
+.validation-description { flex: 1; min-width: 0; overflow-wrap: anywhere; line-height: 1.6; }
+.validation-description strong { font-weight: 500; }
+.validation-actions { display: flex; flex-shrink: 0; gap: 4px; flex-wrap: wrap; }
+.validation-item.is-ignored .validation-description { color: var(--muted-foreground); }
+.validation-ignored-tag { color: var(--muted-foreground); font-size: .75rem; }

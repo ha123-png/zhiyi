@@ -1,0 +1,21 @@
+/* Shared disclosure styles travel with Disclosure, including on a cold lazy route. */
+.disclosure-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  background: none;
+  color: var(--color-text);
+  padding: 12px 0;
+  text-align: left;
+  font: inherit;
+  font-size: var(--text-label);
+  font-weight: 500;
+  cursor: pointer;
+}
+.disclosure-trigger > span { min-width: 0; overflow-wrap: anywhere; }
+.disclosure-body { padding: 8px 0 4px; }
+.disclosure-body > p { font-size: 12px; line-height: 1.7; color: var(--muted-foreground); }

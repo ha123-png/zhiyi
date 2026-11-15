@@ -173,7 +173,31 @@ def load_golden(path: Path) -> GoldenDataset:
     return GoldenDataset.model_validate_json(path.read_text(encoding="utf-8"))
 
 
+def _validated_sample_paths(dataset_dir: Path, golden: GoldenDataset) -> dict[str, Path]:
+    root = dataset_dir.resolve()
+    paths = {}
+    for filename, sample in golden.samples.items():
+        if sample.category not in CATEGORY_KIND:
+            raise ValueError(f"黄金集包含不支持的类别：{sample.category}")
+        if (
+            not filename or filename in {".", ".."}
+            or any(character in filename for character in ("/", "\\", ":"))
+        ):
+            raise ValueError("黄金样本名称必须是单个文件名。")
+        path = (root / sample.category / filename).resolve()
+        if not path.is_relative_to(root):
+            raise ValueError("黄金样本路径超出数据集目录。")
+        if not path.is_file():
+            raise FileNotFoundError(f"黄金集缺少文件：{sample.category}/{filename}")
+        paths[filename] = path
+    return paths
+
+
 def dataset_fingerprint(dataset_dir: Path, golden: GoldenDataset) -> str:
+    return _dataset_fingerprint(golden, _validated_sample_paths(dataset_dir, golden))
+
+
+def _dataset_fingerprint(golden: GoldenDataset, paths: dict[str, Path]) -> str:
     digest = hashlib.sha256(
         json.dumps(
             golden.model_dump(mode="json"),
@@ -183,12 +207,9 @@ def dataset_fingerprint(dataset_dir: Path, golden: GoldenDataset) -> str:
         ).encode("utf-8")
     )
     for filename, sample in sorted(golden.samples.items()):
-        path = dataset_dir / sample.category / filename
-        if not path.is_file():
-            raise FileNotFoundError(f"黄金集缺少文件：{sample.category}/{filename}")
         digest.update(sample.category.encode("utf-8"))
         digest.update(filename.encode("utf-8"))
-        with path.open("rb") as source:
+        with paths[filename].open("rb") as source:
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(chunk)
     return digest.hexdigest()
@@ -201,6 +222,8 @@ def run_quality_evaluation(
     dataset_dir: Path,
     golden: GoldenDataset,
 ) -> QualityReport:
+    # Validate the entire corpus before passing even the first image to a provider.
+    sample_paths = _validated_sample_paths(dataset_dir, golden)
     scores: list[SampleScore] = []
     templates = _builtin_template_reads()
     with tempfile.TemporaryDirectory(prefix="quality-evaluation-") as temp:
@@ -209,7 +232,7 @@ def run_quality_evaluation(
             kind = CATEGORY_KIND.get(expected.category)
             if kind is None:
                 raise ValueError(f"黄金集包含不支持的类别：{expected.category}")
-            path = dataset_dir / expected.category / filename
+            path = sample_paths[filename]
             classification_match = False
             classification_error_code = None
             extraction_elapsed = 0.0
@@ -327,7 +350,7 @@ def run_quality_evaluation(
             for sample in golden.samples.values()
         ),
         generated_at=datetime.now(timezone.utc),
-        dataset_fingerprint=dataset_fingerprint(dataset_dir, golden),
+        dataset_fingerprint=_dataset_fingerprint(golden, sample_paths),
         golden_schema_version=golden.schema_version,
         model_provider=provider_name,
         model_name=provider.model_name,

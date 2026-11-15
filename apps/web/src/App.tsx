@@ -1,6 +1,3 @@
-import { deletionNotice } from "./deletionNotice";
-import { ModelConnectionState } from "./assistant/ModelConnectionState";
-import * as Popover from "@radix-ui/react-popover";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AssistantProvider, useAssistant } from "./assistant/AssistantProvider";
 import { AssistantDrawer, AssistantPage, AssistantTrigger } from "./assistant/AssistantSurface";
@@ -8,37 +5,62 @@ import { assistantApi } from "./assistant/api";
 import type { Reference } from "./assistant/types";
 import type { TemplateDraft } from "./types";
 import { GlobalTaskCard } from "./components/TaskActivity";
+import { useTaskOverview } from "./useTaskOverview";
+import type { ListScrollMemory } from "./useListScroll";
+import type { HistoryListViewState } from "./components/HistoryPage";
 import { PageLoadBoundary } from "./components/PageLoadBoundary";
+import { PageEntrance, PageOpening } from "./components/PageTransition";
+import { ServiceStatus } from "./components/ServiceStatus";
+import { StatusDot } from "./components/StatusDot";
 import { Onboarding, ONBOARDING_VERSION, onboardingDone } from "./components/Onboarding";
 import { Sidebar } from "./components/Sidebar";
-import { TaskQueuePage } from "./components/TaskQueuePage";
+import { TaskQueuePage, type TaskWorkspaceViewState } from "./components/TaskQueuePage";
+import { PendingDuplicateDialog, type PendingDuplicate } from "./components/PendingDuplicateDialog";
 import { Toast, useToast } from "./components/Toast";
 import {
-  deleteTask,
   getConfirmation,
+  deletePendingDuplicate,
+  getPendingDuplicates,
+  savePendingDuplicate,
+  type PendingDuplicateRecord,
   getOnboardingState,
   getModelStatus,
   getSystemStatus,
   getTasks,
-  getTaskSummary,
   pauseQueue,
   resumeQueue,
   subscribeTaskEvents,
-  taskEventsConnected,
 } from "./api";
 import type { TaskEvent } from "./api";
-import type { DemoScenario, ModelStatus, NavigationKey, SystemStatus, Task, TaskStatus } from "./types";
+import type { DemoScenario, ModelStatus, NavigationKey, SystemStatus, Task, TaskGroup } from "./types";
+import { useUpdates } from "./useUpdates";
+import { taskGroupCounts } from "./taskPresentation";
 
-const DashboardPage = lazy(() => import("./components/DashboardPage").then(module => ({ default: module.DashboardPage })));
+const pageModules = {
+  dashboard: () => import("./components/DashboardPage").then(module => ({ default: module.DashboardPage })),
+  backups: () => import("./components/BackupPage").then(module => ({ default: module.BackupPage })),
+  connections: () => import("./components/ConnectionsPage").then(module => ({ default: module.ConnectionsPage })),
+  tables: () => import("./components/DataTablePage").then(module => ({ default: module.DataTablePage })),
+  extract: () => import("./components/ExtractPage").then(module => ({ default: module.ExtractPage })),
+  history: () => import("./components/HistoryPage").then(module => ({ default: module.HistoryPage })),
+  guide: () => import("./components/GuidePage").then(module => ({ default: module.GuidePage })),
+  settings: () => import("./components/SettingsPage").then(module => ({ default: module.SettingsPage })),
+  templates: () => import("./components/TemplatesPage").then(module => ({ default: module.TemplatesPage })),
+};
+function preparePage(page: NavigationKey) {
+  // Warm the module on navigation intent; no page is mounted or data read yet.
+  if (page in pageModules) void pageModules[page as keyof typeof pageModules]().catch(() => undefined);
+}
+const DashboardPage = lazy(pageModules.dashboard);
 const StatisticBridge = lazy(() => import("./dashboard/StatisticBridge").then(module => ({ default: module.StatisticBridge })));
-const BackupPage = lazy(() => import("./components/BackupPage").then(module => ({ default: module.BackupPage })));
-const ConnectionsPage = lazy(() => import("./components/ConnectionsPage").then(module => ({ default: module.ConnectionsPage })));
-const DataTablePage = lazy(() => import("./components/DataTablePage").then(module => ({ default: module.DataTablePage })));
-const ExtractPage = lazy(() => import("./components/ExtractPage").then(module => ({ default: module.ExtractPage })));
-const HistoryPage = lazy(() => import("./components/HistoryPage").then(module => ({ default: module.HistoryPage })));
-const GuidePage = lazy(() => import("./components/GuidePage").then(module => ({ default: module.GuidePage })));
-const SettingsPage = lazy(() => import("./components/SettingsPage").then(module => ({ default: module.SettingsPage })));
-const TemplatesPage = lazy(() => import("./components/TemplatesPage").then(module => ({ default: module.TemplatesPage })));
+const BackupPage = lazy(pageModules.backups);
+const ConnectionsPage = lazy(pageModules.connections);
+const DataTablePage = lazy(pageModules.tables);
+const ExtractPage = lazy(pageModules.extract);
+const HistoryPage = lazy(pageModules.history);
+const GuidePage = lazy(pageModules.guide);
+const SettingsPage = lazy(pageModules.settings);
+const TemplatesPage = lazy(pageModules.templates);
 
 function applyTheme(theme: "auto" | "light" | "dark") {
   const root = document.documentElement;
@@ -60,11 +82,16 @@ function AppContent() {
   const [assistantTemplateVersion, setAssistantTemplateVersion] = useState<number | null>(null);
   const [assistantDraft, setAssistantDraft] = useState<TemplateDraft | null>(null);
   const [assistantRow, setAssistantRow] = useState<number | null>(null);
-  const [attentionCounts, setAttentionCounts] = useState<{ pending?: number; review?: number }>({});
   const [activePage, setActivePage] = useState<NavigationKey>("workspace");
-  const [historyEntry, setHistoryEntry] = useState<"completed" | "problems">("completed");
+  const [focusAssistantComposer, setFocusAssistantComposer] = useState(false);
+  const [historyEntry, setHistoryEntry] = useState<HistoryListViewState["tab"]>();
+  const historyViewState = useRef<HistoryListViewState | undefined>(undefined);
+  const rememberHistoryView = useCallback((state: HistoryListViewState) => {
+    historyViewState.current = state;
+  }, []);
   const pageWrapRef = useRef<HTMLDivElement>(null);
   const pageScrollPositionsRef = useRef<Partial<Record<NavigationKey, number>>>({});
+  const listScrollMemory = useRef<ListScrollMemory>({});
   // 跳转表竞态守卫：getConfirmation 期间用户切换页面时不再强行跳回数据表
   const navSeqRef = useRef(0);
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
@@ -72,44 +99,113 @@ function AppContent() {
   const [selectedTableId, setSelectedTableId] = useState<string | null>(null);
   const [tableJumpNotice, setTableJumpNotice] = useState<string | null>(null);
   const [highlightTaskId, setHighlightTaskId] = useState<string | null>(null);
-  const [tasks, setTasks] = useState<Task[]>([]);
+  const taskOverview = useTaskOverview();
+  const [taskViewState, setTaskViewState] = useState<TaskWorkspaceViewState>({ group: "all", searchInput: "", page: 0 });
+  const [taskEntryRevision, setTaskEntryRevision] = useState(0);
+  const [taskEntryGroup, setTaskEntryGroup] = useState<TaskGroup>("pending");
+  const { tasks, state: taskReadState, refresh: loadTasks } = taskOverview;
+  const [queueBusy, setQueueBusy] = useState(false);
+  const [taskNoticeHost, setTaskNoticeHost] = useState<HTMLSpanElement | null>(null);
+  const updates = useUpdates();
+  const [duplicates, setDuplicates] = useState<PendingDuplicate[]>(() => {
+    try {
+      const value = JSON.parse(sessionStorage.getItem("zhiyi-duplicate-uploads") ?? "[]");
+      return Array.isArray(value) ? value : [];
+    } catch { return []; }
+  });
+  const [activeDuplicate, setActiveDuplicate] = useState<PendingDuplicate | null>(null);
+  const duplicateWrites = useRef(new Map<string, Promise<PendingDuplicateRecord>>());
+  const persistedDuplicates = useRef(new Set<string>());
+  const removedDuplicates = useRef(new Set<string>());
+  const removeDuplicates = useCallback((items: readonly PendingDuplicate[]) => {
+    const ids = new Set(items.map(item => item.id));
+    for (const id of ids) {
+      persistedDuplicates.current.delete(id);
+      removedDuplicates.current.add(id);
+    }
+    setDuplicates(current => current.filter(entry => !ids.has(entry.id)));
+    setActiveDuplicate(current => current && ids.has(current.id) ? null : current);
+  }, []);
+  const queueMutation = useRef(false);
   // 上传中乐观任务：上传请求发出前立即显示在全局任务条并开始计时，
   // 不等后端创建任务的异步响应（上传完成后由真实任务替换）。
   const [optimisticTasks, setOptimisticTasks] = useState<Task[]>([]);
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
+  const [systemStatusFailed, setSystemStatusFailed] = useState(false);
+  const [statusRefresh, setStatusRefresh] = useState(0);
+  const statusGeneration = useRef(0);
   const [onboardingOpen, setOnboardingOpen] = useState(false);
+  const [onboardingSetupPending, setOnboardingSetupPending] = useState(false);
+  const [onboardingSession, setOnboardingSession] = useState(0);
+  const [settingsFocusRequest, setSettingsFocusRequest] = useState<{ section: "local" | "ai" | "about"; revision: number }>();
   const [extractionDemo, setExtractionDemo] = useState<DemoScenario | null>(null);
   const { toast, notify, clear } = useToast();
-  // 失败/待选模板 toast 去重：同一任务同一状态只通知一次，避免 SSE 重复推送刷屏。
-  const notifiedTasksRef = useRef<Set<string>>(new Set());
-  const notifyRef = useRef(notify);
-  notifyRef.current = notify;
+
+  const rememberDuplicate = useCallback((item: PendingDuplicate) => {
+    const write = savePendingDuplicate(item);
+    duplicateWrites.current.set(item.id, write);
+    void write.then(saved => {
+      persistedDuplicates.current.add(item.id);
+      setDuplicates(current => current.map(entry => entry.id === item.id ? saved : entry));
+    }, () => notify("重复待确认暂未保存到本机，关闭前请先处理。", "error"))
+      .finally(() => { if (duplicateWrites.current.get(item.id) === write) duplicateWrites.current.delete(item.id); });
+  }, [notify]);
 
   useEffect(() => {
-    applyTheme(
-      (localStorage.getItem("theme") as "auto" | "light" | "dark") || "auto",
-    );
+    let active = true;
+    void getPendingDuplicates().then(items => {
+      if (!active || !Array.isArray(items)) return;
+      for (const item of items) persistedDuplicates.current.add(item.id);
+      setDuplicates(current => {
+        const known = new Set(current.map(item => item.id));
+        return [...current, ...items.filter(item => !known.has(item.id) && !removedDuplicates.current.has(item.id))];
+      });
+    }).catch(() => { if (active) notify("暂时无法读取重复待确认，重新打开知意后可重试。", "error"); });
+    try {
+      const legacy = JSON.parse(sessionStorage.getItem("zhiyi-duplicate-uploads") ?? "[]");
+      if (Array.isArray(legacy) && legacy.length) {
+        void Promise.all(legacy.map(item => savePendingDuplicate(item))).then(items => {
+          for (const item of items) persistedDuplicates.current.add(item.id);
+          sessionStorage.removeItem("zhiyi-duplicate-uploads");
+        }).catch(() => { if (active) notify("部分旧会话待确认尚未保存，请先处理。", "error"); });
+      }
+    } catch { /* Older sessions may have no accessible pending cache. */ }
+    return () => { active = false; };
+  }, [notify]);
+
+  useEffect(() => {
+    let theme: "auto" | "light" | "dark" = "auto";
+    try {
+      const saved = localStorage.getItem("theme");
+      if (saved === "light" || saved === "dark") theme = saved;
+    } catch { /* Optional preferences must not prevent the workspace opening. */ }
+    applyTheme(theme);
   }, []);
 
   useEffect(() => {
     let active = true;
+    const generation = statusGeneration.current;
+    const current = () => active && generation === statusGeneration.current;
     let checking = false;
     let timer: number | undefined;
+    void getModelStatus()
+      .then(status => { if (current()) setModelStatus(status); })
+      .catch(() => { if (current()) setModelStatus(null); });
     // A restored app can become reachable before its worker has started.
     // Keep that transient state from remaining on screen until a reload.
     const refresh = async () => {
-      if (checking || document.hidden) return;
+      if (!current() || checking || document.hidden) return;
       checking = true;
       window.clearTimeout(timer);
       try {
         const status = await getSystemStatus();
-        if (active) setSystemStatus(status);
+        if (current()) { setSystemStatus(status); setSystemStatusFailed(false); }
       } catch {
-        if (active) setSystemStatus(null);
+        if (current()) { setSystemStatus(null); setSystemStatusFailed(true); }
       } finally {
         checking = false;
-        if (active) timer = window.setTimeout(() => void refresh(), 15000);
+        if (current()) timer = window.setTimeout(() => void refresh(), 15000);
       }
     };
     const visible = () => { if (!document.hidden) void refresh(); };
@@ -120,7 +216,7 @@ function AppContent() {
       window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", visible);
     };
-  }, []);
+  }, [statusRefresh]);
 
   useEffect(() => {
     let active = true;
@@ -130,29 +226,10 @@ function AppContent() {
         if (completedVersion >= ONBOARDING_VERSION || onboardingDone()) return;
         setOnboardingOpen(true);
       })
-      .catch(() => {
-        if (active && !onboardingDone()) setOnboardingOpen(true);
-      });
+      // A failed read cannot establish that this is a first visit. The guide
+      // remains available in Settings; do not cover service recovery with it.
+      .catch(() => undefined);
     return () => { active = false; };
-  }, []);
-
-  // 顶部只展示仍需用户关注或仍在运行的任务。终态失败属于状态监控/历史，
-  // 不能让旧失败轮番占据一个无法真正清空的全局横幅。
-  const taskRequest = useRef(0);
-  const loadTasks = useCallback(async () => {
-    const request = ++taskRequest.current;
-    try {
-      const [active, exports, summary] = await Promise.all([
-        getTasks({ limit: 1000, activeOnly: true }),
-        getTasks({ limit: 1000, exportPending: true }),
-        getTaskSummary().catch(() => null),
-      ]);
-      if (request !== taskRequest.current) return;
-      setTasks(Array.from(new Map([...active, ...exports].map((task) => [task.id, task])).values()));
-      setAttentionCounts({ pending: summary?.waiting_for_action == null || summary?.pending_exports == null ? undefined : summary.waiting_for_action + summary.pending_exports, review: summary?.needs_review });
-    } catch {
-      // 顶部任务栏静默失败，错误由各页面自行处理
-    }
   }, []);
 
   // 全局处理日志：由后端 SSE 任务事件生成，覆盖入队/开始/校验/完成/失败/暂停/
@@ -182,7 +259,7 @@ function AppContent() {
             return `「${event.filename}」提取已完成；${event.export_mode === "move" ? "原文件已归档" : "副本已导出"}`;
           case "failed":
           case "needs_rebind":
-            return `「${event.filename}」提取已完成；${event.export_mode === "move" ? "原文件归档" : "副本导出"}需要处理，请查看待处理事项`;
+            return `「${event.filename}」提取已完成；${event.export_mode === "move" ? "原文件归档" : "副本导出"}需要处理，请到状态监控的“待确认”查看`;
           case "pending":
           case "awaiting_confirmation":
           case "exporting":
@@ -203,35 +280,23 @@ function AppContent() {
       case "needs_review":
         return `「${event.filename}」等待确认`;
       case "waiting_for_template":
-        return `「${event.filename}」需要你确认，请查看待处理事项`;
+        return `「${event.filename}」需要你确认，请到状态监控的“待确认”查看`;
       default:
         return null;
     }
   }, []);
 
-  // SSE 事件 → 全局日志 + 失败/待选模板 toast：事件驱动，实时且不受页面切换影响
+  // 任务事件进入处理日志，失败和待确认事项由顶栏提供入口。
   const handleTaskEvents = useCallback(
     (events: TaskEvent[]) => {
       const messages: { message: string; taskId?: string }[] = [];
       for (const event of events) {
         const message = statusToLogMessage(event);
         if (message) messages.push({ message, taskId: event.status === "failed" ? event.id : undefined });
-        const key = `${event.id}:${event.status}`;
-        if (notifiedTasksRef.current.has(key)) continue;
-        notifiedTasksRef.current.add(key);
-        if (event.status === "failed") {
-          const reason = event.failure_message
-            ? `：${event.failure_message.slice(0, 90)}${event.failure_message.length > 90 ? "…" : ""}`
-            : "";
-          notifyRef.current(`「${event.filename}」处理失败${reason}。诊断详情见状态监控。`, "error", 6000);
-        } else if (event.status === "waiting_for_template") {
-          notifyRef.current(`「${event.filename}」需要你确认，请查看待处理事项`, "info");
-        }
       }
       appendTaskLogs(messages);
-      void loadTasks();
     },
-    [appendTaskLogs, statusToLogMessage, loadTasks],
+    [appendTaskLogs, statusToLogMessage],
   );
 
   // 上传请求发出前：立即把文件以乐观任务加入全局任务条并开始计时（不依赖后端响应）
@@ -264,7 +329,7 @@ function AppContent() {
   // 上传完成：先拉取真实任务（乐观任务仍在，无闪烁），再把乐观任务移除；
   // 真实任务开始处理时由全局任务条从零重新计时（不叠加排队耗时）。
   const handleUploadsComplete = useCallback(
-    async (entries: { tempId: string; realId: string; startedAt: number }[]) => {
+    async () => {
       await loadTasks();
       setOptimisticTasks([]);
     },
@@ -272,69 +337,31 @@ function AppContent() {
   );
 
   useEffect(() => {
-    loadTasks();
-    const assistantChanged = (event: Event) => {
-      if ((event as CustomEvent<{ task_id?: string }>).detail?.task_id) void loadTasks();
-    };
-    window.addEventListener("zhiyi:assistant-changed", assistantChanged);
-    void getModelStatus().then(setModelStatus).catch(() => setModelStatus(null));
-    // SSE 实时推送：任务状态变化立即刷新全局任务条（上传/停止/完成马上反映）；
-    // 低频轮询仅作断线兜底（EventSource 自动重连期间仍有刷新）。
-    const unsub =
-      typeof EventSource === "undefined"
-        ? undefined
-        : subscribeTaskEvents(handleTaskEvents);
-    let lastRefresh = Date.now();
-    const visible = () => { if (!document.hidden) { lastRefresh = Date.now(); void loadTasks(); } };
-    document.addEventListener("visibilitychange", visible);
-    const timer = window.setInterval(() => {
-      if (!document.hidden && (!taskEventsConnected() || Date.now() - lastRefresh >= 30000)) {
-        lastRefresh = Date.now(); void loadTasks();
-      }
-    }, 5000);
-    return () => {
-      window.removeEventListener("zhiyi:assistant-changed", assistantChanged);
-      document.removeEventListener("visibilitychange", visible);
-      taskRequest.current += 1;
-      window.clearInterval(timer);
-      unsub?.();
-    };
-  }, [loadTasks, handleTaskEvents]);
+    const unsubscribe = typeof EventSource === "undefined" ? undefined : subscribeTaskEvents(handleTaskEvents);
+    return () => unsubscribe?.();
+  }, [handleTaskEvents]);
 
-  const handlePauseTask = useCallback(async (_taskId: string) => {
-    try {
-      // 暂停是队列级操作：冻结整个队列（当前任务中断、排队任务不再启动）。
-      // 状态反馈由全局任务卡承担（显示"已暂停"），不再重复弹 toast。
-      await pauseQueue();
-      await loadTasks();
-    } catch (err) {
-      notify(err instanceof Error ? err.message : "暂停队列失败。", "error");
-    }
+  const handlePauseTask = useCallback(async () => {
+    if (queueMutation.current) return;
+    queueMutation.current = true; setQueueBusy(true);
+    try { await pauseQueue(); await loadTasks(); }
+    catch (err) { notify(err instanceof Error ? err.message : "暂停队列失败。", "error"); }
+    finally { queueMutation.current = false; setQueueBusy(false); }
   }, [loadTasks, notify]);
 
-  const handleResumeTask = useCallback(async (_taskId: string) => {
-    try {
-      await resumeQueue();
-      await loadTasks();
-    } catch (err) {
-      notify(err instanceof Error ? err.message : "启动队列失败。", "error");
-    }
-  }, [loadTasks, notify]);
-
-  const handleDeleteTask = useCallback(async (taskId: string) => {
-    try {
-      const result = await deleteTask(taskId);
-      await loadTasks();
-      notify(deletionNotice(result, "文件及其关联数据已删除。"), "info");
-    } catch (err) {
-      notify(err instanceof Error ? err.message : "删除任务失败", "error");
-    }
+  const handleResumeTask = useCallback(async () => {
+    if (queueMutation.current) return;
+    queueMutation.current = true; setQueueBusy(true);
+    try { await resumeQueue(); await loadTasks(); }
+    catch (err) { notify(err instanceof Error ? err.message : "启动队列失败。", "error"); }
+    finally { queueMutation.current = false; setQueueBusy(false); }
   }, [loadTasks, notify]);
 
   const navigateTo = useCallback((page: NavigationKey, afterProceed?: () => void) => {
     const proceed = () => {
       navSeqRef.current += 1;
       pageScrollPositionsRef.current[activePage] = pageWrapRef.current?.scrollTop ?? 0;
+      setFocusAssistantComposer(false);
       afterProceed?.();
       setActivePage(page);
     };
@@ -368,20 +395,9 @@ function AppContent() {
     };
   }, [activePage]);
 
-  useEffect(() => {
-    const wrapper = pageWrapRef.current;
-    if (!wrapper?.animate || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
-    // Animate the existing scroll container; no animation key, delayed route
-    // switch or retained hidden page can reset a draft or defer session close.
-    const animation = wrapper.animate([{ opacity: 0.7 }, { opacity: 1 }], {
-      duration: 160, easing: "cubic-bezier(.2,0,0,1)",
-    });
-    return () => animation.cancel();
-  }, [activePage]);
-
   const handleNavigate = useCallback((page: NavigationKey) => {
     navigateTo(page, () => {
-      if (page === "history") setHistoryEntry("completed");
+      if (page === "history") setHistoryEntry(undefined);
       setExtractionDemo(null);
       if (page === "extract") setSelectedTask(null);
       if (page === "tables") {
@@ -394,10 +410,30 @@ function AppContent() {
     });
   }, [navigateTo]);
 
+  const openTaskGroup = useCallback((group: TaskGroup) => {
+    navigateTo("workspace", () => {
+      setTaskViewState(current => ({ ...current, group, searchInput: "", page: 0 }));
+      setTaskEntryGroup(group);
+      setTaskEntryRevision(value => value + 1);
+    });
+  }, [navigateTo]);
+
   const refreshModelStatus = useCallback(() => {
-    void getModelStatus().then(setModelStatus).catch(() => setModelStatus(null));
-    void getSystemStatus().then(setSystemStatus).catch(() => setSystemStatus(null));
+    // Invalidate before effect cleanup: a queued response from the old profile
+    // must not restore its snapshot while the new profile is being checked.
+    statusGeneration.current += 1;
+    setModelStatus(null);
+    setSystemStatus(null);
+    setSystemStatusFailed(false);
+    setStatusRefresh(value => value + 1);
   }, []);
+
+  const showDemo = useCallback((scenario: DemoScenario = "business") => {
+    navigateTo("extract", () => {
+      setSelectedTask(null);
+      setExtractionDemo(scenario);
+    });
+  }, [navigateTo]);
 
   const openTask = useCallback((task: Task) => {
     navigateTo("extract", () => {
@@ -452,7 +488,7 @@ function AppContent() {
       if (ref.kind === "table" || ref.kind === "revisions") {
         navigateTo("tables", () => {
           setSelectedTableId(ref.id); setSelectedTableTemplateId(null); setHighlightTaskId(null);
-          setAssistantRow(ref.row_id ?? null); setTableJumpNotice(ref.row_id ? `来自问知意：定位记录 #${ref.row_id}` : "来自问知意的资料引用");
+          setAssistantRow(ref.row_id ?? null); setTableJumpNotice(ref.row_id ? "来自问知意：查看所选记录" : "来自问知意的资料引用");
         });
         return;
       }
@@ -467,11 +503,21 @@ function AppContent() {
     return () => window.removeEventListener("zhiyi:assistant-navigate", onReference);
   }, [assistant.setDrawerOpen, navigateTo, notify]);
 
+  const serviceStatus = <ServiceStatus systemStatus={systemStatus} modelStatus={modelStatus} failed={systemStatusFailed} />;
+  const summary = taskOverview.summary;
+  const pendingCount = summary ? taskGroupCounts(summary, tasks).pending + duplicates.length : undefined;
+
+  const updateNotice = (updates.status?.result?.available || updates.status?.downloaded_version) && !updates.checking
+    ? <button className="gtb-failure-link" type="button" onClick={() => navigateTo("settings", () => {
+      setSettingsFocusRequest(previous => ({ section: "about", revision: (previous?.revision ?? 0) + 1 }));
+    })}>有新版本</button> : null;
+
   return (
     <div className="app-shell">
       <div className="app-frame">
         <Sidebar
           active={activePage}
+          onNavigateIntent={preparePage}
           modelConnected={modelStatus?.connected ?? null}
           modelName={modelStatus?.configured_model ?? null}
           onNavigate={handleNavigate}
@@ -479,55 +525,82 @@ function AppContent() {
 
         <main className="app-main">
           <div className="global-task-bar">
-            <GlobalTaskCard
+            {taskReadState !== "ready" && optimisticTasks.length === 0 ? (
+              <section className="gtb-card" aria-label="当前任务状态" aria-live="polite">
+                <div className="gtb-status">
+                  <StatusDot state="unknown" />
+                  <span>{taskReadState === "loading" ? "正在读取任务…" : "任务状态未确认"}</span>
+                </div>
+                <div className="gtb-info"><div className="gtb-stage">
+                  {taskReadState === "loading" ? "读取完成后显示当前队列" : "读取失败，暂时无法判断队列是否空闲"}
+                  {duplicates.length > 0 && <button className="gtb-failure-link" type="button" onClick={() => openTaskGroup("pending")}>
+                    {duplicates.length} 个待处理事项
+                  </button>}
+                  <span ref={setTaskNoticeHost} className="task-notice-slot" />
+                  {updateNotice}
+                </div></div>
+                {serviceStatus}
+                {taskReadState === "error" && <button className="btn ghost sm" type="button" onClick={() => void loadTasks()}>重试任务状态</button>}
+              </section>
+            ) : <GlobalTaskCard
               tasks={[...optimisticTasks, ...tasks]}
-              onPause={handlePauseTask}
-              onResume={handleResumeTask}
-              onDelete={handleDeleteTask}
-              onOpenPending={() => handleNavigate("workspace")}
-              pendingCount={attentionCounts.pending}
-              reviewCount={attentionCounts.review}
-            />
+              onPauseQueue={handlePauseTask}
+              onResumeQueue={handleResumeTask}
+              onOpenPending={() => openTaskGroup("pending")}
+              onOpenTasks={() => handleNavigate("workspace")}
+              queuePaused={taskOverview.queuePaused}
+              busy={queueBusy}
+              pendingCount={pendingCount ?? (duplicates.length || undefined)}
+              failedCount={taskOverview.summary?.failed}
+              onOpenFailed={() => openTaskGroup("failed")}
+              noticeSlot={<>
+                <span ref={setTaskNoticeHost} className="task-notice-slot" />
+                {updateNotice}
+              </>}
+              serviceStatus={serviceStatus}
+            />}
             {activePage !== "assistant" && <AssistantTrigger />}
-            <Popover.Root><Popover.Trigger className="system-status-trigger">
-              {systemStatus == null ? "正在连接服务…" : !systemStatus.api.connected ? "服务未连接" : !systemStatus.worker.connected ? "文件处理未启动" : "服务已就绪"}
-              <span aria-hidden="true">⌄</span>
-            </Popover.Trigger>
-            <Popover.Content className="system-status-popover" align="start" sideOffset={8} collisionPadding={16}>
-            <strong>连接详情</strong><div className="system-status-summary" role="status"><span>
-              {systemStatus
-                ? [systemStatus.api, systemStatus.worker]
-                    .map((component) => component.message)
-                    .join(" · ")
-                : "正在检查 API、任务消费者和模型服务。"}</span>
-              <span title={modelStatus?.configuration_error || "检查提取方案的模型服务与模型名称；不代表文件提取质量。"}>提取模型：{modelStatus?.configured_model || "未配置"} · {modelStatus == null ? "检查中" : modelStatus.configuration_error ? "配置需检查" : modelStatus.connected ? "服务可达" : "未连接"}</span>
-              <ModelConnectionState/>
-            </div>
-            </Popover.Content></Popover.Root>
           </div>
 
           <div className={`app-page-wrap ${activePage === "assistant" ? "ask-page-wrap" : ""}`} ref={pageWrapRef}>
             <PageLoadBoundary key={activePage}>
-            <Suspense fallback={<div className="view muted" role="status">正在打开页面…</div>}>
+            <Suspense fallback={<PageOpening />}>
+            <PageEntrance page={activePage} container={pageWrapRef} />
             {activePage === "workspace" ? (
               <TaskQueuePage
                 logs={taskLogs}
+                overview={taskOverview}
+                viewState={taskViewState}
+                scrollMemory={listScrollMemory.current}
+                onViewStateChange={setTaskViewState}
+                entryRevision={taskEntryRevision}
+                entryGroup={taskEntryGroup}
                 onOpenData={openTaskData}
                 onOpenTask={openTask}
+                onNavigateExtract={() => handleNavigate("extract")}
+                duplicates={duplicates}
+                onOpenDuplicate={setActiveDuplicate}
+                onDeleteDuplicates={removeDuplicates}
+                beforeDeleteDuplicates={async items => {
+                  await Promise.allSettled(items.map(item => duplicateWrites.current.get(item.id)));
+                }}
               />
             ) : activePage === "extract" ? (
               <ExtractPage
                 initialTask={selectedTask}
                 demo={extractionDemo}
-                onNavigateHistory={() => navigateTo("history")}
+                onNavigateHistory={() => handleNavigate("history")}
                 onTasksChange={loadTasks}
                 onUploadStarted={handleUploadStarted}
                 onUploadsComplete={handleUploadsComplete}
+                noticeHost={taskNoticeHost}
+                onDuplicate={item => { rememberDuplicate(item); setDuplicates(current => [...current, item]); }}
               />
             ) : activePage === "templates" ? (
               <TemplatesPage initialTemplateId={assistantTemplate} initialVersion={assistantTemplateVersion} initialDraft={assistantDraft} onDraftConsumed={() => setAssistantDraft(null)} />
             ) : activePage === "tables" ? (
               <DataTablePage
+                onNavigateExtract={() => handleNavigate("extract")}
                 initialTemplateId={selectedTableTemplateId}
                 initialTableId={selectedTableId}
                 jumpNotice={tableJumpNotice}
@@ -535,20 +608,28 @@ function AppContent() {
                 initialRowId={assistantRow}
               />
             ) : activePage === "assistant" ? (
-              <AssistantPage />
+              <AssistantPage focusComposer={focusAssistantComposer} />
             ) : activePage === "history" ? (
-              <HistoryPage initialTab={historyEntry} onOpenData={openTaskData} onOpenTask={openTask} />
+              <HistoryPage initialTab={historyEntry} viewState={historyViewState.current} onViewStateChange={rememberHistoryView}
+                scrollMemory={listScrollMemory.current} onOpenData={openTaskData}
+                onNavigateExtract={() => handleNavigate("extract")} />
             ) : activePage === "dashboard" ? (
-              <Suspense fallback={<div className="view muted">正在打开数据仪表盘…</div>}><DashboardPage onReview={() => { setHistoryEntry("problems"); navigateTo("history"); }} onNavigate={page => { if (page === "history") setHistoryEntry("completed"); navigateTo(page); }} onOpenTable={id => {
+              <DashboardPage onReview={() => navigateTo("history", () => {
+                setHistoryEntry("problems");
+                delete listScrollMemory.current["history-problems"];
+              })} onNavigate={handleNavigate} onOpenTable={id => {
                 setSelectedTableId(id); setSelectedTableTemplateId(null); setHighlightTaskId(null);
                 setAssistantRow(null); setTableJumpNotice(null); navigateTo("tables");
-              }} /></Suspense>
+              }} />
             ) : activePage === "backups" ? (
               <BackupPage />
             ) : activePage === "settings" ? (
               <SettingsPage
-                onShowOnboarding={() => setOnboardingOpen(true)}
+                onShowOnboarding={() => { setOnboardingSetupPending(false); setOnboardingSession(value => value + 1); setOnboardingOpen(true); }}
+                onResumeOnboarding={onboardingSetupPending ? () => { setOnboardingSetupPending(false); setOnboardingOpen(true); } : undefined}
+                settingsFocusRequest={settingsFocusRequest}
                 onModelStatusChanged={refreshModelStatus}
+                updates={updates}
               />
             ) : activePage === "connections" ? (
               <ConnectionsPage />
@@ -558,21 +639,45 @@ function AppContent() {
             </Suspense>
             </PageLoadBoundary>
           </div>
+          {activeDuplicate && <PendingDuplicateDialog key={activeDuplicate.id} item={activeDuplicate}
+            onClose={() => setActiveDuplicate(null)}
+            onSkip={async () => {
+              await duplicateWrites.current.get(activeDuplicate.id)?.catch(() => undefined);
+              await deletePendingDuplicate(activeDuplicate.id);
+              removeDuplicates([activeDuplicate]);
+            }}
+            onBeforeRetry={async () => {
+              const write = duplicateWrites.current.get(activeDuplicate.id);
+              if (write) return (await write).sha256;
+              if (persistedDuplicates.current.has(activeDuplicate.id) && activeDuplicate.sha256) return activeDuplicate.sha256;
+              return (await savePendingDuplicate(activeDuplicate)).sha256;
+            }}
+            onQueued={() => { removeDuplicates([activeDuplicate]); void loadTasks(); }}
+            onView={duplicates.find(item => item.id === activeDuplicate.id)?.hasResult ? async () => {
+              const [existing] = await getTasks({ taskIds: [activeDuplicate.existingTaskId] });
+              if (!existing?.has_result) throw new Error("已有任务暂时没有可查看的提取结果。");
+              setActiveDuplicate(null);
+              openTask(existing);
+            } : undefined} />}
         </main>
       </div>
-      <AssistantDrawer />
+      <AssistantDrawer onExpand={() => navigateTo("assistant", () => setFocusAssistantComposer(true))} />
       <Suspense fallback={null}><StatisticBridge onSaved={() => notify("已添加到仪表盘，聊天中的分析快照保持原样。", "success")} /></Suspense>
       <Onboarding
+        key={onboardingSession}
         open={onboardingOpen}
         modelStatus={modelStatus}
         onNavigate={handleNavigate}
-        onShowDemo={(scenario) => {
-          navigateTo("extract", () => {
-            setSelectedTask(null);
-            setExtractionDemo(scenario);
-          });
-        }}
-        onClose={() => setOnboardingOpen(false)}
+        onShowDemo={showDemo}
+        onSetup={section => navigateTo("settings", () => {
+          try { sessionStorage.setItem("zhiyi-settings-anchor", section); } catch { /* Optional reading preference. */ }
+          setSettingsFocusRequest(previous => ({ section, revision: (previous?.revision ?? 0) + 1 }));
+          setExtractionDemo(null);
+          setHighlightTaskId(null);
+          setOnboardingSetupPending(true);
+          setOnboardingOpen(false);
+        })}
+        onClose={() => { setOnboardingSetupPending(false); setOnboardingOpen(false); }}
       />
       <Toast toast={toast} onDismiss={clear} />
     </div>

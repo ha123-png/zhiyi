@@ -10,12 +10,12 @@
 .virtual-pdf-flow .document-preview-page-label { line-height:24px; }
 .document-xlsx-preview .data-table, .document-docx-preview .data-table { width:max-content; min-width:100%; }
 .document-xlsx-preview td, .document-docx-preview td { min-width:100px; max-width:320px; overflow-wrap:anywhere; }
-.document-preview-with-download .xlsx-sheet-tabs { overflow-x:auto; flex-wrap:nowrap; }
-.document-preview-with-download .xlsx-sheet-tab { flex-shrink:0; }
-.document-preview-with-download > .document-preview-loading,
-.document-preview-with-download > .document-preview-error { position:static; min-height:120px; }
-.document-preview-with-download .document-xlsx-preview { max-height:none; }
-.document-preview-with-download .document-xlsx-preview .data-table-scroll { flex:none; max-height:none; }
-.document-preview-with-download .document-preview-pagination { padding-inline:8px; }
+.document-preview-content .xlsx-sheet-tabs { overflow-x:auto; flex-wrap:nowrap; }
+.document-preview-content .xlsx-sheet-tab { flex-shrink:0; }
+.document-preview-content > .document-preview-loading,
+.document-preview-content > .document-preview-error { position:static; min-height:120px; }
+.document-preview-content .document-xlsx-preview { max-height:none; }
+.document-preview-content .document-xlsx-preview .data-table-scroll { flex:none; max-height:none; }
+.document-preview-content .document-preview-pagination { padding-inline:8px; }
 .document-preview-page-jump input { font:inherit; color:inherit; }
-.document-preview-with-download .document-text-preview { overflow-wrap:anywhere; }
+.document-preview-content .document-text-preview { overflow-wrap:anywhere; }

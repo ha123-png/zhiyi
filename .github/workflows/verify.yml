@@ -18,7 +18,7 @@ jobs:
     # Source verification and candidate builds only; never publish a Release.
     if: github.repository == 'ha123-png/zhiyi'
     runs-on: windows-2022
-    timeout-minutes: 25
+    timeout-minutes: 40
     defaults:
       run:
         shell: pwsh
@@ -47,10 +47,15 @@ jobs:
           uv run --project apps/api --no-sync ruff check apps/api/src apps/api/tests scripts/prepare-acceptance.py scripts/smoke-upgrade.py scripts/smoke-smart.py scripts/smoke-invoice.py scripts/prepare-source-acceptance.py scripts/smoke-prefix.py scripts/prepare-card-acceptance.py scripts/serve-verification.py scripts/smoke-design-journey.py scripts/smoke-template-contract.py scripts/verify-release-model.py scripts/verify-release-pressure.py scripts/collect-third-party-notices.py scripts/verify-packaged-business.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git diff --check
-      - name: Check public release helper contracts
-        run: uv run --project apps/api --no-sync python -m unittest discover -s scripts/tests -p "test_*.py"
+      - name: Check release helpers and product documentation
+        run: |
+          uv run --project apps/api --no-sync pytest scripts/tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test scripts/tests/test_live_cloud_process.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run --project apps/api --no-sync python scripts/check-doc-governance.py
       - name: Web tests
-        run: npm run test:web
+        run: npm run test:web -- --maxWorkers=3
       - name: Web build
         run: npm run build:web
       - name: API, migration and Windows lifecycle tests

@@ -1,17 +1,16 @@
 import { deletionNotice } from "../deletionNotice";
 import { Disclosure } from "./Disclosure";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ChevronDown,
   Cpu,
   FileCog,
   FolderOpen,
   Layers,
+  Info,
   ListChecks,
   MonitorCog,
   Rocket,
   RotateCcw,
-  ShieldCheck,
   SunMoon,
   Trash2,
 } from "lucide-react";
@@ -24,14 +23,67 @@ import {
 } from "../api";
 import type { ModelStatus, SystemSettings, SystemStatus } from "../types";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { NoticeDialog } from "./NoticeDialog";
+import { Toast, useToast } from "./Toast";
 import { ClearLocalData } from "./ClearLocalData";
 import { Icon } from "./Icon";
+import { CollapseChevron } from "./CollapseChevron";
 import { ExistingLocalModelSettings } from "./ExistingLocalModelSettings";
 import { ModelProfilesSettings } from "./ModelProfilesSettings";
 import { SmartPoolSettings } from "./SmartPoolSettings";
 import { desktopApi, isDesktopApp } from "../desktop";
+import type { useUpdates } from "../useUpdates";
+import "./cards.css";
 
 type Theme = "auto" | "light" | "dark";
+type LimitKey = "upload_limit_mb" | "input_text_limit" | "input_page_limit" | "input_row_limit" | "input_docx_image_limit";
+
+function SettingLimitField({ label, unit, value, fallback, disabled, rangeMax, onCommit }: {
+  label: string; unit: string; value?: number; fallback?: number; disabled?: boolean; rangeMax?: number;
+  onCommit: (raw: string) => Promise<number | null>;
+}) {
+  const [draft, setDraft] = useState(String(value ?? fallback ?? ""));
+  const dirty = useRef(false);
+  const revision = useRef(0);
+  useEffect(() => {
+    if (!dirty.current) setDraft(String(value ?? fallback ?? ""));
+  }, [value, fallback]);
+  const edit = (raw: string) => {
+    dirty.current = true;
+    revision.current += 1;
+    setDraft(raw);
+  };
+  const commit = async (raw: string) => {
+    const submitted = revision.current;
+    const saved = await onCommit(raw);
+    if (saved !== null && submitted === revision.current) {
+      dirty.current = false;
+      setDraft(String(saved));
+    }
+  };
+  return <label className="input-limit-field">
+    {label}<span className="input-with-unit"><input aria-label={label} type="number" min="1" disabled={disabled}
+      value={draft} onChange={event => edit(event.target.value)} onBlur={event => void commit(event.target.value)} /><span>{unit}</span></span>
+    {rangeMax !== undefined && <input aria-label={`${label}滑块`} type="range" min="1" disabled={disabled}
+      max={Math.max(rangeMax, value ?? fallback ?? 1, Number(draft) || 1)} value={draft || String(value ?? fallback ?? 1)}
+      onChange={event => edit(event.target.value)} onPointerUp={event => void commit(event.currentTarget.value)}
+      onKeyUp={event => {
+        if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key)) {
+          void commit(event.currentTarget.value);
+        }
+      }} />}
+  </label>;
+}
+
+function readTheme(): Theme {
+  // Keep a theme applied during this page session when storage is unavailable.
+  const applied = document.documentElement.dataset.zhiyiThemePreference;
+  if (applied === "auto" || applied === "light" || applied === "dark") return applied;
+  try {
+    const saved = localStorage.getItem("theme");
+    return saved === "light" || saved === "dark" ? saved : "auto";
+  } catch { return "auto"; }
+}
 
 interface CardProps {
   id: string;
@@ -57,11 +109,7 @@ function SettingsCard({ id, title, icon, support, collapsed, onToggle, children 
           <Icon icon={icon} size={16} />
           {title}
         </span>
-        <Icon
-          icon={ChevronDown}
-          size={15}
-          className={`settings-card-caret${open ? "" : " collapsed"}`}
-        />
+        <CollapseChevron expanded={open} size={15} className="settings-card-caret" />
       </button>
       <div className={`collapse${open ? " open" : ""}`} inert={!open} aria-hidden={!open}>
         <div className="collapse-content">
@@ -77,10 +125,16 @@ function SettingsCard({ id, title, icon, support, collapsed, onToggle, children 
 
 export function SettingsPage({
   onShowOnboarding,
+  onResumeOnboarding,
   onModelStatusChanged,
+  settingsFocusRequest,
+  updates,
 }: {
   onShowOnboarding?: () => void;
+  onResumeOnboarding?: () => void;
   onModelStatusChanged?: () => void;
+  settingsFocusRequest?: { section: "local" | "ai" | "about"; revision: number };
+  updates?: ReturnType<typeof useUpdates>;
 } = {}) {
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
@@ -88,55 +142,95 @@ export function SettingsPage({
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [settingsLoading, setSettingsLoading] = useState(true);
+  const [saveErrors, setSaveErrors] = useState<Partial<Record<keyof SystemSettings, string>>>({});
+  const [savingCount, setSavingCount] = useState(0);
+  const confirmedSettings = useRef<SystemSettings | null>(null);
+  const saveQueues = useRef(new Map<keyof SystemSettings, Promise<unknown>>());
+  const saveVersions = useRef<Partial<Record<keyof SystemSettings, number>>>({});
+  const [statusLoading, setStatusLoading] = useState(true);
+  const statusRequest = useRef(0);
+  const [localModelRefresh, setLocalModelRefresh] = useState(0);
   const [clearOpen, setClearOpen] = useState(false);
+  const [clearError, setClearError] = useState<string | null>(null);
   const [resetOpen, setResetOpen] = useState(false);
   const [clearBusy, setClearBusy] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
+  const { toast, notify, clear } = useToast();
+  const [statusNoticeOpen, setStatusNoticeOpen] = useState(false);
+  const [themeNotice, setThemeNotice] = useState<string | null>(null);
   const [exportDirectory, setExportDirectory] = useState<string | null>(null);
-  const [theme, setTheme] = useState<Theme>(
-    (localStorage.getItem("theme") as Theme | null) ?? "auto",
-  );
+  const [theme, setTheme] = useState<Theme>(readTheme);
 
-  useEffect(() => {
-    Promise.all([getModelStatus(), getSystemStatus()])
-      .then(([model, system]) => {
-        setModelStatus(model);
-        setSystemStatus(system);
-      })
-      .catch((reason) => setError(reason instanceof Error ? reason.message : "加载失败"));
+  const loadStatus = useCallback(async () => {
+    const request = ++statusRequest.current;
+    setStatusLoading(true);
+    setError(null);
+    const [model, system] = await Promise.allSettled([getModelStatus(), getSystemStatus()]);
+    if (request !== statusRequest.current) return;
+    if (model.status === "fulfilled") setModelStatus(model.value);
+    if (system.status === "fulfilled") setSystemStatus(system.value);
+    const failures = [model, system].flatMap(result => result.status === "rejected"
+      ? [result.reason instanceof Error ? result.reason.message : "状态读取失败"] : []);
+    if (failures.length) setError([...new Set(failures)].join("；"));
+    setStatusLoading(false);
   }, []);
+  useEffect(() => {
+    void loadStatus();
+    return () => { statusRequest.current += 1; };
+  }, [loadStatus]);
+  const activeProfileChanged = useCallback(() => {
+    setModelStatus(null);
+    setSystemStatus(null);
+    void loadStatus();
+    setLocalModelRefresh(value => value + 1);
+    onModelStatusChanged?.();
+  }, [loadStatus, onModelStatusChanged]);
 
   useEffect(() => {
     const bridge = desktopApi();
     if (bridge) void bridge.get_export_directory().then(setExportDirectory);
   }, []);
 
-  useEffect(() => {
-    getSystemSettings()
-      .then(setSettings)
-      .catch((reason) =>
-        setSettingsError(reason instanceof Error ? reason.message : "加载设置失败"));
+  const loadSettings = useCallback(async () => {
+    setSettingsLoading(true);
+    setSettingsError(null);
+    try {
+      const loaded = await getSystemSettings();
+      confirmedSettings.current = loaded;
+      setSettings(loaded);
+    }
+    catch (reason) { setSettingsError(reason instanceof Error ? reason.message : "加载设置失败"); }
+    finally { setSettingsLoading(false); }
   }, []);
+  useEffect(() => { void loadSettings(); }, [loadSettings]);
 
   useEffect(() => {
-    const anchor = sessionStorage.getItem("zhiyi-settings-anchor");
+    let anchor: string | null = settingsFocusRequest?.section ?? null;
+    if (!anchor) {
+      try { anchor = sessionStorage.getItem("zhiyi-settings-anchor"); }
+      catch { return; }
+    }
     if (!anchor) return;
-    sessionStorage.removeItem("zhiyi-settings-anchor");
+    try { sessionStorage.removeItem("zhiyi-settings-anchor"); } catch { /* The selected section can still open. */ }
     const cardId = anchor === "smart-pool-settings" ? "smart-pool" : anchor;
     setCollapsed((current) => ({ ...current, [cardId]: false }));
-    requestAnimationFrame(() => {
-      document.getElementById(`settings-${cardId}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    const frame = requestAnimationFrame(() => {
+      const section = document.getElementById(`settings-${cardId}`);
+      const reduced = typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      section?.scrollIntoView({ behavior: reduced ? "instant" : "smooth", block: "start" });
+      section?.querySelector<HTMLButtonElement>(".settings-card-head")?.focus({ preventScroll: true });
     });
-  }, []);
+    return () => cancelAnimationFrame(frame);
+  }, [settingsFocusRequest]);
 
   function toggleCard(id: string) {
     setCollapsed((current) => ({ ...current, [id]: !current[id] }));
   }
 
-  function changeTheme(nextTheme: Theme) {
+  function applyTheme(nextTheme: Theme) {
     setTheme(nextTheme);
-    localStorage.setItem("theme", nextTheme);
+    document.documentElement.dataset.zhiyiThemePreference = nextTheme;
     const isDark = nextTheme === "dark"
       || (nextTheme === "auto"
         && typeof window.matchMedia === "function"
@@ -144,51 +238,98 @@ export function SettingsPage({
     document.documentElement.classList.toggle("dark", isDark);
   }
 
+  function changeTheme(nextTheme: Theme) {
+    applyTheme(nextTheme);
+    try {
+      localStorage.setItem("theme", nextTheme);
+      setThemeNotice(null);
+    } catch {
+      setThemeNotice("主题已在本次打开中生效；浏览器未能记住，刷新或重新打开后可能恢复原主题。");
+    }
+  }
+
+  function persistSetting<Key extends keyof SystemSettings>(key: Key, value: SystemSettings[Key]): Promise<SystemSettings[Key] | null> {
+    const version = (saveVersions.current[key] ?? 0) + 1;
+    saveVersions.current[key] = version;
+    const previous = saveQueues.current.get(key) ?? Promise.resolve();
+    setSavingCount(count => count + 1);
+    // Serialize each field, while allowing independent fields to save without
+    // resending an optimistic snapshot of unrelated settings.
+    const task = previous.then(async () => {
+      try {
+        const confirmed = confirmedSettings.current;
+        const saved = confirmed?.[key] === value ? confirmed
+          : await updateSystemSettings({ [key]: value } as Pick<SystemSettings, Key>);
+        const savedValue = saved?.[key] ?? value;
+        confirmedSettings.current = { ...confirmedSettings.current!, [key]: savedValue };
+        if (saveVersions.current[key] === version) {
+          setSettings(current => current ? { ...current, [key]: savedValue } : current);
+          setSaveErrors(current => { const next = { ...current }; delete next[key]; return next; });
+        }
+        return savedValue;
+      } catch (reason) {
+        if (saveVersions.current[key] === version) {
+          setSaveErrors(current => ({ ...current, [key]: reason instanceof Error ? reason.message : "保存失败，请重试。" }));
+          setSettings(current => current && confirmedSettings.current
+            ? { ...current, [key]: confirmedSettings.current[key] } : current);
+        }
+        return null;
+      } finally {
+        setSavingCount(count => Math.max(0, count - 1));
+      }
+    });
+    saveQueues.current.set(key, task);
+    void task.then(() => { if (saveQueues.current.get(key) === task) saveQueues.current.delete(key); });
+    return task;
+  }
+
   const toggleSetting = async (
     key: "image_convert" | "office_convert" | "word_include_images" | "allow_limited_input",
   ) => {
     if (!settings) return;
-    const next = { ...settings, [key]: !settings[key] };
-    setSettings(next);
-    try {
-      await updateSystemSettings(next);
-      setSettingsError(null);
-      setNotice(
-        `已${next[key] ? "开启" : "关闭"}${
+    const nextValue = !settings[key];
+    setSettings(current => current ? { ...current, [key]: nextValue } : current);
+    const pending = persistSetting(key, nextValue);
+    const version = saveVersions.current[key];
+    const saved = await pending;
+    if (saved !== null && saveVersions.current[key] === version) {
+      notify(
+        `已${saved ? "开启" : "关闭"}${
           key === "image_convert"
             ? "图片自动格式转换"
             : key === "office_convert"
               ? "Office 文档自动转换"
               : key === "word_include_images" ? "Word 内嵌图片" : "限制发送给模型的内容"
-        }，新上传的文件立即生效。`,
+        }，新上传的文件立即生效。`, "success",
       );
-    } catch (reason) {
-      setSettingsError(reason instanceof Error ? reason.message : "保存设置失败");
-      setSettings(settings);
     }
   };
 
-  async function saveLimit(key: "upload_limit_mb" | "input_text_limit" | "input_page_limit" | "input_row_limit" | "input_docx_image_limit", raw: string) {
-    if (!settings) return;
+  async function saveLimit(key: LimitKey, raw: string): Promise<number | null> {
+    if (!settings) return null;
     const value = Number(raw);
-    if (!Number.isSafeInteger(value) || value < 1) { setSettingsError("请输入大于零的整数。"); return; }
-    if (settings[key] === value) return;
-    try { const saved = await updateSystemSettings({ [key]: value }); setSettings(saved); setSettingsError(null); }
-    catch (reason) { setSettingsError(reason instanceof Error ? reason.message : "保存失败，请重试。"); }
+    if (!Number.isSafeInteger(value) || value < 1) {
+      saveVersions.current[key] = (saveVersions.current[key] ?? 0) + 1;
+      setSaveErrors(current => ({ ...current, [key]: "请输入大于零的整数。" }));
+      return null;
+    }
+    const saved = await persistSetting(key, value);
+    return typeof saved === "number" ? saved : null;
   }
 
   const handleClearHistory = async () => {
     setClearBusy(true);
+    setClearError(null);
     try {
       const result = await clearHistory("清除历史");
       setClearOpen(false);
-      setNotice(
+      notify(
         deletionNotice(result, result.cleared_count > 0
           ? `已清理 ${result.cleared_count} 个文件及其当前数据、原件和修订历史。`
-          : "没有可清理的历史记录。"),
+          : "没有可清理的历史记录。"), "success",
       );
     } catch (reason) {
-      setSettingsError(reason instanceof Error ? reason.message : "清理历史失败");
+      setClearError(reason instanceof Error ? reason.message : "清理历史失败");
     } finally {
       setClearBusy(false);
     }
@@ -197,58 +338,88 @@ export function SettingsPage({
   const handleResetSettings = async () => {
     setResetBusy(true);
     try {
-      localStorage.removeItem("theme");
+      applyTheme("auto");
+      let saved = false;
+      try { localStorage.removeItem("theme"); saved = true; }
+      catch {
+        try { localStorage.setItem("theme", "auto"); saved = true; }
+        catch { /* The current theme is already reset even without persistence. */ }
+      }
       setResetOpen(false);
-      setNotice("主题已恢复为跟随系统，页面正在刷新…");
-      setTimeout(() => window.location.reload(), 800);
+      setThemeNotice(saved ? null : "本次已恢复为跟随系统；浏览器未能保存重置，刷新或重新打开后可能恢复原主题。");
+      notify(saved ? "主题已恢复为跟随系统。" : "本次主题已恢复为跟随系统，但浏览器未能保存重置。", saved ? "success" : "info");
     } finally {
       setResetBusy(false);
     }
   };
 
-  const isLocalProvider =
-    modelStatus?.provider === "lm_studio" || modelStatus?.provider === "ollama";
-
   return (
     <div className="view">
-      <div className="page-header">
-        <div className="eyebrow">配置</div>
-        <h1>系统设置</h1>
-        <div className="support">管理 AI 服务、数据存储和本机使用偏好。</div>
-      </div>
+      {onResumeOnboarding && <div className="onboarding-return">
+        <span>使用引导 · 连接服务</span>
+        <button className="btn secondary sm" type="button" onClick={onResumeOnboarding}>返回引导</button>
+      </div>}
 
-      {error && <div className="callout danger" style={{ marginBottom: 16 }}>{error}</div>}
-      {notice && (
-        <div className="callout" style={{ marginBottom: 16, borderColor: "var(--color-success-300)", background: "var(--color-success-50)", color: "var(--color-success-700)" }}>
-          {notice}
-        </div>
-      )}
+      <Toast toast={toast} onDismiss={clear} />
+      {statusNoticeOpen && error && <NoticeDialog title="运行状态读取失败" onClose={() => setStatusNoticeOpen(false)}
+        actions={<button className="btn primary sm" type="button" disabled={statusLoading}
+          onClick={() => { setStatusNoticeOpen(false); void loadStatus(); }}>重新检查状态</button>}>
+        <p>{error}</p>
+      </NoticeDialog>}
 
       <div className="settings-stack">
         <div className="task-col">
+          {updates && <SettingsCard collapsed={collapsed} icon={Info} id="about" onToggle={toggleCard} title="关于知意">
+            <div className="settings-toggles">
+              <div className="setting-row">
+                <div>
+                  <div className="settings-name">当前版本 {updates.status ? `v${updates.status.current_version}` : ""}</div>
+                  <div className="small muted" role="status">
+                    {updates.error || (updates.updating === "downloading" ? "正在下载并校验更新…" :
+                      updates.status?.install_failed ? "上次更新未完成，可重新安装。" :
+                      updates.status?.downloaded_version ? `v${updates.status.downloaded_version} 已下载` :
+                      updates.checking ? "正在检查…" : updates.status?.result?.available
+                      ? `发现新版本 v${updates.status.result.latest_version}${updates.status.result.downloadable ? "" : " · 暂无可校验的安装包"}` : updates.status?.result
+                        ? `当前没有更高版本 · 最新公开版 v${updates.status.result.latest_version}` : "检查公开发行的 Windows 版本，含 Beta。")}
+                  </div>
+                </div>
+                <div className="row" style={{ gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                  <button className="btn secondary sm" type="button" disabled={updates.checking || Boolean(updates.updating)}
+                    onClick={() => void (updates.status ? updates.check() : updates.load())}>{updates.status ? "检查更新" : "读取版本"}</button>
+                  {(updates.status?.downloaded_version || updates.status?.result?.downloadable && updates.status.result.available) &&
+                    <button className="btn primary sm" type="button" disabled={Boolean(updates.updating) || updates.checking}
+                      onClick={() => void updates.update()}>
+                      {updates.updating === "restarting" ? "正在重启…" : updates.status?.downloaded_version ? "重启并更新" : updates.updating ? "下载中…" : "下载更新"}
+                    </button>}
+                </div>
+              </div>
+              <div className="setting-row">
+                <div><div className="settings-name">自动检查更新</div>
+                  <div className="small muted">开启后定期检查。下载完成后，可选择重启应用更新。</div>
+                </div>
+                <button aria-label="自动检查更新" aria-pressed={Boolean(updates.status?.auto_check)}
+                  className={`toggle${updates.status?.auto_check ? " on" : ""}`} type="button"
+                  disabled={!updates.status || updates.saving} onClick={() => void updates.toggle()}><span /></button>
+              </div>
+            </div>
+          </SettingsCard>}
           <SettingsCard
             collapsed={collapsed}
             icon={MonitorCog}
             id="status"
             onToggle={toggleCard}
-            support="区分程序、任务处理器与 AI 服务，避免把模型离线误报成程序损坏。"
             title="当前运行状态"
           >
             <div className="settings-toggles">
-              <StatusRow label="本地程序" message={systemStatus?.api.message ?? "正在检查…"} ready={systemStatus?.api.connected} />
-              <StatusRow label="任务处理器" message={systemStatus?.worker.message ?? "正在检查…"} ready={systemStatus?.worker.connected} />
+              <StatusRow label="本机程序" message={systemStatus ? (systemStatus.api.connected ? "运行正常" : "暂时无法连接") : (statusLoading ? "正在检查…" : "暂时无法读取")} ready={systemStatus?.api.connected} />
+              <StatusRow label="文件处理" message={systemStatus ? (systemStatus.worker.connected ? "已启动" : "尚未启动") : (statusLoading ? "正在检查…" : "暂时无法读取")} ready={systemStatus?.worker.connected} />
               <StatusRow
                 label="AI 服务"
-                message={modelStatus?.configuration_error ?? systemStatus?.model.message ?? "正在检查…"}
+                message={modelStatus?.configuration_error ?? systemStatus?.model.message ?? (statusLoading ? "正在检查…" : "暂时无法读取")}
                 ready={modelStatus?.connected}
               />
-              <div className="setting-row">
-                <div>
-                  <div className="settings-name">当前页面地址</div>
-                  <div className="small muted">正式安装版由同一个本地端口提供网页和 API。</div>
-                </div>
-                <div className="small mono">{window.location.origin}</div>
-              </div>
+              {error && <button className="link-btn" type="button" aria-haspopup="dialog"
+                onClick={() => setStatusNoticeOpen(true)}>运行状态读取失败</button>}
             </div>
           </SettingsCard>
 
@@ -257,10 +428,10 @@ export function SettingsPage({
             icon={Cpu}
             id="ai"
             onToggle={toggleCard}
-            support="方案版本、系统密钥和排队任务快照由后端统一保护。"
+            support="配置提取模型、服务地址和识别参数。"
             title="AI 服务配置"
           >
-            <ModelProfilesSettings onActiveProfileChanged={onModelStatusChanged} />
+            <ModelProfilesSettings onActiveProfileChanged={activeProfileChanged} />
           </SettingsCard>
 
           <SettingsCard
@@ -268,7 +439,6 @@ export function SettingsPage({
             icon={ListChecks}
             id="smart-pool"
             onToggle={toggleCard}
-            support="智能匹配只在预选池内选模板；勾选太杂或用途重叠容易匹配错。"
             title="智能匹配预选池"
           >
             <SmartPoolSettings />
@@ -279,13 +449,12 @@ export function SettingsPage({
             icon={Rocket}
             id="onboarding"
             onToggle={toggleCard}
-            support="可随时重新查看首次使用引导：上传 → 提取 → 核对当前数据 → 数据仓库。"
             title="使用引导"
           >
             <div className="setting-row">
               <div>
                 <div className="settings-name">重新查看引导</div>
-                <div className="small muted">带你走一遍核心流程，也可以用示例发票直接试一次</div>
+                <div className="small muted">了解核心流程，查看只读示例。</div>
               </div>
               <button
                 className="btn secondary sm"
@@ -304,10 +473,10 @@ export function SettingsPage({
             icon={Rocket}
             id="local"
             onToggle={toggleCard}
-            support="管理已经安装的 LM Studio 或 Ollama：启动服务、设置上下文、加载和卸载模型。"
+            support="启动本地服务，加载或卸载模型。"
             title="本地模型管理"
           >
-            <ExistingLocalModelSettings />
+            <ExistingLocalModelSettings refreshSignal={localModelRefresh} />
           </SettingsCard>
 
           <SettingsCard
@@ -315,16 +484,16 @@ export function SettingsPage({
             icon={SunMoon}
             id="appearance"
             onToggle={toggleCard}
-            support="外观偏好只保存在当前浏览器，不改变业务数据。"
             title="外观"
           >
             <div className="segmented" role="group" aria-label="界面主题">
               {(["auto", "light", "dark"] as const).map((value) => (
-                <button key={value} type="button" className={theme === value ? "active" : ""} onClick={() => changeTheme(value)}>
+                <button key={value} type="button" aria-pressed={theme === value} className={theme === value ? "active" : ""} onClick={() => changeTheme(value)}>
                   {value === "auto" ? "跟随系统" : value === "light" ? "浅色" : "深色"}
                 </button>
               ))}
             </div>
+            {themeNotice && <p className="small muted" role="status">{themeNotice}</p>}
           </SettingsCard>
 
           {/* 导出/入文件配置：桌面导出位置与上传格式准入 */}
@@ -333,10 +502,11 @@ export function SettingsPage({
             icon={FileCog}
             id="formats"
             onToggle={toggleCard}
-            support="图片类（webp/bmp/tiff/gif）自动转 PNG；Word/Excel/文本按原始结构提取文字并交给模型。Word 默认只提取文本，可开启连同内嵌图片一起识别。关闭总开关后对应格式将无法上传。"
+            support="设置文件转换、下载位置与提取范围。"
             title="导出/入文件配置"
           >
             <div className="settings-toggles">
+              {settingsLoading && !settings && <p className="small muted" role="status">正在读取文件设置…</p>}
               {isDesktopApp() && (
                 <div className="setting-row export-directory-row">
                   <div>
@@ -348,7 +518,7 @@ export function SettingsPage({
                     const selected = await desktopApi()?.choose_export_directory();
                     if (selected) {
                       setExportDirectory(selected);
-                      setNotice(`默认导出位置已改为 ${selected}`);
+                      notify(`默认导出位置已改为 ${selected}`, "success");
                     }
                   }}><Icon icon={FolderOpen} size={13} /> 选择文件夹</button>
                 </div>
@@ -356,10 +526,11 @@ export function SettingsPage({
               <div className="setting-row">
                 <div>
                   <div className="settings-name">Office 文档自动转换</div>
-                  <div className="small muted">Word / Excel / 纯文本转为文字后识别；关闭则这些格式无法上传</div>
+                  <div className="small muted">开启后可在文件提取上传 .docx、.xlsx、.txt 和 .md，并读取其中的文字。关闭后，文件提取不接收这四种格式。</div>
                 </div>
                 <button
                   aria-label="Office 文档自动转换"
+                  aria-pressed={Boolean(settings?.office_convert)}
                   className={`toggle ${settings?.office_convert ? "on" : "off"}`}
                   type="button"
                   disabled={!settings}
@@ -371,10 +542,11 @@ export function SettingsPage({
               <div className="setting-row">
                 <div>
                   <div className="settings-name">Word 内嵌图片</div>
-                  <div className="small muted">默认只提取文本；开启后文字与文档里的图片（如发票截图）一起交给模型</div>
+                  <div className="small muted">默认仅提取文字。开启后，受支持的 .docx 正文图片也会发送给模型，需使用支持图片的模型。</div>
                 </div>
                 <button
                   aria-label="Word 内嵌图片"
+                  aria-pressed={Boolean(settings?.word_include_images)}
                   className={`toggle ${settings?.word_include_images ? "on" : "off"}`}
                   type="button"
                   disabled={!settings || !settings.office_convert}
@@ -386,10 +558,11 @@ export function SettingsPage({
               <div className="setting-row">
                 <div>
                   <div className="settings-name">图片自动格式转换</div>
-                  <div className="small muted">webp → jpg、tiff → png，确保能传给大模型</div>
+                  <div className="small muted">WebP、BMP、TIFF 和 GIF 转为 PNG，供模型读取</div>
                 </div>
                 <button
                   aria-label="图片自动格式转换"
+                  aria-pressed={Boolean(settings?.image_convert)}
                   className={`toggle ${settings?.image_convert ? "on" : "off"}`}
                   type="button"
                   disabled={!settings}
@@ -400,31 +573,34 @@ export function SettingsPage({
               </div>
               <div className="input-settings-panel">
                 <h3>文件接收与读取</h3>
-                <label className="input-limit-field">单文件上传上限
-                  <span className="input-with-unit"><input type="number" min="1" defaultValue={settings?.upload_limit_mb ?? 50} key={`upload-${settings?.upload_limit_mb}`} onBlur={(event) => void saveLimit("upload_limit_mb", event.target.value)} /><span>MB</span></span>
-                </label>
-                <p className="small muted">防止误传过大的文件。超过此大小会停止上传，不代表 AI 无法处理。</p>
+                <SettingLimitField label="单文件上传上限" unit="MB" disabled={!settings} value={settings?.upload_limit_mb}
+                  onCommit={raw => saveLimit("upload_limit_mb", raw)} />
+                <p className="small muted">超过上限的文件将停止上传。</p>
                 <div className="setting-row">
                   <div><div className="settings-name">限制发送给模型的内容</div>
                     <p className="small muted">开启后只提供文件开头，到上限即停止，结果可能缺少信息。原件仍完整保存，具体范围可在来源详情查看。</p></div>
                   <button aria-label="限制发送给模型的内容" aria-pressed={Boolean(settings?.allow_limited_input)} className={`toggle ${settings?.allow_limited_input ? "on" : "off"}`} type="button" disabled={!settings} onClick={() => void toggleSetting("allow_limited_input")}><span /></button>
                 </div>
                 {settings?.allow_limited_input && <div className="input-limits-grid">{([
-                  ["input_text_limit", "从开头读取文字", "字符", 20000, 1, 100000],
-                  ["input_page_limit", "PDF 页数／多帧图片帧数", "页／帧", 10, 1, 100],
-                  ["input_row_limit", "Excel 非空行", "行", 500, 1, 10000],
-                  ["input_docx_image_limit", "Word 内嵌图片", "张", 10, 1, 100],
-                ] as const).map(([key, label, unit, fallback, min, max]) => <label className="input-limit-field" key={`${key}-${settings[key]}`}>
-                  {label}<span className="input-with-unit"><input aria-label={label} type="number" min={min} defaultValue={settings[key] ?? fallback} onBlur={(event) => void saveLimit(key, event.target.value)} /><span>{unit}</span></span>
-                  <input aria-label={`${label}滑块`} type="range" min={min} max={Math.max(max, settings[key] ?? fallback)} defaultValue={settings[key] ?? fallback} onPointerUp={(event) => void saveLimit(key, event.currentTarget.value)} onKeyUp={(event) => void saveLimit(key, event.currentTarget.value)} />
-                </label>)}</div>}
+                  ["input_text_limit", "从开头读取文字", "字符", 20000, 100000],
+                  ["input_page_limit", "PDF 页数／多帧图片帧数", "页／帧", 10, 100],
+                  ["input_row_limit", "Excel 非空行", "行", 500, 10000],
+                  ["input_docx_image_limit", "Word 内嵌图片", "张", 10, 100],
+                ] as const).map(([key, label, unit, fallback, max]) => <SettingLimitField key={key}
+                  label={label} unit={unit} value={settings[key]} fallback={fallback} rangeMax={max}
+                  onCommit={raw => saveLimit(key, raw)} />)}</div>}
                 <Disclosure className="reading-help" title="如何读取">
-                  <p>关闭限制时，知意提供全部可读取内容，由 AI 服务决定能否接受；超时或服务拒绝会明确提示，不会偷偷截取后重试。</p>
-                  <p>PDF 从第 1 页、多帧图片从第 1 帧开始连续读取。Excel 按工作表顺序累计非空行，同时受文字上限限制；Word 达到文字或图片上限即停止。达到上限后，后续内容不会交给 AI，跨越读取边界的信息可能不完整。</p>
+                  <p>关闭限制时，将全部可读取内容交给 AI；超时或超出服务限制时会提示失败。</p>
+                  <p>从文件开头读取：PDF 和多帧图片按页，Excel 按工作表累计非空行，Word 按文字和图片上限。超出部分不参与本次提取。</p>
                   <p>实际读取位置可在结果的来源详情中查询。安全解压和像素限制仍生效。设置只影响新上传文件，普通重试沿用原设置；选择按当前读取设置重试，才会重新确定范围。</p>
                 </Disclosure>
               </div>
-              {settingsError && <div className="small danger-text">{settingsError}</div>}
+              {settingsError && <div className="small danger-text" role="alert">
+                <span>{settingsError}</span>{" "}
+                {!settings && <button className="btn secondary sm" type="button" disabled={settingsLoading} onClick={() => void loadSettings()}>重试读取文件设置</button>}
+              </div>}
+              {savingCount > 0 && <p className="small muted" role="status">正在保存文件设置…</p>}
+              {Object.entries(saveErrors).map(([key, message]) => <p className="small danger-text" role="alert" key={key}>{message}</p>)}
             </div>
           </SettingsCard>
 
@@ -441,16 +617,16 @@ export function SettingsPage({
               <div className="setting-row">
                 <div>
                   <div className="settings-name">清理历史数据</div>
-                  <div className="small muted">删除已完成、待核对、失败和已取消文件，以及对应当前数据、修订历史和内部原件；保留独立导入/合并数据、外部归档文件与备份</div>
+                  <div className="small muted">删除历史文件及其当前数据、修订和内部原件。合并表随原表更新，独立导入数据、外部归档和备份保留。</div>
                 </div>
-                <button className="btn danger sm" type="button" onClick={() => setClearOpen(true)}>
+                <button className="btn danger sm" type="button" onClick={() => { setClearError(null); setClearOpen(true); }}>
                   <Icon icon={Trash2} size={13} /> 清理
                 </button>
               </div>
               <div className="setting-row">
                 <div>
                   <div className="settings-name">重置界面主题</div>
-                  <div className="small muted">恢复为跟随系统并刷新页面；不改变模型配置和业务数据</div>
+                  <div className="small muted">立即恢复为跟随系统；不改变模型配置和业务数据</div>
                 </div>
                 <button className="btn danger sm" type="button" onClick={() => setResetOpen(true)}>
                   <Icon icon={RotateCcw} size={13} /> 重置
@@ -466,17 +642,18 @@ export function SettingsPage({
       <ConfirmDialog
         open={clearOpen}
         title="清理历史数据"
-        description="将删除全部已完成、待核对、失败和已取消文件的记录、当前数据、修订历史及内部原件。独立导入和合并结果、外部归档文件、备份保留。此操作不可恢复。"
+        description="将删除已完成、待核对、失败和已取消文件的记录、当前数据、修订历史及内部原件。相关行也会从实时合并表中移除。独立导入数据、外部归档文件和备份保留。此操作不可恢复。"
         confirmText="清除历史"
         buttonLabel="确认清理"
         busy={clearBusy}
+        error={clearError}
         onConfirm={() => void handleClearHistory()}
         onClose={() => setClearOpen(false)}
       />
       <ConfirmDialog
         open={resetOpen}
         title="重置界面主题"
-        description="将把主题恢复为跟随系统并刷新页面；模型方案与业务数据不受影响。"
+        description="将把主题立即恢复为跟随系统；模型方案与业务数据不受影响。"
         confirmText="重置"
         buttonLabel="确认重置"
         busy={resetBusy}
@@ -484,9 +661,6 @@ export function SettingsPage({
         onClose={() => setResetOpen(false)}
       />
 
-      <div className="settings-footnote" style={{ marginTop: 16 }}>
-        <Icon icon={ShieldCheck} size={13} /> 首版接收 PDF、JPG、PNG 及已开启转换的图片与 Office 文档；本地模型任务固定串行。危险操作均有二次确认。
-      </div>
     </div>
   );
 }
@@ -498,7 +672,7 @@ function StatusRow({ label, message, ready }: { label: string; message: string; 
         <div className="settings-name">{label}</div>
         <div className="small muted">{message}</div>
       </div>
-      <span className={`badge ${ready ? "live" : "muted"}`}>{ready ? "可用" : "需检查"}</span>
+      <span className="badge muted">{ready === undefined ? "待确认" : ready ? "可用" : "需检查"}</span>
     </div>
   );
 }

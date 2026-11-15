@@ -1,6 +1,7 @@
 """Validated capabilities for first-party conversations; no loopback MCP calls."""
 
 import json
+from document_pipeline_api.schemas.json_numbers import NumericPrecisionError, loads_json_numbers
 from typing import Literal
 from uuid import uuid4
 from fastapi import HTTPException
@@ -35,6 +36,7 @@ from document_pipeline_api.services.assistant_operations import (
     preview_plan,
     preview_undo,
 )
+from document_pipeline_api.services.assistant_answers import FinishAnswer, ANSWER_DESCRIPTION
 
 
 class Context(Strict):
@@ -168,6 +170,7 @@ class ToolDetail(Strict):
 
 
 TOOL_MODELS = {
+    "finish_answer": (FinishAnswer, ANSWER_DESCRIPTION),
     "read_handbook": (Handbook, "按需读取知意使用手册：数据流、修订删除、模板、命名归档、智能匹配、问知意、统计、备份、API 和 MCP。不读取用户资料，也不执行修改。"),
     "enable_analysis_options": (
         AnalysisOptions,
@@ -207,16 +210,16 @@ TOOL_MODELS = {
     ),
     "read_data_rows": (
         RowQuery,
-        "读取授权原始行、row_id、版本和来源。界面选中行自动限制；默认按记录编号从小到大，前两条只传 limit=2，第一条只传 limit=1，不添加排序或筛选。filters 只允许真实业务字段，按编号查询用 row_ids。",
+        "读取授权原始行、row_id、版本和来源，不计算金额合计。返回的 analysis_id 只是明细快照，不能作为统计已完成的依据；金额合计必须另用 analyze_data_table 的 metrics op=sum，并使用其 totals。界面选中行自动限制；默认按记录编号从小到大，前两条只传 limit=2，第一条只传 limit=1，不添加排序或筛选。filters 只允许真实业务字段，按编号查询用 row_ids。",
     ),
     "catalog": (Catalog, "查找本次已授权的表、模板或任务；不列出范围外资料。"),
     "read_resource": (
         Resource,
-        "读取授权资料。table 表结构；task 文件状态和前三条当前明细；file_data 按 page/limit 读当前明细；file_revisions 读文件版本目录，指定 version 读变化；template 模板版本；revisions 按 page/limit 读独立行历史，可指定 row_id，省略需整表授权。文件类 id 是文件 ID。引用由系统提供。",
+        "读取授权资料。table 表结构；task 文件状态和前三条当前明细；file_data 按 page/limit 读当前明细。task/file_data 首次读取建立本轮文件版本，后续页自动检查；版本变化请重读第一页，勿拼接旧页，version 可指定期望的当前版本。file_revisions 读文件版本目录，指定 version 读变化；template 模板版本；revisions 按 page/limit 读独立行历史，可指定 row_id，省略需整表授权。文件类 id 是文件 ID。引用由系统提供。",
     ),
     "analyze_data_table": (
         AnalysisRequest,
-        "后端真实查询和计算。先读表结构获取字段 key；金额使用 sum，公共字段使用 auto 防止重复累计。图表使用返回的 analysis_id。",
+        "后端真实查询和计算。先读表结构获取字段 key；用户要求金额合计时必须实际调用，以 metrics op=sum 和真实金额字段计算，使用返回的 totals 回答，不能把明细快照或模型自行加总说成后端统计。公共字段使用 auto 防止重复累计。图表使用返回的 analysis_id。",
     ),
     "render_chart": (
         Chart,
@@ -267,7 +270,9 @@ def structured_arguments(model, arguments):
         if not isinstance(value, str) or "string" in types or not ({"array", "object"} & types):
             continue
         try:
-            decoded = json.loads(value)
+            decoded = loads_json_numbers(value)
+        except NumericPrecisionError:
+            raise
         except ValueError:
             continue
         if ("array" in types and isinstance(decoded, list)) or (
@@ -385,13 +390,16 @@ def scoped_tool_specs(session, context, artifacts, draft, question="", *, stable
         allowed.add("read_tool_result")
         if not any(s["function"]["name"] == "read_tool_result" for s in specs):
             specs += [s for s in tool_specs(True) if s["function"]["name"] == "read_tool_result"]
-    allowed.add("read_handbook")
+    allowed.update({"read_handbook", "finish_answer"})
     specs = [s for s in specs if s["function"]["name"] in allowed]
     if "propose_operations" in allowed and not any(
         s["function"]["name"] == "propose_operations" for s in specs
     ):
         specs += [s for s in tool_specs(True) if s["function"]["name"] == "propose_operations"]
-    table = session.get(DataTableRecord, context.table_id) if context.table_id else None
+    # The resource picker uses table_ids even for one table. Reuse the same
+    # metadata contract without granting any additional table permission.
+    sole_table_id = next(iter(selected_tables)) if len(selected_tables) == 1 and not context.workspace else None
+    table = session.get(DataTableRecord, sole_table_id) if sole_table_id else None
     columns = {c.key: c.label for c in table_columns(session, table)} if table else {}
     for spec in specs:
         name = spec["function"]["name"]
@@ -448,8 +456,8 @@ def scoped_tool_specs(session, context, artifacts, draft, question="", *, stable
                 schema["$defs"] = {k: v for k, v in schema["$defs"].items() if k in reachable}
         if name in {"read_analysis_snapshot", "prepare_export"} and not stable:
             props["analysis_id"]["enum"] = list(all_snapshots)
-        if name == "read_data_rows" and columns and not context.workspace and not context.table_ids:
-            props["table_id"]["enum"] = [context.table_id]
+        if name == "read_data_rows" and columns and sole_table_id:
+            props["table_id"]["enum"] = [sole_table_id]
             schema["$defs"]["Filter"]["properties"]["field"]["enum"] = list(columns)
         if name == "analyze_data_table":
             props.pop("records", None)
@@ -472,8 +480,8 @@ def scoped_tool_specs(session, context, artifacts, draft, question="", *, stable
             spec["function"]["description"] += (
                 " 聚合接口：选中行、页面搜索及分组已自动应用，不要把 row_id 当业务字段添加到 filters。例：‘按供应方汇总选中记录’只需 table_id、dimensions 和 metrics，不需要 filters 或 search。不要传 records；读取明细使用 read_data_rows。"
             )
-            if columns and not context.workspace and not context.table_ids:
-                props["table_id"]["enum"] = [context.table_id]
+            if columns and sole_table_id:
+                props["table_id"]["enum"] = [sole_table_id]
                 props["dimensions"]["items"]["enum"] = list(columns)
                 schema["$defs"]["Filter"]["properties"]["field"]["enum"] = list(columns)
                 schema["$defs"]["Metric"]["properties"]["field"] = {"enum": [*columns, None]}
@@ -633,6 +641,29 @@ def file_row_scope(session, context, task_id):
 def require_full_file(session, context, task_id):
     if file_row_scope(session, context, task_id) is not None:
         raise HTTPException(403, "当前只授权了部分明细。读取原件或完整文件修订历史，请在对话设置中选择这份文件；没有自动扩大范围。")
+
+
+def _current_file_page(session, context, body, artifacts):
+    """Read and anchor one file within read_resource's existing SQLite snapshot."""
+    from document_pipeline_api.services.current_data import get_current
+    from document_pipeline_api.services.file_collections import file_details
+
+    current = get_current(session, body.id)
+    version = current.current_version
+    previous = artifacts.get("_file_read_versions", {}).get(body.id)
+    if body.version is not None and body.version != version:
+        raise HTTPException(409, f"文件当前版本为 {version}，与请求版本 {body.version} 不同；请重新读取第一页，不要拼接旧页。")
+    if body.page > 1 and previous is not None and previous != version:
+        raise HTTPException(409, f"文件已从版本 {previous} 更新到 {version}，后续页未读取；请重新读取第一页，不要拼接旧页。")
+    row_scope = file_row_scope(session, context, body.id)
+    details = file_details(session, body.id, page=body.page, page_size=body.limit, row_ids=row_scope)
+    notice = None
+    if previous is not None and previous != version:
+        notice = f"已重新读取第一页，当前版本从 {previous} 更新为 {version}；不要与旧页拼接。"
+    elif previous is None and body.page > 1:
+        notice = f"本次从版本 {version} 的第 {body.page} 页开始，前面的页面未读取；后续页保持此版本，重读第一页可更新版本。"
+    artifacts.setdefault("_file_read_versions", {})[body.id] = version
+    return current, details, row_scope, notice
 
 
 def require_capability(context, capability):
@@ -814,7 +845,7 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
     if name == "read_conversation_history" and artifacts.get("_history_thread"):
         from document_pipeline_api.models.assistant import AssistantMessage, AssistantToolCall, AssistantRun
         from document_pipeline_api.services.assistant_memory import scope_identity, summarize_result
-        scope = scope_identity(artifacts["_history_context"])
+        scope = scope_identity(artifacts["_history_context"], session=session)
         query = select(AssistantMessage).where(AssistantMessage.thread_id == artifacts["_history_thread"],
             AssistantMessage.position < artifacts["_history_before"])
         if body.search:
@@ -825,7 +856,7 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
         # Scope metadata is checked before returning any historical content.
         found = 0
         for message in session.scalars(query.order_by(AssistantMessage.position.desc()).execution_options(yield_per=50)):
-            old_scope = scope_identity(json.loads(message.context_json))
+            old_scope = scope_identity(json.loads(message.context_json), session=session)
             if old_scope and old_scope != scope and any(v for k,v in old_scope.items() if k != "table_name"):
                 continue
             if found != body.index:
@@ -978,16 +1009,15 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
         permit_read(session, context, permission_kind, body.id)
         ref = {"kind": body.kind, "id": body.id, "row_id": body.row_id}
         if body.kind in {"file_data", "file_revisions"}:
-            from document_pipeline_api.services.file_collections import file_details
             from document_pipeline_api.services.file_revisions import list_revisions, revision_details
             task = session.get(TaskRecord, body.id)
             if task is None:
                 raise HTTPException(404, "文件已删除。")
             reference = {"kind": "task", "id": body.id, "label": task.display_filename}
             if body.kind == "file_data":
+                _, details, _, notice = _current_file_page(session, context, body, artifacts)
                 return {"reference": reference, "kind": "file_current",
-                        **file_details(session, body.id, page=body.page, page_size=body.limit,
-                                       row_ids=file_row_scope(session, context, body.id)),
+                        **details, **({"notice": notice} if notice else {}),
                         "scope": "仅本次授权范围内的当前数据"}
             require_full_file(session, context, body.id)
             if body.version is None:
@@ -1061,11 +1091,7 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
         }
         extraction = session.get(ExtractionRecord, task.id)
         if extraction is not None:
-            from document_pipeline_api.services.file_collections import file_details
-            from document_pipeline_api.services.current_data import get_current
-            current = get_current(session, task.id)
-            row_scope = file_row_scope(session, context, task.id)
-            details = file_details(session, task.id, page=body.page, page_size=body.limit, row_ids=row_scope)
+            current, details, row_scope, notice = _current_file_page(session, context, body, artifacts)
             # File-wide issue text may contain values from unselected details.
             issues = json.loads(current.validation_json) if row_scope is None else []
             result["extraction"] = {
@@ -1078,6 +1104,8 @@ def execute_tool(session, context, name, arguments, artifacts, settings=None):
                 "scope": "完整文件" if row_scope is None else "仅本次授权的明细；未读取文件级校验详情",
             }
             result["note"] = "当前结果按页读取，默认三条明细，不代表全文。更多内容用 file_data 翻页，修订用 file_revisions，原件用 read_original_page。"
+            if notice:
+                result["note"] += notice
         return result
     if name == "analyze_data_table":
         result = analyze(session, scoped_analysis(session, context, body))

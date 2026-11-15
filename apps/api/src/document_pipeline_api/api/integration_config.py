@@ -33,6 +33,8 @@ class PermissionRequest(BaseModel):
     task_read: bool = False
     template_read: bool = False
     result_read: bool = False
+    revision_read: bool = False
+    original_read: bool = False
     data_read: bool = False
     task_control: bool = False
     write_enabled: bool = False
@@ -110,6 +112,8 @@ def save_permissions(request: Request, body: PermissionRequest) -> dict[str, boo
         "mcp_task_read": body.task_read,
         "mcp_template_read": body.template_read,
         "mcp_result_read": body.result_read,
+        "mcp_revision_read": body.revision_read,
+        "mcp_original_read": body.original_read,
         "mcp_data_read": body.data_read,
         "mcp_data_scope": body.data_scope,
         "mcp_table_ids": sorted(set(body.table_ids)) if body.data_scope == "selected" else [],

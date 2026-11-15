@@ -109,7 +109,7 @@ def test_cancel_during_connect_error_remains_cancellation(tmp_path):
         provider.close()
 
 
-def test_partial_reply_survives_read_timeout_with_saved_redacted_diagnostic(client):
+def test_unverified_partial_reply_is_withheld_on_read_timeout_with_saved_redacted_diagnostic(client):
     requests = []
     closed = []
 
@@ -136,7 +136,7 @@ def test_partial_reply_survives_read_timeout_with_saved_redacted_diagnostic(clie
     run = result["runs"][0]
     assert run["status"] == "failed"
     assert "等待聊天服务回复超时" in run["error"] and "_ssl.c" not in run["error"]
-    assert result["messages"][-1]["parts"] == [{"type": "text", "text": "已经收到的部分回答。"}]
+    assert result["messages"][-1]["parts"] == []
     assert run["usage"]["model_calls"] == 1 and not run["usage"]["usage_complete"]
     assert run["usage"]["error_code"] == "chat_read_timeout"
     assert "ReadTimeout" in run["usage"]["error_diagnostic"]

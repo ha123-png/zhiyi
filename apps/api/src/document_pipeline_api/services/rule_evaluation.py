@@ -32,11 +32,12 @@ def evaluate_rules(
     result: DocumentExtraction | TemplateExtraction,
     template_id: str | None,
     template_version: int | None,
+    manual_revision: bool = False,
 ) -> RuleEvaluation:
     if isinstance(result, DocumentExtraction):
         return RuleEvaluation(
             engine_version=BUILTIN_RULE_ENGINE_VERSION,
-            issues=validate_extraction(result, document_kind),
+            issues=validate_extraction(result, document_kind, manual_revision=manual_revision),
         )
     if template_id is None or template_version is None:
         raise ValueError("自定义结果缺少精确模板版本，不能执行规则。")
@@ -47,5 +48,6 @@ def evaluate_rules(
             result,
             template.deterministic_rules,
             template.fields,
+            manual_revision=manual_revision,
         ),
     )

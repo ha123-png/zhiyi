@@ -11,6 +11,8 @@ BUILTIN_RULE_ENGINE_VERSION = "builtin-v1"
 def validate_extraction(
     result: DocumentExtraction,
     document_kind: DocumentKind,
+    *,
+    manual_revision: bool = False,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     for field, label in (
@@ -30,14 +32,26 @@ def validate_extraction(
                 )
             )
 
-    item_total = sum(item.amount or 0 for item in result.items)
+    def can_compare(*values):
+        return all(type(value) in (int, float) for value in values)
+
+    def not_checked(code, field, label):
+        issues.append(ValidationIssue(
+            code=code, field=field, message=f"{label}未校验：计算所需的值为空或为文本。",
+            severity="warning", not_checked=True,
+        ))
+
+    item_amounts = [item.amount for item in result.items]
+    item_total = (
+        None if manual_revision and not can_compare(*item_amounts)
+        else sum(value or 0 for value in item_amounts)
+    )
     for index, item in enumerate(result.items):
-        if (
-            item.quantity is not None
-            and item.unit_price is not None
-            and item.amount is not None
-            and abs(item.quantity * item.unit_price - item.amount) >= 0.01
-        ):
+        if not can_compare(item.quantity, item.unit_price, item.amount):
+            if manual_revision:
+                not_checked("line_amount_mismatch", f"items[{index}].amount", "明细金额")
+            continue
+        if abs(item.quantity * item.unit_price - item.amount) >= 0.01:
             issues.append(
                 ValidationIssue(
                     code="line_amount_mismatch",
@@ -50,10 +64,9 @@ def validate_extraction(
                 )
             )
     if document_kind is DocumentKind.INVOICE:
-        if (
-            result.amount_before_tax is not None
-            and abs(item_total - result.amount_before_tax) >= 0.01
-        ):
+        if manual_revision and not can_compare(item_total, result.amount_before_tax):
+            not_checked("invoice_line_total_mismatch", "amount_before_tax", "明细金额合计")
+        elif can_compare(item_total, result.amount_before_tax) and abs(item_total - result.amount_before_tax) >= 0.01:
             issues.append(
                 ValidationIssue(
                     code="invoice_line_total_mismatch",
@@ -62,12 +75,10 @@ def validate_extraction(
                     severity="error",
                 )
             )
-        if (
-            result.amount_before_tax is not None
-            and result.tax_amount is not None
-            and result.total_amount is not None
-            and abs(result.amount_before_tax + result.tax_amount - result.total_amount) >= 0.01
-        ):
+        if not can_compare(result.amount_before_tax, result.tax_amount, result.total_amount):
+            if manual_revision:
+                not_checked("invoice_tax_total_mismatch", "total_amount", "价税合计")
+        elif abs(result.amount_before_tax + result.tax_amount - result.total_amount) >= 0.01:
             issues.append(
                 ValidationIssue(
                     code="invoice_tax_total_mismatch",
@@ -76,7 +87,9 @@ def validate_extraction(
                     severity="error",
                 )
             )
-    elif result.total_amount is not None and abs(item_total - result.total_amount) >= 0.01:
+    elif manual_revision and not can_compare(item_total, result.total_amount):
+        not_checked("delivery_line_total_mismatch", "total_amount", "明细金额合计")
+    elif can_compare(item_total, result.total_amount) and abs(item_total - result.total_amount) >= 0.01:
         issues.append(
             ValidationIssue(
                 code="delivery_line_total_mismatch",

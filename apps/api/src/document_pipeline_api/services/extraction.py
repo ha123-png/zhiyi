@@ -68,8 +68,6 @@ _PROCESSABLE_CONTENT_TYPES = {
     *TEXT_CONTENT_TYPES,
 }
 
-# docx 内嵌图片并入识别输入页的上限
-
 PROMPT_VERSION = "builtin-v2"
 EXTRACTION_PROMPTS = {
     DocumentKind.INVOICE: (
@@ -232,7 +230,24 @@ def save_review(
         result=validation_result(extraction, saved_result),
         template_id=extraction.template_id,
         template_version=extraction.template_version,
+        manual_revision=True,
     )
+    snapshot = current_snapshot(session, task_id)
+    header, items = saved_result.header, saved_result.items
+    detail_ids = update.detail_ids
+    previous_ids = [item["id"] for item in snapshot["items"]]
+    if detail_ids is None:
+        if len(items) != len(previous_ids):
+            raise HTTPException(409, "明细数量已变化，请刷新后使用当前文件编辑入口。")
+        detail_ids = previous_ids
+    if len(detail_ids) != len(items) or len([value for value in detail_ids if value is not None]) != len({value for value in detail_ids if value is not None}):
+        raise HTTPException(422, "明细身份与提交的数据不一致。")
+    existing_ids = set(previous_ids)
+    supplied_ids = {value for value in detail_ids if value is not None}
+    if not supplied_ids <= existing_ids:
+        raise HTTPException(409, "部分明细已经删除或不属于这份文件，请刷新。")
+    from document_pipeline_api.services.autonomous_extraction import carry_type_issues
+    type_issues = carry_type_issues(prior_issues, previous_ids, detail_ids, saved_result)
     issues = evaluation.issues + input_scope_issues(extraction.input_scope_json)
     # 用户可显式忽略部分校验问题：仍记录（审计语义不变），但不再阻断保存/确认
     stored_issues = [
@@ -241,20 +256,10 @@ def save_review(
         })
         for issue in issues
     ]
-    blocking_issues = [issue for issue in stored_issues if not issue.ignored]
-    snapshot = current_snapshot(session, task_id)
-    header, items = saved_result.header, saved_result.items
-    detail_ids = update.detail_ids
-    if detail_ids is None:
-        if len(items) != len(snapshot["items"]):
-            raise HTTPException(409, "明细数量已变化，请刷新后使用当前文件编辑入口。")
-        detail_ids = [item["id"] for item in snapshot["items"]]
-    if len(detail_ids) != len(items) or len([value for value in detail_ids if value is not None]) != len({value for value in detail_ids if value is not None}):
-        raise HTTPException(422, "明细身份与提交的数据不一致。")
-    existing_ids = {item["id"] for item in snapshot["items"]}
-    supplied_ids = {value for value in detail_ids if value is not None}
-    if not supplied_ids <= existing_ids:
-        raise HTTPException(409, "部分明细已经删除或不属于这份文件，请刷新。")
+    stored_issues.extend(type_issues)
+    blocking_issues = [issue for issue in stored_issues if not issue.ignored and not issue.not_checked]
+    if task.status == TaskStatus.COMPLETED.value:
+        blocking_issues = []
     stored_json = json.dumps([issue.model_dump() for issue in stored_issues], ensure_ascii=False)
     current = revise_current(
         session, task_id, expected_version=update.expected_version,
@@ -270,6 +275,8 @@ def save_review(
     from document_pipeline_api.services.file_names import confirm_file_name
     confirm_file_name(task, update.filename)
     task.status = TaskStatus.NEEDS_REVIEW.value if blocking_issues else TaskStatus.COMPLETED.value
+    if not blocking_issues:
+        task.completed_at = task.completed_at or current.updated_at
     session.execute(update_rows_pending_statement(task_id, bool(blocking_issues)))
     session.commit()
     return _read_extraction(session, extraction)
@@ -551,10 +558,11 @@ def process_task(
             },
         ):
             return None
-        if selected_template.engine_kind == "autonomous":
-            from document_pipeline_api.services.autonomous_extraction import AutonomousExtraction, extraction_prompt
+        autonomous = selected_template.engine_kind == "autonomous"
+        if autonomous:
+            from document_pipeline_api.services.autonomous_extraction import AutonomousModelResult, extraction_prompt
             document_kind = DocumentKind.CUSTOM
-            result_type = AutonomousExtraction
+            result_type = AutonomousModelResult
             prompt = extraction_prompt(selected_template)
         elif selected_template.engine_kind == "legacy" and selected_template.builtin_key in {"invoice", "delivery"}:
             document_kind = DocumentKind(selected_template.builtin_key)
@@ -577,13 +585,14 @@ def process_task(
         from document_pipeline_api.services.model_usage import model_call
         with model_call(session, model_client, "extraction", task_settings.model_provider):
             raw_result = _extract_from_pages(model_client, image_paths, prompt + "\n" + input_text, model_type)
-        raw_values = raw_result.model_dump()
-        naming_advice = raw_values.pop("file_name_advice", None)
+        naming_advice = raw_result.model_dump(include={"file_name_advice"}).get("file_name_advice")
         output_schema = None
-        if selected_template.engine_kind == "autonomous":
-            dynamic_result = AutonomousExtraction.model_validate(raw_values)
+        if autonomous:
+            dynamic_result = raw_result.extraction()
             output_schema = dynamic_result.columns()
-            raw_values.pop("fields")
+            raw_values = dynamic_result.model_dump(exclude={"fields"})
+        else:
+            raw_values = raw_result.model_dump(exclude={"file_name_advice"})
         result = (DocumentExtraction if document_kind != DocumentKind.CUSTOM else TemplateExtraction).model_validate(raw_values)
         if not transition_leased_task(
             session,
@@ -608,6 +617,8 @@ def process_task(
             template_version=selected_template.version,
         )
         issues = evaluation.issues + input_scope_issues(prepared.scope.model_dump_json())
+        if autonomous:
+            issues.extend(raw_result.type_issues())
         if selected_template.behavior.suggest_filename and task.file_name_json is None:
             from document_pipeline_api.services.file_names import automatic_file_name, confirm_file_name, fixed_file_name
             name = fixed_file_name(session, task, selected_template) if selected_template.behavior.filename_mode == "fixed" else automatic_file_name(task.filename, naming_advice, raw_values)
@@ -659,6 +670,7 @@ def process_task(
             destination = destination_for_extraction(session,record)
             if destination is None or task.target_table_id != destination.id:
                 task.target_table_id = None
+                task.pending_reason = "target_table"
                 materialize_task_result(session, task.id)
                 task.candidate_templates_json = json.dumps(
                     [{
@@ -733,6 +745,7 @@ def process_task(
             lease.token,
             code=failure_code,
             message=failure_message,
+            diagnostic=getattr(error, "diagnostic", None) if isinstance(error, ModelServiceError) else None,
         )
         raise
     finally:

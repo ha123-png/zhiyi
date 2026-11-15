@@ -14,7 +14,7 @@ client = file_client
 
 
 def test_file_history_survives_live_tool_event_and_followup_model_call(client):
-    from test_assistant import ScriptedProvider, select_profile, send, finish
+    from test_assistant import ScriptedProvider, select_profile, send, finish, final_answer
     task = upload(client, '流式历史.txt')
     process(client, task, Model())
     ScriptedProvider.requests = []
@@ -23,7 +23,7 @@ def test_file_history_survives_live_tool_event_and_followup_model_call(client):
           'arguments': {'kind': 'file_revisions', 'id': task}}],
         [{'type': 'tool', 'id': 'details', 'name': 'read_resource',
           'arguments': {'kind': 'file_revisions', 'id': task, 'version': 1}}],
-        [{'type': 'text', 'text': '已经读取初次提取的文件版本。'}],
+        [final_answer('已经读取初次提取的文件版本。')],
     ]
     client.app.state.conversation_factory = ScriptedProvider
     thread = finish(client, send(client, select_profile(client), text='读取此文件修订历史', context={'task_id': task}))
@@ -49,6 +49,10 @@ def test_help_and_model_read_the_same_topics_without_loading_all_prose(client):
             tool = execute_tool(session, context, "read_handbook", {'topic': topic['id']}, {})
             assert tool == {'kind': 'handbook', **api}
             assert len(json.dumps(model_result(tool, 'test'), ensure_ascii=False)) < 6000
+            if topic['id'] == 'api':
+                text = ' '.join(paragraph for section in tool['sections'] for paragraph in section['paragraphs'])
+                assert '下载原件并读取修订历史' in text
+                assert '旧密钥保留此前的访问权限' in text
         advertised = scoped_tool_specs(session, context, {}, False, '知意的数据怎么流动')
         assert 'read_handbook' in [tool['function']['name'] for tool in advertised]
         assert 'deleted_before' not in json.dumps(advertised)  # no whole manual in tools
@@ -94,7 +98,7 @@ def test_thousand_detail_file_reads_and_history_stay_bounded_and_scoped(client):
         scoped = execute_tool(session, selected, 'read_resource', {'kind': 'file_data', 'id': first, 'page': 2}, {})
         assert scoped['total'] == 1 and scoped['items'] == []
         searched = execute_tool(session, Context(table_id=table, search='987654321'), 'read_resource', {'kind': 'file_data', 'id': first}, {})
-        assert searched['total'] == 1 and searched['items'][0]['values']['f2'] == 987654321
+        assert searched['total'] == 1 and searched['items'][0]['values']['i1'] == 987654321
         context = Context(table_id=table)
         loaded.clear()
         read = execute_tool(session, context, 'read_resource', {'kind': 'task', 'id': first}, {})
@@ -103,7 +107,7 @@ def test_thousand_detail_file_reads_and_history_stay_bounded_and_scoped(client):
         assert len(set(loaded)) == 3
         assert 'original_result' not in read['extraction']
         next_page = execute_tool(session, context, 'read_resource', {'kind': 'file_data', 'id': first, 'page': 2}, {})
-        assert next_page['items'][0]['values']['f2'] == 3
+        assert next_page['items'][0]['values']['i1'] == 3
         assert len(next_page['items']) == 3
         for kind in ('task', 'file_data', 'file_revisions'):
             with pytest.raises(HTTPException) as error:
@@ -116,7 +120,7 @@ def test_thousand_detail_file_reads_and_history_stay_bounded_and_scoped(client):
     editing = client.post('/api/v1/tables/edit-sessions').json()['id']
     changed = client.patch(f'/api/v1/tasks/{first}/current', json={
         'expected_version': current['version'], 'edit_session_id': editing,
-        'header_changes': {'f1': '新客户'}, 'detail_changes': {str(row_id): {'f2': 42}},
+        'header_changes': {'h1': '新客户'}, 'detail_changes': {str(row_id): {'i1': 42}},
     })
     assert changed.status_code == 200, changed.text
     removed = client.patch(f'/api/v1/tasks/{first}/current', json={
@@ -129,9 +133,9 @@ def test_thousand_detail_file_reads_and_history_stay_bounded_and_scoped(client):
         history = execute_tool(session, context, 'read_resource', {'kind': 'file_revisions', 'id': first}, {})
         assert history['total'] == 2
         detail = execute_tool(session, context, 'read_resource', {'kind': 'file_revisions', 'id': first, 'version': 2}, {})
-        assert detail['header']['f1'] == {'before': '甲', 'after': '新客户'}
-        assert detail['items'][0]['deleted_before']['values'] == {'f2': 42}
-        assert detail['items'][0]['before']['values'] == {'f2': 0}
+        assert detail['header']['h1'] == {'before': '甲', 'after': '新客户'}
+        assert detail['items'][0]['deleted_before']['values'] == {'i1': 42}
+        assert detail['items'][0]['before']['values'] == {'i1': 0}
         assert detail['items'][0]['after'] is None
         initial = execute_tool(session, context, 'read_resource', {'kind': 'file_revisions', 'id': first, 'version': 1}, {})
         assert initial['total_details'] == 1000 and len(initial['items']) == 3

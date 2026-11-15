@@ -32,3 +32,36 @@ it("restores the supplied fact when an unchanged value leaves editing, then show
   view.rerender(<EditableText editing={false} value="18" onCommit={commit} />);
   expect(cell).toHaveTextContent(/^18$/);
 });
+
+it.each([
+  { key: "Enter", isComposing: true },
+  { key: "Escape", isComposing: true },
+  { key: "Enter", keyCode: 229 },
+])("keeps IME candidate keys inside the editor: %j", key => {
+  const commit = vi.fn(), cancel = vi.fn();
+  render(<EditableText editing value="原值" onCommit={commit} onCancel={cancel} />);
+  const cell = screen.getByText("原值");
+  cell.textContent = "候选中的中文";
+  fireEvent.keyDown(cell, key);
+  expect(commit).not.toHaveBeenCalled();
+  expect(cancel).not.toHaveBeenCalled();
+  expect(cell).toHaveTextContent("候选中的中文");
+  expect(cell).toHaveFocus();
+  fireEvent.keyDown(cell, { key: "Enter", isComposing: false });
+  expect(commit).toHaveBeenCalledExactlyOnceWith("候选中的中文");
+});
+
+it("keeps a focused draft through a fact refresh and restores the newest fact on cancel", () => {
+  const commit = vi.fn(), cancel = vi.fn();
+  const view = render(<div tabIndex={0}><EditableText editing value="原值" onCommit={commit} onCancel={cancel} /></div>);
+  const cell = screen.getByText("原值");
+  cell.textContent = "尚未提交的草稿";
+  fireEvent.input(cell);
+  view.rerender(<div tabIndex={0}><EditableText editing value="后台新值" onCommit={commit} onCancel={cancel} /></div>);
+  expect(cell).toHaveTextContent("尚未提交的草稿");
+  expect(cell).toHaveFocus();
+  fireEvent.keyDown(cell, { key: "Escape" });
+  expect(cell).toHaveTextContent("后台新值");
+  expect(cancel).toHaveBeenCalledOnce();
+  expect(commit).not.toHaveBeenCalled();
+});

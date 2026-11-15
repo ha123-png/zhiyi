@@ -31,7 +31,7 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
-def scope_identity(value):
+def scope_identity(value, *, session=None):
     keys = (
         "workspace",
         "table_id",
@@ -49,6 +49,14 @@ def scope_identity(value):
     result = {
         k: value[k] for k in keys if value.get(k) or (k in {"row_ids", "source_keys"} and value.get(k) is not None)
     }
+    if session is not None and result.get("task_id") and result.get("table_id"):
+        from document_pipeline_api.models import FileCurrentDataRecord
+
+        current = session.get(FileCurrentDataRecord, result["task_id"])
+        if current is not None and current.table_id == result["table_id"]:
+            # Completion adds this derived parent without granting the whole table.
+            # Explicit extra tables and every detail/search/view boundary remain.
+            result.pop("table_id")
     for key in ("table_ids", "task_ids", "template_ids", "row_ids", "source_keys"):
         if isinstance(result.get(key), list):
             result[key] = sorted(set(result[key]))
@@ -72,7 +80,7 @@ def message_state_fingerprint(parts_json, context_json):
 
 
 def native_context_segment(raw, profile_id, profile_version, saved_tools, *, parts_json,
-                           context_json, current_context):
+                           context_json, current_context, session=None):
     """Only replay completed, unchanged, same-model protocol segments.
 
     The caller must still apply current resource scope filtering before calling.
@@ -90,7 +98,7 @@ def native_context_segment(raw, profile_id, profile_version, saved_tools, *, par
         if value.get("source_state") != message_state_fingerprint(parts_json, context_json):
             return None
         previous_context = json.loads(context_json)
-        if (scope_identity(previous_context) != scope_identity(current_context)
+        if (scope_identity(previous_context, session=session) != scope_identity(current_context, session=session)
                 or previous_context.get("mode") != current_context.get("mode")
                 or set(previous_context.get("capabilities", []))
                 != set(current_context.get("capabilities", []))):
@@ -219,6 +227,7 @@ def summarize_result(result, *, history=False, status=None):
         return {
             **{k: v for k, v in result.items() if k != "extraction"},
             "extraction_available": True,
+            "version": extraction.get("version"),
             "result_preview": preview,
             "item_count": extraction.get("item_count", len(business.get("items", []))) if isinstance(business, dict) else None,
             "validation_issues": extraction.get("validation_issues", [])[:10],
@@ -338,6 +347,14 @@ def model_result(result, tool_id, budget=6000):
         return value
     small = {"tool_id": summary.get("tool_id", tool_id), "context_limited": True,
         "notice": "有界预览；完整结果保存在本机，可用 read_tool_result 按字段和偏移读取。预览不能代表全部记录。"}
+    # A page-one reread may have changed the file version. Keep its warning
+    # before allocating space to business previews, while bounding all text.
+    for key in ("notice", "note"):
+        if isinstance(summary.get(key), str):
+            text = preview_values(summary[key])
+            candidate = {**small, key: f"{text} {small[key]}" if key == "notice" else text}
+            if len(encode(candidate)) <= budget * 0.7:
+                small = candidate
     # Preserve facts/identifiers first. Even error messages, column lists and
     # user-controlled names must obey the transport budget.
     for key in ("analysis_id", "snapshot_id", "reference", "source", "totals", "row_count", "group_count",

@@ -24,10 +24,11 @@ from fastapi import (
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from PIL import Image
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.config import Settings
+from document_pipeline_api.models.system_setting import PENDING_DUPLICATE_ID_PATTERN, PENDING_DUPLICATE_PREFIX, SystemSettingRecord
 from document_pipeline_api.public_errors import public_error_message
 from document_pipeline_api.db import get_session
 from document_pipeline_api.domain.tasks import TaskStatus
@@ -36,6 +37,11 @@ from document_pipeline_api.models.task import TaskRecord
 from document_pipeline_api.schemas.extraction import ExtractionRead, ReviewUpdate
 from document_pipeline_api.schemas.data_tables import ConfirmRequest, ConfirmationRead
 from document_pipeline_api.schemas.tasks import (
+    MAX_TASK_QUERY_IDS,
+    TaskQueryId,
+    TaskBatchRetryResult,
+    TaskGroup,
+    TaskGroupCounts,
     TaskRead,
     TaskTemplateSelection,
     TasksSummary,
@@ -54,6 +60,7 @@ from document_pipeline_api.services.tasks import (
     retry_tasks,
     select_task_template,
     accept_task_scope,
+    task_terminal_window_expression,
 )
 from document_pipeline_api.services.file_formats import (
     UnsupportedTextFileError,
@@ -66,6 +73,9 @@ from document_pipeline_api.services.queue_pause import (
     is_queue_paused,
 )
 from document_pipeline_api.storage_paths import resolve_task_storage_path
+
+
+from document_pipeline_api.api.numeric_body import validate_numeric_body
 
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -139,13 +149,21 @@ def get_tasks(
     search: str | None = None,
     template_id: str | None = None,
     since: datetime | None = None,
+    terminal_since: datetime | None = None,
+    group: TaskGroup | None = None,
+    task_ids: Annotated[list[TaskQueryId] | None, Query(max_length=MAX_TASK_QUERY_IDS)] = None,
 ) -> list[TaskRead]:
     """任务列表。limit/offset 用于历史页分页；active_only 供全局任务条与状态监控轮询
     （只拉还在动的任务，避免万级历史任务每次全量加载）；status/search/template_id/since
-    供历史页服务端筛选。记录数来自唯一当前数据，清空后为零；原始提取快照仍保留。
+    供历史页服务端筛选。task_ids 为有界的显式任务集合（重复 query 参数），与筛选条件
+    取交集后仍按原规则排序/分页；不存在的 ID 不返回，不按最近历史推断批次。
+    terminal_since 仅过滤较早且无需继续处理的完成/取消记录，按 UTC 更新时间判断；
+    不影响旧 since 的全状态时间筛选语义。记录数来自唯一当前数据，清空后为零。
     """
     # 1.0 前把旧的“省略 limit 即全表返回”收紧为默认 100 条。继续全量返回会让
     # 一个长期运行的本地实例最终耗尽 API/浏览器内存；集成方应显式翻页。
+    from document_pipeline_api.services.read_snapshot import begin_read_snapshot
+    begin_read_snapshot(session)
     tasks = list_tasks(
         session,
         limit=limit,
@@ -156,6 +174,9 @@ def get_tasks(
         search=search,
         template_id=template_id,
         since=since,
+        terminal_since=terminal_since,
+        task_ids=task_ids,
+        group=group,
     )
     task_ids = [task.id for task in tasks]
     if not task_ids:
@@ -181,8 +202,10 @@ def get_tasks(
             elapsed_seconds[task_id] = round(float(elapsed), 1)
             processing_engines[task_id] = "multimodal_model"
             processing_models[task_id] = model_name
+    from document_pipeline_api.services.task_presentation import pending_details_for_tasks
+    pending_details = pending_details_for_tasks(session, tasks)
     return [
-        TaskRead.model_validate(task).model_copy(
+        TaskRead.model_validate(task, context={"pending_details": pending_details}).model_copy(
             update={
                 "internal_storage": _storage_description(request.app.state.settings, task),
                 "record_count": record_counts.get(task.id, 0),
@@ -204,39 +227,21 @@ def _storage_description(settings, task):
         return {**task.internal_storage, "error": "原件位置无法验证，请检查存储目录。"}
 
 
-def _extraction_snapshot_rows(document_kind: str, result_json: str) -> int:
-    """提取快照的记录数：明细取 items 长度；没有明细但表头字段有内容时算 1 条，
-    更符合直觉——只有表头没有明细的提取（如自定义模板）也算一条记录。"""
-    try:
-        payload = json.loads(result_json)
-    except (TypeError, ValueError):
-        return 0
-    if not isinstance(payload, dict):
-        return 1 if payload else 0
-    items = payload.get("items")
-    if isinstance(items, list):
-        if items:
-            return len(items)
-        items = []
-    # 表头：自定义模板结果在 header 下，内置单据结果在顶层（items 之外的字段）
-    header = payload.get("header") if isinstance(payload.get("header"), dict) else payload
-    if any(header.get(key) not in (None, "") for key in header):
-        return 1
-    return 0
-
-
 @router.get("/summary", response_model=TasksSummary)
 def tasks_summary(
     session: SessionDependency,
     search: str | None = None,
     template_id: str | None = None,
     since: datetime | None = None,
+    terminal_since: datetime | None = None,
 ) -> TasksSummary:
     """各状态任务计数（历史页统计条与 tab 计数）。
 
     支持与列表相同的筛选参数，便于在"搜索/模板/时间筛选"下计算总页数；
     用 SQL 聚合（status 列在复合索引内），不加载任务全表。
     """
+    from document_pipeline_api.services.read_snapshot import begin_read_snapshot
+    begin_read_snapshot(session)
     statement = select(TaskRecord.status, func.count()).group_by(TaskRecord.status)
     if search:
         from document_pipeline_api.services.tasks import task_name_matches
@@ -246,6 +251,8 @@ def tasks_summary(
     if since is not None:
         from document_pipeline_api.services.tasks import normalize_task_since
         statement = statement.where(TaskRecord.updated_at >= normalize_task_since(since))
+    if terminal_since is not None:
+        statement = statement.where(task_terminal_window_expression(terminal_since))
     rows = session.execute(statement).all()
     summary = TasksSummary(total=sum(count for _, count in rows))
     from document_pipeline_api.services.tasks import ACTIVE_TASK_STATUSES
@@ -271,6 +278,15 @@ def tasks_summary(
     if statement.whereclause is not None:
         export_count = export_count.where(statement.whereclause)
     summary.pending_exports = session.scalar(export_count) or 0
+    from document_pipeline_api.services.tasks import task_group_expression
+    groups = ("all", "active", "pending", "completed", "failed", "cancelled")
+    group_statement = select(*[
+        func.coalesce(func.sum(case((task_group_expression(group), 1), else_=0)), 0)
+        for group in groups
+    ]).select_from(TaskRecord)
+    if statement.whereclause is not None:
+        group_statement = group_statement.where(statement.whereclause)
+    summary.group_counts = TaskGroupCounts(**dict(zip(groups, session.execute(group_statement).one())))
     return summary
 
 
@@ -283,6 +299,8 @@ async def create_task(
     template_id: Annotated[str | None, Form()] = None,
     target_table_id: Annotated[str | None, Form()] = None,
     duplicate_policy: Annotated[Literal["reject", "allow"], Form()] = "reject",
+    expected_sha256: Annotated[str | None, Form(pattern=r"^[a-f0-9]{64}$")] = None,
+    pending_duplicate_id: Annotated[str | None, Form(pattern=PENDING_DUPLICATE_ID_PATTERN)] = None,
 ) -> TaskRead:
     settings: Settings = request.app.state.settings
     task = await create_task_from_upload(
@@ -293,15 +311,10 @@ async def create_task(
         template_id,
         target_table_id=target_table_id,
         duplicate_policy=duplicate_policy,
+        expected_sha256=expected_sha256,
+        pending_duplicate_id=pending_duplicate_id,
     )
-    from document_pipeline_api.services.internal_storage import classify_task_original
-    classify_task_original(session, settings, task.id)
-    frozen = freeze_new_task_if_paused(session, task.id)
-    if settings.queue_enabled and not frozen:
-        from document_pipeline_api.services.queueing import enqueue_task
-
-        enqueue_task(task.id)
-    return TaskRead.model_validate(task)
+    return _finish_upload(session, settings, task)
 
 
 class NativeImportRequest(BaseModel):
@@ -311,6 +324,8 @@ class NativeImportRequest(BaseModel):
     template_id: str | None = None
     target_table_id: str | None = None
     duplicate_policy: Literal["reject", "allow"] = "reject"
+    expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    pending_duplicate_id: str | None = Field(default=None, pattern=PENDING_DUPLICATE_ID_PATTERN)
 
 
 @router.post("/native-import", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
@@ -329,6 +344,8 @@ async def native_import(request: Request, session: SessionDependency, body: Nati
                     UploadFile(source, filename=name, headers=Headers({"content-type": content_type})),
                     body.template_mode, body.template_id, target_table_id=body.target_table_id,
                     duplicate_policy=body.duplicate_policy,
+                    expected_sha256=body.expected_sha256,
+                    pending_duplicate_id=body.pending_duplicate_id,
                     source_file={key: value for key, value in origin.items() if key != "expires"})
             except HTTPException as error:
                 if (error.status_code == 409 and isinstance(error.detail, dict)
@@ -339,6 +356,45 @@ async def native_import(request: Request, session: SessionDependency, body: Nati
                 raise
     except (CopyExportError, OSError) as error:
         raise HTTPException(422, str(error) if isinstance(error, CopyExportError) else "无法读取所选文件，请关闭占用程序或重新选择文件。") from error
+    return _finish_upload(session, settings, task)
+
+
+@router.post("/pending-duplicates/{item_id}/extract", response_model=TaskRead, status_code=201)
+async def extract_pending_duplicate(request: Request, item_id: Annotated[str, ApiPath(pattern=PENDING_DUPLICATE_ID_PATTERN)],
+                                    session: SessionDependency) -> TaskRead:
+    from starlette.datastructures import Headers
+    from document_pipeline_api.services.file_operation_lock import file_operation_lock
+    from document_pipeline_api.services.tasks import UploadFingerprintMismatch
+
+    settings: Settings = request.app.state.settings
+    with file_operation_lock(settings.storage_dir):
+        pending = session.get(SystemSettingRecord, PENDING_DUPLICATE_PREFIX + item_id)
+        if pending is None:
+            raise HTTPException(404, "这条待确认记录已经处理。")
+        item = json.loads(pending.value)
+        original = session.get(TaskRecord, item["existingTaskId"])
+        unavailable = {"code": "original_unavailable", "message": "保存的原件无法读取或内容已变化，请选择原件。"}
+        if original is None or original.sha256 != item.get("sha256"):
+            raise HTTPException(409, unavailable)
+        try:
+            path = resolve_task_storage_path(settings.storage_dir, original)
+            source = path.open("rb")
+        except (ValueError, OSError) as error:
+            raise HTTPException(409, unavailable) from error
+        with source:
+            selection = item["selection"]
+            try:
+                task = await create_task_from_upload(
+                    session, settings, UploadFile(source, filename=item["name"], headers=Headers({"content-type": original.content_type})),
+                    "smart" if selection == "smart" else "manual", None if selection == "smart" else selection,
+                    duplicate_policy="allow", expected_sha256=item["sha256"], pending_duplicate_id=item_id,
+                )
+            except UploadFingerprintMismatch as error:
+                raise HTTPException(409, unavailable) from error
+    return _finish_upload(session, settings, task)
+
+
+def _finish_upload(session: Session, settings: Settings, task: TaskRecord) -> TaskRead:
     from document_pipeline_api.services.internal_storage import classify_task_original
     classify_task_original(session, settings, task.id)
     frozen = freeze_new_task_if_paused(session, task.id)
@@ -363,11 +419,12 @@ def cancel(request: Request, task_id: str, session: SessionDependency) -> TaskRe
 def retry(request: Request, task_id: str, session: SessionDependency, use_current_settings: bool = False) -> TaskRead:
     settings: Settings = request.app.state.settings
     task = retry_task(session, settings, task_id, use_current_settings=use_current_settings)
-    frozen = freeze_new_task_if_paused(session, task.id)
-    if settings.queue_enabled and not frozen:
-        from document_pipeline_api.services.queueing import enqueue_task
+    if task.status == TaskStatus.QUEUED.value:
+        frozen = freeze_new_task_if_paused(session, task.id)
+        if settings.queue_enabled and not frozen:
+            from document_pipeline_api.services.queueing import enqueue_task
 
-        enqueue_task(task.id)
+            enqueue_task(task.id)
     return TaskRead.model_validate(task)
 
 
@@ -375,29 +432,32 @@ class BatchRetryRequest(BaseModel):
     task_ids: list[str] = Field(min_length=1)
 
 
-@router.post("/batch-retry")
+@router.post("/batch-retry", response_model=TaskBatchRetryResult)
 def retry_batch(
     request: Request,
     body: BatchRetryRequest,
     session: SessionDependency,
-) -> dict[str, object]:
+) -> TaskBatchRetryResult:
     settings: Settings = request.app.state.settings
-    retried = retry_tasks(session, settings, body.task_ids)
+    result = retry_tasks(session, settings, body.task_ids)
     runnable = [
         task_id
-        for task_id in retried
-        if not freeze_new_task_if_paused(session, task_id)
+        for task_id in result.retried
+        if (task := session.get(TaskRecord, task_id)) is not None
+        and task.status == TaskStatus.QUEUED.value
+        and not freeze_new_task_if_paused(session, task_id)
     ]
     if settings.queue_enabled:
         from document_pipeline_api.services.queueing import enqueue_task
 
         for task_id in runnable:
             enqueue_task(task_id)
-    return {"retried": retried, "skipped": len(body.task_ids) - len(retried)}
+    return result
 
 
 class BatchDeleteRequest(BaseModel):
-    task_ids: list[str] = Field(min_length=1)
+    task_ids: list[str] = Field(default_factory=list)
+    pending_ids: list[Annotated[str, Field(pattern=PENDING_DUPLICATE_ID_PATTERN)]] = Field(default_factory=list)
 
 
 @router.post("/batch-delete")
@@ -407,7 +467,9 @@ def delete_batch(
     session: SessionDependency,
 ) -> dict[str, object]:
     settings: Settings = request.app.state.settings
-    deleted, kept_rows = delete_tasks_batch(session, settings, body.task_ids)
+    if not body.task_ids and not body.pending_ids:
+        raise HTTPException(422, "请选择要删除的记录。")
+    deleted, kept_rows = delete_tasks_batch(session, settings, body.task_ids, pending_ids=body.pending_ids)
     from document_pipeline_api.services.original_cleanup import pending_cleanup_count
     pending = pending_cleanup_count(session, body.task_ids)
     return {
@@ -460,10 +522,19 @@ def select_template(
 ) -> TaskRead:
     settings: Settings = request.app.state.settings
     if selection.target_table_id:
+        from document_pipeline_api.services.read_snapshot import begin_write_snapshot
+        from document_pipeline_api.services.task_presentation import pending_details_for_task
+        begin_write_snapshot(session)
+        session.expire_all()
+        task = session.get(TaskRecord, task_id)
+        if task is None:
+            raise HTTPException(404, "没有找到这个任务。")
+        if pending_details_for_task(task, session)["pending_action"] != "confirm_target_table":
+            raise HTTPException(409, "这个任务当前不需要确认数据表，请刷新任务状态。")
         confirmation = confirm_task(
             session,
             task_id,
-            0,
+            selection.expected_review_version if selection.expected_review_version is not None else 0,
             target_table_id=selection.target_table_id,
         )
         from document_pipeline_api.services.task_exports import process_task_export
@@ -522,7 +593,7 @@ def export_action(task_id: str, body: ExportAction, request: Request, session: S
     return act_on_task_export(session, request.app.state.settings, task_id, body)
 
 
-@router.put("/{task_id}/review", response_model=ExtractionRead)
+@router.put("/{task_id}/review", response_model=ExtractionRead, dependencies=[Depends(validate_numeric_body)])
 def update_review(
     task_id: str,
     update: ReviewUpdate,

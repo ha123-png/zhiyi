@@ -5,17 +5,13 @@ import pytest
 from openpyxl import Workbook
 from PIL import Image
 
+from document_pipeline_api.services.document_preview import docx_window
 from document_pipeline_api.services.file_formats import (
-    MAX_LINES_PER_PAGE,
     UnsupportedImageError,
     UnsupportedTextFileError,
-    extract_docx_blocks,
     extract_text,
     inspect_image_frame_count,
-    normalize_image,
     render_image_frames,
-    render_text_pages,
-    split_text_pages,
 )
 
 
@@ -23,7 +19,7 @@ def test_word_preview_accepts_plain_document_without_relationships(tmp_path: Pat
     path = tmp_path / "plain.docx"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("word/document.xml", '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>正文仍可阅读</w:t></w:r></w:p></w:body></w:document>''')
-    assert extract_docx_blocks(path, max_uncompressed_bytes=10000) == [
+    assert docx_window(path, 0, max_uncompressed_bytes=10000)["blocks"] == [
         {"type": "paragraph", "text": "正文仍可阅读"},
     ]
 
@@ -34,7 +30,7 @@ def test_word_preview_keeps_image_in_heading(tmp_path: Path):
         archive.writestr("word/document.xml", '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>图示题目</w:t><w:drawing><a:blip r:embed="rId1"/></w:drawing></w:r></w:p></w:body></w:document>''')
         archive.writestr("word/_rels/document.xml.rels", '<Relationships><Relationship Id="rId1" Target="media/image1.png"/></Relationships>')
         archive.writestr("word/media/image1.png", b"image-placeholder")
-    assert extract_docx_blocks(path, max_uncompressed_bytes=10000) == [
+    assert docx_window(path, 0, max_uncompressed_bytes=10000)["blocks"] == [
         {"type": "heading", "level": 1, "text": "图示题目"},
         {"type": "image", "image_index": 1, "caption": "图片 1"},
     ]
@@ -48,12 +44,11 @@ def _bmp_bytes() -> bytes:
     return buffer.getvalue()
 
 
-def test_normalize_image_converts_bmp_to_png(tmp_path: Path) -> None:
+def test_render_image_frames_converts_bmp_to_png(tmp_path: Path) -> None:
     source = tmp_path / "sample.bmp"
-    target = tmp_path / "sample.png"
     source.write_bytes(_bmp_bytes())
 
-    normalize_image(source, target)
+    [target] = render_image_frames(source, tmp_path, "bmp", max_frames=1)
 
     with Image.open(target) as image:
         assert image.format == "PNG"
@@ -157,31 +152,3 @@ def test_office_uncompressed_budget_is_enforced_before_parsing(tmp_path: Path) -
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             max_uncompressed_bytes=100,
         )
-
-
-def test_split_text_pages_enforces_max_pages() -> None:
-    text = "\n".join(f"行 {index}" for index in range(MAX_LINES_PER_PAGE * 3))
-    pages = split_text_pages(text, max_pages=3)
-    assert len(pages) == 3
-
-    with pytest.raises(UnsupportedTextFileError):
-        split_text_pages(text, max_pages=2)
-
-
-def test_empty_text_is_rejected() -> None:
-    with pytest.raises(UnsupportedTextFileError):
-        split_text_pages("  \n \n", max_pages=5)
-
-
-@pytest.mark.skipif(
-    not (Path("C:/Windows/Fonts/msyh.ttc").exists()
-         or Path("C:/Windows/Fonts/simsun.ttc").exists()
-         or Path("C:/Windows/Fonts/simhei.ttf").exists()),
-    reason="需要 Windows 系统中文字体",
-)
-def test_render_text_pages_produces_pngs(tmp_path: Path) -> None:
-    rendered = render_text_pages(["第一行\n第二行"], tmp_path, "task-1")
-
-    assert len(rendered) == 1
-    with Image.open(rendered[0]) as image:
-        assert image.format == "PNG"

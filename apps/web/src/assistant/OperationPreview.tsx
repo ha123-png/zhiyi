@@ -25,22 +25,29 @@ export function containsTemplateWrite(result: ToolResult) {
 }
 
 type Change = { id: string; row: number | undefined; name?: string; field: string; before: unknown; after: unknown };
-type ChangeGroup = { name: string; fields: string[]; columns: Record<string, string>; changes: Map<string, Change>; notes: Set<string>; increments: Set<string> };
+type ChangeGroup = { table: string; name: string; fields: string[]; columns: Record<string, string>; changes: Map<string, Change>; notes: Set<string>; increments: Set<string> };
 
 export function OperationPreview({ result }: { result: ToolResult }) {
   const items = (result.items || []) as Item[];
   const groups = new Map<string, ChangeGroup>();
+  const positionsByTable = new Map<string, Map<number | undefined, number>>();
   const other: Item[] = [];
   const affectedRecords = new Set<string>();
+  const positionFor = (table: string, row: number | undefined) => {
+    const positions = positionsByTable.get(table) || new Map<number | undefined, number>();
+    positionsByTable.set(table, positions);
+    if (!positions.has(row)) positions.set(row, positions.size + 1);
+    return positions.get(row)!;
+  };
   for (const item of items) {
+    const table = item.operation.table_id || item.name || "数据表";
     if (!["update_rows", "increment_rows"].includes(item.operation.kind)) {
       other.push(item);
       continue;
     }
     const fields = [...new Set(item.affected.flatMap(row => Object.keys(record(row.after))))].filter(k => !k.startsWith("__")).sort();
-    const table = item.operation.table_id || item.name || "数据表";
     const key = JSON.stringify([table, fields]);
-    const group: ChangeGroup = groups.get(key) || { name: item.name || "数据表", fields, columns: {}, changes: new Map(), notes: new Set(), increments: new Set() };
+    const group: ChangeGroup = groups.get(key) || { table, name: item.name || "数据表", fields, columns: {}, changes: new Map(), notes: new Set(), increments: new Set() };
     Object.assign(group.columns, item.columns);
     if (item.note) group.notes.add(item.note);
     if (item.operation.kind === "increment_rows") {
@@ -58,22 +65,26 @@ export function OperationPreview({ result }: { result: ToolResult }) {
     }
     groups.set(key, group);
   }
+  // Match the rendered order: grouped changes first, then other operations.
+  for (const group of groups.values()) for (const change of group.changes.values()) positionFor(group.table, change.row);
+  const otherWithPositions = other.map(item => ({ item, positions: item.affected.map(row =>
+    row.task_id ? 0 : positionFor(item.operation.table_id || item.name || "数据表", row.row_id)) }));
   return <div className="ask-plan">
     <h4>{String(result.title || "变更预览")}</h4>
-    {!!affectedRecords.size && <p className="ask-plan-summary">影响 {affectedRecords.size} 条记录 · {Array.from(groups.values()).reduce((sum, group) => sum + group.changes.size, 0)} 处字段变更</p>}
+    {!!affectedRecords.size && <p className="ask-plan-summary">修改 {affectedRecords.size} 条记录 · {Array.from(groups.values()).reduce((sum, group) => sum + group.changes.size, 0)} 处字段变更</p>}
     {Array.from(groups.entries()).map(([key, group]) => <section className="ask-plan-item" key={key}>
       <h5>{group.name} · {group.fields.map(field => group.columns[field] || field).join("、")}</h5>
       {group.increments.size === 1 && Array.from(group.increments)[0] && <p className="ask-plan-note">{Array.from(group.increments)[0]}</p>}
       <div className="ask-data-scroll" role="region" aria-label={`${group.name}变更记录`} tabIndex={0}>
         <table className="ask-change-table"><thead><tr><th>记录</th>{group.fields.length > 1 && <th>字段</th>}<th>修改前</th><th>修改后</th></tr></thead>
           <tbody>{Array.from(group.changes.values()).map(change => <tr key={change.id}>
-            <td>{change.name ? <span className="ask-record-label">{change.name}<small>#{change.row}</small></span> : `#${change.row}`}</td>{group.fields.length > 1 && <td>{group.columns[change.field] || change.field}</td>}
+            <td>{change.name ? <span className="ask-record-label">{change.name}</span> : `预览记录 ${positionFor(group.table, change.row)}`}</td>{group.fields.length > 1 && <td>{group.columns[change.field] || change.field}</td>}
             <td>{value(change.before)}</td><td>{value(change.after)}</td>
           </tr>)}</tbody></table>
       </div>
       {Array.from(group.notes).map(note => <p className="ask-plan-note" key={note}>{note}</p>)}
     </section>)}
-    {other.map((item, index) => <section className="ask-plan-item" key={index}>
+    {otherWithPositions.map(({ item, positions }, index) => <section className="ask-plan-item" key={index}>
       <h5>{item.label}{item.name ? ` · ${item.name}` : ""}</h5>
       {item.operation.kind.includes("template") ? <p>此历史模板提案已停止支持执行。请在模板页查看或编辑模板。</p> : <>
         {!!item.affected.length && <div className="ask-data-scroll" role="region" aria-label={`${item.name || item.label}变更记录`} tabIndex={0}>
@@ -81,7 +92,7 @@ export function OperationPreview({ result }: { result: ToolResult }) {
             <tbody>{item.affected.flatMap((row, i) => row.task_id ? <tr key={row.task_id}>
               <td>{row.name}</td><td>{row.model} · {row.provider}</td><td>{labels[value(row.before)] || value(row.before)}</td><td>{labels[value(row.after)] || value(row.after)}</td>
             </tr> : Object.keys(record(row.after === null ? row.before : row.after)).filter(k => !k.startsWith("__")).map(k => <tr key={`${i}-${k}`}>
-              <td>#{row.row_id}</td><td>{item.columns?.[k] || k}</td><td>{value(record(row.before)[k])}</td><td>{row.after === null ? "删除记录" : value(record(row.after)[k])}</td>
+              <td>{row.name || `预览记录 ${positions[i]}`}</td><td>{item.columns?.[k] || k}</td><td>{value(record(row.before)[k])}</td><td>{row.after === null ? "删除记录" : value(record(row.after)[k])}</td>
             </tr>))}</tbody></table>
         </div>}
         {!item.affected.length && (item.operation.kind === "add_rows" && Array.isArray(item.after) ? <>

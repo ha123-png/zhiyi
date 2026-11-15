@@ -44,8 +44,8 @@ def _workbook(session, files, output):
     workbook = Workbook(write_only=True)
     workbook.properties.subject = "zhiyi:per-file-export:v1"
     directory = workbook.create_sheet("目录")
-    directory.append([_cell(directory, text, bold=True) for text in ("文件", "工作表", "明细数", "文件标识")])
-    used = {"目录"}
+    directory.append([_cell(directory, text, bold=True) for text in ("文件", "工作表", "明细数")])
+    used = {"目录".casefold()}
     try:
         for current in files:
             schema = json.loads(current.schema_json)
@@ -56,14 +56,6 @@ def _workbook(session, files, output):
             sheet.column_dimensions["A"].width = 28
             sheet.column_dimensions["B"].width = 55
             sheet.append([_cell(sheet, "文件", bold=True), _cell(sheet, filename)])
-            sheet.append([_cell(sheet, "文件标识"), _cell(sheet, current.task_id)])
-            sheet.append(["上传原名", _cell(sheet, current.source.filename)])
-            sheet.append([_cell(sheet, "当前数据版本"), _cell(sheet, current.current_version)])
-            extraction = session.get(ExtractionRecord, current.task_id)
-            if extraction and extraction.input_scope_json:
-                sheet.append(["提取读取范围", _cell(sheet, extraction.input_scope_json)])
-            if json.loads(current.validation_json):
-                sheet.append([_cell(sheet, "校验状态"), _cell(sheet, "仍有待处理问题，请在文件历史中查看")])
             sheet.append([])
             sheet.append([_cell(sheet, "文件级字段", bold=True), _cell(sheet, "内容", bold=True)])
             for column in schema:
@@ -83,7 +75,7 @@ def _workbook(session, files, output):
                 count += 1
             link = _cell(directory, title)
             link.hyperlink = "#'" + title.replace("'", "''") + "'!A1"
-            directory.append([_cell(directory, filename), link, _cell(directory, count), _cell(directory, current.task_id)])
+            directory.append([_cell(directory, filename), link, _cell(directory, count)])
         workbook.save(output)
     except Exception:
         # Workbook.close() alone does not finish write-only sheet generators or
@@ -127,7 +119,7 @@ def export_files_excel(session, table, *, pack=False, selection=None):
                         with archive.open(name, "w", force_zip64=True) as target:
                             import shutil
                             shutil.copyfileobj(part, target, length=1024 * 1024)
-                    manifest.append({"workbook": name, "files": [{"id": file.task_id, "filename": file.source.display_filename} for file in files]})
+                    manifest.append({"workbook": name, "files": [file.source.display_filename for file in files]})
                 archive.writestr("目录.json", json.dumps({"total_files": count, "parts": manifest}, ensure_ascii=False))
             return _response(output, table.name + selection.suffix + "-Excel分包.zip", "application/zip", selection)
         _workbook(session, session.scalars(selection.files).all(), output)

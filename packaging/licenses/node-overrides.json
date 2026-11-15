@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "packages": {
+    "@napi-rs/canvas-win32-x64-msvc@1.0.5": {
+      "version": "1.0.5",
+      "package_integrity": "sha512-KQQwG9/sBmcGxqaLFIQf+k2OefREGoyEaIBmRuTM8bUuFKOEE9Xk5pel90hE6pmBwk/vo4RB0OdX+FxobJGMFw==",
+      "package_tree_sha256": "859c957d21e57854319734164cd7db6d12ba673387d5cabefaae4dabdb9ccff0",
+      "file": "canvas-1.0.5-upstream-LICENSE.txt",
+      "sha256": "8802fecf9da4367bc23bcf20b21cc143785fc6c92b152f3fa7fbe6ce08d344d6",
+      "license": "MIT",
+      "source_url": "https://raw.githubusercontent.com/Brooooooklyn/canvas/e719be9c97d510061bc73b19feac999bc69b6c83/LICENSE",
+      "source_revision": "e719be9c97d510061bc73b19feac999bc69b6c83",
+      "source_git_blob_sha1": "e0024071be828a07166aef9825c50a1912f652ac",
+      "disclosure": "同版本上游 canvas v1.0.5 根许可证，与同版本 @napi-rs/canvas 所附许可证逐字节一致；该平台二进制包自身未附全文。",
+      "nested_license_sha256": {}
+    },
+    "victory-vendor@37.3.6": {
+      "version": "37.3.6",
+      "package_integrity": "sha512-SbPDPdDBYp+5MJHhBCAyI7wKM3d5ivekigc2Dk2s7pgbZ9wIgIBYGVw4zGHBml/qTFbexrofXW6Gu4noGxrOwQ==",
+      "package_tree_sha256": "711e1968a14c1469ac6e18caa6ecd299ac30eee36acc680b431bd3f2ca9a8611",
+      "file": "victory-vendor-37.3.6-upstream-LICENSE.txt",
+      "sha256": "34dee5fd5e5cc756efb5ad4d64652bce719bdf5e900ca5d7538253e737930bc4",
+      "license": "MIT AND ISC AND BSD-3-Clause",
+      "source_url": "https://raw.githubusercontent.com/FormidableLabs/victory/d9d9ca2d5038d6ef9de91f2cef39e6fb2733baa6/LICENSE.txt",
+      "source_revision": "d9d9ca2d5038d6ef9de91f2cef39e6fb2733baa6",
+      "source_git_blob_sha1": "4d33f1aba85636b665016cabb1b991209177c606",
+      "disclosure": "上游 v37.3.6 仓库根许可证补全包自身 MIT；原包 lib-vendor 内 13 份许可证均另行保留，其中包含 BSD-3-Clause，原包 MIT AND ISC 声明不完整。",
+      "nested_license_sha256": {
+        "lib-vendor/d3-array/LICENSE": "faa682e3e430941f958d26180458f5934a62f58dac4d70ccdd15608c15d0f884",
+        "lib-vendor/d3-color/LICENSE": "faa682e3e430941f958d26180458f5934a62f58dac4d70ccdd15608c15d0f884",
+        "lib-vendor/d3-ease/LICENSE": "b989d9085148d21ff64a75e14462aefa06b2589a55553b07b1460c70081c7d08",
+        "lib-vendor/d3-format/LICENSE": "e008c5e25a6be382593089c29bfabbc553c6378eee02895aec46ce396cc404ee",
+        "lib-vendor/d3-interpolate/LICENSE": "e008c5e25a6be382593089c29bfabbc553c6378eee02895aec46ce396cc404ee",
+        "lib-vendor/d3-path/LICENSE": "0ab21426fad1e8b819ea8ab4c7faf5a24d4fca9c01572fe722490d600bba0d22",
+        "lib-vendor/d3-scale/LICENSE": "e008c5e25a6be382593089c29bfabbc553c6378eee02895aec46ce396cc404ee",
+        "lib-vendor/d3-shape/LICENSE": "e008c5e25a6be382593089c29bfabbc553c6378eee02895aec46ce396cc404ee",
+        "lib-vendor/d3-time-format/LICENSE": "e008c5e25a6be382593089c29bfabbc553c6378eee02895aec46ce396cc404ee",
+        "lib-vendor/d3-time/LICENSE": "e008c5e25a6be382593089c29bfabbc553c6378eee02895aec46ce396cc404ee",
+        "lib-vendor/d3-timer/LICENSE": "e008c5e25a6be382593089c29bfabbc553c6378eee02895aec46ce396cc404ee",
+        "lib-vendor/d3-voronoi/LICENSE": "ad6cf57648385d6c40a29f73c55e42922dd793823df5ea265ccd834873bf09b9",
+        "lib-vendor/internmap/LICENSE": "9ea8903938dab5f12c4572d60725069bec2d1b0dc3bcc210b09bae946a5ebb1f"
+      }
+    },
+    "react-remove-scroll-bar@2.3.8": {
+      "version": "2.3.8",
+      "package_integrity": "sha512-9r+yi9+mgU33AKcj6IbT9oRCO78WriSj6t/cF8DWBZJ9aOGPOTEDvdUDz1FwKim7QXWwmHqtdHnRJfhAxEG46Q==",
+      "package_tree_sha256": "a40091964018613e8761538e95a2d396e0674184d306944632f1189b3ffa8df5",
+      "file": "react-remove-scroll-bar-2.3.8-later-upstream-LICENSE.txt",
+      "sha256": "a79aae0c0f21990d9d963bb3c5a79cdcea9a46f8523ba55c58d7fe776b6ebc84",
+      "license": "MIT",
+      "source_url": "https://raw.githubusercontent.com/theKashey/react-remove-scroll-bar/7301c160fda44cb8cf2b9fdfde61efad35736196/LICENSE",
+      "source_revision": "7301c160fda44cb8cf2b9fdfde61efad35736196",
+      "source_git_blob_sha1": "7c08c3990396ecefd90f99ff5d9a34f26f5b5616",
+      "disclosure": "2.3.8 原包 README 和 package.json 声明 MIT、作者 Anton Korzunov；此文件由上游于 2025-05-21 后补，不是该 tarball 原件，其与发布 gitHead 的祖先关系未证实。",
+      "nested_license_sha256": {}
+    },
+    "use-composed-ref@1.4.0": {
+      "version": "1.4.0",
+      "package_integrity": "sha512-djviaxuOOh7wkj0paeO1Q/4wMZ8Zrnag5H6yBvzN7AKKe8beOaED9SF5/ByLqsku8NP4zQqsvM2u3ew/tJK8/w==",
+      "package_tree_sha256": "716efa94e356079d24873ac2d0ceb9f9f21f419e00e2740061bd15c73db3a56f",
+      "file": "use-composed-ref-1.4.0-SPDX-MIT.txt",
+      "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5",
+      "license": "MIT",
+      "source_url": "https://raw.githubusercontent.com/spdx/license-list-data/d46e94e2c78ceede1cfc63cfa0396472d2798d4c/text/MIT.txt",
+      "source_revision": "d46e94e2c78ceede1cfc63cfa0396472d2798d4c",
+      "source_git_blob_sha1": "d817195dad53ec992418c28ffca5fbd1cd86502a",
+      "disclosure": "标准 SPDX MIT 许可文本；精确版本 1.4.0 上游 package.json 声明 MIT，但上游未附许可证全文或版权声明；不推定作者为版权人或虚构年份。",
+      "nested_license_sha256": {}
+    }
+  }
+}

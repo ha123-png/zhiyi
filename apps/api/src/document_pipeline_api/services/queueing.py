@@ -10,6 +10,9 @@ from document_pipeline_api.worker import run_extraction
 def enqueue_task(task_id: str) -> str:
     task = run_extraction.s(task_id)
     task.id = task_id
+    # A previous pause or cancellation can leave a one-use revocation even
+    # after its old message has already been consumed.
+    huey.restore_by_id(task_id)
     huey.enqueue(task)
     return task_id
 

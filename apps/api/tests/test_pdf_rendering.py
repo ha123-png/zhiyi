@@ -7,7 +7,6 @@ from PIL import Image
 from document_pipeline_api.services.pdf_rendering import (
     UnsupportedPdfError,
     render_pdf_pages,
-    render_single_page_pdf,
 )
 
 
@@ -24,10 +23,9 @@ def create_pdf(path: Path, pages: int) -> None:
 
 def test_renders_single_pdf_page_to_model_image(tmp_path: Path) -> None:
     pdf_path = tmp_path / "single.pdf"
-    image_path = tmp_path / "rendered" / "page.png"
     create_pdf(pdf_path, pages=1)
 
-    render_single_page_pdf(pdf_path, image_path)
+    [image_path] = render_pdf_pages(pdf_path, tmp_path / "rendered", max_pages=1)
 
     with Image.open(image_path) as image:
         assert image.width == 1785

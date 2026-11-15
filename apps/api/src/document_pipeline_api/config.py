@@ -36,6 +36,7 @@ class Settings:
     integration_read_token: str = ""
     integration_write_token: str = ""
     development_origins_enabled: bool = False
+    model_loaded_context_length: int | None = None
 
     @classmethod
     def local(cls) -> "Settings":

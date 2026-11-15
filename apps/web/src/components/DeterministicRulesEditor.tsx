@@ -98,9 +98,15 @@ export function DeterministicRulesEditor({ disabled, fields, rules, onChange, co
   const selectedType = available.find(field => pathFor(field) === fieldPath)?.value_type;
   const parsedMinimum = parseRuleNumber(minimum);
   const parsedMaximum = parseRuleNumber(maximum);
-  const validChoice = kind === "range" ? selectedType === "number"
+  const eligibleReference = (path: string, candidates: typeof available) => !path || candidates.some(field => pathFor(field) === path);
+  const validReferences = kind === "row_multiply"
+    ? [leftField, rightField, resultField].every(path => eligibleReference(path, numericItems))
+    : kind === "sum"
+      ? eligibleReference(leftField, numericItems) && eligibleReference(resultField, numericHeaders)
+      : eligibleReference(fieldPath, available);
+  const validChoice = validReferences && (kind === "range" ? selectedType === "number"
     : kind === "enum" ? splitValues(values).every(value => selectedType === "number" ? parseRuleNumber(value) !== null : selectedType === "boolean" ? ["true", "false"].includes(value) : true)
-    : kind === "pattern" ? labels.has(fieldPath) : true;
+    : kind === "pattern" ? labels.has(fieldPath) : true);
   const parsedTolerance = parseRuleNumber(tolerance);
   const validTolerance = !["row_multiply", "sum"].includes(kind) || (parsedTolerance !== null && parsedTolerance >= 0 && parsedTolerance <= 1000000);
   const validRange = kind !== "range" || (selectedType === "number"

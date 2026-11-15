@@ -136,15 +136,14 @@ def test_delete_last_detail_clears_header_preserves_file_and_history(engine):
             initialize_current(session, task_id="A", table_id="table", header={"customer": "甲"}, items=[], schema=SCHEMA)
 
 
-def test_stale_edit_and_invalid_type_are_rejected_without_partial_changes(engine):
+def test_manual_text_is_preserved_and_stale_edit_is_rejected_without_partial_changes(engine):
     with Session(engine) as session:
         first_id = current_snapshot(session, "A")["items"][0]["id"]
-        with pytest.raises(HTTPException) as error:
-            revise_current(session, "A", expected_version=0, header_changes={"customer": "不应保存"},
-                           detail_changes={first_id: {"quantity": "不是数字"}})
-        assert error.value.status_code == 422
-        assert current_snapshot(session, "A")["header"]["customer"] == "甲"
-        revise_current(session, "A", expected_version=0, header_changes={"customer": "乙"})
+        revise_current(session, "A", expected_version=0, header_changes={"customer": "乙"},
+                       detail_changes={first_id: {"quantity": "不是数字"}})
+        saved = current_snapshot(session, "A")
+        assert saved["header"]["customer"] == "乙"
+        assert saved["items"][0]["values"]["quantity"] == "不是数字"
         with pytest.raises(HTTPException) as error:
             revise_current(session, "A", expected_version=0, header_changes={"customer": "丙"})
         assert error.value.status_code == 409

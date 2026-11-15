@@ -1,6 +1,6 @@
 [project]
 name = "document-pipeline-api"
-version = "0.6.0"
+version = "0.7.0"
 description = "Local-first multimodal document data pipeline API"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -8,9 +8,9 @@ dependencies = [
   "fastapi==0.141.1",
   "httpx==0.28.1",
   "huey==3.3.0",
-  "mcp==1.28.1",
+  "mcp==1.30.0",
   "openpyxl==3.1.5",
-  "pillow>=12.3.0",
+  "pillow>=13.0.0",
   "pydantic==2.13.4",
   "pypdfium2>=5.12.1",
   "python-multipart==0.0.31",
@@ -43,7 +43,8 @@ packages = ["src/document_pipeline_api"]
 [tool.uv]
 # MCP brings PyJWT transitively; keep fresh resolutions above the reviewed
 # security fixes and the follow-up compact-token compatibility correction.
-constraint-dependencies = ["pyjwt>=2.15.1"]
+# HTTP clients also need the CA bundle with compromised emSign roots removed.
+constraint-dependencies = ["pyjwt>=2.15.1", "certifi>=2026.10.18"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

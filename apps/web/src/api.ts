@@ -48,6 +48,53 @@ export async function getGuideTopic(topic: string): Promise<GuideContent> {
   return readResponse(await apiFetch(`${API_BASE_URL}/guide/${encodeURIComponent(topic)}`));
 }
 
+export interface PendingDuplicateRecord {
+  id: string; name: string; size: number; selection: string;
+  existingTaskId: string; sha256?: string | null; createdAt: string; hasResult?: boolean;
+}
+export async function getPendingDuplicates(): Promise<PendingDuplicateRecord[]> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/user-state/pending-duplicates`));
+}
+export async function savePendingDuplicate(item: PendingDuplicateRecord) {
+  const { id, name, size, selection, existingTaskId, sha256, createdAt } = item;
+  return readResponse<PendingDuplicateRecord>(await apiFetch(`${API_BASE_URL}/user-state/pending-duplicates`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, name, size, selection, existingTaskId, sha256, createdAt }),
+  }));
+}
+export async function deletePendingDuplicate(id: string): Promise<void> {
+  const response = await apiFetch(`${API_BASE_URL}/user-state/pending-duplicates/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!response.ok) await readResponse(response);
+}
+
+export class StoredOriginalUnavailable extends Error {}
+
+export async function extractPendingDuplicate(id: string): Promise<Task> {
+  const response = await apiFetch(`${API_BASE_URL}/tasks/pending-duplicates/${encodeURIComponent(id)}/extract`, { method: "POST" });
+  if (response.status === 409) {
+    const body = await response.clone().json().catch(() => null);
+    if (body?.detail?.code === "original_unavailable") throw new StoredOriginalUnavailable(body.detail.message);
+  }
+  return readResponse(response);
+}
+
+export interface UpdateCheck { available: boolean; latest_version: string; checked_at: string; release_url: string; downloadable: boolean }
+export interface UpdateStatus { current_version: string; auto_check: boolean; result: UpdateCheck | null; downloaded_version: string | null; install_failed: boolean }
+export async function getUpdateStatus(): Promise<UpdateStatus> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/updates`));
+}
+export async function checkForUpdates(): Promise<UpdateCheck> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/updates/check`, { method: "POST" }));
+}
+export async function downloadAppUpdate(): Promise<{ downloaded_version: string }> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/updates/download`, { method: "POST" }));
+}
+export async function saveAutoUpdateCheck(auto_check: boolean): Promise<{ auto_check: boolean }> {
+  return readResponse(await apiFetch(`${API_BASE_URL}/updates`, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ auto_check }),
+  }));
+}
+
 export interface FileRevisionSummary {
   id: string; version: number; operation: string; editor: string; created_at: string;
   sealed: boolean; modified_fields: number; deleted_details: number; added_details: number;
@@ -116,11 +163,11 @@ export interface LocalExportBinding {
 }
 
 export async function getLocalExportBinding(templateId: string): Promise<LocalExportBinding> {
-  return readResponse(await fetch(`${API_BASE_URL}/templates/${encodeURIComponent(templateId)}/local-export`));
+  return readResponse(await apiFetch(`${API_BASE_URL}/templates/${encodeURIComponent(templateId)}/local-export`));
 }
 
 export async function saveLocalExportBinding(templateId: string, body: { expected_revision: number; enabled: boolean; parent_path: string | null; mode?: "copy" | "move" }): Promise<LocalExportBinding> {
-  return readResponse(await fetch(`${API_BASE_URL}/templates/${encodeURIComponent(templateId)}/local-export`, {
+  return readResponse(await apiFetch(`${API_BASE_URL}/templates/${encodeURIComponent(templateId)}/local-export`, {
     method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   }));
 }
@@ -144,9 +191,18 @@ function statusFallback(status: number, action: string): string {
   return `${action}失败，请稍后重试。`;
 }
 
-export async function responseErrorMessage(response: Response, action = "请求"): Promise<string> {
-  const body = (await response.json().catch(() => null)) as { detail?: unknown } | null;
-  if (typeof body?.detail === "string" && body.detail.trim()) return body.detail.trim();
+export async function responseErrorMessage(response: Response, action = "请求", signal?: AbortSignal): Promise<string> {
+  const body = (await response.json().catch(error => {
+    if (signal?.aborted || (error && typeof error === "object" && error.name === "AbortError")) throw error;
+    return null;
+  })) as { detail?: unknown } | null;
+  if (typeof body?.detail === "string") {
+    const detail = body.detail.trim();
+    // Business errors are written for this Chinese UI. Framework/provider
+    // diagnostics do not become user instructions merely by arriving in detail.
+    const technical = /Traceback|\b(?:sqlalchemy|sqlite3|pydantic)\.|\b(?:TypeError|ValueError|ValidationError|OperationalError)\b|\[SQL:/i.test(detail);
+    if (/\p{Script=Han}/u.test(detail) && !technical) return detail;
+  }
   return statusFallback(response.status, action);
 }
 
@@ -154,12 +210,27 @@ export class ApiError extends Error {
   constructor(message: string, readonly status: number) { super(message); this.name = "ApiError"; }
 }
 
-async function readResponse<T>(response: Response): Promise<T> {
+/** Decode JSON without presenting transport/parser diagnostics as user actions. */
+export async function readJsonResponse<T>(response: Response, signal?: AbortSignal): Promise<T> {
+  try {
+    return await response.json() as T;
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    const name = error && typeof error === "object" && "name" in error ? error.name : undefined;
+    if (name === "TypeError" || name === "SyntaxError") {
+      throw new Error("未能读取完整结果。请刷新当前页面，确认最新状态后再操作。");
+    }
+    // AbortError and other explicit cancellation objects keep their identity.
+    throw error;
+  }
+}
+
+async function readResponse<T>(response: Response, signal?: AbortSignal): Promise<T> {
   if (response.ok) {
-    return response.json() as Promise<T>;
+    return readJsonResponse<T>(response, signal);
   }
 
-  throw new ApiError(await responseErrorMessage(response), response.status);
+  throw new ApiError(await responseErrorMessage(response, "请求", signal), response.status);
 }
 
 /** 校验无响应体接口（如 204 删除）是否成功；失败时把后端 detail 抛成友好错误。 */
@@ -169,12 +240,16 @@ async function expectOk(response: Response): Promise<void> {
 }
 
 /** fetch wrapper that turns network errors into a friendly Chinese message. */
-async function apiFetch(url: string, init?: RequestInit): Promise<Response> {
+export async function apiFetch(url: string, init?: RequestInit): Promise<Response> {
   try {
     return await fetch(url, init);
   } catch (error) {
+    if (init?.signal?.aborted) throw error;
     if (error instanceof TypeError) {
-      throw new Error("无法连接本地后端服务，请确认 API 已启动。");
+      if (!["GET", "HEAD"].includes((init?.method ?? "GET").toUpperCase())) {
+        throw new Error("连接中断，尚未确认操作结果。请先查看最新状态，再决定是否重试。");
+      }
+      throw new Error("无法连接知意，请稍后重试。如果仍无法连接，请关闭并重新打开知意。");
     }
     throw error;
   }
@@ -186,22 +261,31 @@ export async function getTasks(options?: {
   activeOnly?: boolean;
   exportPending?: boolean;
   status?: string;
+  group?: import("./types").TaskGroup;
   search?: string;
   templateId?: string;
   since?: string;
+  terminalSince?: string;
+  taskIds?: readonly string[];
+  signal?: AbortSignal;
 }): Promise<Task[]> {
+  if (options?.taskIds?.length === 0) return [];
   const params = new URLSearchParams();
   if (options?.limit != null) params.set("limit", String(options.limit));
   if (options?.offset) params.set("offset", String(options.offset));
   if (options?.activeOnly) params.set("active_only", "true");
   if (options?.exportPending) params.set("export_pending", "true");
   if (options?.status) params.set("status", options.status);
+  if (options?.group) params.set("group", options.group);
   if (options?.search) params.set("search", options.search);
   if (options?.templateId) params.set("template_id", options.templateId);
   if (options?.since) params.set("since", options.since);
+  if (options?.terminalSince) params.set("terminal_since", options.terminalSince);
+  for (const id of options?.taskIds ?? []) params.append("task_ids", id);
   const query = params.toString();
   return readResponse<Task[]>(
-    await apiFetch(`${API_BASE_URL}/tasks${query ? `?${query}` : ""}`),
+    await apiFetch(`${API_BASE_URL}/tasks${query ? `?${query}` : ""}`, { signal: options?.signal }),
+    options?.signal,
   );
 }
 
@@ -216,11 +300,13 @@ export async function getTaskSummary(options?: {
   search?: string;
   templateId?: string;
   since?: string;
+  terminalSince?: string;
 }): Promise<TaskSummary> {
   const params = new URLSearchParams();
   if (options?.search) params.set("search", options.search);
   if (options?.templateId) params.set("template_id", options.templateId);
   if (options?.since) params.set("since", options.since);
+  if (options?.terminalSince) params.set("terminal_since", options.terminalSince);
   const query = params.toString();
   return readResponse<TaskSummary>(
     await apiFetch(`${API_BASE_URL}/tasks/summary${query ? `?${query}` : ""}`),
@@ -399,7 +485,7 @@ export async function unloadLocalModel(modelName: string): Promise<LocalModelAct
 }
 
 export class DuplicateUploadError extends Error {
-  constructor(message: string, readonly taskId: string, readonly status: string, readonly retryToken?: string) {
+  constructor(message: string, readonly taskId: string, readonly sha256?: string) {
     super(message);
     this.name = "DuplicateUploadError";
   }
@@ -410,8 +496,8 @@ async function readUploadResponse(response: Response): Promise<Task> {
     const body = await response.clone().json().catch(() => null);
     const detail = body?.detail;
     if (detail?.code === "duplicate_upload" && typeof detail.duplicate_task_id === "string") {
-      throw new DuplicateUploadError(detail.message, detail.duplicate_task_id, detail.duplicate_status,
-        typeof detail.retry_token === "string" ? detail.retry_token : undefined);
+      throw new DuplicateUploadError(detail.message, detail.duplicate_task_id,
+        typeof detail.duplicate_sha256 === "string" ? detail.duplicate_sha256 : undefined);
     }
   }
   return readResponse<Task>(response);
@@ -422,19 +508,23 @@ export async function uploadTask(
   templateSelection: string,
   targetTableId?: string,
   duplicatePolicy: "reject" | "allow" = "reject",
+  expectedSha256?: string,
+  pendingDuplicateId?: string,
 ): Promise<Task> {
   if ("token" in file) {
     return readUploadResponse(await apiFetch(`${API_BASE_URL}/tasks/native-import`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token: file.token, template_mode: templateSelection === "smart" ? "smart" : "manual",
         template_id: templateSelection === "smart" ? null : templateSelection, target_table_id: targetTableId ?? null,
-        duplicate_policy: duplicatePolicy }),
+        duplicate_policy: duplicatePolicy, expected_sha256: expectedSha256, pending_duplicate_id: pendingDuplicateId }),
     }));
   }
   const body = new FormData();
   body.append("file", file);
   body.append("template_mode", templateSelection === "smart" ? "smart" : "manual");
   body.append("duplicate_policy", duplicatePolicy);
+  if (expectedSha256) body.append("expected_sha256", expectedSha256);
+  if (pendingDuplicateId) body.append("pending_duplicate_id", pendingDuplicateId);
   if (templateSelection !== "smart") body.append("template_id", templateSelection);
   if (targetTableId) body.append("target_table_id", targetTableId);
   return readUploadResponse(await apiFetch(`${API_BASE_URL}/tasks`, { method: "POST", body }));
@@ -513,8 +603,8 @@ export async function retryTask(taskId: string, useCurrentSettings = false): Pro
 
 export async function retryTasksBatch(
   taskIds: string[],
-): Promise<{ retried: string[]; skipped: number }> {
-  return readResponse<{ retried: string[]; skipped: number }>(
+): Promise<import("./types").BatchRetryResult> {
+  return readResponse<import("./types").BatchRetryResult>(
     await apiFetch(`${API_BASE_URL}/tasks/batch-retry`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -565,12 +655,13 @@ export async function deleteTask(taskId: string): Promise<{ kept_rows: number; p
 
 export async function deleteTasksBatch(
   taskIds: string[],
+  pendingIds: string[] = [],
 ): Promise<{ deleted: number; kept_rows: number; pending_cleanup?: number }> {
   return readResponse<{ deleted: number; kept_rows: number; pending_cleanup?: number }>(
     await apiFetch(`${API_BASE_URL}/tasks/batch-delete`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task_ids: taskIds }),
+      body: JSON.stringify({ task_ids: taskIds, ...(pendingIds.length && { pending_ids: pendingIds }) }),
     }),
   );
 }
@@ -657,35 +748,19 @@ export async function selectTaskTemplate(
   taskId: string,
   templateId?: string,
   targetTableId?: string,
+  expectedReviewVersion?: number,
 ): Promise<Task> {
   return readResponse<Task>(
     await apiFetch(`${API_BASE_URL}/tasks/${taskId}/template`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ template_id: templateId ?? null, target_table_id: targetTableId ?? null }),
+      body: JSON.stringify({ template_id: templateId ?? null, target_table_id: targetTableId ?? null, ...(expectedReviewVersion == null ? {} : { expected_review_version: expectedReviewVersion }) }),
     }),
   );
 }
 
 export async function acceptTaskInputScope(taskId: string): Promise<Task> {
   return readResponse<Task>(await apiFetch(`${API_BASE_URL}/tasks/${taskId}/input-scope`, { method: "POST" }));
-}
-
-export async function confirmTask(
-  taskId: string,
-  expectedReviewVersion: number,
-  targetTableId?: string,
-): Promise<Confirmation> {
-  return readResponse<Confirmation>(
-    await apiFetch(`${API_BASE_URL}/tasks/${taskId}/confirm`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        expected_review_version: expectedReviewVersion,
-        target_table_id: targetTableId ?? null,
-      }),
-    }),
-  );
 }
 
 export async function getConfirmation(taskId: string): Promise<Confirmation> {
@@ -760,12 +835,12 @@ export async function generateTemplateDraft(
       body: form,
       signal,
     }),
+    signal,
   );
 }
 
 export async function createTemplate(
   draft: TemplateDraft,
-  expectedUpdatedAt?: string,
 ): Promise<ExtractionTemplate> {
   return readResponse<ExtractionTemplate>(
     await apiFetch(`${API_BASE_URL}/templates`, {
@@ -935,7 +1010,7 @@ export async function mergeTables(
   );
 }
 
-export interface TableExportScope { viewId?: string | null; search?: string; rowIds?: number[] | null; taskIds?: string[] | null; sourceKeys?: string[] | null }
+export interface TableExportScope { viewId?: string | null; search?: string; rowIds?: number[] | null; taskIds?: string[] | null; sourceKeys?: string[] | null; columns?: string[] }
 function tableExportQuery(scope: TableExportScope): string {
   const query = new URLSearchParams();
   if (scope.viewId) query.set("view_id", scope.viewId);
@@ -943,6 +1018,7 @@ function tableExportQuery(scope: TableExportScope): string {
   if (scope.rowIds != null) query.set("row_ids", scope.rowIds.join(","));
   if (scope.taskIds != null) query.set("task_ids", scope.taskIds.join(","));
   if (scope.sourceKeys != null) query.set("source_keys", JSON.stringify(scope.sourceKeys));
+  for (const key of scope.columns ?? []) query.append("columns", key);
   return query.size ? `?${query}` : "";
 }
 export function getTableExportUrl(tableId: string, format: "xlsx" | "csv" | "json" | "zip" = "xlsx", scope: TableExportScope = {}): string {
@@ -951,6 +1027,10 @@ export function getTableExportUrl(tableId: string, format: "xlsx" | "csv" | "jso
 
 export function getTableViewsExportUrl(tableId: string, scope: TableExportScope = {}): string {
   return `${API_BASE_URL}/tables/${tableId}/export-views.xlsx${tableExportQuery(scope)}`;
+}
+
+export function getTableNotesExportUrl(tableId: string, revisions: boolean, inputScope: boolean): string {
+  return `${API_BASE_URL}/tables/${tableId}/export-notes.xlsx?revisions=${revisions}&input_scope=${inputScope}`;
 }
 
 export async function getSourceCards(tableId: string, scope: TableExportScope, page = 1, pageSize = 6): Promise<import("./types").SourceCardPage> {
@@ -1087,6 +1167,9 @@ export interface IntegrationSettings {
   task_read: boolean;
   template_read: boolean;
   result_read: boolean;
+  revision_read?: boolean;
+  original_read?: boolean;
+  legacy_http_keys?: ("read" | "write")[];
   data_read: boolean;
   task_control: boolean;
   write_enabled: boolean;
@@ -1144,6 +1227,8 @@ export async function saveIntegrationPermissions(payload: {
   task_read: boolean;
   template_read: boolean;
   result_read: boolean;
+  revision_read?: boolean;
+  original_read?: boolean;
   data_read: boolean;
   task_control: boolean;
   write_enabled: boolean;

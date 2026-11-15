@@ -12,6 +12,7 @@ import { useAssistant } from "./AssistantProvider";
 import { assistantApi } from "./api";
 import type { BusinessContext } from "./types";
 import { Fold } from "./Interaction";
+import { serviceConsentLabel } from "./consent";
 
 type Resource = {
   id: string;
@@ -53,6 +54,8 @@ export function ConversationSettings() {
   const [kind, setKind] = useState<Resource["kind"]>("table");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [resourceAttempt, setResourceAttempt] = useState(0);
+  const searchInput = useRef<HTMLInputElement>(null);
   const [open, setOpen] = useState(false);
   const resourceId = useId();
   const requestId = useRef(0);
@@ -95,6 +98,7 @@ export function ConversationSettings() {
     if (!open) return;
     const id = ++requestId.current;
     setLoading(true);
+    setError("");
     const timer = window.setTimeout(
       () => {
         void assistantApi<Resource[]>(
@@ -124,7 +128,7 @@ export function ConversationSettings() {
       window.clearTimeout(timer);
       requestId.current++;
     };
-  }, [open, kind, search]);
+  }, [open, kind, search, resourceAttempt]);
   const selected = (["table", "task", "template"] as const).flatMap((type) =>
     [
       ...new Set([
@@ -210,14 +214,13 @@ export function ConversationSettings() {
             <X size={16} />
           </Popover.Close>
         </header>
-        {ask.authorizationPending && <p className="ask-authorization-notice" role="status">正在同步这段对话的授权变化；同步完成前不能确认旧操作预览。</p>}
         {ask.authorizationError && <div className="ask-authorization-notice error" role="alert">
           <span>授权尚未同步，操作预览不能确认。{ask.authorizationError}</span>
-          <button type="button" disabled={ask.busy} onClick={() => void ask.retryAuthorizationSync()}>重试同步</button>
+          <button type="button" onClick={() => void ask.retryAuthorizationSync()}>重试同步</button>
         </div>}
         <section className="ask-setting-section" aria-label="聊天模型设置">
         <label className="ask-setting-label">
-          聊天模型 <span>{ask.busy ? "本轮使用" : "下一条使用"}</span>
+          聊天模型 <span role="status">{ask.busy ? "本轮使用" : ask.authorizationPending ? "正在同步设置" : "下一条使用"}</span>
         </label>
         <div className="ask-model-row">
           <select
@@ -246,17 +249,23 @@ export function ConversationSettings() {
             设为默认
           </button>
         </div>
-        {ask.lastModelRun && (ask.lastModelRun.profile_id !== ask.profileId ||
-          ask.lastModelRun.model !== ask.profile?.model_name || ask.lastModelRun.profile_version !== ask.profile?.version) &&
-          <p className="ask-notice">上次回答使用：{ask.lastModelRun.model}</p>}
-        {ask.profile?.is_remote && <p className="ask-consent-setting">
-          {ask.remoteConsent ? "已允许这段对话发送所选资料" : "发送前会确认云端资料范围"}
-          {ask.remoteConsent && <button disabled={ask.busy} onClick={() => ask.setRemoteConsent(false)}>撤销授权</button>}
-        </p>}
+        {ask.lastModelRun && <p className="ask-notice">上次回答使用 {ask.lastModelRun.model}</p>}
+        {ask.profile?.is_remote && <div className="ask-consent-setting" role="group" aria-label="模型服务传输允许" tabIndex={-1}>
+          <div>
+            <p>{ask.rememberedRemoteConsent ? "已在此设备记住对此模型服务的允许" : ask.remoteConsent ? "已允许这段对话发送所选资料" : "发送前需要允许传输至此模型服务"}</p>
+            <small>{serviceConsentLabel(ask.profile)}</small>
+            {ask.rememberedRemoteConsent && <small>新对话沿用此选择；资料范围和操作权限仍由各对话设置。</small>}
+          </div>
+          {ask.remoteConsent && <button type="button" onClick={event => {
+            event.currentTarget.parentElement?.focus();
+            ask.setRemoteConsent(false);
+          }}>撤销对此服务的允许</button>}
+        </div>}
+        {ask.profile?.is_remote && ask.consentNotice && <p className="ask-notice" role="status">{ask.consentNotice}</p>}
         </section>
         <section className="ask-setting-section" aria-label="资料范围设置">
         <label className="ask-setting-label">
-          允许这段对话使用哪些资料 <span>勾选后按需读取</span>
+          可读取的资料 <span>仅在回答需要时读取</span>
         </label>
         <div className="ask-scope-actions">
           <button
@@ -268,7 +277,7 @@ export function ConversationSettings() {
               })
             }
           >
-            清除范围
+            清除资料范围
           </button>
           {hasPage && (
             <button
@@ -303,7 +312,7 @@ export function ConversationSettings() {
         </div>
         <p className="ask-scope-description">
           {ctx.workspace
-            ? "允许按需查找全部资料"
+            ? "可按需查找知意中的表、文件和模板"
             : selected.length
               ? ctx.row_ids != null
                 ? `仅限当前表选中的 ${ctx.row_ids.length} 条记录${selected.filter(item => item.kind === "table").length > 1 ? "；其他已选表使用全部记录" : ""}`
@@ -370,8 +379,9 @@ export function ConversationSettings() {
                 </button>
               ))}
             </div>
-            <div role="tabpanel" id={`${resourceId}-panel`} aria-labelledby={`${resourceId}-${kind}`}>
+            <div role="tabpanel" id={`${resourceId}-panel`} aria-labelledby={`${resourceId}-${kind}`} aria-busy={loading}>
             <input
+              ref={searchInput}
               className="ask-resource-search"
               aria-label="搜索可选资料"
               placeholder={`筛选${{ table: "数据表", task: "文件", template: "模板" }[kind]}名称…`}
@@ -385,7 +395,7 @@ export function ConversationSettings() {
                   <label key={r.id}>
                     <input
                       type="checkbox"
-                      disabled={ask.busy}
+                      disabled={ask.busy || loading || !!error}
                       checked={
                         (ctx[`${r.kind}_ids`] ?? []).includes(r.id) ||
                         ctx[`${r.kind}_id`] === r.id
@@ -407,7 +417,7 @@ export function ConversationSettings() {
               {resources.length === 100 && (
                 <p>当前显示前 100 项，可输入名称缩小列表。</p>
               )}
-              {loading && <p>正在读取列表…</p>}
+              {loading && <p role="status">正在读取列表…</p>}
               {!resources.length && !loading && !error && (
                 <p>
                   {search
@@ -416,7 +426,13 @@ export function ConversationSettings() {
                 </p>
               )}
             </div>
-            {error && <p role="alert">{error}</p>}
+            {error && <div className="ask-resource-error" role="alert">
+              <span>{error}</span>
+              <button type="button" onClick={() => {
+                setResourceAttempt(attempt => attempt + 1);
+                searchInput.current?.focus();
+              }}>重新读取资料</button>
+            </div>}
             </div>
           </div>
         )}
@@ -443,24 +459,26 @@ export function ConversationSettings() {
         </div>
         <p className="ask-scope-description">
           {ctx.mode === "read"
-            ? "查询与分析，不生成业务修改。"
+            ? "可查询和分析已授权资料，不能修改。"
             : ctx.mode === "delegate"
-              ? "仅下一次发送：自动执行授权内的数据修改和版本恢复。新增、删除、任务与表结构操作仍需确认。"
-              : "先展示修改预览，确认后执行。"}
+              ? "仅下一条消息。可直接修改授权内的已有记录、调整数值或撤销符合条件的改动。新增、删除、任务和表结构操作仍需确认。"
+              : "先列出拟执行的操作和影响范围，由你确认后执行。"}
         </p>
         {ctx.mode !== "read" && (
           <Fold title="允许的操作能力">
             <div className="ask-capabilities">
               {(
                 [
-                  ["data", "数据编辑"],
-                  ["tasks", "任务控制"],
-                  ["organize", "表结构与分组"],
+                  ["data", "数据编辑", "修改、新增或删除数据记录"],
+                  ["tasks", "任务控制", "暂停、继续、重试或取消已有任务"],
+                  ["organize", "表结构与分组", "建表、改表名、加列或分组"],
                 ] as const
-              ).map(([key, label]) => (
+              ).map(([key, label, description]) => (
                 <label key={key}>
                   <input
                     type="checkbox"
+                    aria-label={label}
+                    aria-describedby={`${resourceId}-cap-${key}`}
                     checked={caps.includes(key)}
                     disabled={ask.busy}
                     onChange={(e) =>
@@ -472,7 +490,7 @@ export function ConversationSettings() {
                       })
                     }
                   />
-                  {label}
+                  <span>{label}<small className="ask-capability-description" id={`${resourceId}-cap-${key}`}>{description}</small></span>
                 </label>
               ))}
             </div>

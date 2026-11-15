@@ -129,6 +129,36 @@ function fillPattern(pattern = "PO-\\d{3}") {
   fireEvent.change(screen.getByLabelText("格式表达式（正则）"), { target: { value: pattern } });
 }
 
+it.each(["required", "enum", "sum", "row_multiply"])("does not add a %s rule with a field that is no longer eligible", kind => {
+  const onChange = vi.fn();
+  const initialFields: TemplateField[] = [...fields, { ...fields[1], key: "quantity", label: "数量" }];
+  const props = { disabled: false, fields: initialFields, rules: [], onChange };
+  const view = render(<DeterministicRulesEditor {...props} />);
+  fireEvent.change(screen.getByLabelText("规则类型"), { target: { value: kind } });
+  if (kind === "required" || kind === "enum") {
+    fireEvent.change(screen.getByLabelText("检查字段"), { target: { value: "header.document_number" } });
+    if (kind === "enum") fireEvent.change(screen.getByPlaceholderText("例如：有效，作废"), { target: { value: "有效,作废" } });
+  } else if (kind === "sum") {
+    fireEvent.change(screen.getByLabelText("明细求和字段（如 明细金额）"), { target: { value: "items[].amount" } });
+    fireEvent.change(screen.getByLabelText("抬头合计字段（如 合计金额）"), { target: { value: "header.total_amount" } });
+  } else {
+    fireEvent.change(screen.getByLabelText("左操作数字段（如 数量）"), { target: { value: "items[].quantity" } });
+    fireEvent.change(screen.getByLabelText("右操作数字段（如 单价）"), { target: { value: "items[].amount" } });
+    fireEvent.change(screen.getByLabelText("结果字段（如 明细金额）"), { target: { value: "items[].amount" } });
+  }
+  const add = screen.getByRole("button", { name: "添加校验规则" });
+  expect(add).toBeEnabled();
+  const nextFields = kind === "required" || kind === "enum"
+    ? initialFields.filter(field => field.key !== "document_number")
+    : initialFields.map(field => field.key === "amount"
+      ? { ...field, ...(kind === "sum" ? { value_type: "text" as const } : { section: "header" as const }) }
+      : field);
+  view.rerender(<DeterministicRulesEditor {...props} fields={nextFields} contextKey="changed-fields" />);
+  fireEvent.click(add);
+  expect(onChange).not.toHaveBeenCalled();
+  expect(add).toBeDisabled();
+});
+
 it("rejects server-invalid syntax before adding and permits a corrected valid pattern even when the sample does not match", async () => {
   vi.mocked(previewTemplatePattern).mockReset()
     .mockResolvedValueOnce({ valid: false, matches: false, message: "不支持分组。" })

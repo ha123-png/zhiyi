@@ -3,7 +3,7 @@ from collections import Counter
 from uuid import uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from document_pipeline_api.services.current_data import row_values_expression
@@ -42,13 +42,17 @@ def _category_rows(session, table_id, field_key):
         return result
     path = '$."' + field_key.replace("\\", "\\\\").replace('"', '\\"') + '"'
     kind = func.coalesce(func.json_type(values, path), 'null')
-    value = func.json_extract(values, path)
+    # SQLite converts integers above int64 to REAL. Keep integer tokens exact
+    # so distinct business values cannot merge into one rounded category.
+    value = case((kind == 'integer', values.op('->')(path)),
+                 else_=func.json_extract(values, path))
     query = select(kind, value, func.count()).where(DataRowRecord.table_id == table_id).group_by(kind, value)
     result = []
     for value_type, raw, count in session.execute(query):
         if value_type in {'array', 'object'}:
             raise HTTPException(422, "分组字段包含复杂内容，请选择文字、数字或真假值字段。")
-        actual = True if value_type == 'true' else False if value_type == 'false' else raw
+        actual = (int(raw) if value_type == 'integer' else
+                  True if value_type == 'true' else False if value_type == 'false' else raw)
         result.append((_canonical_json(actual), "未填写" if actual is None else ("是" if actual is True else "否" if actual is False else str(actual))[:128], count))
     return result
 
@@ -96,6 +100,8 @@ def create_split_views(session: Session, table_id: str, field_key: str, *, by_fi
     if table is None:
         raise HTTPException(404, "没有找到这个数据表。")
     require_tabular(table)
+    from document_pipeline_api.services.merged_tables import require_writable
+    require_writable(table)
     field_key = "" if by_file else field_key
     if not by_file and field_key not in {column.key for column in table_columns(session, table)} | {'source_filename', 'item_index'}:
         raise HTTPException(422, "数据表中不存在这个字段。")
@@ -243,6 +249,10 @@ def _view_predicate(record: DataViewRecord):
         _, _, path = _view_filter(record)
         return func.coalesce(func.json_type(row_values_expression(), path), 'null') == 'null'
     json_type, comparison, path = _view_filter(record)
+    if json_type == 'integer':
+        # Binding a Python integer above int64 to SQLite overflows; the JSON
+        # token is exact for both category discovery and its row predicate.
+        return (func.json_type(row_values_expression(), path) == json_type) & (row_values_expression().op('->')(path) == str(comparison))
     return (func.json_type(row_values_expression(), path) == json_type) & (func.json_extract(row_values_expression(), path) == comparison)
 
 

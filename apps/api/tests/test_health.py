@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from document_pipeline_api.config import Settings
@@ -13,7 +15,7 @@ def test_health_contract() -> None:
     assert response.json() == {
         "status": "ok",
         "service": "document-pipeline-api",
-        "version": "0.6.0",
+        "version": (Path(__file__).resolve().parents[3] / "VERSION").read_text(encoding="utf-8").strip(),
     }
 
 

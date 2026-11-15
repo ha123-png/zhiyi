@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { DashboardSummary } from "../types";
 import { expect, it, vi } from "vitest";
 import { DashboardPage } from "./DashboardPage";
@@ -16,7 +16,7 @@ it("keeps the latest range when earlier requests finish late and can recover fro
   let oldResolve!: (value: DashboardSummary) => void;
   vi.mocked(api.getDashboardSummary).mockResolvedValueOnce({average_elapsed_seconds: 2, processed_count: 1, failed_count: 0, success_rate: 1, new_rows: 7});
   render(<DashboardPage />);
-  expect(screen.getByRole("heading", {name:"数据仪表盘"})).toBeInTheDocument();
+  expect(screen.getByRole("combobox", {name:"时间范围"})).toBeEnabled();
   await screen.findByText("7");
   vi.mocked(api.getDashboardSummary).mockImplementationOnce(() => new Promise(resolve => { oldResolve = resolve; }));
   fireEvent.change(screen.getByRole("combobox", {name: "时间范围"}), {target: {value: "30"}});
@@ -27,9 +27,10 @@ it("keeps the latest range when earlier requests finish late and can recover fro
   expect(screen.queryByText("30")).not.toBeInTheDocument();
   vi.mocked(api.getDashboardSummary).mockRejectedValueOnce(new Error("synthetic offline"));
   fireEvent.change(screen.getByRole("combobox", {name: "时间范围"}), {target: {value: "1"}});
-  await screen.findByRole("alert");
+  fireEvent.click(await screen.findByRole("button", { name: "统计读取事项" }));
+  expect(screen.getByRole("dialog", { name: "统计读取事项" })).toHaveTextContent("当前显示「近 90 天」的上次结果");
   vi.mocked(api.getDashboardSummary).mockResolvedValueOnce({average_elapsed_seconds: null, processed_count: 0, failed_count: 0, success_rate: null, new_rows: 1});
-  fireEvent.click(screen.getByRole("button", {name: "重新加载"}));
+  fireEvent.click(screen.getByRole("button", {name: "重新读取"}));
   await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
 });
 
@@ -52,7 +53,61 @@ it("requests the complete retained history and explains its automatic bucket wit
   expect(screen.getByRole("button", {name:/文件任务.*2.*当前保留/})).toBeInTheDocument();
   const explanation = screen.getByRole("button", {name:"仪表盘统计说明"});
   expect(explanation).toHaveAttribute("aria-expanded", "false");
+  expect(screen.queryByRole("dialog", {name:"统计说明"})).not.toBeInTheDocument();
+  explanation.focus();
   fireEvent.click(explanation);
   expect(explanation).toHaveAttribute("aria-expanded", "true");
-  expect(await screen.findByText(/“全部”覆盖当前保留的完整历史/)).toBeInTheDocument();
+  const help = await screen.findByRole("dialog", {name:"统计说明"});
+  expect(within(help).getByText(/“全部”覆盖当前保留的完整历史/)).toBeInTheDocument();
+  expect(within(help).getByRole("button", {name:"关闭统计说明"})).toHaveFocus();
+  fireEvent.keyDown(help, {key:"Escape"});
+  expect(screen.queryByRole("dialog", {name:"统计说明"})).not.toBeInTheDocument();
+  expect(explanation).toHaveFocus();
+  fireEvent.click(explanation);
+  fireEvent.mouseDown(screen.getByRole("dialog", {name:"统计说明"}).parentElement!);
+  expect(screen.queryByRole("dialog", {name:"统计说明"})).not.toBeInTheDocument();
+  expect(explanation).toHaveFocus();
+});
+
+it("distinguishes a confirmed empty dashboard from an unresolved initial load", async () => {
+  vi.clearAllMocks();
+  vi.mocked(api.getTaskSummary).mockResolvedValue({total: 0, completed: 0, needs_review: 0, failed: 0});
+  vi.mocked(api.getTables).mockResolvedValue([]);
+  vi.mocked(api.getDashboardSummary).mockResolvedValue({average_elapsed_seconds: null, processed_count: 0, failed_count: 0, success_rate: null, new_rows: 0});
+  vi.mocked(api.getDashboardTrend).mockResolvedValue([]);
+  vi.mocked(dashboardApi.cards).mockResolvedValue({items: [], limit: 4});
+  vi.mocked(dashboardApi.overview).mockResolvedValue({rows_trend: [], templates: [], model_usage: {calls: 0, by_purpose: []}} as never);
+
+  render(<DashboardPage />);
+
+  expect(await screen.findByText("还没有自定义统计。选择“添加统计”创建常看的数据视图。")).toBeInTheDocument();
+  expect(screen.getByRole("button", {name: /文件任务.*0.*当前保留/})).toBeInTheDocument();
+  expect(screen.getByRole("button", {name: "添加统计"})).toBeEnabled();
+  expect(screen.queryByText("正在读取我的统计…")).not.toBeInTheDocument();
+});
+
+it("audit: keeps the first data trend unknown until overview succeeds and recovers from its failure", async () => {
+  vi.clearAllMocks();
+  vi.mocked(api.getTaskSummary).mockResolvedValue({total: 7, completed: 7, needs_review: 0, failed: 0});
+  vi.mocked(api.getTables).mockResolvedValue([]);
+  vi.mocked(api.getDashboardSummary).mockResolvedValue({average_elapsed_seconds: null, processed_count: 7, failed_count: 0, success_rate: 1, new_rows: 7});
+  vi.mocked(api.getDashboardTrend).mockResolvedValue([]);
+  vi.mocked(dashboardApi.cards).mockResolvedValue({items: [], limit: 4});
+  let failOverview!: (reason: Error) => void;
+  vi.mocked(dashboardApi.overview).mockReset()
+    .mockImplementationOnce(() => new Promise((_, reject) => { failOverview = reject; }))
+    .mockResolvedValue({rows_trend: [], templates: [], model_usage: {calls: 0, by_purpose: []}} as never);
+  render(<DashboardPage />);
+  await screen.findByRole("button", {name: /文件任务.*7.*当前保留/});
+  fireEvent.click(screen.getByRole("button", {name: "数据"}));
+  const trend = screen.getByRole("region", {name: "期间趋势"});
+  expect(within(trend).getByText("—")).toBeInTheDocument();
+  expect(within(trend).getByRole("status")).toHaveTextContent("正在读取数据新增趋势");
+  await act(async () => { failOverview(new Error("合成数据趋势读取失败")); });
+  expect(within(trend).getByRole("alert")).toHaveTextContent("合成数据趋势读取失败");
+  expect(within(trend).getByText("—")).toBeInTheDocument();
+  fireEvent.click(within(trend).getByRole("button", {name: "重新加载趋势"}));
+  await waitFor(() => expect(within(trend).queryByRole("alert")).not.toBeInTheDocument());
+  await waitFor(() => expect(trend).toHaveAttribute("aria-busy", "false"));
+  expect(within(trend).getByText("0")).toBeInTheDocument();
 });

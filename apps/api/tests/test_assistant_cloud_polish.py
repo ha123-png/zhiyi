@@ -5,7 +5,7 @@ import httpx
 import pytest
 from PIL import Image
 
-from test_assistant import client as ledger_fixture, ScriptedProvider, select_profile, send, finish
+from test_assistant import client as ledger_fixture, ScriptedProvider, select_profile, send, finish, final_answer
 from document_pipeline_api.models import TaskRecord, AssistantMessage
 from document_pipeline_api.config import Settings
 from document_pipeline_api.model_providers.conversation import (
@@ -31,7 +31,7 @@ def test_fabricated_tool_wrapper_is_repaired_once_never_executed(client, repeat)
         [{"type": "text", "text": fake}]
         if repeat
         else [
-            {"type": "tool", "id": "catalog", "name": "catalog", "arguments": {"kind": "tables"}},
+            final_answer("没有取得本轮统计结果。", kind="limitation"),
         ]
     )
     client.app.state.conversation_factory = ScriptedProvider
@@ -41,7 +41,7 @@ def test_fabricated_tool_wrapper_is_repaired_once_never_executed(client, repeat)
     )
     assert "vis_001" not in json.dumps(detail["messages"])
     assert detail["runs"][0]["status"] == ("failed" if repeat else "completed")
-    assert [tool["name"] for tool in detail["tools"]] == ([] if repeat else ["catalog"])
+    assert detail["tools"] == []
 
 
 def test_requested_json_and_verified_snapshots_are_not_censored():
@@ -52,10 +52,12 @@ def test_requested_json_and_verified_snapshots_are_not_censored():
 def test_tool_budget_reserves_a_final_summary_without_more_execution(client):
     class BudgetProvider(ScriptedProvider):
         advertised = []
+        choices = []
 
-        def stream(self, messages, tools):
+        def stream(self, messages, tools, **options):
             self.advertised.append(tools)
-            yield from super().stream(messages, tools)
+            self.choices.append(options.get("tool_choice"))
+            yield from super().stream(messages, tools, **options)
 
     BudgetProvider.plan = [
         [{"type": "tool", "id": f"list-{i}", "name": "catalog", "arguments": {"kind": "tables"}}]
@@ -64,7 +66,9 @@ def test_tool_budget_reserves_a_final_summary_without_more_execution(client):
     client.app.state.conversation_factory = BudgetProvider
     detail = finish(client, send(client, select_profile(client), context={"table_ids": ["ledger"]}))
     assert detail["runs"][0]["status"] == "completed"
-    assert len(detail["tools"]) == 8 and BudgetProvider.advertised[-1] == []
+    assert len(detail["tools"]) == 8
+    assert [spec["function"]["name"] for spec in BudgetProvider.advertised[-1]] == ["finish_answer"]
+    assert BudgetProvider.choices == [None] * 8 + ["required"]
 
 
 def test_legacy_fabrication_is_not_reused_as_evidence(client):
@@ -219,7 +223,7 @@ def test_text_only_model_fallback_does_not_claim_to_see_image(client, known_text
             elif any("data:image" in json.dumps(m) for m in messages):
                 raise VisionNotSupportedError("不支持图像输入")
             else:
-                yield {"type": "text", "text": "图片没有文字层，当前模型无法识别，请切换视觉方案。"}
+                yield final_answer("图片没有文字层，当前模型无法识别，请切换视觉方案。", kind="limitation")
 
     client.app.state.conversation_factory = TextOnlyProvider
     detail = finish(client, send(client, profile, context={"task_ids": ["text-only"]}))

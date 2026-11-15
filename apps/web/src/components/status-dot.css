@@ -1,0 +1,19 @@
+.status-dot {
+  --status-dot-strength: 35%;
+  --status-dot-color: var(--muted-foreground);
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--status-dot-color) var(--status-dot-strength), var(--card));
+}
+.dark .status-dot { --status-dot-strength: 42%; }
+.status-dot[data-state="processing"], .status-dot[data-state="queued"] { --status-dot-color: var(--info); }
+.status-dot[data-state="completed"], .status-dot[data-state="idle"], .status-dot.is-healthy { --status-dot-color: var(--success); }
+.status-dot[data-state="pending"] { --status-dot-color: var(--warning); }
+.status-dot[data-state="failed"] { --status-dot-color: var(--destructive); }
+.status-dot[data-state="paused"] { --status-dot-color: color-mix(in srgb, var(--muted-foreground) 70%, #8b5cf6 30%); }
+.status-dot[data-state="processing"], .status-dot[data-state="queued"], .status-dot[data-state="pending"] { animation: status-dot-breath 4.8s ease-in-out infinite; }
+@keyframes status-dot-breath { 0%, 100% { opacity: 1; } 50% { opacity: .94; } }
+@media (prefers-reduced-motion: reduce) { .status-dot[data-state] { animation: none; } }

@@ -206,15 +206,14 @@ def test_generate_does_not_return_rules_unless_user_asks(client: TestClient) -> 
     assert draft.rule_suggestions == []
 
 
-@pytest.mark.parametrize("with_rules,rules,expected_warning", [
-    (True, [], "本次未生成校验规则，可在模板中补充。"),
-    (True, [AiGeneratedRule(kind="required", field="不存在", section="header")],
-     "本次未生成可用的校验规则，可在模板中补充。"),
-    (False, [], None),
-    (True, [AiGeneratedRule(kind="required", field="金额", section="header")], None),
+@pytest.mark.parametrize("with_rules,rules,expected_status", [
+    (True, [], []),
+    (True, [AiGeneratedRule(kind="required", field="不存在", section="header")], ["rejected"]),
+    (False, [], []),
+    (True, [AiGeneratedRule(kind="required", field="金额", section="header")], ["accepted"]),
 ])
-def test_requested_rules_without_usable_suggestions_are_explicit(
-    client, with_rules, rules, expected_warning,
+def test_optional_rules_leave_only_actionable_warnings(
+    client, with_rules, rules, expected_status,
 ):
     fake = _FakeProvider(AiGeneratedTemplate(
         presentation_mode="table",
@@ -223,11 +222,10 @@ def test_requested_rules_without_usable_suggestions_are_explicit(
     ))
     draft = _run_generate(client, fake=fake, requirement="生成金额字段和有依据的校验规则",
                           images=0, with_rules=with_rules)
-    assert draft.warnings == ([expected_warning] if expected_warning else [])
+    assert draft.warnings == []
+    assert [suggestion.status for suggestion in draft.rule_suggestions] == expected_status
     assert len(draft.fields) == 1 and draft.fields[0].label == "金额"
-    assert len(draft.rule_suggestions) == (len(rules) if with_rules else 0)
-    if rules and expected_warning:
-        assert draft.rule_suggestions[0].status == "rejected"
+    if expected_status == ["rejected"]:
         assert "不存在" in draft.rule_suggestions[0].reason
 
 
@@ -528,4 +526,5 @@ def test_generation_contract_names_explicit_choices_and_reports_fallbacks(client
     assert "两个字段日期和金额，全部文本，默认卡片" in fake.last_prompt
     fallback = _run_generate(client, fake=_FakeProvider(AiGeneratedTemplate(fields=[AiGeneratedField(label="内容")])), requirement="内容", images=0)
     assert fallback.behavior.presentation.mode == "table"
-    assert len(fallback.warnings) == 2
+    assert len(fallback.warnings) == 1
+    assert fallback.name == "" and fallback.description == ""

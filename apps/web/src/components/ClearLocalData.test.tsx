@@ -9,7 +9,7 @@ beforeEach(() => {
   localStorage.clear();
   vi.mocked(getClearDataStatus).mockResolvedValue(status);
 });
-afterEach(() => { vi.clearAllMocks(); vi.useRealTimers(); });
+afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); vi.useRealTimers(); });
 
 async function openConfirmation() {
   const button = screen.getByRole("button", { name: /清除全部|重试清除/ });
@@ -73,3 +73,46 @@ it("waits through restart and never treats an older success or incomplete state 
   vi.mocked(getClearDataStatus).mockResolvedValue({ ...status, result: { state: "succeeded", completed_at: "new" } });
   await waitFor(() => expect(done).toHaveBeenCalledOnce(), { timeout: 3000 });
 }, 10000);
+
+it.each([
+  { storageName: "localStorage", scheduled: false, incomplete: false },
+  { storageName: "sessionStorage", scheduled: false, incomplete: false },
+  { storageName: "localStorage", scheduled: true, incomplete: false },
+  { storageName: "sessionStorage", scheduled: true, incomplete: false },
+  { storageName: "localStorage", scheduled: false, incomplete: true },
+  { storageName: "sessionStorage", scheduled: true, incomplete: true },
+] as const)("separates service success from denied $storageName (scheduled=$scheduled, previously incomplete=$incomplete) and retries browser cleanup without deleting again", async ({ storageName, scheduled, incomplete }) => {
+  const done = vi.fn();
+  const before = { ...status, incomplete };
+  vi.mocked(getClearDataStatus).mockResolvedValue(before);
+  vi.mocked(clearAllLocalData).mockResolvedValue(scheduled ? { scheduled: true } : { scheduled: false, state: "succeeded" });
+  render(<ClearLocalData onCleared={done} />);
+  const submit = await openConfirmation();
+  if (scheduled) {
+    vi.mocked(getClearDataStatus).mockResolvedValueOnce(before).mockResolvedValue({
+      ...status, result: { state: "succeeded", completed_at: "fresh" },
+    });
+    vi.useFakeTimers();
+  }
+  const denied = vi.spyOn(window, storageName, "get").mockImplementation(() => {
+    throw new DOMException("Synthetic storage refusal", "SecurityError");
+  });
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: "清除全部本地数据" } });
+  await act(async () => { fireEvent.click(submit); });
+  if (scheduled) {
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    vi.useRealTimers();
+  }
+  const retry = await screen.findByRole("button", { name: "重试清除浏览器偏好" });
+  expect(screen.getByRole("alert")).toHaveTextContent("知意中的数据已清除");
+  expect(screen.getByRole("alert")).toHaveTextContent("浏览器偏好");
+  expect(screen.queryByText(/上次清除未完成/)).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "重试清除" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(clearAllLocalData).toHaveBeenCalledOnce();
+  expect(done).not.toHaveBeenCalled();
+  denied.mockRestore();
+  fireEvent.click(retry);
+  await waitFor(() => expect(done).toHaveBeenCalledOnce());
+  expect(clearAllLocalData).toHaveBeenCalledOnce();
+});

@@ -1,8 +1,9 @@
 import base64
-import json
 from pathlib import Path
 
 import httpx
+
+from document_pipeline_api.schemas.json_numbers import NumericPrecisionError
 
 from document_pipeline_api.model_providers.base import (
     ModelRequestRejectedError,
@@ -14,10 +15,9 @@ from document_pipeline_api.model_providers.base import (
 from document_pipeline_api.model_providers.openai_compatible import (
     CONNECT_TIMEOUT_SECONDS,
     _DEFAULT_SYSTEM_PROMPT,
-    _extract_json_text,
     _image_mime_type,
     _response_error_detail,
-    _validate_payload,
+    parse_structured_content,
 )
 
 
@@ -87,9 +87,7 @@ class OllamaProvider:
             self.last_usage = _ollama_usage(body)
             if body.get("done_reason") == "length":
                 raise ModelResponseError("模型输出达到长度上限，结果未完成。原件仍保留，请调整模型设置后重试。")
-            content = body["message"]["content"]
-            payload = json.loads(_extract_json_text(content))
-            return _validate_payload(result_type, payload)
+            return parse_structured_content(body["message"]["content"], result_type)
         except httpx.TimeoutException as error:
             raise ModelTimeoutError(
                 "处理超时：模型可能未加载、正在加载或响应缓慢，"
@@ -118,9 +116,11 @@ class OllamaProvider:
                 "连接 Ollama 服务出错"
                 f"（{self.base_url}）。请检查 Ollama 是否正常运行、网络是否通畅。"
             ) from error
+        except NumericPrecisionError as error:
+            raise ModelResponseError("模型返回的数值精度超出支持范围，结果未保存。请核对原件或调整字段类型后重试。") from error
         except (KeyError, TypeError, ValueError) as error:
             raise ModelResponseError(
-                "Ollama 返回内容不符合字段结构，可以重试或更换模型。"
+                "Ollama 响应缺少预期的结果内容。"
             ) from error
 
     def available_models(self) -> list[str]:
@@ -225,9 +225,7 @@ class OllamaProvider:
             self.last_usage = _ollama_usage(body)
             if body.get("done_reason") == "length":
                 raise ModelResponseError("模型输出达到长度上限，结果未完成。原件仍保留，请调整模型设置后重试。")
-            content = body["message"]["content"]
-            payload = json.loads(_extract_json_text(content))
-            return _validate_payload(result_type, payload)
+            return parse_structured_content(body["message"]["content"], result_type)
         except httpx.TimeoutException as error:
             raise ModelTimeoutError(
                 "Ollama 理解文件超时：模型可能未加载、正在加载或响应缓慢，"
@@ -256,9 +254,11 @@ class OllamaProvider:
                 "连接 Ollama 服务出错"
                 f"（{self.base_url}）。请检查 Ollama 是否正常运行、网络是否通畅。"
             ) from error
+        except NumericPrecisionError as error:
+            raise ModelResponseError("模型返回的数值精度超出支持范围，结果未保存。请核对原件或调整字段类型后重试。") from error
         except (KeyError, TypeError, ValueError) as error:
             raise ModelResponseError(
-                "Ollama 返回内容不符合字段结构，可以重试或更换模型。"
+                "Ollama 响应缺少预期的结果内容。"
             ) from error
 
 

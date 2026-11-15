@@ -1,22 +1,22 @@
-import { ConfirmDialog } from "./ConfirmDialog";
+import type { PendingDuplicate } from "./PendingDuplicateDialog";
+import { NoticeDialog } from "./NoticeDialog";
+import { Toast, useToast } from "./Toast";
+import { createPortal } from "react-dom";
 import { useModalFocus } from "../useModalFocus";
 import { useUnsavedChanges } from "../useUnsavedChanges";
-import { parseNumericInput } from "../numericInput";
-import { SmartPoolSettings } from "./SmartPoolSettings";
+import { manualCellValue } from "../numericInput";
+import { ExtractConfiguration } from "./ExtractConfiguration";
 import { DetailRowAction } from "./DetailRowAction";
+import { DetailColumnResizer } from "./DetailColumnResizer";
 import { DetailPagination, useDetailPage } from "./DetailPagination";
-import { Disclosure } from "./Disclosure";
 import { FileRevisionHistory } from "./FileRevisionHistory";
 import { desktopApi, type NativeImportFile } from "../desktop";
 import { taskDisplayName } from "../taskNames";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAssistantPageContext } from "../assistant/AssistantProvider";
 import {
-  CheckCircle2,
-  ChevronDown,
   ChevronLeft,
   ChevronRight,
-  EyeOff,
   FileSearch,
   FileText,
   FileUp,
@@ -25,11 +25,9 @@ import {
   Loader2,
   Maximize2,
   Minus,
-  Pencil,
   Plus,
   Save,
   ScanSearch,
-  ShieldAlert,
   UploadCloud,
   X,
 } from "lucide-react";
@@ -38,12 +36,12 @@ import {
   DuplicateUploadError,
   getExtraction,
   getOriginalFileUrl,
-  getTasks,
   getTemplates,
   subscribeTaskEvents,
   updateReview,
   uploadTask,
 } from "../api";
+import { readBatchTasks } from "../batchTasks";
 import type {
   DemoScenario,
   Extraction,
@@ -56,12 +54,16 @@ import type {
   TemplateValue,
 } from "../types";
 import { Icon } from "./Icon";
+import { ValidationResults } from "./ValidationResults";
+import { useValidationFieldLocator } from "./useValidationFieldLocator";
 import { DocumentPreview } from "./DocumentPreview";
+import { OriginalDownload } from "./OriginalDownload";
 import { InputScopeDetails, PartialInputAction } from "./InputScopeDetails";
 import { FileNameConfirmation } from "./FileNameConfirmation";
 import { EditableText } from "./EditableText";
 import { parseServerTime, serverDate } from "../time";
 import { evidenceDescription } from "../evidence";
+import { formatNumericValue } from "../numberDisplay";
 
 function formatDateTime(iso: string): string {
   const d = serverDate(iso);
@@ -73,12 +75,14 @@ interface HeaderColumn {
   key: string;
   label: string;
   numeric: boolean;
+  valueType?: string;
 }
 
 interface ItemColumn {
   key: string;
   label: string;
   numeric: boolean;
+  valueType?: string;
 }
 
 interface ValidationIssue {
@@ -126,7 +130,9 @@ const documentItemLabels: Record<string, string> = {
  * 动态生成（平铺的内置单据结果），保证数据始终可读、不出现空白表。
  */
 function headerColumnsFor(extraction: Extraction | null): HeaderColumn[] {
-  if (extraction?.current_schema?.length) return extraction.current_schema.filter(field => field.section === "header").map(field => ({key: field.key, label: field.label, numeric: field.value_type === "number"}));
+  if (extraction?.current_schema?.length) return extraction.current_schema.filter(field => field.section === "header").map(field => ({
+    key: field.key, label: field.label, numeric: field.value_type === "number", valueType: field.value_type,
+  }));
   const template = extraction?.template;
   if (template && template.fields.some((f) => f.section === "header" && f.key)) {
     return template.fields
@@ -135,6 +141,7 @@ function headerColumnsFor(extraction: Extraction | null): HeaderColumn[] {
         key: f.key as string,
         label: template.output_mapping?.[f.key as string] || f.label,
         numeric: f.value_type === "number",
+        valueType: f.value_type,
       }));
   }
   if (extraction && isTemplateResult(extraction.result)) {
@@ -155,7 +162,9 @@ function headerColumnsFor(extraction: Extraction | null): HeaderColumn[] {
 }
 
 function itemColumnsFor(extraction: Extraction | null): ItemColumn[] {
-  if (extraction?.current_schema?.length) return extraction.current_schema.filter(field => field.section === "item").map(field => ({key: field.key, label: field.label, numeric: field.value_type === "number"}));
+  if (extraction?.current_schema?.length) return extraction.current_schema.filter(field => field.section === "item").map(field => ({
+    key: field.key, label: field.label, numeric: field.value_type === "number", valueType: field.value_type,
+  }));
   const template = extraction?.template;
   if (template && template.fields.some((f) => f.section === "item" && f.key)) {
     return template.fields
@@ -164,6 +173,7 @@ function itemColumnsFor(extraction: Extraction | null): ItemColumn[] {
         key: f.key as string,
         label: template.output_mapping?.[f.key as string] || f.label,
         numeric: f.value_type === "number",
+        valueType: f.value_type,
       }));
   }
   if (extraction) {
@@ -241,7 +251,7 @@ function formatValue(value: TemplateValue | undefined): string {
   // 空值显示为空字符串，而不是"—"：避免把"空"伪装成数据，也避免编辑时误删
   if (value === null || value === undefined) return "";
   if (typeof value === "number") {
-    return Number.isFinite(value) ? value.toLocaleString() : "";
+    return Number.isFinite(value) ? formatNumericValue(value) : "";
   }
   if (typeof value === "boolean") return value ? "是" : "否";
   return String(value);
@@ -407,17 +417,6 @@ function itemEvidencePath(extraction: Extraction, row: number, key: string): str
   return `items[${row}].${documentItemKeys[key] ?? key}`;
 }
 
-function editedValue(raw: string, previous: TemplateValue | undefined, numeric: boolean, label: string): TemplateValue {
-  if (numeric) {
-    if (raw === "—") return null;
-    return parseNumericInput(raw, label);
-  }
-  const value = raw.trim();
-  if (!value || value === "—") return null;
-  if (typeof previous === "boolean") return value === "是" || value.toLowerCase() === "true";
-  return value;
-}
-
 // 记住用户上次的模板选择（智能匹配 / 手动 + 模板）：默认沿用上次用过的模式，
 // 而不是每次回到页面都重置成智能匹配
 const LAST_UPLOAD_MODE_KEY = "last-upload-mode-v1";
@@ -468,6 +467,8 @@ interface ExtractPageProps {
     realId: string;
     startedAt: number;
   }[]) => void;
+  noticeHost?: HTMLElement | null;
+  onDuplicate?: (item: PendingDuplicate) => void;
 }
 
 export function ExtractPage({
@@ -477,14 +478,24 @@ export function ExtractPage({
   onTasksChange,
   onUploadStarted,
   onUploadsComplete,
+  noticeHost,
+  onDuplicate,
 }: ExtractPageProps = {}) {
   const [initialMode] = useState(readLastUploadMode);
   const [matchMode, setMatchMode] = useState<"auto" | "manual">(initialMode.mode);
   const [dragOver, setDragOver] = useState(false);
-  const [editingExtractCell, setEditingExtractCell] = useState<string | null>(
+  const [savedReview, setSavedReview] = useState<{ taskId: string; version: number } | null>(null);
+  const [editingExtractCell, setEditingExtractCellState] = useState<string | null>(
     null,
   );
+  const editingExtractCellRef = useRef<string | null>(null);
+  function setEditingExtractCell(value: string | null) {
+    if (value !== null) setSavedReview(null);
+    editingExtractCellRef.current = value;
+    setEditingExtractCellState(value);
+  }
   const [validationPanelOpen, setValidationPanelOpen] = useState(true);
+  const [reviewConflict, setReviewConflict] = useState(false);
   const [previewScale, setPreviewScale] = useState(1.0);
   const [previewPage, setPreviewPage] = useState(1);
   const [previewPageCount, setPreviewPageCount] = useState(1);
@@ -496,15 +507,17 @@ export function ExtractPage({
   const [extractValidationIssues, setExtractValidationIssues] = useState<
     ValidationIssue[]
   >([]);
-  const invalidReviewDraftsRef = useRef<Record<string, string>>({});
-  const [invalidReviewDrafts, setInvalidReviewDrafts] = useState<Record<string, string>>({});
-  const [numericInputError, setNumericInputError] = useState<string | null>(null);
 
   const [templates, setTemplates] = useState<ExtractionTemplate[]>([]);
+  const [templatesLoading, setTemplatesLoading] = useState(true);
+  const [templatesError, setTemplatesError] = useState<string | null>(null);
+  const [templatesReload, setTemplatesReload] = useState(0);
+  const templatesRequest = useRef(0);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>(
     initialMode.templateId,
   );
   const [task, setTask] = useState<Task | null>(null);
+  useEffect(() => { setSavedReview(null); }, [task?.id, initialTask?.id, demo]);
   const loadSeqRef = useRef(0);
   useAssistantPageContext("extract", { task_id: task?.id ?? null, template_id: task?.template_id ?? null, template_version: task?.template_version ?? null });
   const [extraction, setExtraction] = useState<Extraction | null>(null);
@@ -513,24 +526,37 @@ export function ExtractPage({
   const [draftDetailIds, setDraftDetailIds] = useState<number[] | undefined>();
   useEffect(() => {
     setDraftDetailIds(extraction?.detail_ids);
-    invalidReviewDraftsRef.current = {};
-    setInvalidReviewDrafts({});
-    setNumericInputError(null);
   }, [extraction]);
   const [draftResult, setDraftResult] = useState<ExtractionResult | null>(null);
   const [loading, setLoading] = useState(false);
   const uploadInFlight = useRef(false);
-  const [duplicateUploads, setDuplicateUploads] = useState<Array<{
-    file: File | NativeImportFile; selection: string; conflict: DuplicateUploadError;
-  }>>([]);
-  const [duplicateBusy, setDuplicateBusy] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [uploadErrors, setUploadErrors] = useState<{ file: string; message: string }[]>([]);
+  const [noticesOpen, setNoticesOpen] = useState(false);
+  const [saveNoticeOpen, setSaveNoticeOpen] = useState(false);
+  const [scopeNoticeBusy, setScopeNoticeBusy] = useState(false);
+  const { toast, notify, clear } = useToast();
+  const [saving, setSavingState] = useState(false);
+  const savingRef = useRef(false);
+  function setSaving(value: boolean) {
+    savingRef.current = value;
+    setSavingState(value);
+  }
   const [error, setError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  useEffect(() => { setSaveError(null); setSaveNoticeOpen(false); clear(); }, [task?.id, initialTask?.id, clear]);
   // 批量上传：本次放入队列的任务列表（状态随轮询刷新）
   const [batch, setBatch] = useState<BatchItem[]>([]);
+  const [batchReadError, setBatchReadError] = useState<string | null>(null);
+  const [batchRestoring, setBatchRestoring] = useState(false);
+  const [batchRestoreAttempt, setBatchRestoreAttempt] = useState(0);
+  const [batchRefreshAttempt, setBatchRefreshAttempt] = useState(0);
   // A new selection starts a new automatic-preview scope. Older tasks remain
   // in the queue but their completed results must not hide this upload's failure.
   const latestUploadIdsRef = useRef<Set<string> | null>(null);
+  const autoPreviewScopeRef = useRef(0);
+  const initialTaskIdRef = useRef(initialTask?.id ?? null);
+  initialTaskIdRef.current = initialTask?.id ?? null;
+  const [pendingAutoResult, setPendingAutoResult] = useState<{ task: Task; scope: number; error: string | null } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const resultSectionRef = useRef<HTMLDivElement | null>(null);
@@ -623,6 +649,7 @@ export function ExtractPage({
       evidence: [],
     };
     setTask(demoTask);
+    setReviewConflict(false);
     setExtraction(demoExtraction);
     setDraftResult(structuredClone(demoResult));
     setExtractValidationIssues(scenario.issues.map((issue, index) => ({ id: `${issue.code}-${index}`, index, row: 0, field: issue.field, msg: issue.message, ignored: false })));
@@ -638,28 +665,29 @@ export function ExtractPage({
 
   // 恢复"本次加入队列"的状态：切页/刷新后回来，批量队列提示不丢
   useEffect(() => {
+    if (demo || latestUploadIdsRef.current !== null) return;
     const savedIds = loadBatchIds();
     if (savedIds.length === 0) return;
-    // batch 任务都是刚上传的，必然在最新 200 条内；避免恢复逻辑全量拉历史（ISSUE-067）
-    getTasks({ limit: 200 })
-      .then((items) => {
+    const controller = new AbortController();
+    let active = true;
+    setBatchRestoring(true);
+    setBatchReadError(null);
+    readBatchTasks(savedIds, controller.signal)
+      .then(({ tasks }) => {
         // A delayed restoration must not replace files selected since mount.
-        if (latestUploadIdsRef.current !== null) return;
-        const byId = new Map(items.map((t) => [t.id, t]));
-        const restored = savedIds
-          .map((id) => byId.get(id))
-          .filter((t): t is Task => t !== undefined)
-          .map((task) => ({ task }));
-        if (restored.length > 0) {
-          setBatch(restored);
-        } else {
-          saveBatchIds([]);
+        if (!active || latestUploadIdsRef.current !== null) return;
+        setBatch(tasks.map(task => ({ task })));
+        // Only a complete, successful ID-scoped read can prove IDs are gone.
+        saveBatchIds(tasks.map(task => task.id));
+      })
+      .catch((reason: unknown) => {
+        if (active && latestUploadIdsRef.current === null) {
+          setBatchReadError(reason instanceof Error ? reason.message : "上次队列暂时无法读取。");
         }
       })
-      .catch(() => {
-        // 后端不可达时暂不恢复，保留本地记录
-      });
-  }, []);
+      .finally(() => { if (active) setBatchRestoring(false); });
+    return () => { active = false; controller.abort(); };
+  }, [demo, batchRestoreAttempt]);
 
   // Remember which file was open, but reload its current facts from the service.
   // Cached values may predate warehouse edits, deletion, or a backup restore.
@@ -669,6 +697,7 @@ export function ExtractPage({
     if (!record) return;
     const seq = ++loadSeqRef.current;
     setTask(record.task);
+    setReviewConflict(false);
     setExtraction(null);
     setDraftResult(null);
     setExtractValidationIssues([]);
@@ -685,18 +714,25 @@ export function ExtractPage({
       if (seq !== loadSeqRef.current) return;
       if (reason instanceof ApiError && reason.status === 404) {
         clearLastExtraction(); setTask(null);
+        return;
       }
       setError(reason instanceof Error ? reason.message : "读取上次文件失败，请在文件历史中重新打开。");
     }).finally(() => { if (seq === loadSeqRef.current) setLoading(false); });
   }, [demo]);
 
   useEffect(() => {
+    let active = true;
+    const sequence = ++templatesRequest.current;
+    setTemplatesLoading(true);
+    setTemplatesError(null);
     getTemplates()
-      .then((data) => setTemplates(data))
-      .catch(() => {
-        // 模板加载失败不阻塞主流程，下拉框保持为空
-      });
-  }, []);
+      .then((data) => { if (active && sequence === templatesRequest.current) setTemplates(data); })
+      .catch((reason) => {
+        if (active && sequence === templatesRequest.current) setTemplatesError(reason instanceof Error ? reason.message : "模板读取失败。");
+      })
+      .finally(() => { if (active && sequence === templatesRequest.current) setTemplatesLoading(false); });
+    return () => { active = false; };
+  }, [templatesReload]);
 
   // 上次记忆的手动模板若已被删除/停用，回退到空选择，避免提交无效模板
   useEffect(() => {
@@ -717,6 +753,7 @@ export function ExtractPage({
     setLoading(true);
     setSaving(false);
     setError(null);
+    setReviewConflict(false);
     setExtraction(null);
     setDraftResult(null);
     setExtractValidationIssues([]);
@@ -725,7 +762,7 @@ export function ExtractPage({
     setPreviewPage(1);
     setPreviewPageCount(initialTask.page_count ?? 1);
     setSelectedEvidencePath(null);
-    if (initialTask.status === "waiting_for_template") {
+    if (initialTask.status === "waiting_for_template" && initialTask.pending_action !== "confirm_target_table") {
       setExtraction(null); setDraftResult(null); setLoading(false);
       setBatch((current) => current.some((item) => item.task.id === initialTask.id) ? current : [...current, { task: initialTask }]);
       return;
@@ -738,9 +775,14 @@ export function ExtractPage({
         setExtractValidationIssues(mapValidationIssues(result));
       })
       .catch((err) => {
-        if (!cancelled && seq === loadSeqRef.current) {
-          setError(err instanceof Error ? err.message : "读取提取结果失败");
+        if (cancelled || seq !== loadSeqRef.current) return;
+        if (err instanceof ApiError && err.status === 404 &&
+            (initialTask.status === "completed" || initialTask.status === "needs_review")) {
+          if (loadLastExtraction()?.task.id === initialTask.id) clearLastExtraction();
+          setTask(null);
+          return;
         }
+        setError(err instanceof Error ? err.message : "读取提取结果失败");
       })
       .finally(() => {
         if (!cancelled && seq === loadSeqRef.current) setLoading(false);
@@ -762,15 +804,10 @@ export function ExtractPage({
   // 批量处理中保留最近完成的结果，下一份完成后再平滑替换；不能因为队列仍活动
   // 就把用户正在核对的结果隐藏掉。
   const showExtractData = hasExtractData;
+  const canEditExtraction = !demo && Boolean(task && ["completed", "needs_review"].includes(task.status))
+    && extraction?.has_current_data !== false;
   // 待处理任务（含待匹配）：状态条只显示这些，已完成/失败请去状态监控看
-  const pendingBatch = batch.filter(
-    (b) =>
-      BATCH_ACTIVE_STATUSES.has(b.task.status)
-      || b.task.status === "waiting_for_template",
-  );
-  const failedBatch = batch.filter(({ task: item }) => item.status === "failed"
-    && (latestUploadIdsRef.current === null || latestUploadIdsRef.current.has(item.id)));
-
+  const pendingBatch = batch.filter((b) => BATCH_ACTIVE_STATUSES.has(b.task.status));
   const displayExtraction = hasExtractData && extraction
     ? (draftResult ? { ...extraction, result: draftResult } : extraction)
     : null;
@@ -779,12 +816,17 @@ export function ExtractPage({
   const extractedColumns = [...headerColumns, ...itemColumns];
   const headerValues = displayExtraction ? buildHeaderValues(displayExtraction, headerColumns) : {};
   const itemRows = displayExtraction ? buildItemRows(displayExtraction, itemColumns) : [];
+  const [detailWidths, setDetailWidths] = useState<Record<string, number>>({});
+  const detailWidth = (key: string) => detailWidths[key] ?? 132;
   const detailPage = useDetailPage(itemRows.length, task?.id);
+  const locateValidationField = useValidationFieldLocator(resultSectionRef, task?.id);
   const selectedEvidence = extraction?.evidence?.find(
     (item) => item.field_path === selectedEvidencePath,
   );
-  const unsavedReview = useUnsavedChanges(() => {
+  const evidenceLabel = evidenceDescription(selectedEvidence);
+  const isReviewDirty = () => {
     if (demo || !task || !extraction || extraction.task_id !== task.id || !draftResult) return false;
+    if (editingExtractCellRef.current !== null) return true;
     const baselineIgnored = extraction.validation_issues
       .map((issue, index) => issue.ignored === true ? index : -1)
       .filter((index) => index >= 0);
@@ -798,9 +840,11 @@ export function ExtractPage({
     return JSON.stringify(draftResult) !== JSON.stringify(extraction.result)
       || JSON.stringify(draftDetailIds) !== JSON.stringify(extraction.detail_ids)
       || JSON.stringify(draftIgnored) !== JSON.stringify(baselineIgnored)
-      || chosenName !== baselineName
-      || Object.keys(invalidReviewDrafts).length > 0;
-  });
+      || chosenName !== baselineName;
+  };
+  const reviewDirtyRef = useRef(isReviewDirty);
+  reviewDirtyRef.current = isReviewDirty;
+  const unsavedReview = useUnsavedChanges(() => reviewDirtyRef.current());
 
   const templateDisplayName = (() => {
     // Upload controls describe the next file, never how a historical result was produced.
@@ -832,26 +876,93 @@ export function ExtractPage({
   // 记录当前自动展示的完成任务。同一轮轮询只选择 updated_at 最新的一份，
   // 避免多个请求争抢；后续任务完成时再替换。
   const autoDisplayedTaskIdRef = useRef<string | null>(null);
-  const loadResultForTask = useCallback(async (loadedTask: Task) => {
+  const autoLoadingTaskIdsRef = useRef(new Set<string>());
+  const pendingAutoResultRef = useRef(pendingAutoResult);
+  pendingAutoResultRef.current = pendingAutoResult;
+  const setPendingAutoResultValue = useCallback((value: typeof pendingAutoResult) => {
+    pendingAutoResultRef.current = value;
+    setPendingAutoResult(value);
+  }, []);
+  const offerAutoResult = useCallback((loadedTask: Task, scope: number, error: string | null = null) => {
+    const current = pendingAutoResultRef.current;
+    if (current?.scope === scope && parseServerTime(current.task.updated_at) > parseServerTime(loadedTask.updated_at)) return;
+    setPendingAutoResultValue({ task: loadedTask, scope, error: current?.task.id === loadedTask.id && error === null ? current.error : error });
+  }, [setPendingAutoResultValue]);
+  const isCurrentAutoPreview = useCallback((loadedTask: Task, scope: number, selectedTaskId: string | null) => {
+    return scope === autoPreviewScopeRef.current
+      && selectedTaskId === initialTaskIdRef.current
+      && (latestUploadIdsRef.current === null || latestUploadIdsRef.current.has(loadedTask.id));
+  }, []);
+  const shouldDeferAutoPreview = useCallback(() => {
+    return savingRef.current || uploadInFlight.current
+      || editingExtractCellRef.current !== null || reviewDirtyRef.current();
+  }, []);
+  const loadResultForTask = useCallback(async (loadedTask: Task, explicit = false) => {
+    const scope = autoPreviewScopeRef.current;
+    const selectedTaskId = initialTaskIdRef.current;
+    if (!isCurrentAutoPreview(loadedTask, scope, selectedTaskId)) return;
+    // Opening a history item is an explicit selection. A remembered batch must
+    // not replace it unless this page has since started a new upload batch.
+    if (!explicit && selectedTaskId && latestUploadIdsRef.current === null) return;
+    const pending = pendingAutoResultRef.current;
+    if (!explicit && pending?.scope === scope) {
+      offerAutoResult(loadedTask, scope, pending.task.id === loadedTask.id ? pending.error : null);
+      return;
+    }
+    if (!explicit && shouldDeferAutoPreview()) {
+      offerAutoResult(loadedTask, scope);
+      return;
+    }
+    if ((!explicit && autoDisplayedTaskIdRef.current === loadedTask.id) || autoLoadingTaskIdsRef.current.has(loadedTask.id)) return;
+    if (savingRef.current || uploadInFlight.current) return;
+    autoLoadingTaskIdsRef.current.add(loadedTask.id);
     const seq = ++loadSeqRef.current;
     try {
       const result = await getExtraction(loadedTask.id);
+      if (!isCurrentAutoPreview(loadedTask, scope, selectedTaskId)) return;
+      if (shouldDeferAutoPreview()) {
+        offerAutoResult(loadedTask, scope);
+        return;
+      }
+      const pending = pendingAutoResultRef.current;
+      if (pending?.scope === scope && parseServerTime(pending.task.updated_at) > parseServerTime(loadedTask.updated_at)) return;
       if (seq !== loadSeqRef.current) return;
       setTask(loadedTask);
-      setSaving(false);
+      setReviewConflict(false);
       setExtraction(result);
       setDraftResult(structuredClone(result.result));
       setExtractValidationIssues(mapValidationIssues(result));
       setPreviewPage(1);
       setPreviewPageCount(loadedTask.page_count ?? 1);
       setSelectedEvidencePath(null);
+      editingExtractCellRef.current = null;
+      setEditingExtractCellState(null);
       setError(null);
       saveLastExtraction({ task: loadedTask, extraction: result });
+      autoDisplayedTaskIdRef.current = loadedTask.id;
+      if (pendingAutoResultRef.current?.task.id === loadedTask.id) setPendingAutoResultValue(null);
     } catch (err) {
+      if (!isCurrentAutoPreview(loadedTask, scope, selectedTaskId)) return;
+      if (shouldDeferAutoPreview()) {
+        offerAutoResult(loadedTask, scope, err instanceof Error ? err.message : "读取提取结果失败");
+        return;
+      }
       if (seq !== loadSeqRef.current) return;
-      setError(err instanceof Error ? err.message : "读取提取结果失败");
+      offerAutoResult(loadedTask, scope, err instanceof Error ? err.message : "读取提取结果失败");
+    } finally {
+      autoLoadingTaskIdsRef.current.delete(loadedTask.id);
     }
-  }, []);
+  }, [isCurrentAutoPreview, offerAutoResult, setPendingAutoResultValue, shouldDeferAutoPreview]);
+
+  function openPendingAutoResult() {
+    const pending = pendingAutoResultRef.current;
+    if (!pending || pending.scope !== autoPreviewScopeRef.current || savingRef.current || uploadInFlight.current) return;
+    unsavedReview.protect(() => {
+      discardCurrentReviewDraft();
+      setEditingExtractCell(null);
+      void loadResultForTask(pending.task, true);
+    });
+  }
 
   function discardCurrentReviewDraft() {
     if (extraction) {
@@ -859,9 +970,6 @@ export function ExtractPage({
       setDraftDetailIds(extraction.detail_ids);
       setExtractValidationIssues(mapValidationIssues(extraction));
     }
-    invalidReviewDraftsRef.current = {};
-    setInvalidReviewDrafts({});
-    setNumericInputError(null);
     if (task) {
       setNameChoices((current) => {
         if (!(task.id in current)) return current;
@@ -886,6 +994,8 @@ export function ExtractPage({
     if (files.length === 0 || uploadInFlight.current) return;
     uploadInFlight.current = true;
     setError(null);
+    if (duplicatePolicy === "reject") setUploadErrors([]);
+    setReviewConflict(false);
     setLoading(true);
     const selection = selectedTemplate ?? templateSelection();
     const startedAt = Date.now();
@@ -915,7 +1025,12 @@ export function ExtractPage({
         });
         if (uploaded.length === 1) {
           // A new source must never be paired with the previous file's values.
+          autoPreviewScopeRef.current += 1;
+          autoDisplayedTaskIdRef.current = null;
+          setPendingAutoResultValue(null);
           latestUploadIdsRef.current = new Set();
+          setBatchRestoring(false);
+          setBatchReadError(null);
           loadSeqRef.current += 1;
           setSaving(false);
           setExtraction(null);
@@ -930,14 +1045,10 @@ export function ExtractPage({
         latestUploadIdsRef.current!.add(uploadedTask.id);
       } catch (err) {
         if (err instanceof DuplicateUploadError) {
-          if ("token" in file && !err.retryToken) {
-            setError("这份文件已导入。如需再次提取，请重新选择文件。");
-          } else {
-            const retryFile = "token" in file ? { ...file, token: err.retryToken! } : file;
-            setDuplicateUploads((pending) => [...pending, { file: retryFile, selection, conflict: err }]);
-          }
+          onDuplicate?.({ id: crypto.randomUUID(), name: file.name, size: file.size,
+            selection, existingTaskId: err.taskId, sha256: err.sha256, createdAt: new Date(startedAt).toISOString() });
         } else {
-          setError(err instanceof Error ? err.message : "上传失败");
+          setUploadErrors(errors => [...errors, { file: file.name, message: err instanceof Error ? err.message : "上传失败" }]);
         }
       }
     }
@@ -952,19 +1063,6 @@ export function ExtractPage({
     });
     // 立即同步全局任务条：上传成功即刻显示"正在识别"，不等下一次轮询
     onTasksChange?.();
-  }
-
-  function confirmDuplicateUpload() {
-    const pending = duplicateUploads[0];
-    if (!pending || duplicateBusy || uploadInFlight.current) return;
-    unsavedReview.protect(() => {
-      discardCurrentReviewDraft();
-      setDuplicateBusy(true);
-      void processFiles([pending.file], "allow", pending.selection)
-        .then(() => setDuplicateUploads((current) => current.slice(1)))
-        .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "上传失败"))
-        .finally(() => setDuplicateBusy(false));
-    });
   }
 
   async function chooseFiles() {
@@ -991,23 +1089,32 @@ export function ExtractPage({
   // 批次任务刷新：以 SSE 事件驱动（任务状态变化时后端推送），低频轮询仅作断线兜底。
   // 拉取后若批次任务内容无变化则不触发重渲染，避免多重刷新导致界面闪烁。
   useEffect(() => {
-    if (!batch.some((b) => BATCH_ACTIVE_STATUSES.has(b.task.status))) return;
+    const hasActive = batch.some((b) => BATCH_ACTIVE_STATUSES.has(b.task.status));
+    if (!batch.length || (!hasActive && batchRefreshAttempt === 0)) return;
     let cancelled = false;
+    let inFlight = false;
+    let controller: AbortController | undefined;
     const refresh = () => {
+      if (inFlight) return;
+      inFlight = true;
+      const request = new AbortController();
+      controller = request;
       void (async () => {
         try {
-          // 本次 batch 任务数量有限，拉最近 200 条足够覆盖，避免全量历史随刷新加载（ISSUE-067）
-          const items = await getTasks({ limit: 200 });
+          const { tasks: items, missingIds } = await readBatchTasks(batch.map(item => item.task.id), request.signal);
           if (cancelled) return;
+          setBatchReadError(null);
           const byId = new Map(items.map((t) => [t.id, t]));
-          let changed = false;
-          const refreshedBatch = batch.map((b) => {
+          const missing = new Set(missingIds);
+          let changed = missing.size > 0;
+          const refreshedBatch = batch.filter(item => !missing.has(item.task.id)).map((b) => {
             const cur = byId.get(b.task.id);
-            if (cur && cur.updated_at !== b.task.updated_at) changed = true;
+            if (cur && (cur.updated_at !== b.task.updated_at || cur.status !== b.task.status)) changed = true;
             return cur ? { ...b, task: cur } : b;
           });
           if (!changed) return;
           setBatch(refreshedBatch);
+          saveBatchIds(refreshedBatch.map(item => item.task.id));
           setTask((current) => current ? byId.get(current.id) ?? current : current);
           onTasksChange?.();
           const latestResult = refreshedBatch
@@ -1016,34 +1123,35 @@ export function ExtractPage({
             .filter((item) => item.status === "completed" || item.status === "needs_review")
             .sort((left, right) => parseServerTime(right.updated_at) - parseServerTime(left.updated_at))[0];
           if (latestResult && autoDisplayedTaskIdRef.current !== latestResult.id) {
-            autoDisplayedTaskIdRef.current = latestResult.id;
             void loadResultForTask(latestResult);
           }
-        } catch {
-          // 刷新失败静默，下个周期重试
+        } catch (reason: unknown) {
+          if (!cancelled) setBatchReadError(reason instanceof Error ? reason.message : "队列状态暂时无法更新。");
+        } finally {
+          inFlight = false;
         }
       })();
     };
     const unsub =
-      typeof EventSource === "undefined"
+      !hasActive || typeof EventSource === "undefined"
         ? undefined
         : subscribeTaskEvents(refresh);
-    const timer = window.setInterval(refresh, 5000);
+    const timer = hasActive ? window.setInterval(refresh, 5000) : undefined;
+    refresh();
     return () => {
       cancelled = true;
+      controller?.abort();
       window.clearInterval(timer);
       unsub?.();
     };
-  }, [batch, onTasksChange, loadResultForTask]);
+  }, [batch, batchRefreshAttempt, initialTask?.id, onTasksChange, loadResultForTask]);
 
   async function handleSave() {
-    if (Object.keys(invalidReviewDraftsRef.current).length > 0) {
-      setNumericInputError((current) => current ?? "请先修正所有标记为无效的数字字段，再保存核对结果。");
-      return;
-    }
-    if (!task || !extraction || !draftResult || task.id !== extraction.task_id || saving) return;
+    setSavedReview(null);
+    if (!task || !extraction || !draftResult || task.id !== extraction.task_id || saving || !canEditExtraction) return;
     const seq = ++loadSeqRef.current;
-    setError(null);
+    setSaveError(null);
+    setReviewConflict(false);
     setSaving(true);
     try {
       // 用户忽略的校验问题下标随保存提交；被忽略的问题仍记录但不再阻断确认
@@ -1062,14 +1170,21 @@ export function ExtractPage({
       setExtraction(updated);
       setDraftResult(structuredClone(updated.result));
       setExtractValidationIssues(mapValidationIssues(updated));
+      setSavedReview({ taskId: task.id, version: updated.review_version });
     } catch (err) {
-      if (seq === loadSeqRef.current) setError(err instanceof Error ? err.message : "保存修改失败");
+      if (seq === loadSeqRef.current) {
+        const conflict = err instanceof ApiError && err.status === 409;
+        setReviewConflict(conflict);
+        setSaveError(conflict ? "这份文件的数据已有更新，本次修改尚未保存。" : err instanceof Error ? err.message : "保存修改失败");
+        notify(conflict ? "修改未保存，点「处理冲突」查看。" : "修改未保存，点「查看原因」查看。", "error");
+      }
     } finally {
       if (seq === loadSeqRef.current) setSaving(false);
     }
   }
 
   function toggleIssueIgnored(index: number) {
+    setSavedReview(null);
     setExtractValidationIssues((current) =>
       current.map((issue) =>
         issue.index === index ? { ...issue, ignored: !issue.ignored } : issue,
@@ -1077,23 +1192,8 @@ export function ExtractPage({
     );
   }
 
-  function rememberInvalidReviewDraft(key: string, raw: string, reason: unknown) {
-    const next = { ...invalidReviewDraftsRef.current, [key]: raw };
-    invalidReviewDraftsRef.current = next;
-    setInvalidReviewDrafts(next);
-    setNumericInputError(reason instanceof Error ? reason.message : "数字格式无效");
-  }
-
-  function clearInvalidReviewDraft(key: string) {
-    if (!(key in invalidReviewDraftsRef.current)) return;
-    const next = { ...invalidReviewDraftsRef.current };
-    delete next[key];
-    invalidReviewDraftsRef.current = next;
-    setInvalidReviewDrafts(next);
-    if (Object.keys(next).length === 0) setNumericInputError(null);
-  }
-
   function updateHeaderDraft(key: string, raw: string) {
+    setSavedReview(null);
     if (!draftResult) return;
     const column = headerColumns.find((item) => item.key === key);
     let previous: TemplateValue | undefined;
@@ -1102,14 +1202,7 @@ export function ExtractPage({
       const target = documentHeaderKeys[key];
       if (target) previous = draftResult[target] as TemplateValue;
     }
-    let value: TemplateValue;
-    try {
-      value = editedValue(raw, previous, column?.numeric ?? typeof previous === "number", column?.label ?? key);
-    } catch (reason) {
-      rememberInvalidReviewDraft(`h-${key}`, raw, reason);
-      return;
-    }
-    clearInvalidReviewDraft(`h-${key}`);
+    const value = manualCellValue(raw === "—" ? "" : raw, column?.valueType ?? typeof previous);
     setDraftResult((current) => {
       if (!current) return current;
       const next = structuredClone(current);
@@ -1127,6 +1220,7 @@ export function ExtractPage({
   }
 
   function updateItemDraft(row: number, key: string, raw: string) {
+    setSavedReview(null);
     if (!draftResult) return;
     const column = itemColumns.find((item) => item.key === key);
     let previous: TemplateValue | undefined;
@@ -1135,14 +1229,7 @@ export function ExtractPage({
       const target = documentItemKeys[key];
       if (target) previous = draftResult.items[row]?.[target] as TemplateValue | undefined;
     }
-    let value: TemplateValue;
-    try {
-      value = editedValue(raw, previous, column?.numeric ?? typeof previous === "number", column?.label ?? key);
-    } catch (reason) {
-      rememberInvalidReviewDraft(`${row}-${key}`, raw, reason);
-      return;
-    }
-    clearInvalidReviewDraft(`${row}-${key}`);
+    const value = manualCellValue(raw === "—" ? "" : raw, column?.valueType ?? typeof previous);
     setDraftResult((current) => {
       if (!current) return current;
       const next = structuredClone(current);
@@ -1175,121 +1262,77 @@ export function ExtractPage({
               </article>
   ) : null;
 
+  const resultOffer = pendingAutoResult?.scope === autoPreviewScopeRef.current ? pendingAutoResult : null;
+  const uploadNoticeCount = uploadErrors.length;
+  const scopeTask = task?.pending_reason === "input_scope" ? task : null;
+  const queueLabel = batchRestoring ? "正在读取上次队列…" : batchReadError ? "队列状态待确认"
+    : pendingBatch.length ? "队列中 " + pendingBatch.length + " 个任务" : null;
+  const hasNotices = Boolean(uploadNoticeCount || error || templatesError || queueLabel || resultOffer || scopeTask);
+  useEffect(() => { if (!hasNotices) setNoticesOpen(false); }, [hasNotices]);
+  const noticeLabel = uploadNoticeCount ? uploadNoticeCount + " 份文件待处理"
+    : scopeTask ? "确认读取范围"
+    : resultOffer && !error && !templatesError && !batchReadError ? resultOffer.error ? "结果读取失败" : "新结果可查看"
+    : error || templatesError || batchReadError ? "查看提取事项" : queueLabel;
+  const noticeButton = hasNotices && <button className="gtb-failure-link" type="button"
+    aria-haspopup="dialog" onClick={() => setNoticesOpen(true)}>{noticeLabel}</button>;
+
   return (
-    <div className="view">
-      <ConfirmDialog
-        open={duplicateUploads.length > 0}
-        tone="normal"
-        eyebrow="重复文件"
-        title="这份文件已经导入"
-        description={<>
-          <strong style={{ overflowWrap: "anywhere" }}>{duplicateUploads[0]?.file.name}</strong>
-          <p>{duplicateUploads[0]?.conflict.message}</p>
-          <p>已有任务：{BATCH_STATUS_LABEL[duplicateUploads[0]?.conflict.status ?? ""] ?? "已接收"}。可跳过并到文件历史查看。</p>
-          {duplicateUploads.length > 1 && <p>还有 {duplicateUploads.length - 1} 个重复文件待确认。</p>}
-        </>}
-        buttonLabel="再次提取"
-        cancelLabel="跳过此文件"
-        busy={duplicateBusy || loading}
-        onClose={() => setDuplicateUploads((pending) => pending.slice(1))}
-        onConfirm={() => void confirmDuplicateUpload()}
-      />
+    <div className="view extract-view">
+      <Toast toast={toast} onDismiss={clear} />
+      {noticeHost ? createPortal(noticeButton, noticeHost) : noticeButton}
+      {noticesOpen && hasNotices && <NoticeDialog title="提取事项" busy={scopeNoticeBusy} onClose={() => setNoticesOpen(false)}>
+        <ul className="notice-dialog-list">
+          {error && <li><p>{error}</p></li>}
+          {uploadErrors.map(({ file, message }, index) => <li key={index}><strong>{file}</strong><p>{message}</p></li>)}
+          {templatesError && <li><p>{templatesError}</p>
+            <button className="btn secondary sm" type="button" disabled={templatesLoading}
+              onClick={() => setTemplatesReload(value => value + 1)}>重新读取模板</button></li>}
+          {batchReadError && <li><strong>{queueLabel}</strong><p>{batchReadError}</p>
+            <button className="btn secondary sm" type="button" disabled={batchRestoring} onClick={() => {
+              if (batch.length) setBatchRefreshAttempt(value => value + 1);
+              else setBatchRestoreAttempt(value => value + 1);
+            }}>重新读取队列</button></li>}
+          {queueLabel && !batchReadError && <li><strong>{queueLabel}</strong></li>}
+          {pendingBatch.map(({ task: queued }) => <li key={queued.id}>
+            <strong>{taskDisplayName(queued)}</strong>
+            <span> · {queued.archive_pending ? "归档待处理" : BATCH_STATUS_LABEL[queued.status]}</span>
+          </li>)}
+          {scopeTask && <li><PartialInputAction key={scopeTask.id} task={scopeTask} onBusyChange={setScopeNoticeBusy} onUpdated={updated => {
+            setTask(current => current?.id === updated.id ? updated : current);
+            setBatch(current => current.map(entry => entry.task.id === updated.id ? { task: updated } : entry));
+            setNoticesOpen(false); onTasksChange?.();
+          }} /></li>}
+          {resultOffer && <li><strong>{taskDisplayName(resultOffer.task)}</strong>
+            {resultOffer.error && <p>{resultOffer.error}</p>}
+            <button className="btn secondary sm" type="button" disabled={saving || loading} onClick={() => {
+              setNoticesOpen(false);
+              openPendingAutoResult();
+            }}>{resultOffer.error ? "重新读取结果" : "查看结果"}</button></li>}
+        </ul>
+      </NoticeDialog>}
       {unsavedReview.dialog}
       {fileHistoryOpen && task && <FileRevisionHistory taskId={task.id} filename={taskDisplayName(task)} onClose={() => setFileHistoryOpen(false)} />}
-      {extraction?.has_current_data === false && <p className="callout">当前数据已清空。原文件和历史版本仍可查看。</p>}
-      <div className="page-header">
-        <div className="eyebrow">提取</div>
-        <h1>文件提取</h1>
-        <div className="support">
-          拖拽或选择文件，AI
-          会自动识别内容并提取结构化数据，下方实时显示校验结果。
-        </div>
-      </div>
-
-      {error && (
-        <div className="callout danger" role="alert" style={{ marginBottom: 16 }}>
-          {error}
-        </div>
-      )}
-      {numericInputError && (
-        <div className="callout danger" role="alert" style={{ marginBottom: 16 }}>
-          {numericInputError}
-        </div>
-      )}
-
-      <div className="extract-topbar">
-        <div
-          className="datastore-toolbar-left"
-          style={{ gap: "calc(var(--space-4) * 2)" }}
-        >
-          <label className="form-label" htmlFor="extract-template">提取模板</label>
-          <select id="extract-template" aria-label="提取模板" className="form-select" style={{ maxWidth: "320px" }}
-            value={matchMode === "auto" ? "smart" : selectedTemplateId}
-            onChange={event => {
-              const value = event.target.value;
+      <ExtractConfiguration
+            templates={templates}
+            automatic={matchMode === "auto"}
+            selectedTemplateId={selectedTemplateId}
+            onSelect={value => {
               const mode = value === "smart" ? "auto" : "manual";
               setMatchMode(mode);
               if (mode === "manual") setSelectedTemplateId(value);
               writeLastUploadMode(mode, mode === "manual" ? value : selectedTemplateId);
-            }}>
-            <option value="smart">智能选择 · 在匹配范围内选择</option>
-            {matchMode === "manual" && !selectedTemplateId && <option value="" disabled>请选择模板…</option>}
-            {templates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}
-          </select>
-        </div>
-        <button className="btn ghost" onClick={onNavigateHistory}>
-          <Icon icon={History} size={16} /> 文件历史
-        </button>
-      </div>
-
-      {matchMode === "auto" && <Disclosure className="template-advanced" title={`匹配范围 · ${templates.filter(template => template.in_smart_pool && template.engine_kind !== "autonomous").length} 个普通模板 · ${templates.some(template => template.in_smart_pool && template.engine_kind === "autonomous") ? "自主提取兜底" : "未启用兜底"}`}>
-        <SmartPoolSettings onUpdated={setTemplates} />
-      </Disclosure>}
-
-      {/* 批量上传：队列预览常驻（无任务时显示空状态，避免任务出现时闪动）；
-          只显示待处理任务，最多 3 个，其余省略；已完成去状态监控查看 */}
-      <div className="batch-list" aria-live="polite">
-        <div className="batch-list-title">
-          {pendingBatch.length > 0
-            ? `队列中 ${pendingBatch.length} 个任务`
-            : "队列空闲"}
-          <span className="batch-list-hint">仅显示待处理，已完成请到状态监控查看</span>
-        </div>
-        {pendingBatch.length === 0 ? (
-          <div className="batch-empty">当前没有待处理的任务</div>
-        ) : (
-          <div className="batch-items">
-            {pendingBatch.slice(0, 3).map((b) => (
-              <span key={b.task.id} className={`batch-item ${b.task.status}`}>
-                <span className="batch-item-name">{taskDisplayName(b.task)}</span>
-                <span className="batch-item-status">
-                  {b.task.archive_pending ? "归档待处理" : b.task.status === "failed" ? "失败" : BATCH_STATUS_LABEL[b.task.status]}
-                </span>
-              </span>
-            ))}
-            {pendingBatch.length > 3 && (
-              <span
-                className="batch-item batch-more"
-                title={`还有 ${pendingBatch.length - 3} 个任务在队列中`}
-              >
-                … 还有 {pendingBatch.length - 3} 个
-              </span>
-            )}
-          </div>
-        )}
-      </div>
-
-      {failedBatch.length > 0 && <div className="callout danger" role="alert" style={{ marginBottom: 16 }}>
-        {failedBatch.slice(0, 3).map(({ task: failed }) => <p key={failed.id}>
-          <strong>{taskDisplayName(failed)} · 提取失败</strong><br />
-          {failed.failure_message || "未能完成提取，请到文件历史查看原因并重试。"}
-        </p>)}
-        {failedBatch.length > 3 && <p>另有 {failedBatch.length - 3} 个文件提取失败。</p>}
-        {onNavigateHistory && <button className="btn secondary sm" onClick={onNavigateHistory}>
-          查看文件历史并重试
-        </button>}
-      </div>}
-
+            }}
+            templateReadState={templatesLoading ? "loading" : templatesError ? "error" : "ready"}
+            onUpdated={items => {
+              // A modal may have read or changed the pool while the page's
+              // initial read is still pending. Keep that newer result.
+              templatesRequest.current += 1;
+              setTemplates(items);
+              setTemplatesLoading(false);
+              setTemplatesError(null);
+            }}
+            onNavigateHistory={onNavigateHistory}
+      />
       <div className="extract-layout">
         {/* 1. 拖入区 */}
         <div
@@ -1366,18 +1409,19 @@ export function ExtractPage({
           <div className="panel-title">
             <div>
               <h3>提取出的数据</h3>
+              {extraction?.has_current_data === false && <p className="support">当前数据已清空</p>}
               {showExtractData && (
                 <div className="support">
                   来源：<span>{extractedSourceName}</span> · 模板：
                   <span>{templateDisplayName}</span>
                   {task?.autonomous_fallback && <span> · 本次未匹配普通模板，使用自主提取兜底</span>}
-                  {extraction && (
+                  {!demo && extraction && (
                     <>
                       {" · "}本次提取耗时：
                       <strong>{extraction.elapsed_seconds.toFixed(1)} 秒</strong>
                     </>
                   )}
-                  {task?.status === "completed" && task.completed_at && (
+                  {!demo && task?.status === "completed" && task.completed_at && (
                     <>
                       {" · "}完成时间：
                       <span>{formatDateTime(task.completed_at)}</span>
@@ -1385,20 +1429,21 @@ export function ExtractPage({
                   )}
                 </div>
               )}
-              {!showExtractData && (
-                <div className="support">
-                  尚未提取 — 拖入文件后结果与校验显示在此
-                </div>
-              )}
+
             </div>
             {showExtractData && !demo && (
               <div className="sheet-detail-actions">
+                <span className="small muted" role="status" aria-live="polite" style={{ minWidth: "3em" }}>
+                  {saveError ? <button className="gtb-failure-link" type="button" aria-haspopup="dialog"
+                    onClick={() => { clear(); setSaveNoticeOpen(true); }}>{reviewConflict ? "处理冲突" : "查看原因"}</button>
+                    : !saving && savedReview?.taskId === task?.id && savedReview?.version === extraction?.review_version ? "已保存" : ""}
+                </span>
                 <button className="btn secondary sm" onClick={() => setFileHistoryOpen(true)}><Icon icon={History} size={14} /> 历史版本</button>
                 <button
                   className="btn primary sm"
                   onClick={handleSave}
-                  disabled={saving || extraction?.has_current_data === false}
-                  title="提交本轮修改，形成一个文件修订版本"
+                  disabled={saving || !canEditExtraction}
+                  title={canEditExtraction ? "提交本轮修改，形成一个文件修订版本" : "此任务当前只读，已有数据和历史仍可查看"}
                 >
                   <Icon
                     icon={saving ? Loader2 : Save}
@@ -1411,11 +1456,22 @@ export function ExtractPage({
             )}
           </div>
 
-          {task?.pending_reason === "input_scope" && <PartialInputAction task={task} onUpdated={onTasksChange} />}
+          {saveNoticeOpen && saveError && <NoticeDialog title={reviewConflict ? "修订冲突" : "修改未保存"}
+            onClose={() => setSaveNoticeOpen(false)}
+            actions={reviewConflict && task && <button className="btn primary sm" type="button" disabled={saving || loading}
+              onClick={() => {
+                setSaveNoticeOpen(false);
+                unsavedReview.protect(() => {
+                  discardCurrentReviewDraft(); setReviewConflict(false); setSaveError(null); void loadResultForTask(task, true);
+                });
+              }}>重新读取</button>}>
+            <p>{saveError}</p>
+          </NoticeDialog>}
+
           {extraction?.input_scope?.coverage === "partial" && <p className="small muted">仅处理部分内容</p>}
           {task && extraction?.file_name && <FileNameConfirmation original={task.filename} state={extraction.file_name}
-            value={nameChoices[task.id]} disabled={saving} onChange={(name) => setNameChoices((current) => ({ ...current, [task.id]: name }))} />}
-          {!showExtractData && task?.pending_reason !== "input_scope" && (
+            value={nameChoices[task.id]} disabled={saving || !canEditExtraction} onChange={(name) => { setSavedReview(null); setNameChoices((current) => ({ ...current, [task.id]: name })); }} />}
+          {!showExtractData && (
             <div className="extract-empty">
               {loading || batchActive ? (
                 // 计时信息与长句提示由顶部全局任务条承担，这里只保留转圈
@@ -1442,7 +1498,8 @@ export function ExtractPage({
                 }
               }}
             >
-              {demo && <div className="callout success"><strong>内置提取示例</strong>　这是只读演示，不会创建任务、写入文件历史或计入仪表盘统计。</div>}
+              {demo && <div className="callout success"><strong>内置提取示例 · 只读</strong>　对照原件查看整理结果。</div>}
+              {!demo && !canEditExtraction && <p className="support">此任务当前只读。原件、已有数据和历史仍可查看。</p>}
               {/* 抬头卡片（单据头字段，一单一行） */}
               <div className="extract-header-card">
                 <div className="extract-header-title">
@@ -1453,21 +1510,22 @@ export function ExtractPage({
                     const evidencePath = headerEvidencePath(extraction, col.key);
                     return (
                     <div
-                      aria-label={`${demo ? "查看" : "编辑"}字段 ${col.label}`}
+                      data-review-field={`h-${col.key}`}
+                      aria-label={`${canEditExtraction ? "编辑" : "查看"}字段 ${col.label}`}
                       className={`extract-header-row evidence-selectable ${
                         evidencePath === selectedEvidencePath ? "is-evidence-selected" : ""
                       }`}
                       key={col.key}
                       onClick={() => {
                         selectEvidence(evidencePath);
-                        if (!demo) setEditingExtractCell(`h-${col.key}`);
+                        if (canEditExtraction && !saving) setEditingExtractCell(`h-${col.key}`);
                       }}
                       onKeyDown={(e) => {
                         if (e.target !== e.currentTarget) return;
                         if (e.key === "Enter" || e.key === " ") {
                           e.preventDefault();
                           selectEvidence(evidencePath);
-                          if (!demo) setEditingExtractCell(`h-${col.key}`);
+                          if (canEditExtraction && !saving) setEditingExtractCell(`h-${col.key}`);
                         }
                       }}
                       role="button"
@@ -1483,7 +1541,7 @@ export function ExtractPage({
                             : ""
                         }`}
                         editing={editingExtractCell === `h-${col.key}`}
-                        value={invalidReviewDrafts[`h-${col.key}`] ?? headerValues[col.key]}
+                        value={headerValues[col.key]}
                         onCancel={() => setEditingExtractCell(null)}
                         onCommit={(raw) => updateHeaderDraft(col.key, raw)}
                       />
@@ -1504,7 +1562,11 @@ export function ExtractPage({
                   </span>
                 </div>
                 <div className="data-table-scroll">
-                  <table className="data-table">
+                  <table className="data-table" style={{ minWidth: 52 + itemColumns.reduce((sum, column) => sum + detailWidth(column.key), 0) }}>
+                    <colgroup>
+                      <col style={{ width: 52 }} />
+                      {itemColumns.map(column => <col key={column.key} style={{ width: detailWidth(column.key) }} />)}
+                    </colgroup>
                     <thead>
                       <tr>
                         <th className="detail-row-gutter" scope="col" aria-label="明细序号">#</th>
@@ -1516,6 +1578,8 @@ export function ExtractPage({
                             }}
                           >
                             <span>{col.label}</span>
+                            <DetailColumnResizer label={col.label} width={detailWidth(col.key)}
+                              onResize={width => setDetailWidths(previous => ({ ...previous, [col.key]: width }))} />
                           </th>
                         ))}
                       </tr>
@@ -1534,18 +1598,8 @@ export function ExtractPage({
                               : ""
                           }
                         >
-                          <td className="detail-row-gutter">{demo ? idx + 1 : <DetailRowAction index={idx + 1} disabled={saving} onDelete={() => {
-                            const shifted: Record<string, string> = {};
-                            for (const [key, raw] of Object.entries(invalidReviewDraftsRef.current)) {
-                              const match = key.match(/^(\d+)-/);
-                              if (!match) { shifted[key] = raw; continue; }
-                              const invalidRow = Number(match[1]);
-                              if (invalidRow < idx) shifted[key] = raw;
-                              else if (invalidRow > idx) shifted[`${invalidRow - 1}${key.slice(match[1].length)}`] = raw;
-                            }
-                            invalidReviewDraftsRef.current = shifted;
-                            setInvalidReviewDrafts(shifted);
-                            if (Object.keys(shifted).length === 0) setNumericInputError(null);
+                          <td className="detail-row-gutter">{!canEditExtraction ? idx + 1 : <DetailRowAction index={idx + 1} disabled={saving} onDelete={() => {
+                            setSavedReview(null);
                             setDraftResult(current => current ? {...current, items: current.items.filter((_, index) => index !== idx)} as ExtractionResult : current);
                             setDraftDetailIds(current => current?.filter((_, index) => index !== idx));
                             setEditingExtractCell(null); setSelectedEvidencePath(null);
@@ -1554,7 +1608,8 @@ export function ExtractPage({
                             const evidencePath = itemEvidencePath(extraction, idx, col.key);
                             return (
                             <td
-                              aria-label={`${demo ? "查看" : "编辑"} ${col.label}，当前值 ${row[col.key] || "空"}`}
+                              data-review-field={`${idx}-${col.key}`}
+                              aria-label={`${canEditExtraction ? "编辑" : "查看"} ${col.label}，当前值 ${row[col.key] || "空"}`}
                               key={col.key}
                               className={`${col.numeric ? "numeric" : ""} ${
                                 extractValidationIssues.some(
@@ -1571,21 +1626,21 @@ export function ExtractPage({
                               }`}
                               onClick={() => {
                                 selectEvidence(evidencePath);
-                                if (!demo) setEditingExtractCell(`${idx}-${col.key}`);
+                                if (canEditExtraction && !saving) setEditingExtractCell(`${idx}-${col.key}`);
                               }}
                               onKeyDown={(event) => {
                                 if (event.target !== event.currentTarget) return;
                                 if (event.key === "Enter" || event.key === "F2") {
                                   event.preventDefault();
                                   selectEvidence(evidencePath);
-                                  if (!demo) setEditingExtractCell(`${idx}-${col.key}`);
+                                  if (canEditExtraction && !saving) setEditingExtractCell(`${idx}-${col.key}`);
                                 }
                               }}
                               tabIndex={0}
                             >
                               <EditableText
                                 editing={editingExtractCell === `${idx}-${col.key}`}
-                                value={invalidReviewDrafts[`${idx}-${col.key}`] ?? row[col.key]}
+                                value={row[col.key]}
                                 onCancel={() => setEditingExtractCell(null)}
                                 onCommit={(raw) => updateItemDraft(idx, col.key, raw)}
                               />
@@ -1600,104 +1655,41 @@ export function ExtractPage({
                 <DetailPagination paging={detailPage} count={itemRows.length} disabled={saving} />
               </div>
 
-              {/* 校验问题面板（紧贴提取数据下方） */}
-              <div
-                className={`validation-panel ${
-                  !validationPanelOpen ? "collapsed" : ""
-                }`}
-              >
-                <button
-                  className="validation-panel-head"
-                  aria-expanded={validationPanelOpen}
-                  aria-controls="extract-validation-content"
-                  onClick={() => setValidationPanelOpen(!validationPanelOpen)}
-                >
-                  <Icon
-                    icon={ShieldAlert}
-                    size={15}
-                    style={{ color: "var(--color-danger-600)" }}
-                  />
-                  <span>校验结果</span>
-                  <span
-                    className={`validation-count ${
-                      extractValidationIssues.length === 0 ? "zero" : ""
-                    }`}
-                  >
-                    {extractValidationIssues.length}
-                  </span>
-                  {extractValidationIssues.length === 0 && (
-                    <span className="validation-hint">全部通过，无异常</span>
-                  )}
-                  <Icon
-                    icon={ChevronDown}
-                    size={15}
-                    className="validation-caret"
-                  />
-                </button>
-                <div className={`collapse${validationPanelOpen ? " open" : ""}`} id="extract-validation-content" inert={!validationPanelOpen} aria-hidden={!validationPanelOpen}>
-                  <div className="collapse-content"><div className="validation-panel-body">
-                    {extractValidationIssues.length === 0 ? (
-                      <div className="validation-empty">
-                        <Icon
-                          icon={CheckCircle2}
-                          size={18}
-                          style={{ color: "var(--color-success-600)" }}
-                        />
-                        <span>本次提取校验全部通过</span>
-                      </div>
-                    ) : null}
-                    {extractValidationIssues.map((issue) => (
-                      <div
-                        className={`validation-item${issue.ignored ? " is-ignored" : ""}`}
-                        key={issue.id}
-                      >
-                        <span className="validation-row-tag">
-                          {issue.row === 0
-                            ? "抬头"
-                            : "明细第 " + issue.row + " 行"}
-                        </span>
-                        <span className="validation-field">
-                          {extractedColumns.find(
-                            (c) => c.key === issue.field,
-                          )?.label || extraction?.template?.fields.find(field => field.key === issue.field)?.label || issue.field}
-                        </span>
-                        <span className="validation-msg">{issue.msg}</span>
-                        {issue.ignored && (
-                          <span className="validation-ignored-tag">已忽略</span>
-                        )}
-                        {!demo && <>
-                        <button
-                          className="btn ghost sm"
-                          title={issue.ignored ? "恢复这条校验" : "忽略这条校验，保存后不再阻断确认"}
-                          onClick={() => toggleIssueIgnored(issue.index)}
-                        >
-                          <Icon icon={EyeOff} size={13} />
-                          {issue.ignored ? "恢复" : "忽略"}
-                        </button>
-                        <button
-                          className="btn ghost sm icon-only"
-                          aria-label="编辑相关字段"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            const path = issue.row === 0
-                              ? headerEvidencePath(extraction, issue.field)
-                              : itemEvidencePath(extraction, issue.row - 1, issue.field);
-                            selectEvidence(path);
-                            setEditingExtractCell(
-                              issue.row === 0
-                                ? `h-${issue.field}`
-                                : `${issue.row - 1}-${issue.field}`,
-                            );
-                          }}
-                        >
-                          <Icon icon={Pencil} size={13} />
-                        </button>
-                        </>}
-                      </div>
-                    ))}
-                  </div></div>
-                </div>
-              </div>
+              <ValidationResults
+                template={extraction.template}
+                issues={extractValidationIssues.map(issue => ({
+                  index: issue.index,
+                  code: issue.id,
+                  row: issue.row === 0 ? "文件级信息" : `明细第 ${issue.row} 行`,
+                  field: extractedColumns.find(column => column.key === issue.field)?.label
+                    || extraction.template?.fields.find(field => field.key === issue.field)?.label || issue.field,
+                  message: issue.msg,
+                  ignored: issue.ignored,
+                  severity: extraction.validation_issues[issue.index]?.severity,
+                  rawValue: extraction.validation_issues[issue.index]?.raw_value,
+                  valueType: (issue.row === 0 ? headerColumns : itemColumns).find(column => column.key === issue.field)?.valueType,
+                  notChecked: extraction.validation_issues[issue.index]?.not_checked, advisory: task?.status === "completed",
+                  canLocate: issue.row === 0 ? headerColumns.some(column => column.key === issue.field)
+                    : issue.row <= itemRows.length && itemColumns.some(column => column.key === issue.field),
+                }))}
+                disabled={saving}
+                ignoreDisabled={!canEditExtraction}
+                onToggleIgnored={demo ? undefined : toggleIssueIgnored}
+                onLocate={index => {
+                  const issue = extractValidationIssues.find(item => item.index === index);
+                  if (!issue) return;
+                  const key = issue.row === 0 ? `h-${issue.field}` : `${issue.row - 1}-${issue.field}`;
+                  selectEvidence(issue.row === 0 ? headerEvidencePath(extraction, issue.field)
+                    : itemEvidencePath(extraction, issue.row - 1, issue.field));
+                  if (issue.row > 0) detailPage.setPage(Math.floor((issue.row - 1) / detailPage.size) + 1);
+                  if (canEditExtraction) setEditingExtractCell(key);
+                  locateValidationField(key);
+                }}
+                locateLabel={canEditExtraction ? "编辑相关字段" : "定位相关字段"}
+                open={validationPanelOpen}
+                onToggle={() => setValidationPanelOpen(open => !open)}
+                contentId="extract-validation-content"
+              />
             </div>
           )}
         </div>
@@ -1709,6 +1701,8 @@ export function ExtractPage({
               <Icon icon={FileText} size={18} /> 原文件
             </h3>
             <div className="preview-pane-actions">
+              {hasExtractData && !demo && task && (task.size_bytes ?? 0) > 0 &&
+                <OriginalDownload key={task.id} url={getOriginalFileUrl(task.id)} filename={task.filename} />}
               {hasExtractData && previewPageCount > 1 && (
                 <>
                   <button
@@ -1774,14 +1768,7 @@ export function ExtractPage({
             {hasExtractData && demoPreview}
             {hasExtractData && !demo && (task.size_bytes ?? 0) > 0 && (
               <div className="document-preview-shell">
-                <div
-                  className={`evidence-status ${selectedEvidence?.status ?? "unselected"}`}
-                  aria-live="polite"
-                >
-                  {selectedEvidencePath
-                    ? evidenceDescription(selectedEvidence)
-                    : "点击右侧字段或异常，查看它在原文件中的来源"}
-                </div>
+                {evidenceLabel && <div className={`evidence-status ${selectedEvidence?.status}`} aria-live="polite">{evidenceLabel}</div>}
                 <div
                   className="document-preview-viewport"
                   onDoubleClick={() => setPreviewFullscreen(true)}
@@ -1830,6 +1817,8 @@ export function ExtractPage({
                 {extractedSourceName}
               </span>
               <div className="preview-pane-actions">
+                {!demo && task && (task.size_bytes ?? 0) > 0 &&
+                  <OriginalDownload key={task.id} url={getOriginalFileUrl(task.id)} filename={task.filename} />}
                 {previewPageCount > 1 && (
                   <>
                     <button
@@ -1885,11 +1874,7 @@ export function ExtractPage({
             </div>
             <div className="preview-fullscreen-body">
               <div className="document-preview-shell fullscreen">
-                <div className={`evidence-status ${selectedEvidence?.status ?? "unselected"}`}>
-                  {selectedEvidencePath
-                    ? evidenceDescription(selectedEvidence)
-                    : "点击字段后可查看来源定位"}
-                </div>
+                {evidenceLabel && <div className={`evidence-status ${selectedEvidence?.status}`} aria-live="polite">{evidenceLabel}</div>}
                 {demo ? demoPreview : <DocumentPreview
                   contentType={task?.content_type ?? ""}
                   filename={task?.filename ?? extractedSourceName}

@@ -87,4 +87,4 @@ def usage_summary(session, start):
             "by_purpose": [{"purpose": purpose, "model": model, "provider": provider, **values}
                            for (purpose, model, provider), values in sorted(groups.items(), key=lambda pair: -pair[1]["calls"])],
             "coverage_start": oldest, "legacy_unmeasured_runs": legacy_runs,
-            "history_note": "提取、匹配、模板生成从 0.4.0 启用后记录；问知意采用已有逐次调用记录。未上报 Token 或缓存不按零计算，历史缺失不补算；不估算费用。"}
+            }

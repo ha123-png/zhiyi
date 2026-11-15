@@ -193,9 +193,12 @@ def read_task_result_value(
         source = select(DataRowRecord.row_json).where(DataRowRecord.task_id == task_id, DataRowRecord.is_header_only.is_(False))\
             .order_by(DataRowRecord.item_index, DataRowRecord.id).offset(path[1]).limit(1).scalar_subquery()
     # Match the key as a bound value, not interpolated JSONPath or executable SQL.
-    fields = func.json_each(source).table_valued("key", "value", "type")
-    selected = session.execute(select(fields.c.type, func.length(fields.c.value),
-        case((fields.c.type == "text", func.substr(fields.c.value, offset + 1, limit)), else_=fields.c.value))
+    fields = func.json_each(source).table_valued("key", "value", "type", "fullkey")
+    numeric_token = source.op("->")(fields.c.fullkey)
+    selected = session.execute(select(fields.c.type,
+        func.length(case((fields.c.type.in_(("integer", "real")), numeric_token), else_=fields.c.value)),
+        case((fields.c.type == "text", func.substr(fields.c.value, offset + 1, limit)),
+             (fields.c.type.in_(("integer", "real")), numeric_token), else_=fields.c.value))
         .where(fields.c.key == path[-1])).first()
     if selected is None:
         raise HTTPException(404, "该位置没有这个字段，请核对字段页和明细位置。")
@@ -203,7 +206,8 @@ def read_task_result_value(
     if kind != "text":
         if offset:
             raise HTTPException(422, "只有文本字段支持 offset 分块读取。")
-        value = None if kind == "null" else kind == "true" if kind in {"true", "false"} else value
+        value = (json.loads(value) if kind in {"integer", "real"} else
+                 None if kind == "null" else kind == "true" if kind in {"true", "false"} else value)
     length = length or 0
     more = kind == "text" and offset + limit < length
     return stringify_unsafe_integers({"task_id": task_id, "view": view, "path": path, "value": value, "value_type": kind,

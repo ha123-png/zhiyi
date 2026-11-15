@@ -24,19 +24,51 @@ describe("GlobalTaskCard", () => {
     vi.useRealTimers();
   });
 
-  it("starts the timer from zero when the file appears and advances while processing", () => {
-    // 上传后任务条第一时间可见即从 00:00 同步开始计时，不因创建/轮询延迟从 2 秒起算
+  it("uses the current server attempt across mounting, reload, delayed processing, retry and pause", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-30T00:00:05Z"));
+    const existing = { ...processingTask, started_at: "2026-07-30T00:00:00Z" };
+    const first = render(<GlobalTaskCard tasks={[existing]} />);
+    expect(screen.getByText("00:05")).toBeInTheDocument();
+    first.unmount();
+    const view = render(<GlobalTaskCard tasks={[existing]} />);
+    expect(screen.getByText("00:05")).toBeInTheDocument();
+    view.rerender(<GlobalTaskCard tasks={[{ ...existing, status: "queued", started_at: null }]} />);
+    expect(screen.getByText("等待开始")).toBeInTheDocument();
+    act(() => vi.setSystemTime(new Date("2026-07-30T00:00:10Z")));
+    view.rerender(<GlobalTaskCard tasks={[{ ...existing, started_at: "2026-07-30T00:00:08Z" }]} />);
+    expect(screen.getByText("00:02")).toBeInTheDocument();
+    view.rerender(<GlobalTaskCard tasks={[{ ...existing, started_at: "2026-07-30T00:00:09Z" }]} />);
+    expect(screen.getByText("00:01")).toBeInTheDocument();
+    view.rerender(<GlobalTaskCard tasks={[{ ...existing, status: "paused", started_at: "2026-07-30T00:00:09Z", updated_at: "2026-07-30T00:00:10Z" }]} />);
+    act(() => vi.advanceTimersByTime(5000));
+    expect(screen.getByText("00:01")).toBeInTheDocument();
+  });
+
+  it("uses first observation only when the server attempt start is absent or invalid", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-30T00:00:05Z"));
+    render(<GlobalTaskCard tasks={[{ ...processingTask, started_at: "invalid" }]} />);
+    expect(screen.getByText("00:00")).toBeInTheDocument();
+    act(() => vi.advanceTimersByTime(3000));
+    expect(screen.getByText("00:03")).toBeInTheDocument();
+    expect(screen.queryByText(/NaN/)).not.toBeInTheDocument();
+  });
+
+  it("uses first observation when the file has no server start, and advances while processing", () => {
+    // This task has no started_at; created_at includes queue time, so only the
+    // first observed processing time is available as a fallback.
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-30T00:00:05.000Z"));
     render(<GlobalTaskCard tasks={[processingTask]} />);
 
-    expect(screen.getByText(/已用 00:00/)).toBeInTheDocument();
+    expect(screen.getByText("00:00")).toBeInTheDocument();
 
     act(() => {
       vi.advanceTimersByTime(1000);
     });
 
-    expect(screen.getByText(/已用 00:01/)).toBeInTheDocument();
+    expect(screen.getByText("00:01")).toBeInTheDocument();
   });
 
   it("does not pretend waiting for a template is processing time", () => {
@@ -46,57 +78,39 @@ describe("GlobalTaskCard", () => {
       />,
     );
 
-    expect(screen.getByText(/此时不计处理耗时/)).toBeInTheDocument();
+    expect(screen.getByText("1 个待处理事项")).toBeInTheDocument();
+    expect(screen.queryByText("处理用时")).not.toBeInTheDocument();
   });
 
-  it("offers pause while processing and confirms deletion of paused task data", async () => {
-    const onPause = vi.fn();
-    const onResume = vi.fn();
-    const onDelete = vi.fn();
-    const { unmount } = render(
-      <GlobalTaskCard
-        onPause={onPause}
-        onResume={onResume}
-        onDelete={onDelete}
-        tasks={[processingTask]}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: /暂停/ }));
-    expect(onPause).toHaveBeenCalledWith("active-task");
-
-    unmount();
-    render(
-      <GlobalTaskCard
-        onPause={onPause}
-        onResume={onResume}
-        onDelete={onDelete}
-        tasks={[{ ...processingTask, status: "paused" }]}
-      />,
-    );
-
-    // 暂停任务提供"启动队列"（全部放回队列）与"删除"（含原文件）
-    fireEvent.click(screen.getByRole("button", { name: /启动队列/ }));
-    expect(onResume).toHaveBeenCalledWith("active-task");
-    fireEvent.click(screen.getByRole("button", { name: "删除" }));
-    const dialog = screen.getByRole("dialog", { name: "删除暂停任务" });
-    expect(dialog).toHaveTextContent("平台内部原件、当前数据和该文件的修订历史");
-    expect(onDelete).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "确认删除" }));
-    expect(onDelete).toHaveBeenCalledWith("active-task");
+  it("separates whole-queue controls from single-file actions", () => {
+    const pause = vi.fn();
+    const resume = vi.fn();
+    const open = vi.fn();
+    const { rerender } = render(<GlobalTaskCard tasks={[processingTask]} onPauseQueue={pause} onResumeQueue={resume} onOpenTasks={open} queuePaused={false}/>);
+    fireEvent.click(screen.getByRole("button", { name: "暂停队列" }));
+    expect(pause).toHaveBeenCalledTimes(1);
+    expect(pause).toHaveBeenCalledWith();
+    rerender(<GlobalTaskCard tasks={[{...processingTask, status: "paused"}]} onPauseQueue={pause} onResumeQueue={resume} onOpenTasks={open} queuePaused={false}/>);
+    expect(screen.queryByRole("button", { name: "启动队列" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "删除" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "查看任务" }));
+    expect(open).toHaveBeenCalledTimes(1);
+    rerender(<GlobalTaskCard tasks={[]} onResumeQueue={resume} queuePaused/>);
+    fireEvent.click(screen.getByRole("button", { name: "启动队列" }));
+    expect(resume).toHaveBeenCalledWith();
   });
 
   it("shows no queue controls while idle or after all tasks finish", () => {
     const { rerender } = render(
-      <GlobalTaskCard onPause={vi.fn()} onResume={vi.fn()} tasks={[]} />,
+      <GlobalTaskCard onPauseQueue={vi.fn()} onResumeQueue={vi.fn()} tasks={[]} />,
     );
     expect(screen.getByText("当前空闲")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /暂停队列|启动队列/ })).not.toBeInTheDocument();
 
     rerender(
       <GlobalTaskCard
-        onPause={vi.fn()}
-        onResume={vi.fn()}
+        onPauseQueue={vi.fn()}
+        onResumeQueue={vi.fn()}
         tasks={[{ ...processingTask, status: "completed" }]}
       />,
     );
@@ -109,9 +123,8 @@ describe("GlobalTaskCard", () => {
     // 否则看起来像"暂停的任务自己又启动了"。
     render(
       <GlobalTaskCard
-        onPause={vi.fn()}
-        onResume={vi.fn()}
-        onDelete={vi.fn()}
+        onPauseQueue={vi.fn()}
+        onResumeQueue={vi.fn()}
         tasks={[
           { ...processingTask, id: "queued-1", filename: "排队.png", status: "queued", created_at: "2026-07-30T00:00:01.000Z" },
           { ...processingTask, id: "paused-1", filename: "暂停.png", status: "paused" },
@@ -136,7 +149,7 @@ describe("GlobalTaskCard", () => {
     expect(screen.getByText("入队中")).toBeInTheDocument();
     expect(screen.getByText("任务正在入队")).toBeInTheDocument();
     expect(screen.getByText("等待开始")).toBeInTheDocument();
-    expect(screen.queryByText(/已用 01:00/)).not.toBeInTheDocument();
+    expect(screen.queryByText("01:00")).not.toBeInTheDocument();
   });
 
   it("shows the oldest queued file as the next task", () => {
@@ -168,7 +181,7 @@ describe("GlobalTaskCard", () => {
     );
 
     expect(screen.getByText("发票_001.pdf")).toBeInTheDocument();
-    expect(screen.getByText(/已用 00:00/)).toBeInTheDocument();
+    expect(screen.getByText("00:00")).toBeInTheDocument();
     expect(screen.queryByText("发票_003.png")).not.toBeInTheDocument();
   });
 
@@ -183,11 +196,11 @@ describe("GlobalTaskCard", () => {
       />,
     );
     // 暂停中：计时冻结在暂停时刻
-    expect(screen.getByText(/已用 00:00/)).toBeInTheDocument();
+    expect(screen.getByText("00:00")).toBeInTheDocument();
     act(() => {
       vi.advanceTimersByTime(5000);
     });
-    expect(screen.getByText(/已用 00:00/)).toBeInTheDocument();
+    expect(screen.getByText("00:00")).toBeInTheDocument();
 
     // 恢复后重新处理：从恢复可见时刻重新从零计时
     act(() => {
@@ -198,12 +211,12 @@ describe("GlobalTaskCard", () => {
         tasks={[{ ...processingTask, status: "processing" }]}
       />,
     );
-    expect(screen.getByText(/已用 00:00/)).toBeInTheDocument();
+    expect(screen.getByText("00:00")).toBeInTheDocument();
 
     act(() => {
       vi.advanceTimersByTime(1000);
     });
-    expect(screen.getByText(/已用 00:01/)).toBeInTheDocument();
+    expect(screen.getByText("00:01")).toBeInTheDocument();
   });
 
   it("restarts the timer when a retry reuses the same task id", () => {
@@ -213,17 +226,17 @@ describe("GlobalTaskCard", () => {
       <GlobalTaskCard tasks={[{ ...processingTask, started_at: "2026-07-30T00:00:00.000Z" }]} />,
     );
     act(() => { vi.advanceTimersByTime(5000); });
-    expect(screen.getByText(/已用 00:05/)).toBeInTheDocument();
+    expect(screen.getByText("01:05")).toBeInTheDocument();
 
     rerender(
       <GlobalTaskCard tasks={[{ ...processingTask, started_at: "2026-07-30T00:01:05.000Z" }]} />,
     );
-    expect(screen.getByText(/已用 00:00/)).toBeInTheDocument();
+    expect(screen.getByText("00:00")).toBeInTheDocument();
   });
 
   it("treats naive server timestamps as UTC so a fresh task never shows 480 minutes", () => {
-    // 后端返回的 created_at 无时区标记（SQLite 丢 Z）；计时锚点以前端可见时刻为准，
-    // 不再解析 naive 时间戳，因此 UTC+8 环境绝不会多出 8 小时（480 分钟）的虚假耗时。
+    // Without started_at the observation fallback excludes queue time;
+    // a timezone-less created_at must never add eight hours to processing.
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-08T02:00:05.000Z"));
     render(
@@ -232,7 +245,7 @@ describe("GlobalTaskCard", () => {
       />,
     );
 
-    expect(screen.getByText(/已用 00:00/)).toBeInTheDocument();
+    expect(screen.getByText("00:00")).toBeInTheDocument();
     expect(screen.queryByText(/480/)).not.toBeInTheDocument();
   });
 
@@ -250,17 +263,28 @@ describe("GlobalTaskCard", () => {
     expect(screen.getByText("当前空闲")).toBeInTheDocument();
   });
 
+  it("keeps processing healthy and exposes failed files through a separate shortcut", () => {
+    const open = vi.fn();
+    render(<GlobalTaskCard tasks={[processingTask, { ...processingTask, id: "failed", status: "failed" }]} onOpenFailed={open} />);
+    expect(screen.getByText("处理中")).toBeInTheDocument();
+    expect(screen.getByText("识别中…")).toBeInTheDocument();
+    expect(screen.getByText("处理用时")).toBeInTheDocument();
+    expect(screen.getByText("00:00").closest("time")).toHaveAttribute("datetime", "PT0S");
+    fireEvent.click(screen.getByRole("button", { name: "1 个文件失败" }));
+    expect(open).toHaveBeenCalledOnce();
+  });
+
   it("offers pending recovery for a failed copy without calling extraction failed", () => {
     const open = vi.fn();
     const task = { ...processingTask, status: "completed", file_export: { status: "failed" } } as Task;
     const { rerender } = render(<GlobalTaskCard tasks={[task]} onOpenPending={open} />);
-    expect(screen.getByText("有待处理事项")).toBeInTheDocument();
+    expect(screen.getByText("1 个待处理事项")).toBeInTheDocument();
     expect(screen.queryByText("当前空闲")).not.toBeInTheDocument();
     expect(screen.queryByText("处理失败")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "查看事项" }));
+    fireEvent.click(screen.getByRole("button", { name: "1 个待处理事项" }));
     expect(open).toHaveBeenCalledOnce();
     rerender(<GlobalTaskCard tasks={[{ ...task, file_export: { ...task.file_export!, status: "skipped" } }]} onOpenPending={open} />);
     expect(screen.getByText("当前空闲")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "查看事项" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /待处理事项/ })).not.toBeInTheDocument();
   });
 });

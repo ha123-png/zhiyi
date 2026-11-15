@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import os
 from secrets import compare_digest
 from typing import Annotated, Literal
 
@@ -6,12 +7,15 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from document_pipeline_api.config import Settings
-from document_pipeline_api.services.integration_config import read_integration_config
+from document_pipeline_api.services.integration_config import is_current_http_key, read_integration_config
 
 
 @dataclass(frozen=True)
 class IntegrationPrincipal:
     scope: Literal["read", "write"]
+    revision_read: bool = False
+    original_read: bool = False
+    table_ids: tuple[str, ...] | None = None
 
 
 bearer = HTTPBearer(auto_error=False)
@@ -67,13 +71,26 @@ def require_integration_read(
         token,
         write_token,
     ):
-        return IntegrationPrincipal(scope="write")
+        return _principal(config, "write", token)
     if read_token and read_token.isascii() and compare_digest(
         token,
         read_token,
     ):
-        return IntegrationPrincipal(scope="read")
+        return _principal(config, "read", token)
     raise _invalid_credentials()
+
+
+def _principal(config: dict[str, str], kind: Literal["read", "write"], token: str) -> IntegrationPrincipal:
+    if is_current_http_key(token):
+        return IntegrationPrincipal(scope=kind, revision_read=True, original_read=True)
+    # Keep access that was granted to credentials already issued by earlier builds.
+    table_ids = tuple(filter(None, config.get(f"api_{kind}_table_ids", "").split(os.pathsep)))
+    return IntegrationPrincipal(
+        scope=kind,
+        revision_read=bool(table_ids) and config.get(f"api_{kind}_revision_read") == "1",
+        original_read=bool(table_ids) and config.get(f"api_{kind}_original_read") == "1",
+        table_ids=table_ids,
+    )
 
 
 def require_integration_write(

@@ -249,12 +249,25 @@ def xlsx_window(path: Path, sheet_index: int, offset: int, column_offset: int,
                                  read_only=True, data_only=True, keep_links=False)
         try:
             _deadline(started, cancelled)
-            names = workbook.sheetnames
+            sheets = workbook.worksheets
+            names = [sheet.title for sheet in sheets]
+            if not names:
+                raise UnsupportedTextFileError("没有可预览的数据工作表，请在原件中查看图表。")
             if not 0 <= sheet_index < len(names):
                 raise UnsupportedTextFileError("没有找到这个工作表。")
-            sheet = workbook.worksheets[sheet_index]
+            sheet = sheets[sheet_index]
+            from document_pipeline_api.services.xlsx_numbers import XlsxNumericError, validate_xlsx_numbers
+            try:
+                window_columns = validate_xlsx_numbers(
+                    sheet, min_row=offset + 1, max_row=offset + ROW_WINDOW,
+                    min_column=column_offset + 1, max_column=column_offset + COLUMN_WINDOW,
+                    check_cancelled=lambda: _deadline(started, cancelled))
+            except XlsxNumericError as error:
+                raise UnsupportedTextFileError(str(error)) from error
             total_rows = sheet.max_row
-            total_columns = sheet.max_column
+            # Unsized worksheets are valid (including write-only exports).
+            # Reuse the bounded XML pass, never scan or allocate the full grid.
+            total_columns = sheet.max_column if sheet.max_column is not None else window_columns
             rows = []
             clipped = False
             # Explicit max_col prevents sparse formatting at XFD from creating
@@ -270,7 +283,7 @@ def xlsx_window(path: Path, sheet_index: int, offset: int, column_offset: int,
             rows = rows[:ROW_WINDOW]
             if total_rows is not None:
                 rows = rows[:max(0, total_rows - offset)]
-            columns = min(COLUMN_WINDOW, max(0, (total_columns or COLUMN_WINDOW) - column_offset))
+            columns = min(COLUMN_WINDOW, max(0, total_columns - column_offset))
             result = {"name": sheet.title,
                       "columns": [_excel_column_name(column_offset + i) for i in range(columns)],
                       "rows": [row[:columns] for row in rows]}

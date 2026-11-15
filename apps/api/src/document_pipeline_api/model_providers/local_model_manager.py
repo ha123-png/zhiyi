@@ -334,10 +334,10 @@ class LmStudioManager(LocalModelManager):
                     "message": "模型加载命令已结束，但本地 API 尚未确认模型就绪。",
                     "detail": "请稍后刷新；若仍未就绪，请检查可用内存/显存。",
                 }
-            return {"ok": True, "message": f"已加载 {expected_identifier}（上下文 {context_length}）。"}
+            return {"ok": True, "message": f"已加载 {expected_identifier}。"}
         except subprocess.TimeoutExpired:
             if expected_identifier in self.server_status().get("loaded", []):
-                return {"ok": True, "message": f"已加载 {expected_identifier}（上下文 {context_length}）。"}
+                return {"ok": True, "message": f"已加载 {expected_identifier}。"}
             return {
                 "ok": False,
                 "message": f"加载 {model_name} 超时，模型尚未就绪。",
@@ -478,7 +478,7 @@ class OllamaManager(LocalModelManager):
                     },
                 )
                 response.raise_for_status()
-            return {"ok": True, "message": f"已预热加载 {model_name}（上下文 {context_length}）。"}
+            return {"ok": True, "message": f"已预热加载 {model_name}。"}
         except httpx.HTTPStatusError as error:
             return {"ok": False, "message": f"Ollama 拒绝加载（{error.response.status_code}）。"}
         except httpx.RequestError:

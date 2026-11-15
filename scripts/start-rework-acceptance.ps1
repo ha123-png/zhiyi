@@ -12,7 +12,7 @@ $pythonPath = Join-Path $projectRoot 'apps/api/.venv/Scripts/python.exe'
 $projectRoot = (& $pythonPath -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' $projectRoot).Trim()
 if ($LASTEXITCODE -ne 0) { throw '无法确认项目真实目录。' }
 $pythonPath = Join-Path $projectRoot 'apps/api/.venv/Scripts/python.exe'
-if (-not $DataDir) { $DataDir = Join-Path $projectRoot '.local/v050-20260927-main/data' }
+if (-not $DataDir) { $DataDir = Join-Path $projectRoot '.local/tmp/2026-10-30-polish/acceptance/data' }
 $acceptanceData = (& $pythonPath -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' $DataDir).Trim()
 if ($LASTEXITCODE -ne 0) { throw '无法确认验收数据真实目录。' }
 $localRoot = [IO.Path]::GetFullPath((Join-Path $projectRoot '.local')) + [IO.Path]::DirectorySeparatorChar

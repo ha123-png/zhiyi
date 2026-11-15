@@ -1,6 +1,8 @@
 from pathlib import Path
 from unittest.mock import Mock
 
+import httpx
+import pytest
 import subprocess
 
 from document_pipeline_api.model_providers.local_model_manager import (
@@ -8,6 +10,37 @@ from document_pipeline_api.model_providers.local_model_manager import (
     OllamaManager,
     _parse_cli_models,
 )
+from document_pipeline_api.model_providers.loaded_context import (
+    loaded_context_for_model, read_loaded_context_lengths,
+)
+
+
+@pytest.mark.parametrize(("provider", "url", "path", "payload"), [
+    ("lm_studio", "http://localhost:1234/v1", "/api/v1/models", {"models": [
+        {"key": "downloaded-only", "max_context_length": 262144, "loaded_instances": []},
+        {"key": "catalog-key", "max_context_length": 262144, "loaded_instances": [
+            {"id": "loaded", "config": {"context_length": 100000}},
+            {"id": "other", "config": {"context_length": 4096}},
+        ]},
+    ]}),
+    ("ollama", "http://localhost:11434", "/api/ps", {"models": [
+        {"name": "loaded:latest", "model": "loaded:latest", "context_length": 100000},
+        {"name": "older:latest", "details": {"context_length": 262144}},
+    ]}),
+])
+def test_read_loaded_capacity_uses_the_provider_instance_not_model_maximum(monkeypatch, provider, url, path, payload):
+    def respond(request):
+        assert request.method == "GET"
+        assert request.url.path == path
+        return httpx.Response(200, json=payload)
+
+    original = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: original(transport=httpx.MockTransport(respond), **kwargs))
+    lengths = read_loaded_context_lengths(provider, url)
+    assert loaded_context_for_model(provider, lengths, "loaded") == 100000
+    assert "downloaded-only" not in lengths
+    assert "catalog-key" not in lengths
+    assert "older:latest" not in lengths
 
 
 def test_ollama_load_and_unload_use_native_keep_alive_protocol(monkeypatch) -> None:

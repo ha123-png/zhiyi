@@ -51,8 +51,11 @@ _CLEAR_DATA_SENTINEL = "__clear_all_local_data__"
 class _ControlServer(ThreadingHTTPServer):
     token: str
     stop_event: threading.Event
+    maintenance_event: threading.Event
     restore_lock: threading.Lock
     restore_name: str | None
+    accepting_maintenance: bool
+    maintenance_token: object | None
 
 
 class _ControlHandler(BaseHTTPRequestHandler):
@@ -84,14 +87,28 @@ class _ControlHandler(BaseHTTPRequestHandler):
             self.send_error(400)
             return
         with self.server.restore_lock:
-            if self.server.restore_name is not None:
-                self.send_error(409)
-                return
-            self.server.restore_name = name
+            accepted = (
+                self.server.accepting_maintenance
+                and not self.server.stop_event.is_set()
+                and self.server.restore_name is None
+            )
+            if accepted:
+                self.server.accepting_maintenance = False
+                self.server.restore_name = name
+                ticket = object()
+                self.server.maintenance_token = ticket
+        if not accepted:
+            self.send_error(409)
+            return
         self.send_response(202)
         self.end_headers()
         # 先让 API 把“已安排维护”响应送到浏览器，再停止子进程。
-        threading.Timer(0.5, self.server.stop_event.set).start()
+        def wake_if_pending() -> None:
+            with self.server.restore_lock:
+                if self.server.maintenance_token is ticket:
+                    self.server.maintenance_event.set()
+
+        threading.Timer(0.5, wake_if_pending).start()
 
     def log_message(self, *_args: object) -> None:
         return
@@ -177,33 +194,47 @@ def _write_state(path: Path, payload: dict[str, object]) -> None:
     write_json(path, payload)
 
 
-def _wait_for_health(port: int, processes: list[subprocess.Popen[bytes]]) -> None:
+def _wait_for_health(
+    port: int, processes: list[subprocess.Popen[bytes]], stop_event: threading.Event,
+) -> bool:
     deadline = time.monotonic() + 30
     url = f"http://127.0.0.1:{port}/api/v1/health"
     while time.monotonic() < deadline:
+        if stop_event.is_set():
+            return False
         failed = next((process for process in processes if process.poll() is not None), None)
         if failed is not None:
             raise RuntimeError(f"程序组件启动失败，退出代码：{failed.returncode}")
         try:
             with urlopen(url, timeout=1) as response:
                 if response.status == 200:
-                    return
+                    return not stop_event.is_set()
         except (OSError, URLError):
-            time.sleep(0.25)
+            pass
+        if stop_event.wait(0.25):
+            return False
+    if stop_event.is_set():
+        return False
     raise RuntimeError("程序启动超过 30 秒，请检查运行日志。")
 
 
 def _wait_for_worker_heartbeat(
     heartbeat_path: Path,
     worker: subprocess.Popen[bytes],
-) -> None:
+    stop_event: threading.Event,
+) -> bool:
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
+        if stop_event.is_set():
+            return False
         if worker.poll() is not None:
             raise RuntimeError(f"任务处理器启动失败，退出代码：{worker.returncode}")
         if heartbeat_path.is_file():
-            return
-        time.sleep(0.1)
+            return not stop_event.is_set()
+        if stop_event.wait(0.1):
+            return False
+    if stop_event.is_set():
+        return False
     raise RuntimeError("任务处理器启动超过 15 秒，请检查运行日志。")
 
 
@@ -215,38 +246,49 @@ def run_supervisor(
     stop_event: threading.Event | None = None,
 ) -> None:
     active_data_dir = (data_dir or default_data_dir()).resolve()
-    app_port = resolve_app_port(active_data_dir, explicit_port)
     runtime_dir = active_data_dir / "runtime"
     logs_dir = active_data_dir / "logs"
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    logs_dir.mkdir(parents=True, exist_ok=True)
     state_path = runtime_dir / "supervisor.json"
     active_stop_event = stop_event or threading.Event()
+    if active_stop_event.is_set():
+        return
     token = secrets.token_urlsafe(32)
 
     with SingleInstance(runtime_dir / "instance.lock"), ExitStack() as stack:
+        # Only the owner of this data directory may select or persist its port.
+        app_port = resolve_app_port(active_data_dir, explicit_port)
+        logs_dir.mkdir(parents=True, exist_ok=True)
         from document_pipeline_api.business_backup import recover_interrupted_restore
         recover_interrupted_restore(active_data_dir)
         control = _ControlServer(("127.0.0.1", 0), _ControlHandler)
         control.token = token
         control.stop_event = active_stop_event
+        control.maintenance_event = threading.Event()
         control.restore_lock = threading.Lock()
         control.restore_name = None
+        control.accepting_maintenance = False
+        control.maintenance_token = None
         control_thread = threading.Thread(target=control.serve_forever, daemon=True)
         control_thread.start()
         stack.callback(control.server_close)
         stack.callback(control.shutdown)
 
+        def close_maintenance_admission() -> None:
+            with control.restore_lock:
+                control.accepting_maintenance = False
+
+        stack.callback(close_maintenance_admission)
+
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         stack.callback(state_path.unlink, missing_ok=True)
         first_start = True
 
-        while True:
-            active_stop_event.clear()
+        while not active_stop_event.is_set():
             # Maintenance can remove logs after the child handles close.
             # Recreate the owned directory for every launch, including restart.
             logs_dir.mkdir(parents=True, exist_ok=True)
             processes: list[subprocess.Popen[bytes]] = []
+            child_failure = None
             with ExitStack() as child_stack:
                 job = child_stack.enter_context(KillOnCloseJob())
 
@@ -267,40 +309,57 @@ def run_supervisor(
                     if process.pid <= 4:
                         process.kill()
                         raise RuntimeError("拒绝管理不安全的子进程 PID。")
-                    job.assign(process._handle)
+                    try:
+                        job.assign(process._handle)
+                    except BaseException:
+                        try:
+                            process.kill()
+                        finally:
+                            process.wait(timeout=10)
+                        raise
                     processes.append(process)
                     return process
 
                 api_process = start_child("api")
-                _wait_for_health(app_port, [api_process])
-                heartbeat_path = runtime_dir / "worker-heartbeat.json"
-                heartbeat_path.unlink(missing_ok=True)
-                worker_process = start_child("worker")
-                _wait_for_worker_heartbeat(heartbeat_path, worker_process)
+                api_ready = _wait_for_health(app_port, [api_process], active_stop_event)
+                worker_ready = False
+                if api_ready and not active_stop_event.is_set():
+                    heartbeat_path = runtime_dir / "worker-heartbeat.json"
+                    heartbeat_path.unlink(missing_ok=True)
+                    worker_process = start_child("worker")
+                    worker_ready = _wait_for_worker_heartbeat(heartbeat_path, worker_process, active_stop_event)
 
-                _write_state(
-                    state_path,
-                    {
-                        "pid": os.getpid(),
-                        "token": token,
-                        "control_port": control.server_port,
-                        "app_port": app_port,
-                        "child_pids": [process.pid for process in processes],
-                    },
-                )
-                if first_start and open_browser:
-                    webbrowser.open(f"http://127.0.0.1:{app_port}/")
-                first_start = False
-
-                while not active_stop_event.wait(0.5):
-                    failed = next(
-                        (process for process in processes if process.poll() is not None),
-                        None,
+                if worker_ready and not active_stop_event.is_set():
+                    _write_state(
+                        state_path,
+                        {
+                            "pid": os.getpid(),
+                            "token": token,
+                            "control_port": control.server_port,
+                            "app_port": app_port,
+                            "child_pids": [process.pid for process in processes],
+                        },
                     )
-                    if failed is not None:
-                        raise RuntimeError(
-                            f"程序组件意外退出，退出代码：{failed.returncode}"
+                    with control.restore_lock:
+                        control.accepting_maintenance = not active_stop_event.is_set()
+                    if first_start and open_browser:
+                        webbrowser.open(f"http://127.0.0.1:{app_port}/")
+                    first_start = False
+
+                    while not active_stop_event.wait(0.1):
+                        if control.maintenance_event.is_set():
+                            break
+                        failed = next(
+                            (process for process in processes if process.poll() is not None),
+                            None,
                         )
+                        if failed is not None:
+                            with control.restore_lock:
+                                control.accepting_maintenance = False
+                            child_failure = RuntimeError(
+                                f"程序组件意外退出，退出代码：{failed.returncode}"
+                            )
+                            break
 
             # 关闭 Job 后其明确子进程树会被终止；等句柄真正释放后才替换 SQLite。
             for process in processes:
@@ -315,9 +374,14 @@ def run_supervisor(
             _seal_stopped_edit_sessions(active_data_dir)
 
             with control.restore_lock:
+                control.accepting_maintenance = False
                 restore_name = control.restore_name
                 control.restore_name = None
+                control.maintenance_token = None
+                control.maintenance_event.clear()
             if restore_name is None:
+                if child_failure is not None:
+                    raise child_failure
                 break
             if restore_name == _CLEAR_DATA_SENTINEL:
                 _perform_supervised_clear_data(active_data_dir)
@@ -347,7 +411,7 @@ def _perform_supervised_clear_data(data_dir: Path) -> None:
     from document_pipeline_api.services.clear_data import clear_local_data
     try:
         result = clear_local_data(Settings(database_url=f"sqlite:///{data_dir / 'document-pipeline.db'}", storage_dir=data_dir / "uploads"))
-        result["message"] = "全部本地数据已清除，正在重新启动应用。外部副本、备份和模型文件保留。"
+        result["message"] = "全部本地数据已清除。外部副本、备份和模型文件保留。"
     except Exception:
         result = {"state": "failed", "message": "清除未完成，部分数据可能已清理。请重试清除；未清理外部副本、备份或模型文件。"}
     result["completed_at"] = time.time()
@@ -359,7 +423,7 @@ def request_clear_data(data_dir: Path) -> bool:
 
 
 def _perform_supervised_restore(data_dir: Path, name: str) -> None:
-    """在 API/Worker 已退出后恢复；无论成功失败，监督器随后都会重启子进程。"""
+    """在组件退出后恢复；如同时收到关闭请求，恢复后不再启动子进程。"""
     from document_pipeline_api.business_backup import (
         BusinessBackupError,
         restore_business_backup,
@@ -383,7 +447,7 @@ def _perform_supervised_restore(data_dir: Path, name: str) -> None:
         )
         payload = {
             "state": "succeeded",
-            "message": "备份恢复成功，应用已重新启动。",
+            "message": "备份恢复成功。",
             "rollback_dir": str(rollback),
             "completed_at": time.time(),
         }

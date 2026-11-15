@@ -9,9 +9,11 @@ declare global {
         choose_import_files?(): Promise<NativeImportFile[]>;
         choose_folder?(): Promise<string | null>;
         open_export_folder?(taskId: string): Promise<string>;
+        open_backup_folder?(): Promise<void>;
         export_table(url: string, filename: string): Promise<string>;
         export_template(filename: string, content: string): Promise<string>;
         download_task_file(url: string, filename: string): Promise<string>;
+        restart_with_update?(): Promise<{ ok: boolean; message?: string }>;
       };
     };
   }

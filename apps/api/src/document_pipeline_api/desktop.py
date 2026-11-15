@@ -6,6 +6,7 @@ import json
 import hashlib
 import os
 import sqlite3
+import subprocess
 from contextlib import closing
 import ctypes
 import traceback
@@ -34,12 +35,59 @@ class _DesktopApi:
         # can block the UI thread while the bridge is being registered.
         self._window: object | None = None
         self._settings_path = data_dir / "desktop-settings.json"
+        self._update_lock = threading.Lock()
+
+    def restart_with_update(self) -> dict[str, str | bool]:
+        if not self._update_lock.acquire(blocking=False):
+            return {"ok": False, "message": "更新正在启动。"}
+        started = False
+        try:
+            from document_pipeline_api.api.updates import download_directory, downloaded_version
+
+            if self._window is None or sys.platform != "win32" or not getattr(sys, "frozen", False):
+                return {"ok": False, "message": "请在 Windows 安装版中重启并更新。"}
+            directory = download_directory(self._data_dir)
+            version = downloaded_version(self._data_dir)
+            installer = directory / "update.exe"
+            if not version or installer.is_symlink() or not installer.is_file():
+                return {"ok": False, "message": "请先完成新版下载。"}
+            with closing(sqlite3.connect(self._data_dir / "document-pipeline.db", timeout=2)) as db:
+                if db.execute("SELECT 1 FROM tasks WHERE status IN ('processing', 'validating') LIMIT 1").fetchone():
+                    return {"ok": False, "message": "有文件正在提取，请处理完成后再更新。"}
+            metadata = json.loads((directory / "download.json").read_text(encoding="utf-8"))
+            script = directory / "install-update.ps1"
+            if script.is_symlink():
+                raise ValueError("Invalid update helper path")
+            bundled_script = Path(sys._MEIPASS) / "desktop" / "install-update.ps1"
+            script.write_text(bundled_script.read_text(encoding="utf-8-sig"), encoding="utf-8-sig")
+            powershell = Path(os.environ["SystemRoot"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+            # PowerShell must use the system DLL paths and launch a fresh packaged process.
+            update_environment = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
+            set_dll_directory = ctypes.windll.kernel32.SetDllDirectoryW
+            if not set_dll_directory(None):
+                raise OSError("Unable to restore the system DLL search path")
+            try:
+                subprocess.Popen(
+                    [str(powershell), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script),
+                     "-InstallDirectory", str(Path(sys.executable).resolve().parent), "-DataDirectory", str(self._data_dir),
+                     "-Installer", str(installer), "-Digest", metadata["sha256"], "-Version", version, "-DesktopPid", str(os.getpid())],
+                    cwd=directory, env=update_environment, creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            finally:
+                set_dll_directory(ctypes.c_wchar_p(sys._MEIPASS))
+            started = True
+            self._window.destroy()
+            return {"ok": True}
+        except (OSError, ValueError, KeyError, sqlite3.Error):
+            return {"ok": False, "message": "暂时无法启动更新，请检查知意安装和待处理任务。"}
+        finally:
+            if not started:
+                self._update_lock.release()
 
     def _configured_export_directory(self) -> Path:
         try:
-            value = json.loads(self._settings_path.read_text(encoding="utf-8")).get(
-                "export_directory"
-            )
+            payload = json.loads(self._settings_path.read_text(encoding="utf-8"))
+            value = payload.get("export_directory") if isinstance(payload, dict) else None
             if isinstance(value, str) and value.strip():
                 return Path(value).expanduser().resolve()
         except (OSError, TypeError, json.JSONDecodeError):
@@ -109,6 +157,14 @@ class _DesktopApi:
         except OSError:
             raise ValueError("无法打开文件夹，请检查磁盘连接、目录权限或资源管理器。内部原件预览不受影响。") from None
         return str(path.parent)
+
+    def open_backup_folder(self) -> None:
+        directory = self._data_dir / "backups"
+        try:
+            directory.mkdir(exist_ok=True)
+            os.startfile(str(directory), "explore")
+        except OSError:
+            raise ValueError("无法打开备份文件夹。") from None
 
     def _export_target(self, filename: str) -> Path:
         validate_copy_name(filename)
@@ -196,7 +252,9 @@ class _DesktopApi:
         parsed = urlparse(url)
         if parsed.hostname not in {"127.0.0.1", "localhost"}:
             raise ValueError("桌面版只允许从知意本地服务导出。")
-        is_table_export = "/export." in parsed.path or "/export-views." in parsed.path
+        is_table_export = parsed.path.rsplit("/", 1)[-1] in {
+            "export.xlsx", "export-views.xlsx", "export-notes.xlsx", "export.csv", "export.json", "export.zip",
+        }
         if not parsed.path.startswith("/api/v1/tables/") or not is_table_export:
             raise ValueError("导出地址无效。")
         target = self._export_target(filename)
@@ -390,54 +448,54 @@ def _run_primary_desktop(active_data_dir: Path, explicit_port: int | None, windo
     )
     supervisor.start()
     try:
-        url = _wait_for_desktop_url(active_data_dir, supervisor, errors)
-    except RuntimeError:
-        existing_url = _existing_desktop_url(active_data_dir)
-        if existing_url and _focus_existing_window(window_title):
-            supervisor.join(timeout=2)
-            return
-        raise
-    try:
-        import webview
+        try:
+            url = _wait_for_desktop_url(active_data_dir, supervisor, errors)
+        except RuntimeError:
+            existing_url = _existing_desktop_url(active_data_dir)
+            if existing_url and _focus_existing_window(window_title):
+                return
+            raise
+        try:
+            import webview
 
-        initial_position = _initial_window_position(_WINDOW_WIDTH, _WINDOW_HEIGHT)
-        position_options = (
-            {"x": initial_position[0], "y": initial_position[1]}
-            if initial_position else {}
-        )
-        desktop_api = _DesktopApi(active_data_dir)
-        window = webview.create_window(
-            window_title,
-            url=url,
-            width=_WINDOW_WIDTH,
-            height=_WINDOW_HEIGHT,
-            min_size=(1080, 680),
-            resizable=True,
-            background_color="#f8fafc",
-            text_select=True,
-            js_api=desktop_api,
-            **position_options,
-        )
-        if window is None:
-            raise RuntimeError("无法创建知意桌面窗口。")
-        desktop_api._window = window
-        window.events.closed += shutdown.set
-        window.events.before_show += lambda: _center_window(window, webview, window_title)
-        icon = _application_icon()
-        webview.start(
-            gui="edgechromium",
-            private_mode=False,
-            storage_path=str(active_data_dir / "webview"),
-            icon=str(icon) if icon else None,
-        )
-    except BaseException:  # noqa: BLE001 - even runtime-loader exits need a browser fallback
-        logs = active_data_dir / "logs"
-        logs.mkdir(parents=True, exist_ok=True)
-        (logs / "desktop.log").write_text(traceback.format_exc(), encoding="utf-8")
-        _show_desktop_error(
-            "知意桌面窗口无法启动。请运行“诊断知意”并查看 desktop.log。"
-        )
-        raise
+            initial_position = _initial_window_position(_WINDOW_WIDTH, _WINDOW_HEIGHT)
+            position_options = (
+                {"x": initial_position[0], "y": initial_position[1]}
+                if initial_position else {}
+            )
+            desktop_api = _DesktopApi(active_data_dir)
+            window = webview.create_window(
+                window_title,
+                url=url,
+                width=_WINDOW_WIDTH,
+                height=_WINDOW_HEIGHT,
+                min_size=(1080, 680),
+                resizable=True,
+                background_color="#f8fafc",
+                text_select=True,
+                js_api=desktop_api,
+                **position_options,
+            )
+            if window is None:
+                raise RuntimeError("无法创建知意桌面窗口。")
+            desktop_api._window = window
+            window.events.closed += shutdown.set
+            window.events.before_show += lambda: _center_window(window, webview, window_title)
+            icon = _application_icon()
+            webview.start(
+                gui="edgechromium",
+                private_mode=False,
+                storage_path=str(active_data_dir / "webview"),
+                icon=str(icon) if icon else None,
+            )
+        except BaseException:  # noqa: BLE001 - even runtime-loader exits need a browser fallback
+            logs = active_data_dir / "logs"
+            logs.mkdir(parents=True, exist_ok=True)
+            (logs / "desktop.log").write_text(traceback.format_exc(), encoding="utf-8")
+            _show_desktop_error(
+                "知意桌面窗口无法启动。请运行“诊断知意”并查看 desktop.log。"
+            )
+            raise
     finally:
         shutdown.set()
         supervisor.join(timeout=20)

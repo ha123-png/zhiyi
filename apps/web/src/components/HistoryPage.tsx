@@ -2,30 +2,30 @@ import { deletionNotice } from "../deletionNotice";
 import { FileRevisionHistory } from "./FileRevisionHistory";
 import { DetailPagination, useDetailPage } from "./DetailPagination";
 import { DetailRowAction } from "./DetailRowAction";
+import { DetailColumnResizer } from "./DetailColumnResizer";
 import { FileHistoryActions } from "./FileHistoryActions";
 import { History } from "lucide-react";
-import { taskDisplayName } from "../taskNames";
+import { taskDisplayName, taskTemplateName } from "../taskNames";
 import { FileLocation } from "./FileLocation";
 import { Disclosure } from "./Disclosure";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { usePointerDrag } from "../usePointerDrag";
+import type { ListScrollMemory } from "../useListScroll";
 import {
   ArrowRight,
-  CheckCircle2,
   ChevronLeft,
   ChevronRight,
   ChevronsLeft,
   ChevronsRight,
-  EyeOff,
-  Download,
   FileText,
   List,
   Loader2,
   Save,
   Search,
-  ShieldAlert,
   Table2,
 } from "lucide-react";
 import {
+  ApiError,
   deleteTask,
   getExtraction,
   getOriginalFileUrl,
@@ -42,15 +42,21 @@ import type {
   TemplateValue,
 } from "../types";
 import { serverDate } from "../time";
-import { desktopApi } from "../desktop";
+import { OriginalDownload } from "./OriginalDownload";
 import { DocumentPreview } from "./DocumentPreview";
 import { InputScopeDetails } from "./InputScopeDetails";
 import { TaskExportDetails } from "./TaskExportDetails";
 import { EditableText } from "./EditableText";
-import { ConfirmDialog } from "./ConfirmDialog";
+import { DeleteTaskDialog } from "./DeleteTaskDialog";
 import { Icon } from "./Icon";
-import { parseNumericInput } from "../numericInput";
+import { NoticeDialog } from "./NoticeDialog";
+import { Toast, useToast } from "./Toast";
+import { manualCellValue } from "../numericInput";
 import { useUnsavedChanges } from "../useUnsavedChanges";
+import { ValidationResults } from "./ValidationResults";
+import { useValidationFieldLocator } from "./useValidationFieldLocator";
+import { HISTORY_PAGE_SIZE, HistoryTableGrid } from "./HistoryTableGrid";
+import "./history-page.css";
 
 function formatDateTime(iso: string): string {
   const d = serverDate(iso);
@@ -93,23 +99,43 @@ const BUILTIN_LABELS: Record<string, string> = {
 };
 
 type HistoryTab = "completed" | "problems" | "original";
+interface HistoryFilters {
+  fileSearch: string;
+  templateFilter: string;
+  timeFilter: string;
+}
+const DEFAULT_FILTERS: HistoryFilters = { fileSearch: "", templateFilter: "", timeFilter: "all" };
+export interface HistoryListViewState {
+  tab: Exclude<HistoryTab, "original">;
+  filters: HistoryFilters;
+  completedPage: number;
+  problemsPage: number;
+}
 
 interface HistoryPageProps {
   initialTab?: HistoryTab;
-  onOpenTask?: (task: Task) => void;
+  viewState?: HistoryListViewState;
+  onViewStateChange?: (state: HistoryListViewState) => void;
+  scrollMemory?: ListScrollMemory;
   onOpenData?: (task: Task) => void;
+  onNavigateExtract?: () => void;
 }
 
-export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }: HistoryPageProps = {}) {
-  const [historyTab, setHistoryTab] = useState<HistoryTab>(initialTab);
+export function HistoryPage({ onOpenData, onNavigateExtract, initialTab, viewState, onViewStateChange, scrollMemory }: HistoryPageProps = {}) {
+  const startPointerDrag = usePointerDrag();
+  const savedView = initialTab === undefined ? viewState : undefined;
+  const [historyTab, setHistoryTab] = useState<HistoryTab>(initialTab ?? savedView?.tab ?? "completed");
   // 当前页任务：服务端分页，万级历史不一次载入前端内存（ISSUE-067）
+  const [loadedOffset, setLoadedOffset] = useState(0);
   const [pageTasks, setPageTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [listReadError, setListReadError] = useState<string | null>(null);
+  const [originalReadError, setOriginalReadError] = useState<string | null>(null);
+  const [loadedListQuery, setLoadedListQuery] = useState<string | null>(null);
 
-  // 全局计数（统计条）与"当前筛选下"计数（tab 角标 + 总页数）
-  const [summary, setSummary] = useState<TaskSummary | null>(null);
-  const [filteredSummary, setFilteredSummary] = useState<TaskSummary | null>(null);
+  // 当前筛选下的角标计数和页数。
+  const [filteredSummary, setFilteredSummary] = useState<{ scope: string; counts: TaskSummary } | null>(null);
 
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
   const [extraction, setExtraction] = useState<Extraction | null>(null);
@@ -118,17 +144,27 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
   const [columnWidths, setColumnWidths] = useState<Record<number, number>>({});
   const [detailWidths, setDetailWidths] = useState<Record<string, number>>({});
 
-  // 列表筛选与分页（一页 10 条，超过翻页）
-  const [fileSearch, setFileSearch] = useState("");
-  const [templateFilter, setTemplateFilter] = useState("");
-  const [timeFilter, setTimeFilter] = useState("all");
-  const [completedPage, setCompletedPage] = useState(1);
-  const [problemsPage, setProblemsPage] = useState(1);
+  // 列表筛选与分页
+  const [filters, setFilters] = useState(savedView?.filters ?? DEFAULT_FILTERS);
+  const { fileSearch, templateFilter, timeFilter } = filters;
+  const [completedPage, setCompletedPage] = useState(savedView?.completedPage ?? 1);
+  const [problemsPage, setProblemsPage] = useState(savedView?.problemsPage ?? 1);
   const [jumpPageInput, setJumpPageInput] = useState("");
+  function updateListFilters(changes: Partial<HistoryFilters>) {
+    setFilters(previous => ({ ...previous, ...changes }));
+    setCompletedPage(1);
+    setProblemsPage(1);
+  }
   const listRequest = useRef(0);
-  const listQuery = JSON.stringify([historyTab, completedPage, problemsPage, fileSearch, templateFilter, timeFilter]);
+  const listPage = historyTab === "problems" ? problemsPage : completedPage;
+  const summaryScope = JSON.stringify([fileSearch.trim(), templateFilter, timeFilter]);
+  const currentFilteredSummary = filteredSummary?.scope === summaryScope ? filteredSummary.counts : null;
+  const listQuery = JSON.stringify([historyTab, listPage, fileSearch, templateFilter, timeFilter]);
   const latestListQuery = useRef(listQuery);
   latestListQuery.current = listQuery;
+  const localScrollMemory = useRef<ListScrollMemory>({});
+  const returnToFile = useRef<{ query: string; id: string; returnTab: HTMLButtonElement | null } | null>(null);
+  const returnedFileButton = useRef<HTMLButtonElement>(null);
 
   // 原文件 tab 内编辑：草稿模式，点“修订到表”才触发校验并保存
   const [editingCell, setEditingCell] = useState<string | null>(null);
@@ -136,18 +172,18 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
   const [draftDetailIds, setDraftDetailIds] = useState<number[] | undefined>();
   useEffect(() => { setDraftDetailIds(extraction?.detail_ids); }, [extraction]);
   const [draft, setDraft] = useState<ExtractionResult | null>(null);
+  const originalContentRef = useRef<HTMLDivElement>(null);
   const [saving, setSaving] = useState(false);
+  const [reviewConflict, setReviewConflict] = useState(false);
   // 原文件加载竞态守卫：快速切换文件时只让最新一次请求写入结果
   const originalSeqRef = useRef(0);
   // 用户忽略的校验问题下标：被忽略的问题仍记录，但不再阻断修订到表
   const [ignoredIssueIndices, setIgnoredIssueIndices] = useState<number[]>([]);
-  const [notice, setNotice] = useState<string | null>(null);
+  const { toast, notify, clear } = useToast();
+  const [historyNoticeOpen, setHistoryNoticeOpen] = useState(false);
+  const [originalNoticeOpen, setOriginalNoticeOpen] = useState(false);
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
-  const [originalDownload, setOriginalDownload] = useState<{
-    taskId: string;
-    status: "downloading" | "success" | "error";
-    message: string;
-  } | null>(null);
+
   // 删除整个文件前确认：原件、当前数据及修订历史一起删除
   const [deleteTarget, setDeleteTarget] = useState<Task | null>(null);
   const unsavedReview = useUnsavedChanges(() => !!extraction && !!draft && (
@@ -161,34 +197,23 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     return result.validation_issues.flatMap((issue, index) => issue.ignored ? [index] : []).sort();
   }
 
-  function changeTab(tab: HistoryTab) {
+  function changeTab(tab: HistoryTab, button: HTMLButtonElement) {
     if (tab === historyTab) return;
     unsavedReview.protect(() => {
+      if (historyTab === "original" && returnToFile.current) returnToFile.current.returnTab = button;
       setDraft(extraction ? structuredClone(extraction.result) : null);
       setDraftDetailIds(extraction?.detail_ids);
       setIgnoredIssueIndices(extraction ? ignoredIndices(extraction) : []);
       setEditingCell(null);
       setError(null);
+      setReviewConflict(false);
+      setHistoryNoticeOpen(false);
+      setOriginalNoticeOpen(false);
+      clear();
+      setListReadError(null);
+      setOriginalReadError(null);
       setHistoryTab(tab);
     });
-  }
-
-  async function downloadOriginalFile(task: Task) {
-    const bridge = desktopApi();
-    if (!bridge) return;
-    if (originalDownload?.taskId === task.id && originalDownload.status === "downloading") return;
-    setOriginalDownload({ taskId: task.id, status: "downloading", message: "正在下载原文件…" });
-    try {
-      const absoluteUrl = new URL(getOriginalFileUrl(task.id), window.location.origin).toString();
-      const path = await bridge.download_task_file(absoluteUrl, task.filename);
-      setOriginalDownload({ taskId: task.id, status: "success", message: `下载完成：${path}` });
-    } catch (reason) {
-      setOriginalDownload({
-        taskId: task.id,
-        status: "error",
-        message: reason instanceof Error ? reason.message : "原文件下载失败",
-      });
-    }
   }
 
   useEffect(() => {
@@ -200,8 +225,6 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
       )
       .catch(() => setTemplateNameMap({}));
   }, []);
-
-  const HISTORY_PAGE_SIZE = 10;
 
   // 时间筛选 → since（按 updated_at 下限服务端过滤）
   const timeFilterSince = (): string | undefined => {
@@ -218,10 +241,10 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     const current = () => request === listRequest.current && listQuery === latestListQuery.current;
     const isProblems = historyTab === "problems";
     const status = isProblems ? "needs_review" : "completed";
-    const rawPage = isProblems ? problemsPage : completedPage;
+    const rawPage = listPage;
     const count = isProblems
-      ? (filteredSummary?.needs_review ?? 0)
-      : (filteredSummary?.completed ?? 0);
+      ? (currentFilteredSummary?.needs_review ?? 0)
+      : (currentFilteredSummary?.completed ?? 0);
     const page = Math.min(rawPage, Math.max(1, Math.ceil(count / HISTORY_PAGE_SIZE)));
     const searchText = fileSearch.trim();
     const common = {
@@ -230,23 +253,29 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
       since: timeFilterSince(),
     };
     try {
-      setError(null);
-      const [list, globalSummary, filtered] = await Promise.all([
+      setListReadError(null);
+      const [initialList, filtered] = await Promise.all([
         getTasks({
           ...common,
           status,
           limit: HISTORY_PAGE_SIZE,
           offset: (page - 1) * HISTORY_PAGE_SIZE,
         }),
-        getTaskSummary(),
         getTaskSummary(common),
       ]);
       if (!current()) return;
+      const settledCount = isProblems ? filtered.needs_review : filtered.completed;
+      const settledPage = Math.min(rawPage, Math.max(1, Math.ceil(settledCount / HISTORY_PAGE_SIZE)));
+      const list = settledPage === page ? initialList : await getTasks({
+        ...common, status, limit: HISTORY_PAGE_SIZE, offset: (settledPage - 1) * HISTORY_PAGE_SIZE,
+      });
+      if (!current()) return;
       setPageTasks(list);
-      setSummary(globalSummary);
-      setFilteredSummary(filtered);
+      setLoadedOffset((settledPage - 1) * HISTORY_PAGE_SIZE);
+      setFilteredSummary({ scope: summaryScope, counts: filtered });
+      setLoadedListQuery(listQuery);
     } catch (err) {
-      if (current()) setError(err instanceof Error ? err.message : "加载失败");
+      if (current()) setListReadError(err instanceof Error ? err.message : "加载失败");
     } finally {
       if (current()) setLoading(false);
     }
@@ -265,30 +294,66 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     return () => { clearTimeout(timer); listRequest.current += 1; };
     // 显式列出触发条件：load 使用最新渲染闭包，避免 filteredSummary 变化引发重复加载
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [historyTab, completedPage, problemsPage, fileSearch, templateFilter, timeFilter]);
+  }, [listQuery]);
 
-  const currentCount = historyTab === "problems"
-    ? (filteredSummary?.needs_review ?? 0)
-    : (filteredSummary?.completed ?? 0);
+  const currentCount = (historyTab === "problems" ? currentFilteredSummary?.needs_review : currentFilteredSummary?.completed) ?? 0;
   const currentPageCount = Math.max(1, Math.ceil(currentCount / HISTORY_PAGE_SIZE));
   const currentPage =
     historyTab === "problems"
       ? Math.min(problemsPage, currentPageCount)
       : Math.min(completedPage, currentPageCount);
+  const renderedListQuery = loadedListQuery === listQuery
+    ? JSON.stringify([historyTab, currentPage, fileSearch, templateFilter, timeFilter]) : null;
+  const pageToRemember = renderedListQuery === null ? listPage : currentPage;
+  useEffect(() => {
+    if (historyTab === "original") return;
+    onViewStateChange?.({
+      tab: historyTab, filters,
+      completedPage: historyTab === "completed" ? pageToRemember : completedPage,
+      problemsPage: historyTab === "problems" ? pageToRemember : problemsPage,
+    });
+  }, [historyTab, filters, completedPage, problemsPage, pageToRemember, onViewStateChange]);
+  useLayoutEffect(() => {
+    const target = returnToFile.current;
+    if (!target || historyTab === "original" || renderedListQuery === null || loading) return;
+    returnToFile.current = null;
+    if (target.query === renderedListQuery &&
+        (document.activeElement === target.returnTab || document.activeElement === document.body)) {
+      returnedFileButton.current?.focus({ preventScroll: true });
+    }
+  }, [historyTab, renderedListQuery, loading]);
+  const hasActiveHistoryFilters = Boolean(fileSearch.trim() || templateFilter || timeFilter !== "all");
+
+
+  function retryHistoryRead() {
+    if (loading) return;
+    setLoading(true);
+    setHistoryNoticeOpen(false);
+    setListReadError(null);
+    void load();
+  }
+
+  function retryOriginalRead() {
+    if (extractionLoading || !selectedTask) return;
+    setOriginalReadError(null);
+    unsavedReview.protect(() => loadOriginal(selectedTask));
+  }
 
   function templateLabel(t: Task): string {
-    if (t.template_id && templateNameMap[t.template_id]) {
-      return templateNameMap[t.template_id];
-    }
-    if (t.template_mode === "smart") return "智能匹配";
-    return t.template_id ?? t.template_mode;
+    return taskTemplateName(t, t.template_id ? templateNameMap[t.template_id] : undefined);
   }
 
   function openOriginal(task: Task) {
-    unsavedReview.protect(() => loadOriginal(task));
+    unsavedReview.protect(() => {
+      returnToFile.current = renderedListQuery === null ? null : { query: renderedListQuery, id: task.id, returnTab: null };
+      loadOriginal(task);
+    });
   }
 
   function loadOriginal(task: Task) {
+    setReviewConflict(false);
+    setOriginalNoticeOpen(false);
+    clear();
     setSelectedTask(task);
     setHistoryTab("original");
     setExtraction(null);
@@ -297,6 +362,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     setEditingCell(null);
     setExtractionLoading(true);
     setError(null);
+    setOriginalReadError(null);
     const seq = ++originalSeqRef.current;
     getExtraction(task.id)
       .then((result) => {
@@ -311,38 +377,23 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
       })
       .catch((err) => {
         if (seq !== originalSeqRef.current) return;
-        setError(err instanceof Error ? err.message : "加载提取结果失败");
+        setOriginalReadError(err instanceof Error ? err.message : "加载提取结果失败");
       })
       .finally(() => {
         if (seq === originalSeqRef.current) setExtractionLoading(false);
       });
   }
 
-  function numericField(section: "header" | "item", key: string, previous: unknown): boolean {
-    const field = (extraction?.current_schema ?? extraction?.template?.fields ?? [])
-      .find((entry) => entry.section === section && entry.key === key);
-    return field ? field.value_type === "number" : typeof previous === "number";
-  }
-
-  function editedValue(raw: string, previous: TemplateValue | undefined, numeric: boolean, key: string): TemplateValue {
-    if (numeric) return raw === "—" ? null : parseNumericInput(raw, labelFor(key));
-    const value = raw.trim();
-    if (!value || value === "—") return null;
-    if (typeof previous === "boolean") return value === "是" || value.toLowerCase() === "true";
-    return value;
+  function fieldType(section: "header" | "item", key: string): string | undefined {
+    return (extraction?.current_schema ?? extraction?.template?.fields)
+      ?.find(entry => entry.section === section && entry.key === key)?.value_type;
   }
 
   function updateHeaderDraft(key: string, raw: string) {
     if (!draft || saving) return;
     const next = structuredClone(draft);
     const header = ("header" in next ? next.header : next) as Record<string, TemplateValue>;
-    try {
-      header[key] = editedValue(raw, header[key], numericField("header", key, header[key]), key);
-      setError(null);
-    } catch (reason) {
-      header[key] = raw;
-      setError(reason instanceof Error ? reason.message : "数字格式无效");
-    }
+    header[key] = manualCellValue(raw === "—" ? "" : raw, fieldType("header", key) ?? typeof header[key]);
     setDraft(next);
     setEditingCell(null);
   }
@@ -352,31 +403,9 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     const next = structuredClone(draft);
     const item = (next as { items: Array<Record<string, TemplateValue>> }).items[idx];
     if (!item) return;
-    try {
-      item[key] = editedValue(raw, item[key], numericField("item", key, item[key]), key);
-      setError(null);
-    } catch (reason) {
-      item[key] = raw;
-      setError(reason instanceof Error ? reason.message : "数字格式无效");
-    }
+    item[key] = manualCellValue(raw === "—" ? "" : raw, fieldType("item", key) ?? typeof item[key]);
     setDraft(next);
     setEditingCell(null);
-  }
-
-  function validatedDraft(): ExtractionResult {
-    const next = structuredClone(draft!);
-    // Validate the whole draft: editing another cell must not hide an earlier
-    // invalid numeric input or submit that input as a textual number.
-    const validate = (record: Record<string, TemplateValue>, section: "header" | "item") => {
-      for (const [key, value] of Object.entries(record)) {
-        if (numericField(section, key, value) && typeof value === "string") {
-          record[key] = parseNumericInput(value, labelFor(key));
-        }
-      }
-    };
-    validate(("header" in next ? next.header : next) as Record<string, TemplateValue>, "header");
-    for (const item of next.items) validate(item as Record<string, TemplateValue>, "item");
-    return next;
   }
 
   async function handleSaveToTable() {
@@ -384,11 +413,12 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     const seq = originalSeqRef.current;
     setSaving(true);
     setError(null);
+    setReviewConflict(false);
     try {
       const updated = await updateReview(
         selectedTask.id,
         extraction.review_version,
-        validatedDraft(),
+        draft,
         ignoredIssueIndices,
         undefined,
         draftDetailIds,
@@ -405,7 +435,12 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
       // 保存后刷新列表：任务可能从"校验问题"变"已完成"，列表状态不滞后
       await load();
     } catch (err) {
-      if (seq === originalSeqRef.current) setError(err instanceof Error ? err.message : "保存失败");
+      if (seq === originalSeqRef.current) {
+        const conflict = err instanceof ApiError && err.status === 409;
+        setReviewConflict(conflict);
+        setError(conflict ? "这份文件的数据已有更新，本次修改尚未保存。" : err instanceof Error ? err.message : "保存失败");
+        notify(conflict ? "修改未保存，点「处理冲突」查看。" : "修改未保存，点「查看原因」查看。", "error");
+      }
     } finally {
       if (seq === originalSeqRef.current) setSaving(false);
     }
@@ -426,19 +461,24 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     setError(null);
     try {
       const extractionData = await getExtraction(task.id);
-      const allIndices = (extractionData.validation_issues ?? []).map(
-        (_issue, index) => index,
-      );
+      const issues = extractionData.validation_issues ?? [];
+      const allIndices = issues.flatMap((issue, index) => issue.raw_value == null && !issue.not_checked ? [index] : []);
+      if (allIndices.length === 0 && issues.some(issue => issue.raw_value != null)) {
+        notify("有字段需要对照原件核对。", "info");
+        return;
+      }
       await updateReview(
         task.id,
         extractionData.review_version,
         extractionData.result,
         allIndices,
       );
-      setNotice(`已忽略校验问题并完成：${task.filename}`);
+      notify(issues.some(issue => issue.raw_value != null)
+        ? "已忽略可跳过的校验，仍有字段需要核对。"
+        : `已忽略校验问题并完成：${task.filename}`, "success");
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "忽略并完成失败");
+      notify(err instanceof Error ? err.message : "忽略并完成失败", "error");
     } finally {
       setBusyTaskId(null);
     }
@@ -452,8 +492,9 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     try {
       const result = await deleteTask(deleteTarget.id);
       setDeleteTarget(null);
-      setNotice(
+      notify(
         deletionNotice(result, `已删除文件及关联数据：${deleteTarget.filename}。`),
+        "success",
       );
       await load();
     } catch (err) {
@@ -468,6 +509,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     index: number,
     initialWidth: number,
   ) {
+    if (event.button !== 0) return;
     event.preventDefault();
     const startX = event.clientX;
     const move = (moveEvent: PointerEvent) => {
@@ -476,33 +518,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
         [index]: Math.min(360, Math.max(48, initialWidth + moveEvent.clientX - startX)),
       }));
     };
-    const finish = () => {
-      document.removeEventListener("pointermove", move);
-      document.removeEventListener("pointerup", finish);
-    };
-    document.addEventListener("pointermove", move);
-    document.addEventListener("pointerup", finish);
-  }
-
-  function startDetailResize(
-    event: React.PointerEvent<HTMLSpanElement>,
-    key: string,
-    initialWidth: number,
-  ) {
-    event.preventDefault();
-    const startX = event.clientX;
-    const move = (moveEvent: PointerEvent) => {
-      setDetailWidths((current) => ({
-        ...current,
-        [key]: Math.min(360, Math.max(48, initialWidth + moveEvent.clientX - startX)),
-      }));
-    };
-    const finish = () => {
-      document.removeEventListener("pointermove", move);
-      document.removeEventListener("pointerup", finish);
-    };
-    document.addEventListener("pointermove", move);
-    document.addEventListener("pointerup", finish);
+    startPointerDrag(move, undefined, event.pointerId, event.currentTarget);
   }
 
   const colWidths = useMemo<Record<number, number>>(
@@ -518,12 +534,21 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     [columnWidths, historyTab],
   );
 
+  function resizeWithKeyboard(event: React.KeyboardEvent<HTMLSpanElement>, width: number, apply: (value: number) => void) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const next = event.key === "Home" ? 48 : event.key === "End" ? 360 : width + (event.key === "ArrowLeft" ? -12 : 12);
+    apply(Math.min(360, Math.max(48, next)));
+  }
+
   const renderColumnResizer = (index: number) => (
     <span
       aria-label={`调整第 ${index + 1} 列宽`}
       aria-orientation="vertical"
       className="column-resizer"
       onPointerDown={(event) => startResize(event, index, colWidths[index])}
+      onKeyDown={(event) => resizeWithKeyboard(event, colWidths[index], value => setColumnWidths(current => ({ ...current, [index]: value })))}
+      aria-valuemin={48} aria-valuemax={360} aria-valuenow={colWidths[index]}
       role="separator"
       tabIndex={0}
     />
@@ -572,6 +597,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
       ? (extraction.result as { items?: Array<Record<string, unknown>> }).items ?? []
       : [];
   const detailPage = useDetailPage(displayItems.length, selectedTask?.id);
+  const locateValidationField = useValidationFieldLocator(originalContentRef, selectedTask?.id);
 
   const renderTable = (
     headers: string[],
@@ -579,7 +605,10 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     rows: React.ReactNode[],
     variant?: "problems",
   ) => (
-    <div className="data-table-wrap">
+    <HistoryTableGrid
+      scrollMemory={scrollMemory ?? localScrollMemory.current}
+      scrollSlot={variant === "problems" ? "history-problems" : "history-completed"}
+      query={renderedListQuery}>
       <table className={`data-table history-table${variant ? ` ${variant}` : ""}`} style={{ tableLayout: "fixed" }}>
         {colgroup}
         <thead>
@@ -592,10 +621,62 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
             ))}
           </tr>
         </thead>
-        <tbody>{rows}</tbody>
+        <tbody>
+          {rows}
+          {!loading && !listReadError && loadedListQuery === listQuery && rows.length > 0 &&
+            Array.from({ length: HISTORY_PAGE_SIZE - rows.length }, (_, index) =>
+              <tr key={`blank-${index}`} aria-hidden="true" className="history-blank-row">
+                {headers.map((_, column) => <td key={column} />)}
+              </tr>)}
+        </tbody>
       </table>
-    </div>
+    </HistoryTableGrid>
   );
+
+  const renderEmptyHistoryState = (tab: "completed" | "problems") => {
+    if (loadedListQuery !== listQuery) {
+      return (
+        <div className="history-empty-state" role="status">
+          <strong>暂时无法确认这里是否为空</strong>
+          <span>历史读取失败不代表没有记录。请重新读取后再判断。</span>
+        </div>
+      );
+    }
+    if (currentCount > 0) {
+      return (
+        <div className="history-empty-state" role="status">
+          <strong>当前页没有记录</strong>
+          <span>可以调整页码，或重新读取文件历史。</span>
+        </div>
+      );
+    }
+    if (hasActiveHistoryFilters) {
+      return (
+        <div className="history-empty-state" role="status">
+          <strong>没有符合条件的记录</strong>
+          <span>请调整文件名、模板或时间条件，或使用上方的“清除筛选”。</span>
+        </div>
+      );
+    }
+    if (tab === "problems") {
+      return (
+        <div className="history-empty-state" role="status">
+          <strong>目前没有待确认记录</strong>
+          <span>需要核对的提取结果会显示在这里。</span>
+        </div>
+      );
+    }
+    return (
+      <div className="history-empty-state history-empty-state-first-run" role="status">
+        <Icon icon={FileText} size={24} />
+        <strong>还没有已完成的文件记录</strong>
+        <span>文件处理完成后，记录会显示在这里。</span>
+        <div className="history-empty-actions">
+          {onNavigateExtract && <button className="btn primary sm" type="button" onClick={onNavigateExtract}>去文件提取</button>}
+        </div>
+      </div>
+    );
+  };
 
   const renderHistoryPager = (
     page: number,
@@ -619,7 +700,11 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
     return (
     <div className="history-pagination">
       <span className="footer-info">
-        {loading ? <><Icon icon={Loader2} size={13} className="spin" /> 正在加载下一页…</> : <>显示 {total === 0 ? 0 : (page - 1) * HISTORY_PAGE_SIZE + 1}-{Math.min(page * HISTORY_PAGE_SIZE, total)} 条，共 {total} 条</>}
+        {loadedListQuery !== listQuery && !loading
+          ? "当前筛选结果数尚未确认；下方仍显示上次成功读取的内容。"
+          : loading
+            ? <><Icon icon={Loader2} size={13} className="spin" /> 正在加载下一页…</>
+            : <>显示 {total === 0 ? 0 : (page - 1) * HISTORY_PAGE_SIZE + 1}-{Math.min(page * HISTORY_PAGE_SIZE, total)} 条，共 {total} 条</>}
       </span>
       <div className="pagination">
         <button className="btn icon-only sm" disabled={page <= 1} onClick={() => goToPage(1)} title="第一页">
@@ -658,61 +743,46 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
   };
 
   return (
-    <div className="view">
+    <div className={`view${historyTab === "original" ? "" : " history-list-view"}`}>
       {fileHistoryOpen && selectedTask && <FileRevisionHistory taskId={selectedTask.id} filename={taskDisplayName(selectedTask)} onClose={() => setFileHistoryOpen(false)} />}
-      {extraction?.has_current_data === false && <p className="callout">当前数据已清空。原文件和历史版本仍可查看。</p>}
-      <div className="page-header">
-        <div className="eyebrow">追溯</div>
-        <h1>文件历史</h1>
-        <div className="support">已处理文件的历史记录 · 点击文件名可回溯查看原文件与提取数据</div>
-      </div>
+      <Toast toast={toast} onDismiss={clear} />
 
-      {error && (
-        <div className="callout danger" role="alert" style={{ marginBottom: 16 }}>{error}</div>
-      )}
-      {notice && (
-        <div className="callout success" style={{ marginBottom: 16 }}>{notice}</div>
-      )}
 
-      {/* 累计统计条 */}
-      <div className="hist-stats-bar">
-        <div className="hist-stat-item">
-          <div className="hist-stat-num">{summary?.total ?? 0}</div>
-          <div className="hist-stat-label">累计任务</div>
-        </div>
-        <div className="hist-stat-divider"></div>
-        <div className="hist-stat-item">
-          <div className="hist-stat-num">{summary?.completed ?? 0}</div>
-          <div className="hist-stat-label">已完成</div>
-        </div>
-        <div className="hist-stat-divider"></div>
-        <div className="hist-stat-item">
-          <div className="hist-stat-num">{summary?.needs_review ?? 0}</div>
-          <div className="hist-stat-label">校验问题</div>
-        </div>
-      </div>
+      {historyNoticeOpen && listReadError && historyTab !== "original" && (
+        <NoticeDialog title="文件历史事项" onClose={() => setHistoryNoticeOpen(false)}
+          actions={<button className="btn primary sm" type="button" onClick={retryHistoryRead} disabled={loading}>重新读取历史</button>}>
+            <strong>{loadedListQuery === null
+              ? "尚未读取到历史数据，暂时无法判断这里是否为空。"
+              : loadedListQuery === listQuery
+                ? "重新读取失败，仍显示上次成功读取的结果，可能不是最新状态。"
+                : "当前筛选读取失败，仍显示上次成功读取的内容，可能不符合当前条件。"}</strong>
+            <p>{listReadError}</p>
+        </NoticeDialog>
+      )}
 
       {/* Tab */}
       <div className="history-tabs">
         <button
           className={`hist-tab ${historyTab === "completed" ? "active" : ""}`}
-          onClick={() => changeTab("completed")}
+          onClick={event => changeTab("completed", event.currentTarget)}
         >
-          已完成 <span className="hist-tab-count">{filteredSummary?.completed ?? 0}</span>
+          已完成 <span className="hist-tab-count">{currentFilteredSummary?.completed ?? "—"}</span>
         </button>
         <button
           className={`hist-tab ${historyTab === "problems" ? "active" : ""}`}
-          onClick={() => changeTab("problems")}
+          onClick={event => changeTab("problems", event.currentTarget)}
         >
-          校验问题 <span className="hist-tab-count">{filteredSummary?.needs_review ?? 0}</span>
+          校验问题 <span className="hist-tab-count">{currentFilteredSummary?.needs_review ?? "—"}</span>
         </button>
         <button
           className={`hist-tab ${historyTab === "original" ? "active" : ""}`}
-          onClick={() => changeTab("original")}
+          onClick={event => changeTab("original", event.currentTarget)}
         >
           原文件
           {selectedTask ? <span className="hist-tab-count">1</span> : null}
         </button>
+        {historyTab !== "original" && listReadError && <button className="btn ghost sm" type="button"
+          aria-haspopup="dialog" onClick={() => setHistoryNoticeOpen(true)}>文件历史事项</button>}
       </div>
 
       {/* 筛选栏：文件名搜索 / 模板 / 时间；原文件 tab 是单文件详情视图，不显示筛选栏 */}
@@ -726,13 +796,13 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
               type="text"
               placeholder="按文件名搜索…"
               value={fileSearch}
-              onChange={(e) => setFileSearch(e.target.value)}
+              onChange={(event) => updateListFilters({ fileSearch: event.target.value })}
             />
           </div>
           <select
             className="form-select"
             value={templateFilter}
-            onChange={(e) => setTemplateFilter(e.target.value)}
+            onChange={(event) => updateListFilters({ templateFilter: event.target.value })}
             aria-label="按模板筛选"
           >
             <option value="">全部模板</option>
@@ -743,7 +813,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
           <select
             className="form-select"
             value={timeFilter}
-            onChange={(e) => setTimeFilter(e.target.value)}
+            onChange={(event) => updateListFilters({ timeFilter: event.target.value })}
             aria-label="按时间筛选"
           >
             <option value="all">全部时间</option>
@@ -754,11 +824,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
           {(fileSearch || templateFilter || timeFilter !== "all") && (
             <button
               className="btn ghost sm"
-              onClick={() => {
-                setFileSearch("");
-                setTemplateFilter("");
-                setTimeFilter("all");
-              }}
+              onClick={() => updateListFilters(DEFAULT_FILTERS)}
             >
               清除筛选
             </button>
@@ -766,16 +832,18 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
         </div>
       )}
 
+
+
       {historyTab !== "original" && (
         loading && pageTasks.length === 0 ? (
-        <div className="card flush" style={{ padding: 48, textAlign: "center" }}>
-          <Icon icon={Loader2} size={24} className="spin" />
-        </div>
+        <div className="card flush history-table-card"><div className="history-empty-state" role="status">
+          <Icon icon={Loader2} size={24} className="spin" /><span>正在读取文件记录…</span>
+        </div></div>
         ) : (
         <>
           {historyTab === "completed" && (
             <div className="card flush history-table-card" aria-busy={loading}>
-              {renderTable(
+              {pageTasks.length === 0 ? renderEmptyHistoryState("completed") : renderTable(
                 ["#", "文件名", "模板", "处理方式", "记录数", "提取耗时", "完成时间", ""],
                 (
                   <colgroup>
@@ -789,18 +857,13 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                     <col style={{ width: "48px" }} />
                   </colgroup>
                 ),
-                pageTasks.length === 0
-                  ? [
-                      <tr key="empty">
-                        <td colSpan={8} className="hist-empty-row">暂无已完成的任务</td>
-                      </tr>,
-                    ]
-                  : pageTasks.map((t, idx) => (
+                pageTasks.map((t, idx) => (
                       <tr key={t.id}>
-                        <td className="hist-idx">{idx + 1}</td>
+                        <td className="hist-idx">{loadedOffset + idx + 1}</td>
                         <td>
                           <button
                             className="hist-file-btn"
+                            ref={returnToFile.current?.id === t.id ? returnedFileButton : undefined}
                             onClick={() => openOriginal(t)}
                             title="查看原文件与提取数据"
                           >
@@ -824,7 +887,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
 
           {historyTab === "problems" && (
             <div className="card flush history-table-card" aria-busy={loading}>
-              {renderTable(
+              {pageTasks.length === 0 ? renderEmptyHistoryState("problems") : renderTable(
                 ["#", "文件名", "模板", "处理方式", "问题", "处理时间", ""],
                 (
                   <colgroup>
@@ -837,18 +900,13 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                     <col style={{ width: "48px" }} />
                   </colgroup>
                 ),
-                pageTasks.length === 0
-                  ? [
-                      <tr key="empty">
-                        <td colSpan={7} className="hist-empty-row">暂无校验问题</td>
-                      </tr>,
-                    ]
-                  : pageTasks.map((p, idx) => (
+                pageTasks.map((p, idx) => (
                       <tr key={p.id}>
-                        <td className="hist-idx">{idx + 1}</td>
+                        <td className="hist-idx">{loadedOffset + idx + 1}</td>
                         <td>
                           <button
                             className="hist-file-btn"
+                            ref={returnToFile.current?.id === p.id ? returnedFileButton : undefined}
                             onClick={() => openOriginal(p)}
                             title="查看原文件与提取数据"
                           >
@@ -892,9 +950,21 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
           <div style={{ padding: 48, textAlign: "center" }}>
             <Icon icon={Loader2} size={24} className="spin" />
           </div>
+        ) : originalReadError && !extraction ? (
+          <div className="history-original-read-error" role="alert">
+            <strong>暂时无法读取这份文件的提取结果</strong>
+            <span>{originalReadError}</span>
+            <button className="btn secondary sm" type="button" onClick={retryOriginalRead} disabled={extractionLoading}>
+              {extractionLoading ? "正在读取…" : "重新读取提取结果"}
+            </button>
+          </div>
         ) : (
-          <div className="history-original-body">
+          <div className="history-original-body" ref={originalContentRef}>
                   <div className="history-action-bar">
+                    {extraction?.has_current_data === false && <span className="support">当前数据已清空</span>}
+                    {error && <button className="gtb-failure-link" type="button" aria-haspopup="dialog" onClick={() => {
+                      clear(); setOriginalNoticeOpen(true);
+                    }}>{reviewConflict ? "处理冲突" : "查看原因"}</button>}
                     {extraction ? (
                       <>
                         <button className="btn secondary sm" onClick={() => setFileHistoryOpen(true)}><Icon icon={History} size={14} /> 历史版本</button>
@@ -915,6 +985,11 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                       </button>
                     ) : null}
                   </div>
+                  {originalNoticeOpen && error && <NoticeDialog title={reviewConflict ? "修订冲突" : "修改未保存"}
+                    onClose={() => setOriginalNoticeOpen(false)}
+                    actions={reviewConflict && <button className="btn primary sm" type="button" disabled={saving} onClick={() => {
+                      setOriginalNoticeOpen(false); retryOriginalRead();
+                    }}>重新读取</button>}><p>{error}</p></NoticeDialog>}
                   {/* 元信息 */}
                   <div className="history-meta-bar">
                     <div className="hist-meta-item">
@@ -963,7 +1038,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                           <div className="extract-header-grid">
                             {extractionHeaderKeys.map((key) => (
                               <div
-                                className="extract-header-row"
+                                className="extract-header-row" data-review-field={`h-${key}`} tabIndex={-1}
                                 key={key}
                                 onClick={() => { if (!saving) setEditingCell(`h-${key}`); }}
                                 title="单击编辑"
@@ -992,28 +1067,19 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                               </span>
                             </div>
                             <div className="data-table-scroll">
-                              <table className="data-table" style={{ tableLayout: "fixed", minWidth: detailColumnWidth + 52 }}>
+                              <table className="data-table" style={{ minWidth: detailColumnWidth + 52 }}>
+                                <colgroup>
+                                  <col style={{ width: 52 }} />
+                                  {extractionItemKeys.map(key => <col key={key} style={{ width: detailWidths[key] ?? 132 }} />)}
+                                </colgroup>
                                 <thead>
                                   <tr>
                                     <th className="detail-row-gutter" scope="col" aria-label="明细序号">#</th>
-                                    {extractionItemKeys.map((key) => (
-                                      <th
-                                        key={key}
-                                        style={{ width: `calc(${100 * (detailWidths[key] ?? 132) / detailColumnWidth}% - ${52 * (detailWidths[key] ?? 132) / detailColumnWidth}px)` }}
-                                      >
-                                        <span>{labelFor(key)}</span>
-                                        <span
-                                          aria-label={`调整“${labelFor(key)}”列宽`}
-                                          aria-orientation="vertical"
-                                          className="column-resizer"
-                                          onPointerDown={(event) =>
-                                            startDetailResize(event, key, detailWidths[key] ?? 132)
-                                          }
-                                          role="separator"
-                                          tabIndex={0}
-                                        />
-                                      </th>
-                                    ))}
+                                    {extractionItemKeys.map(key => <th key={key}>
+                                      <span>{labelFor(key)}</span>
+                                      <DetailColumnResizer label={labelFor(key)} width={detailWidths[key] ?? 132}
+                                        onResize={width => setDetailWidths(current => ({ ...current, [key]: width }))} />
+                                    </th>)}
                                   </tr>
                                 </thead>
                                 <tbody>
@@ -1028,6 +1094,7 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                                       }} /></td>
                                       {extractionItemKeys.map((key) => (
                                         <td
+                                          data-review-field={`i-${idx}-${key}`}
                                           aria-label={`编辑 ${labelFor(key)}，当前值 ${String(item[key] ?? "") || "空"}`}
                                           key={key}
                                           onClick={() => { if (!saving) setEditingCell(`i-${idx}-${key}`); }}
@@ -1062,67 +1129,28 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                         ) : null}
                       </div>
 
-                      {/* 校验结果（复用提取页样式） */}
-                      <div className="validation-panel">
-                        <div className="validation-panel-head">
-                          <Icon
-                            icon={ShieldAlert}
-                            size={15}
-                            style={{ color: "var(--color-danger-600)" }}
-                          />
-                          <span>校验结果</span>
-                          <span
-                            className={`validation-count ${
-                              extraction.validation_issues.length === 0 ? "zero" : ""
-                            }`}
-                          >
-                            {extraction.validation_issues.length}
-                          </span>
-                          {extraction.validation_issues.length === 0 && (
-                            <span className="validation-hint">全部通过，无异常</span>
-                          )}
-                        </div>
-                        <div className="validation-panel-body">
-                          {extraction.validation_issues.length === 0 ? (
-                            <div className="validation-empty">
-                              <Icon
-                                icon={CheckCircle2}
-                                size={18}
-                                style={{ color: "var(--color-success-600)" }}
-                              />
-                              <span>本次提取校验全部通过</span>
-                            </div>
-                          ) : (
-                            extraction.validation_issues.map((issue, idx) => (
-                              <div
-                                className={`validation-item${ignoredIssueIndices.includes(idx) ? " is-ignored" : ""}`}
-                                key={idx}
-                              >
-                                <span className="validation-row-tag">
-                                  {issue.severity === "error" ? "阻断" : "提醒"}
-                                </span>
-                                <span className="validation-field">
-                                  {labelFor(issue.field) || issue.field}
-                                </span>
-                                <span className="validation-msg">{issue.message}</span>
-                                {ignoredIssueIndices.includes(idx) && (
-                                  <span className="validation-ignored-tag">已忽略</span>
-                                )}
-                                <button
-                                  className="btn ghost sm"
-                                  title={ignoredIssueIndices.includes(idx) ? "恢复这条校验" : "忽略这条校验，修订到表时不再阻断"}
-                                  onClick={() => toggleIssueIgnored(idx)}
-                                  disabled={saving}
-                                  type="button"
-                                >
-                                  <Icon icon={EyeOff} size={13} />
-                                  {ignoredIssueIndices.includes(idx) ? "恢复" : "忽略"}
-                                </button>
-                              </div>
-                            ))
-                          )}
-                        </div>
-                      </div>
+                      <ValidationResults
+                        template={extraction.template}
+                        issues={extraction.validation_issues.map((issue, index) => {
+                          const match = issue.field.match(/^items\[(\d+)\]\.(.+)$/);
+                          const key = match ? match[2] : issue.field.replace(/^header\./, "");
+                          return { index, code: issue.code, row: match ? `明细第 ${Number(match[1]) + 1} 行` : "文件级信息",
+                            field: labelFor(issue.field), message: issue.message, severity: issue.severity, rawValue: issue.raw_value,
+                            valueType: fieldType(match ? "item" : "header", key),
+                            notChecked: issue.not_checked, advisory: selectedTask?.status === "completed",
+                            ignored: ignoredIssueIndices.includes(index),
+                            canLocate: match ? Number(match[1]) < displayItems.length && extractionItemKeys.includes(key) : extractionHeaderKeys.includes(key) };
+                        })}
+                        disabled={saving}
+                        onToggleIgnored={toggleIssueIgnored}
+                        onLocate={index => {
+                          const issue = extraction.validation_issues[index];
+                          const match = issue.field.match(/^items\[(\d+)\]\.(.+)$/);
+                          const key = match ? `i-${match[1]}-${match[2]}` : `h-${issue.field.replace(/^header\./, "")}`;
+                          if (match) detailPage.setPage(Math.floor(Number(match[1]) / detailPage.size) + 1);
+                          locateValidationField(key);
+                        }}
+                      />
                     </div>
                   ) : null}
 
@@ -1130,51 +1158,11 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
                   <div className="history-original-panel">
                     <div className="history-panel-title">
                       <span>原文件</span>
-                      <a
-                        className="btn ghost sm"
-                        download={desktopApi() ? undefined : selectedTask.filename}
-                        href={getOriginalFileUrl(selectedTask.id)}
-                        onClick={(event) => {
-                          if (!desktopApi()) return;
-                          event.preventDefault();
-                          if (
-                            originalDownload?.taskId === selectedTask.id &&
-                            originalDownload.status === "downloading"
-                          ) return;
-                          void downloadOriginalFile(selectedTask);
-                        }}
-                        aria-disabled={
-                          originalDownload?.taskId === selectedTask.id &&
-                          originalDownload.status === "downloading"
-                        }
-                        title="下载上传时保存的原文件"
-                      >
-                        <Icon icon={Download} size={14} />
-                        {originalDownload?.taskId === selectedTask.id &&
-                        originalDownload.status === "downloading"
-                          ? "下载中…"
-                          : "下载原文件"}
-                      </a>
+                      <OriginalDownload key={selectedTask.id} url={getOriginalFileUrl(selectedTask.id)} filename={selectedTask.filename} />
                     </div>
-                    {originalDownload?.taskId === selectedTask.id && (
-                      <div
-                        className={`callout ${
-                          originalDownload.status === "error"
-                            ? "danger"
-                            : originalDownload.status === "success"
-                              ? "success"
-                              : "info"
-                        }`}
-                        role="status"
-                        style={{ margin: "0 12px 12px", overflowWrap: "anywhere" }}
-                      >
-                        {originalDownload.message}
-                      </div>
-                    )}
                     <div className="history-panel-body history-preview">
                       <DocumentPreview
                         contentType={selectedTask.content_type}
-                        showDownload={false}
                         filename={selectedTask.filename}
                         flowPages
                         pageNumber={1}
@@ -1201,16 +1189,12 @@ export function HistoryPage({ onOpenTask, onOpenData, initialTab = "completed" }
       </div>
 
       {unsavedReview.dialog}
-      {/* 删除确认：删除记录不删表数据，需输入文件名确认 */}
-      <ConfirmDialog
-        open={deleteTarget !== null}
-        title="删除文件记录"
-        description={`将删除「${deleteTarget?.filename ?? ""}」的处理记录、提取结果和原文件。关联的当前数据和全部文件修订历史也会一起删除。独立合并结果和外部归档文件不受影响。此操作不可恢复。`}
-        confirmText={deleteTarget?.filename ?? ""}
-        buttonLabel="确认删除"
-        busy={busyTaskId === deleteTarget?.id}
+      <DeleteTaskDialog
+        tasks={deleteTarget ? [deleteTarget] : []}
+        busy={deleteTarget !== null && busyTaskId === deleteTarget.id}
+        error={error}
         onConfirm={() => void handleDeleteTask()}
-        onClose={() => setDeleteTarget(null)}
+        onClose={() => { setDeleteTarget(null); setError(null); }}
       />
     </div>
   );

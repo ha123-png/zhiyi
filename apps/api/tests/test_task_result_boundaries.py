@@ -299,19 +299,20 @@ def test_mcp_file_reads_have_explicit_scope_and_revoke_together(tmp_path):
     from document_pipeline_api.services.integration_config import write_integration_config
     settings = Settings(database_url=f"sqlite:///{tmp_path / 'mcp.db'}", storage_dir=tmp_path / "uploads")
     write_integration_config(tmp_path, {"mcp_result_read": True})
-    server = create_mcp_server(settings, result_read_enabled=True, data_read_enabled=True, allowed_table_ids=())
+    ungranted = create_mcp_server(settings, result_read_enabled=True, data_read_enabled=True, allowed_table_ids=())
+    server = create_mcp_server(settings, result_read_enabled=True, data_read_enabled=True, allowed_table_ids=("table",))
     engine = build_engine(settings.database_url)
     seed(engine)
     calls = [("get_task_result", {"task_id": "file"}),
              ("get_task_evidence", {"task_id": "file"}),
              ("get_task_result_value", {"task_id": "file", "path": ["header", "customer"], "expected_version": 0})]
     async def permitted():
-        # File-result permission is independent and explicitly says so in the
-        # handbook. The empty table-tool whitelist must still reject tables.
         for name, arguments in calls:
             await server.call_tool(name, arguments)
+            with pytest.raises(Exception, match="授权范围"):
+                await ungranted.call_tool(name, arguments)
         with pytest.raises(Exception, match="授权范围"):
-            await server.call_tool("get_data_table", {"table_id": "table"})
+            await ungranted.call_tool("get_data_table", {"table_id": "table"})
     async def revoked():
         for name, arguments in calls:
             with pytest.raises(Exception, match="权限已变更"):

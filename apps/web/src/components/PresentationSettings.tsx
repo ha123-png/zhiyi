@@ -20,10 +20,6 @@ export function TemplateNameSettings({ value, disabled, onChange }: { value?: Te
   </div>;
 }
 
-export function presentationFields(fields: TemplateField[]): TemplateField[] {
-  return fields.map((field, index) => ({ ...field, key: field.key || `presentation_field_${index}` }));
-}
-
 export function cleanPresentation(value: TemplateBehavior | undefined, fields: TemplateField[]): TemplateBehavior | undefined {
   if (!value) return undefined;
   const refs = new Set(fields.map((f) => `${f.section}.${f.key}`));

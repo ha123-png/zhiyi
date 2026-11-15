@@ -1,4 +1,4 @@
-from document_pipeline_api.model_diagnostics import safe_diagnostic
+from document_pipeline_api.model_diagnostics import service_error_diagnostic
 import base64
 import json
 import re
@@ -6,6 +6,8 @@ from pathlib import Path
 
 import httpx
 from pydantic import ValidationError
+from document_pipeline_api.schemas.json_numbers import NumericPrecisionError, loads_json_numbers
+from document_pipeline_api.services.autonomous_extraction import AutonomousModelResult
 
 from document_pipeline_api.model_providers.base import (
     ModelRequestRejectedError,
@@ -38,11 +40,55 @@ def _extract_json_text(content: str) -> str:
 
 def _validate_payload(result_type: type[SchemaModel], payload: object) -> SchemaModel:
     """Accept valid business JSON first. Repair wrappers only at scalar leaves."""
+    for attempt in range(2):
+        try:
+            return result_type.model_validate(payload)
+        except ValidationError as error:
+            for detail in error.errors():
+                cause = detail.get("ctx", {}).get("error")
+                if isinstance(cause, NumericPrecisionError):
+                    raise cause from error
+            if attempt:
+                raise
+            schema = result_type.model_json_schema()
+            payload = _unwrap_scalar_wrappers(payload, schema, schema)
+
+
+def parse_structured_content(content: object, result_type: type[SchemaModel]) -> SchemaModel:
+    if not isinstance(content, str) or not content.strip():
+        raise ModelResponseError("模型没有返回可读取的结果。")
     try:
-        return result_type.model_validate(payload)
-    except ValidationError:
-        schema = result_type.model_json_schema()
-        return result_type.model_validate(_unwrap_scalar_wrappers(payload, schema, schema))
+        payload = loads_json_numbers(
+            _extract_json_text(content), keep_unrepresentable=issubclass(result_type, AutonomousModelResult),
+        )
+    except json.JSONDecodeError as error:
+        raise ModelResponseError(
+            "模型返回内容无法解析为 JSON，可以重试。",
+            diagnostic=f"模型输出的 JSON 不完整或格式无效。解析停在第 {error.lineno} 行、第 {error.colno} 列。",
+        ) from None
+    try:
+        return _validate_payload(result_type, payload)
+    except ValidationError as error:
+        issue = error.errors(include_url=False, include_context=False, include_input=False)[0]
+        parts = result_type.model_fields.keys() | {"label", "value_type", "value", "fields"}
+        path = ".".join(
+            str(segment + 1) if isinstance(segment, int) else segment if segment in parts else "字段"
+            for segment in issue["loc"]
+        )
+        reason = {
+            "missing": "缺少必填字段",
+            "extra_forbidden": "包含未定义字段",
+            "literal_error": "字段类型标记无效",
+            "list_type": "需要列表",
+            "dict_type": "需要对象",
+            "autonomous_row_width": "明细的值数量与明细字段数量不一致",
+            "autonomous_field_label": "同一分区内的字段名称重复或为空",
+            "autonomous_number_value": "数值字段没有填入可解析的数字",
+        }.get(issue["type"], "值或字段定义不符合提取要求")
+        raise ModelResponseError(
+            "模型返回内容不符合字段结构，可以重试或更换模型。",
+            diagnostic=f"模型已返回 JSON，但结构校验未通过。{path or '提取结果'}：{reason}。",
+        ) from None
 
 
 def _unwrap_scalar_wrappers(value: object, schema: dict, root: dict) -> object:
@@ -100,7 +146,10 @@ def _response_error_detail(response: httpx.Response) -> str:
     except RuntimeError:
         authorization = ""
     secret = authorization.removeprefix("Bearer ")
-    message = safe_diagnostic(message, secrets=(secret,))
+    message = service_error_diagnostic(message, secret)
+    # The shared diagnostic removes URL authority; do not expose a remaining
+    # path or query from an untrusted model-service error response either.
+    message = re.sub(r"(?i)\[服务地址\](?:[/?#][^\s\"'<>]*)?", "[服务地址]", message)
     return f"（服务端返回：{message}）" if message else ""
 
 
@@ -145,38 +194,41 @@ class OpenAICompatibleProvider:
                 headers=self._headers(),
             )
             response.raise_for_status()
-            return [item["id"] for item in response.json().get("data", [])]
-        except httpx.TimeoutException as error:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Invalid model list envelope")
+            models = [item["id"] for item in payload.get("data", [])]
+            if any(not isinstance(model, str) for model in models):
+                raise ValueError("Invalid model identifier")
+            return models
+        except httpx.TimeoutException:
             raise ModelTimeoutError(
-                "连接模型服务超时，请确认本地模型服务已打开并已加载模型，然后重试。"
-            ) from error
+                "连接模型服务超时，请检查服务地址、网络和服务状态后重试。"
+            ) from None
         except httpx.HTTPStatusError as error:
             if error.response.status_code >= 500:
                 raise ModelUnavailableError(
                     "模型服务暂时不可用"
                     + _response_error_detail(error.response)
                     + "，请稍后重试。"
-                ) from error
+                ) from None
             raise ModelRequestRejectedError(
                 "模型服务拒绝了当前配置"
                 + _response_error_detail(error.response)
                 + "，请检查模型地址、密钥和模型名称设置。"
-            ) from error
-        except httpx.ConnectError as error:
+            ) from None
+        except httpx.ConnectError:
             raise ModelUnavailableError(
-                "无法连接模型服务"
-                f"（{self.base_url}）。请确认已打开 LM Studio 并启动本地服务器、"
-                "加载了模型，再回到这里重试。"
-            ) from error
-        except httpx.RequestError as error:
+                "无法连接模型服务，请检查服务地址、网络和服务是否已启动。"
+            ) from None
+        except httpx.RequestError:
             raise ModelUnavailableError(
-                "连接模型服务出错"
-                f"（{self.base_url}）。请检查模型服务是否正常运行、网络是否通畅。"
-            ) from error
-        except (KeyError, TypeError, ValueError) as error:
+                "连接模型服务时出现问题，请检查服务状态和网络后重试。"
+            ) from None
+        except (KeyError, TypeError, ValueError):
             raise ModelResponseError(
                 "模型服务返回的模型列表格式不正确，可以重试或更换模型服务。"
-            ) from error
+            ) from None
 
     def extract_image(
         self,
@@ -303,43 +355,39 @@ class OpenAICompatibleProvider:
             if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
                 raise ValueError("Invalid completion choices")
             choice = choices[0]
-            if choice.get("finish_reason") in {"length", "content_filter"}:
-                raise ModelResponseError("模型输出未完成，结果没有保存为成功。原件仍保留，请调整模型输出设置或缩小处理范围后重试。")
-            content = choice["message"]["content"]
-            payload = json.loads(_extract_json_text(content))
-            return _validate_payload(result_type, payload)
-        except httpx.TimeoutException as error:
+            if choice.get("finish_reason") == "content_filter":
+                raise ModelRequestRejectedError("模型服务因内容限制拒绝了本次请求。请查看服务的内容限制或联系服务方。")
+            if choice.get("finish_reason") == "length":
+                raise ModelResponseError("模型输出未完成，请调整模型输出长度设置或缩小处理范围后重试。")
+            return parse_structured_content(choice["message"]["content"], result_type)
+        except httpx.TimeoutException:
             raise ModelTimeoutError(
-                "处理超时：模型可能未加载、正在加载或响应缓慢，"
-                "请稍后重试，或在设置里更换更快的模型。"
-            ) from error
+                "模型服务响应超时，请检查服务状态和网络后重试。"
+            ) from None
         except httpx.HTTPStatusError as error:
             if error.response.status_code >= 500:
                 raise ModelUnavailableError(
                     "模型服务暂时不可用"
                     + _response_error_detail(error.response)
                     + "，请稍后重试。"
-                ) from error
+                ) from None
             raise ModelRequestRejectedError(
                 "模型服务拒绝了请求"
                 + _response_error_detail(error.response)
                 + "，请检查当前模型方案的鉴权、模型名称和接口支持情况。"
-            ) from error
-        except httpx.ConnectError as error:
+            ) from None
+        except httpx.ConnectError:
             raise ModelUnavailableError(
-                "无法连接模型服务"
-                f"（{self.base_url}）。请确认已打开 LM Studio 并启动本地服务器、"
-                "加载了模型，再重试任务；原件仍保留。"
-            ) from error
-        except httpx.RequestError as error:
+                "无法连接模型服务，请检查服务地址、网络和服务是否已启动。"
+            ) from None
+        except httpx.RequestError:
             raise ModelUnavailableError(
-                "连接模型服务出错"
-                f"（{self.base_url}）。请检查模型服务是否正常运行、网络是否通畅。"
-            ) from error
-        except (KeyError, TypeError, ValueError) as error:
-            raise ModelResponseError(
-                "模型返回内容不符合字段结构，可以重试或更换模型。"
-            ) from error
+                "连接模型服务时出现问题，请检查服务状态和网络后重试。"
+            ) from None
+        except NumericPrecisionError:
+            raise ModelResponseError("模型返回的数值精度超出支持范围，请检查输入数值或字段类型后重试。") from None
+        except (KeyError, TypeError, ValueError):
+            raise ModelResponseError("模型服务响应缺少预期的结果内容。") from None
 
 
 def _image_mime_type(image_path: Path) -> str:

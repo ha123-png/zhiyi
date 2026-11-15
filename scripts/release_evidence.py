@@ -12,10 +12,24 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def file_record(root: Path, path: Path) -> dict:
-    if path.is_symlink() or path.is_junction() or not path.resolve().is_relative_to(root):
+def validate_source_path(root: Path, path: Path) -> Path:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        raise ValueError("Release inputs must not contain links or paths outside the root") from None
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink() or cursor.is_junction():
+            raise ValueError("Release inputs must not contain links or paths outside the root")
+    if not path.resolve().is_relative_to(root):
         raise ValueError("Release inputs must not contain links or paths outside the root")
-    return {"path": path.relative_to(root).as_posix(), "size_bytes": path.stat().st_size,
+    return relative
+
+
+def file_record(root: Path, path: Path) -> dict:
+    relative = validate_source_path(root, path)
+    return {"path": relative.as_posix(), "size_bytes": path.stat().st_size,
             "sha256": digest(path)}
 
 
@@ -28,6 +42,8 @@ def source_snapshot(root: Path) -> dict:
     records = []
     for name in names:
         path = root / name
+        # Check links before exists/is_file: dangling links also report missing.
+        validate_source_path(root, path)
         if path.is_file():
             records.append(file_record(root, path))
         elif not path.exists():

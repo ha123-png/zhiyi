@@ -19,7 +19,7 @@ export function InputScopeDetails({ scope, label = "本次提取输入范围", o
   if (!scope) return null;
   return <Disclosure className="input-scope-details" title={<>{label} · {scope.coverage === "partial" ? "局部读取" : "完整提供"}</>}>
     <div className="scope-content">
-      <p>{originalAvailable ? "完整原件仍保存在知意。" : "此处保留当时的读取范围；当前内容没有可打开的原件关联。"}输入覆盖范围不代表提取正确率或任务完成比例。</p>
+      <p>{originalAvailable ? "完整原件仍保存在知意。" : "此处保留当时的读取范围；当前内容没有可打开的原件关联。"}</p>
       <p><strong>提供范围：</strong>{scope.selected.map(rangeLabel).join("；")}</p>
       {scope.omitted.length > 0 && <>
         <p><strong>未提供范围：</strong></p>
@@ -32,7 +32,7 @@ export function InputScopeDetails({ scope, label = "本次提取输入范围", o
   </Disclosure>;
 }
 
-export function PartialInputAction({ task, onUpdated }: { task: Task; onUpdated?: () => void }) {
+export function PartialInputAction({ task, onUpdated, onBusyChange }: { task: Task; onUpdated?: (updated: Task) => void; onBusyChange?: (busy: boolean) => void }) {
   const [busy, setBusy] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState("");
@@ -41,10 +41,10 @@ export function PartialInputAction({ task, onUpdated }: { task: Task; onUpdated?
     <p>文件已保存，尚未进行正式提取。当前无法提供完整输入；你可以仅提取所示范围，也可以取消任务后缩小文件内容。</p>
     <InputScopeDetails scope={task.planned_scope} label="计划输入范围" />
     <button type="button" className="btn primary sm" disabled={busy || submitted} onClick={async () => {
-      setBusy(true); setError("");
-      try { await acceptTaskInputScope(task.id); setSubmitted(true); onUpdated?.(); }
+      setBusy(true); onBusyChange?.(true); setError("");
+      try { const updated = await acceptTaskInputScope(task.id); setSubmitted(true); onUpdated?.(updated); }
       catch (reason) { setError(reason instanceof Error ? reason.message : "确认失败，请重试。"); }
-      finally { setBusy(false); }
+      finally { setBusy(false); onBusyChange?.(false); }
     }}>{submitted ? "已确认，等待处理" : busy ? "正在确认…" : "仅提取所示范围"}</button>
     {error && <p role="alert">{error}</p>}
   </div>;

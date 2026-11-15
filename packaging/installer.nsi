@@ -6,8 +6,13 @@ SetCompressor /SOLID zlib
 !include "LogicLib.nsh"
 !include "FileFunc.nsh"
 
+!ifndef SMOKE_MODE
+  !include "${__FILEDIR__}\purge-option.nsh"
+  !insertmacro ZhiyiDefinePurgeOptionFunction un.HasPurgeOption
+!endif
+
 !ifndef APP_VERSION
-  !define APP_VERSION "0.6.0"
+  !error "APP_VERSION must be supplied from the canonical VERSION file"
 !endif
 !ifndef BUILD_ROOT
   !error "BUILD_ROOT must point to the PyInstaller dist directory"
@@ -148,8 +153,6 @@ Function un.onInit
   ${EndIf}
   StrCpy $DeleteUserData "0"
 !ifndef SMOKE_MODE
-  ${GetParameters} $0
-  ${GetOptions} $0 "/PURGE" $1
   ${IfNot} ${Silent}
     MessageBox MB_YESNOCANCEL|MB_ICONQUESTION "是否同时删除知意的全部本地数据？选择‘是’会永久删除当前数据、内部原件、文件修订历史、仪表盘统计、模板、设置、缓存，以及数据目录内的全部备份。请先将需要保留的备份导出到其他目录。选择‘否’只卸载程序并保留数据；选择‘取消’将退出卸载。" IDYES purge_data IDNO keep_data
     Abort
@@ -160,10 +163,14 @@ Function un.onInit
       StrCpy $DeleteUserData "0"
       Goto purge_choice_done
     purge_choice_done:
-  ${ElseIf} $1 != ""
+  ${Else}
     ; Silent uninstall preserves data unless the caller explicitly opts in
-    ; with /PURGE, so automated software management cannot erase records.
-    StrCpy $DeleteUserData "1"
+    ; with an exact /PURGE argument, so unrelated options cannot erase records.
+    Call un.HasPurgeOption
+    Pop $0
+    ${If} $0 == "1"
+      StrCpy $DeleteUserData "1"
+    ${EndIf}
   ${EndIf}
 !endif
   IfFileExists "$INSTDIR\${APP_CLI_EXE}" 0 uninstall_stop_done

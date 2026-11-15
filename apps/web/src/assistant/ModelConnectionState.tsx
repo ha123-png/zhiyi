@@ -16,17 +16,20 @@ export function ModelConnectionState() {
   const [result, setResult] = useState<ModelState | null>(null);
   useEffect(() => {
     let alive = true;
+    let latestRequest = 0;
     setResult(null);
-    const read = () =>
+    const read = () => {
+      const request = ++latestRequest;
       void assistantApi<ModelState>(
         `/model-state?profile_id=${encodeURIComponent(ask.profileId)}`,
       )
         .then((value) => {
-          if (alive) setResult(value);
+          if (alive && request === latestRequest) setResult(value);
         })
         .catch(() => {
-          if (alive) setResult(null);
+          if (alive && request === latestRequest) setResult(null);
         });
+    };
     read();
     const timer = window.setInterval(read, 8000);
     return () => {

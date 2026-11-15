@@ -19,7 +19,7 @@ from document_pipeline_api.model_providers import OpenAICompatibleProvider
 from document_pipeline_api.model_providers.base import ModelResponseError
 from document_pipeline_api.schemas.input_scope import InputPolicy
 from document_pipeline_api.services.document_preview import text_window, docx_window, image_thumbnail
-from document_pipeline_api.services.file_formats import normalize_image, UnsupportedImageError
+from document_pipeline_api.services.file_formats import render_image_frames, UnsupportedImageError
 from document_pipeline_api.services.processing_input import prepare_input, render_input_images
 from document_pipeline_api.services import worker_health
 
@@ -75,13 +75,13 @@ def test_transparent_preview_retains_black_ink_and_white_background(tmp_path, mo
     assert path.read_bytes() == original
 
 
-def test_normalize_jpeg_applies_orientation_before_stripping_exif(tmp_path):
-    source, target = tmp_path / 'rotated.jpg', tmp_path / 'converted.png'
+def test_rendered_jpeg_applies_orientation_before_stripping_exif(tmp_path):
+    source = tmp_path / 'rotated.jpg'
     exif = Image.Exif()
     exif[274] = 6
     Image.new('RGB', (120, 60), 'red').save(source, exif=exif)
     original = source.read_bytes()
-    normalize_image(source, target)
+    [target] = render_image_frames(source, tmp_path, 'rotated', max_frames=1)
     with Image.open(target) as result:
         assert result.size == (60, 120)
         assert result.getexif().get(274, 1) == 1

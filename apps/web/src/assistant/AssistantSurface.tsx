@@ -5,10 +5,12 @@ import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { MoreHorizontal, PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { Fold, usePanelWidth, useConversationScroll } from "./Interaction";
 import { ConversationSettings, scopeText } from "./ConversationSettings";
+import { serviceConsentKey, serviceConsentLabel } from "./consent";
 import {
   lazy,
   Suspense,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ComponentProps,
@@ -28,8 +30,6 @@ import {
   Maximize2,
   Plus,
   MessageCircle,
-  Cloud,
-  Monitor,
   Copy,
   ArrowUpRight,
   Search,
@@ -37,7 +37,6 @@ import {
   Pencil,
   Trash2,
   Check,
-  Paperclip,
 } from "lucide-react";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 const LazyAnalysisCard = lazy(() =>
@@ -218,7 +217,7 @@ function ToolCardContent({
         </div>
       )}
       {tool.name === "read_tool_result" && !result.error && (
-        <Fold title="已读取的资料" className="ask-recalled-text"><p>{result.text ? String(result.text) : result.data !== undefined ? JSON.stringify(result.data, null, 2) : "没有更多结果。"}</p></Fold>
+        <p>已读取保存的资料。</p>
       )}
       {tool.name === "catalog" && (
         <div className="ask-catalog-list">
@@ -281,10 +280,10 @@ function ToolCardContent({
                 </tr>
               </thead>
               <tbody>
-                {result.affected.flatMap((row) =>
+                {result.affected.flatMap((row, index) =>
                   Object.keys(row.after).map((key) => (
                     <tr key={`${row.row_id}-${key}`}>
-                      <td>#{row.row_id}</td>
+                      <td>预览记录 {index + 1}</td>
                       <td>
                         {String(
                           (
@@ -497,20 +496,31 @@ function MessageView() {
 }
 function RemoteConsent() {
   const ask = useAssistant();
-  if (!ask.profile?.is_remote || ask.remoteConsent) return null;
+  const target = ask.profile ? serviceConsentKey(ask.profile) : "";
+  const [remember, setRemember] = useState(false);
+  useEffect(() => setRemember(false), [target, ask.remoteConsent]);
+  if (!ask.profile?.is_remote) return null;
+  if (ask.remoteConsent) return ask.consentNotice
+    ? <p className="ask-consent-notice" role="status">{ask.consentNotice}</p> : null;
   return (
-    <label className="ask-remote-consent">
-      <input
-        type="checkbox"
-        checked={ask.remoteConsent}
-        disabled={ask.busy}
-        onChange={(e) => ask.setRemoteConsent(e.target.checked)}
-      />
-      <span>
-        允许这段对话向 <strong>{new URL(ask.profile.base_url).host}</strong>{" "}
-        发送问题、历史及所选资料。相同范围无需重复确认，可在对话设置中撤销。
-      </span>
-    </label>
+    <div className="ask-remote-consent" role="group" aria-label="远程模型传输确认">
+      <p>将向 <strong>{serviceConsentLabel(ask.profile)}</strong> 发送问题、历史及所选资料。</p>
+      <label className="ask-remember-consent">
+        <input type="checkbox" checked={remember} disabled={ask.busy || ask.loading || !!ask.failedThread || !target}
+          onChange={event => setRemember(event.target.checked)} />
+        <span>在此设备记住对此模型服务的允许</span>
+      </label>
+      <div className="ask-consent-actions">
+        <small>{remember ? "新对话也适用；仍只使用各对话选定的资料。可在对话设置中撤销。" : "仅允许这段对话的当前资料范围。可在对话设置中撤销。"}</small>
+        <button type="button" disabled={ask.busy || ask.loading || !!ask.failedThread || !target}
+          onClick={event => {
+            const composer = event.currentTarget.closest(".ask-conversation")?.querySelector<HTMLTextAreaElement>("textarea");
+            ask.setRemoteConsent(true, remember);
+            composer?.focus();
+          }}>{remember ? "允许并记住" : "允许这段对话"}</button>
+      </div>
+      {ask.consentNotice && <p className="ask-consent-notice" role="status">{ask.consentNotice}</p>}
+    </div>
   );
 }
 function Conversation() {
@@ -534,6 +544,7 @@ function Conversation() {
       </div>
       <ThreadPrimitive.Viewport
         className="ask-viewport"
+        aria-busy={ask.loading}
         turnAnchor="bottom"
         ref={scroll.viewport}
         {...scroll.events}
@@ -543,6 +554,11 @@ function Conversation() {
         scrollToBottomOnThreadSwitch={false}
       >
         <div ref={scroll.content} className="ask-scroll-content">
+          {ask.loading && <p className="ask-status" role="status">正在读取对话…</p>}
+          {ask.failedThread && !ask.loading && <div className="ask-load-state">
+            <p>这段对话暂时无法读取，请重试。</p>
+            <button type="button" onClick={() => void ask.switchThread(ask.failedThread!)}>重新读取对话</button>
+          </div>}
           {ask.detail?.has_more && <button type="button" className="ask-load-more" disabled={ask.loadingOlder} onClick={async () => {
             const viewport = scroll.viewport.current;
             const height = viewport?.scrollHeight || 0;
@@ -550,7 +566,7 @@ function Conversation() {
             await ask.loadOlder();
             requestAnimationFrame(() => { if (viewport) viewport.scrollTop = top + viewport.scrollHeight - height; });
           }}>{ask.loadingOlder ? "正在读取…" : "查看更早的消息"}</button>}
-          {!ask.detail?.messages.length && !ask.loading && (
+          {!ask.detail?.messages.length && !ask.loading && !ask.failedThread && (
             <div className="ask-empty">
               <span className="ask-emblem">
                 <MessageCircle size={27} strokeWidth={1.4} />
@@ -640,7 +656,7 @@ function Conversation() {
                 <span>
                   {ask.profile
                     ? "Enter 发送 · Shift + Enter 换行"
-                    : "先选择聊天模型，输入内容不会自动发送"}
+                    : "先选择聊天模型"}
                 </span>
                 {ask.busy ? (
                   <ComposerPrimitive.Cancel aria-label="停止回答">
@@ -665,6 +681,8 @@ export function AssistantTrigger() {
     <button
       className="ask-trigger"
       aria-label="问知意"
+      aria-controls="quick-ask-drawer"
+      aria-haspopup="dialog"
       title="问知意"
       hidden={ask.drawerOpen}
       type="button"
@@ -675,19 +693,30 @@ export function AssistantTrigger() {
     </button>
   );
 }
-export function AssistantDrawer() {
+export function AssistantDrawer({ onExpand }: { onExpand?: () => void } = {}) {
   const ask = useAssistant();
   const ref = useRef<HTMLDialogElement>(null);
+  const returnFocus = useRef<HTMLButtonElement | null>(null);
   const panel = usePanelWidth("zhiyi-ask-drawer-width", 560, 380, 960, true);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (ask.drawerOpen) {
+      // The opener is hidden before showModal(), so native dialog focus return
+      // cannot reliably remember it. Keep the actual node for this opening.
+      returnFocus.current = document.querySelector<HTMLButtonElement>('[aria-controls="quick-ask-drawer"]');
       ref.current?.showModal();
       ref.current?.querySelector<HTMLTextAreaElement>("textarea")?.focus();
-    } else ref.current?.close();
+    } else {
+      ref.current?.close();
+      const opener = returnFocus.current;
+      returnFocus.current = null;
+      // Expanding to the full assistant page removes the quick-ask trigger.
+      if (opener?.isConnected && !opener.hidden) opener.focus({ preventScroll: true });
+    }
   }, [ask.drawerOpen]);
   return (
     <dialog
       ref={ref}
+      id="quick-ask-drawer"
       className="ask-drawer"
       style={{ width: panel.width }}
       aria-label="快捷问知意"
@@ -730,7 +759,8 @@ export function AssistantDrawer() {
               aria-label="展开到问知意页面"
               onClick={() => {
                 ask.setDrawerOpen(false);
-                navigateAssistant({ kind: "assistant", id: "" });
+                if (onExpand) onExpand();
+                else navigateAssistant({ kind: "assistant", id: "" });
               }}
             >
               <Maximize2 size={16} />
@@ -749,8 +779,15 @@ export function AssistantDrawer() {
     </dialog>
   );
 }
-export function AssistantPage() {
+export function AssistantPage({ focusComposer = false }: { focusComposer?: boolean } = {}) {
   const ask = useAssistant();
+  const main = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!focusComposer || ask.drawerOpen) return;
+    // The drawer closes in its layout effect before the destination receives
+    // focus. Normal page visits never request this handoff.
+    (main.current?.querySelector<HTMLTextAreaElement>("textarea") ?? main.current)?.focus({ preventScroll: true });
+  }, [focusComposer, ask.drawerOpen]);
   const [search, setSearch] = useState("");
   const [archived, setArchived] = useState(false);
   const panel = usePanelWidth("zhiyi-ask-history-width", 200, 150, 360);
@@ -768,20 +805,25 @@ export function AssistantPage() {
   const [found, setFound] = useState<Thread[] | null>(null);
   const [more, setMore] = useState(false);
   const [listing, setListing] = useState(false);
+  const [listError, setListError] = useState("");
+  const [listAttempt, setListAttempt] = useState(0);
+  const historySearch = useRef<HTMLInputElement>(null);
   const listVersion = useRef(0);
   useEffect(() => {
     const version = ++listVersion.current;
     setFound(null); setMore(false);
+    setListing(true); setListError("");
     const timer = setTimeout(() => {
-      setListing(true);
       void ask.findThreads(search, archived).then(values => {
         if (version === listVersion.current) { setFound(values); setMore(values.length === 60); }
-      }).catch(error => ask.setError(error.message)).finally(() => {
+      }).catch(error => {
+        if (version === listVersion.current) setListError(error instanceof Error ? error.message : "对话列表读取失败");
+      }).finally(() => {
         if (version === listVersion.current) setListing(false);
       });
     }, search ? 180 : 0);
     return () => { clearTimeout(timer); listVersion.current++; };
-  }, [search, archived, ask.threads, ask.findThreads]);
+  }, [search, archived, ask.threads, ask.findThreads, listAttempt]);
   const threads = found || ask.threads.filter(t => t.archived === archived && t.title.toLocaleLowerCase().includes(search.toLocaleLowerCase()));
   return (
     <div className={`ask-page ${collapsed ? "ask-history-collapsed" : ""}`}>
@@ -807,6 +849,7 @@ export function AssistantPage() {
         <label className="ask-search">
           <Search size={14} />
           <input
+            ref={historySearch}
             aria-label="搜索对话"
             placeholder="搜索对话"
             value={search}
@@ -829,7 +872,7 @@ export function AssistantPage() {
             已归档
           </button>
         </div>
-        <div className="ask-thread-list">
+        <div className="ask-thread-list" aria-busy={listing}>
           {threads.map((t) => (
             <div
               className={`ask-thread-item ${ask.detail?.id === t.id ? "active" : ""}`}
@@ -942,7 +985,15 @@ export function AssistantPage() {
             } catch (error) { ask.setError(error instanceof Error ? error.message : "读取对话失败"); }
             finally { if (version === listVersion.current) setListing(false); }
           }}>{listing ? "正在读取…" : "更多对话"}</button>}
-          {!threads.length && (
+          {listing && !more && <p className="ask-history-empty" role="status">正在读取对话列表…</p>}
+          {listError && <div className="ask-resource-error" role="alert">
+            <span>{listError}</span>
+            <button type="button" onClick={() => {
+              setListAttempt(attempt => attempt + 1);
+              historySearch.current?.focus();
+            }}>重新读取列表</button>
+          </div>}
+          {!threads.length && !listing && !listError && (
             <p className="ask-history-empty">
               {search ? "没有匹配的对话" : archived ? "暂无归档对话。" : "发送第一条消息后，便会保存在这里。"}
             </p>
@@ -957,7 +1008,7 @@ export function AssistantPage() {
           className="ask-resizer"
         />
       )}
-      <section className="ask-main">
+      <section className="ask-main" ref={main} tabIndex={-1}>
         <header className="ask-heading">
           <button
             aria-label={collapsed ? "展开对话列表" : "收起对话列表"}

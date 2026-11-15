@@ -140,6 +140,7 @@ def fail_leased_task(
     *,
     code: str,
     message: str,
+    diagnostic: str | None = None,
     now: datetime | None = None,
 ) -> bool:
     failed_at = now or utc_now()
@@ -158,7 +159,7 @@ def fail_leased_task(
             lease_expires_at=None,
             failure_code=code,
             failure_message=diagnostic_summary(message),
-            failure_detail=safe_diagnostic(message),
+            failure_detail=safe_diagnostic(diagnostic or message),
             updated_at=failed_at,
         )
     )
