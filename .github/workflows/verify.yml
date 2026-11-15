@@ -55,7 +55,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           uv run --project apps/api --no-sync python scripts/check-doc-governance.py
       - name: Web tests
-        run: npm run test:web -- --maxWorkers=3
+        run: npm --workspace apps/web run test -- --maxWorkers=3
       - name: Web build
         run: npm run build:web
       - name: API, migration and Windows lifecycle tests
