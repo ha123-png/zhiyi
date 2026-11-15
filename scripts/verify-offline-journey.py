@@ -53,14 +53,20 @@ class OfflineConversation:
     def close(self):
         pass
 
-    def stream(self, messages, tools):
+    def stream(self, messages, tools, *, tool_choice=None):
         type(self).calls += 1
         if self.step < len(self.plan):
             event = self.plan[self.step]
             self.step += 1
             yield event
         else:
-            yield {"type": "text", "text": "合成流程已返回结果；这条回答来自离线测试替身。"}
+            if self.plan[0]["name"] == "analyze_data_table":
+                result = json.loads(next(message["content"] for message in reversed(messages)
+                                         if message["role"] == "tool"))
+                answer = {"kind": "analysis", "analysis_id": result["analysis_id"]}
+            else:
+                answer = {"kind": "general", "text": "修改建议已准备，等待确认。"}
+            yield {"type": "tool", "id": "finish", "name": "finish_answer", "arguments": answer}
 
 
 def main():
@@ -103,14 +109,14 @@ def main():
         request("PUT", binding_url, json={"expected_revision": 0, "enabled": True, "parent_path": str(external)})
         request("PUT", "/system/settings", json={"allow_limited_input": True, "input_text_limit": 1024})
         tasks = []
-        for index, kind in enumerate(("cancel_then_reimport", "failure_retry", "partial")):
+        for index, kind in enumerate(("cancel_retry", "failure_retry", "partial")):
             raw = (f"离线合成文件 {index}：两条明细 100 和 200，总额 300。\n"
                    + ("有界材料正文。" * 500 + "TAIL_MUST_STAY_LOCAL" if kind == "partial" else "")).encode()
             task = request("POST", "/tasks", files={"file": (f"synthetic-{kind}.txt", raw, "text/plain")},
                            data={"template_id": template["id"]}).json()
             originals[task["id"]] = raw
             before_calls = model.calls
-            if kind == "cancel_then_reimport":
+            if kind == "cancel_retry":
                 assert request("POST", f"/tasks/{task['id']}/cancel").json()["status"] == "cancelled"
                 with client.app.state.session_factory() as session:
                     try:
@@ -121,11 +127,9 @@ def main():
                         raise AssertionError("A cancelled task must refuse processing.")
                 assert model.calls == before_calls
                 assert request("GET", f"/tasks/{task['id']}/file").content == raw
-                # Cancellation is terminal in the product; retry is for failures.
-                assert client.post(f"/api/v1/tasks/{task['id']}/retry").status_code == 409
-                task = request("POST", "/tasks", files={"file": (task["filename"], raw, "text/plain")},
-                               data={"template_id": template["id"]}).json()
-                originals[task["id"]] = raw
+                retried = request("POST", f"/tasks/{task['id']}/retry").json()
+                assert retried["id"] == task["id"] and retried["status"] == "queued"
+                assert request("GET", f"/tasks/{retried['id']}/file").content == raw
             tasks.append(task["id"])
             if kind == "failure_retry":
                 model.fail_next = True
@@ -205,7 +209,7 @@ def main():
         assert client.post("/api/v1/stats/cards", json={"name": "第五张", "table_id": table_id}).status_code == 409
         values = {card["id"]: request("GET", f"/stats/cards/{card['id']}/result").json()["analysis"]["totals"] for card in cards}
         summary = request("GET", "/stats/summary?days=7").json()
-        assert summary["current_tasks"] == 4 and summary["completed_count"] == 3
+        assert summary["current_tasks"] == 3 and summary["completed_count"] == 3
         assert summary["row_count"] == summary["new_rows"] == 6 and summary["review_pending"] == 0
         assert len(request("GET", table_url + "/export.json").json()) == 6
         assert len(list(csv.reader(StringIO(request("GET", table_url + "/export.csv").content.decode("utf-8-sig"))))) == 7
