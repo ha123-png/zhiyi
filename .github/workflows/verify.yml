@@ -49,7 +49,7 @@ jobs:
           git diff --check
       - name: Check release helpers and product documentation
         run: |
-          uv run --project apps/api --no-sync pytest scripts/tests
+          uv run --project apps/api --no-sync pytest scripts/tests --basetemp=".local/tmp/ci-scripts-${{ github.run_id }}-${{ github.run_attempt }}"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node --test scripts/tests/test_live_cloud_process.cjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
