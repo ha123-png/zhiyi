@@ -27,6 +27,7 @@ from test_table_management import _client
 
 LOSSY = ["0.10000000000000001", "999999999999999.99", "1e-400"]
 BIG = "123456789012345678901234567890"
+XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 BUDGET = 2 * 1024 * 1024
 STRUCTURAL_CASES = [
@@ -284,7 +285,7 @@ def test_window_does_not_reject_unselected_sheet_rows_or_columns(tmp_path):
 @pytest.mark.parametrize("token", LOSSY)
 def test_actual_upload_refuses_bad_numeric_source_before_model_or_task_write(tmp_path, token):
     with _client(tmp_path) as client:
-        response = client.post("/api/v1/tasks", files={"file": ("source.xlsx", raw_workbook(token))},
+        response = client.post("/api/v1/tasks", files={"file": ("source.xlsx", raw_workbook(token), XLSX_MEDIA_TYPE)},
                                data={"template_id": "builtin-invoice"})
         assert response.status_code == 422 and "精度" in response.json()["detail"]
         with client.app.state.session_factory() as session:
@@ -406,7 +407,7 @@ def test_original_readers_do_not_bypass_numeric_validation_on_ambiguous_xlsx(tmp
 @pytest.mark.parametrize("case", STRUCTURAL_CASES)
 def test_ambiguous_numeric_upload_is_rejected_before_task_creation(tmp_path, case):
     with _client(tmp_path) as client:
-        response = client.post("/api/v1/tasks", files={"file": ("ambiguous.xlsx", ambiguous_workbook(case))},
+        response = client.post("/api/v1/tasks", files={"file": ("ambiguous.xlsx", ambiguous_workbook(case), XLSX_MEDIA_TYPE)},
                                data={"template_id": "builtin-invoice"})
         assert response.status_code == 422, response.text
         assert any(word in response.json()["detail"] for word in ["精度", "结构"])
